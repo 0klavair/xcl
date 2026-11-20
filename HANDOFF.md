@@ -371,6 +371,38 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. Exe g
   przy Close/ExecuteCommandLists. Układ pól i format rekordów do ustalenia z kodu inline (najpierw builder: tylko compute,
   potem gra). To prawdopodobnie największy pozostały kawałek pracy nad renderowaniem.
 
+### Format listy poleceń D3D12.X (compute) – ustalony na XboxBvhBuilder.dll
+Metoda: atrapa listy (`xbox_bvh_builder_records_into_a_fake_console_list`, `XCL_PROBE_BVH_FAKELIST=1`: vtable 600 thunków
+logujących slot i argumenty, #148 przydziela z UMA, +0x18/+0x30 = bufor rekordów) – builder nagrał całą budowę BLAS bez
+awarii; plus przegląd statyczny wszystkich 141 miejsc zapisu (`record_writers.py` w scratchpadzie).
+- **Pola obiektu listy:** +0x00 vtable, +0x18 wskaźnik zapisu, +0x28 granica dla rekordów dispatch, +0x30 koniec bufora,
+  +0x140 flaga „brudne” (ustawiana, gdy nagłówek ma bity 31:30 = 0), +0x141 bit z pipeline (bit 20 słowa +0x20 rekordu),
+  +0x143 flaga, **+0x344 + 4·i = nagłówek parametru root i** (wpisuje go metoda – u nas #33, najpewniej
+  SetComputeRootSignature – kod inline tylko go kopiuje), +0x544 bieżący pipeline (16 B).
+- **Rekordy** (bez wspólnej ramki; długość wynika z nagłówka / rodzaju):
+  - pipeline 28 B (×34): kopia +0x10..+0x2B obiektu „info” buildera = [wskaźnik PSO (nasz adoptowany obiekt)][wskaźnik
+    obiektu D3D12Core][8 B flag][4 B]; zastępczo slot 25;
+  - parametr root i: nagłówek = [+0x344 + 4i] (+ (n−1) << 16 dla wielu stałych), potem: deskryptor = adres 64-bit
+    (12 B, zastępczo slot 43/45), jedna stała (8 B, slot 37), n stałych (4 + 4n B, slot 39: (i, n, dane, offset));
+  - Dispatch: `0x4002C400` (albo `(0x1000BA00 | flaga) << 2`) + x, y, z = 16 B, zastępczo slot 14 (= PC Dispatch);
+  - `0x4003CC00`, 20 B, zastępczo slot 80 (pewnie dispatch pośredni);
+  - metody: #148 AllocateUploadMemory(rozmiar, wyrównanie) → wskaźnik CPU (= adres GPU w UMA), #146 bariera
+    (1, wskaźnik na opis), #33 (wskaźnik obiektu – root signature / PSO), #14 Dispatch.
+- Nagłówki PM4 typu 3 nie występują jako stałe – nagłówki parametrów pochodzą z listy, więc **XCL może wpisać tam własne
+  znaczniki** (np. 0xC0000000 | i << 8 | znacznik) i jednoznacznie czytać strumień; rekord pipeline rozpoznawać po znanym
+  wskaźniku PSO.
+
+### Plan: konsolowa lista poleceń w XCL (następne sesje)
+1. `hle/d3d12x/console_list.rs`: obiekt o układzie konsoli (pola jak wyżej, bufor rekordów, nagłówki parametrów), opakowujący
+   listę PC; vtable konsolowy: 14 Dispatch, 25 SetPipelineState, 33 SetComputeRootSignature (wpisuje znaczniki, pamięta
+   układ RS), 37/39/43/45 zastępcze parametry (dopisują te same rekordy), 80, 146 bariera, 148 AllocateUploadMemory
+   (UMA), Close/Reset; reszta – logujące zaślepki. CreateCommandList z kodu konsoli → ten obiekt.
+2. PSO: przy tworzeniu zapamiętać PSO → (przetłumaczony?, układ RS z RTS0).
+3. ExecuteCommandLists: interpretacja rekordów → lista PC: przy każdym dispatchu tablica argumentów root (układ z sekcji
+   „Wiązanie argumentów root”) w UMA, `io` = [adres lo, hi, …], root signature ABI + io/res/mem, PSO przetłumaczony, Dispatch;
+   bariery → bariera UAV na `mem`.
+4. Test: prawdziwy XboxBvhBuilder buduje BLAS na GPU przez tę listę → wynik czytany `bvh::Bvh::trace` = brute force.
+
 ## W trakcie (niedokończone)
 Nic otwartego.
 

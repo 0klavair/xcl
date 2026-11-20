@@ -451,3 +451,125 @@ fn memory_cap_is_active() {
         assert!(p.is_null(), "a 9 GB commit went through – the job memory cap is not active");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Fake console command list: what D3D12.X code inlined into a title writes into the list
+// object and which methods it calls (`XCL_PROBE_BVH_FAKELIST=1`).
+// ---------------------------------------------------------------------------------------
+
+static FAKE_SLOT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FAKE_CALLS: std::sync::Mutex<Vec<(u32, [usize; 6])>> = std::sync::Mutex::new(Vec::new());
+static FAKE_BUMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "system" fn fake_method(this: usize, a: usize, b: usize, c: usize, d: usize, e: usize) -> usize {
+    let slot = FAKE_SLOT.load(std::sync::atomic::Ordering::Relaxed);
+    FAKE_CALLS.lock().unwrap().push((slot, [this, a, b, c, d, e]));
+    match slot {
+        // AllocateUploadMemory(size, alignment) → CPU pointer (UMA: = GPU address)
+        148 => {
+            let align = b.max(16);
+            let at = FAKE_BUMP.load(std::sync::atomic::Ordering::Relaxed).div_ceil(align) * align;
+            FAKE_BUMP.store(at + a, std::sync::atomic::Ordering::Relaxed);
+            at
+        }
+        _ => 0,
+    }
+}
+
+/// vtable of `n` thunks: `mov dword [FAKE_SLOT], slot ; jmp fake_method`
+fn fake_vtable(n: usize) -> Vec<usize> {
+    use windows_sys::Win32::System::Memory::*;
+    let per = 32usize;
+    unsafe {
+        let code = VirtualAlloc(std::ptr::null(), n * per, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
+        (0..n)
+            .map(|i| {
+                let mut c = vec![0x48, 0xB8];
+                c.extend_from_slice(&(&FAKE_SLOT as *const _ as u64).to_le_bytes()); // mov rax, &FAKE_SLOT
+                c.extend_from_slice(&[0xC7, 0x00]);
+                c.extend_from_slice(&(i as u32).to_le_bytes()); // mov dword [rax], i
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&(fake_method as *const () as usize as u64).to_le_bytes()); // mov rax, fake_method
+                c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+                assert!(c.len() <= per);
+                let p = code.add(i * per);
+                std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
+                p as usize
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn xbox_bvh_builder_records_into_a_fake_console_list() {
+    let Some(dir) = setup() else { return };
+    if std::env::var_os("XCL_PROBE_BVH_FAKELIST").is_none() {
+        return;
+    }
+    let m = load(dir, "XboxBvhBuilder.dll");
+    unsafe {
+        let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert!(xcl::hle::d3d12x::D3D12XboxCreateDevice(std::ptr::null_mut(), std::ptr::null(), iid.as_ptr() as _, &mut dev) >= 0);
+        let ctor: extern "system" fn(*mut u8, *mut std::ffi::c_void, bool) -> *mut u8 = std::mem::transmute(proc(&m, "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z"));
+        let this = pages(0x10000);
+        ctor(this.as_mut_ptr(), dev, false);
+        let uma = xcl::gpu::uma::get().expect("UMA");
+        // the fake list: vtable, then a zeroed console-sized body; +0x18 / +0x30 = record buffer
+        let vt = Box::leak(fake_vtable(600).into_boxed_slice());
+        let list = pages(0x10000);
+        let records = uma.alloc(1 << 20, 256).unwrap() as usize;
+        let lp = list.as_mut_ptr();
+        let w = |at: usize, v: usize| (lp.add(at) as *mut usize).write(v);
+        w(0, vt.as_ptr() as usize);
+        w(0x18, records);
+        w(0x30, records + (1 << 20));
+        FAKE_BUMP.store(uma.alloc(4 << 20, 4096).unwrap() as usize, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = list.to_vec();
+        // a bottom level of 64 triangles
+        let n = 64u32;
+        let vb = uma.alloc(n as usize * 36, 256).unwrap();
+        for (i, v) in std::slice::from_raw_parts_mut(vb as *mut f32, n as usize * 9).iter_mut().enumerate() {
+            *v = (i % 9) as f32 * 0.1 + (i / 9) as f32;
+        }
+        let geom = GeometryDesc { ty: 0, flags: 1, transform: 0, index_format: 0, vertex_format: 6, index_count: 0, vertex_count: 3 * n, index_buffer: 0, vertex_buffer: vb as u64, vertex_stride: 12 };
+        let inputs = BuildInputs { ty: 1, flags: 0, num_descs: 1, layout: 0, descs: &geom as *const GeometryDesc as u64 };
+        let dest = uma.alloc(13312, 256).unwrap();
+        let scratch = uma.alloc(23872, 256).unwrap();
+        let desc = BuildDesc { dest: dest as u64, inputs, source: 0, scratch: scratch as u64 };
+        println!("vb {vb:?} dest {dest:?} scratch {scratch:?} rekordy {records:#x} upload od {:#x}", FAKE_BUMP.load(std::sync::atomic::Ordering::Relaxed));
+        let build: extern "system" fn(*mut u8, *mut u8, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
+            &m,
+            "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z",
+        ));
+        build(this.as_mut_ptr(), list.as_mut_ptr(), &desc, 0, std::ptr::null());
+        println!("== wywołania metod listy");
+        for (slot, a) in FAKE_CALLS.lock().unwrap().iter() {
+            println!("  #{slot:<4} {:x?}", &a[1..]);
+        }
+        println!("== zmienione pola obiektu listy (offset: przed → po)");
+        for k in (0..0x10000).step_by(8) {
+            let (b, a) = (u64::from_le_bytes(snapshot[k..k + 8].try_into().unwrap()), u64::from_le_bytes(list[k..k + 8].try_into().unwrap()));
+            if a != b {
+                println!("  +{k:#06x}: {b:#x} → {a:#x}");
+            }
+        }
+        let end = (list.as_ptr().add(0x18) as *const usize).read();
+        // what the pointers in the records are: the vtable each points to
+        println!("== urządzenie {dev:?}");
+        let mut seen = std::collections::BTreeSet::new();
+        let rec64 = std::slice::from_raw_parts(records as *const u32, (end - records) / 4);
+        for w in rec64.windows(2) {
+            let p = (w[0] as usize) | (w[1] as usize) << 32;
+            if (0x1_0000_0000..0x7FFF_0000_0000).contains(&p) && w[1] != 4 && seen.insert(p) {
+                let vt = (p as *const usize).read();
+                println!("  wskaźnik {p:#x}: vtable {vt:#x} = {}", xcl::modules::describe_address(vt));
+            }
+        }
+        println!("== bufor rekordów: {} B", end - records);
+        let rec = std::slice::from_raw_parts(records as *const u32, (end - records) / 4);
+        for (i, ch) in rec.chunks(8).enumerate().take(64) {
+            println!("  {:#06x}: {:08x?}", i * 32, ch);
+        }
+    }
+}
