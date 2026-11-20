@@ -291,6 +291,11 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. Exe g
     przesunięte, część tylko przesunięta, 3000 promieni = brute force po trójkątach w świecie), `instance_node_layout`
     (każde pole), rozmiary ≤ model konsoli bez wskaźników rodzica. Wskaźników rodzica nie piszemy (miejsce nieznane,
     żaden widziany shader ich nie czyta).
+- **FSR – decyzja (sesja 5): nie emulować konsolowego FSR4.** Upscaler z paczki to model ML w fp8
+  (`fsr4_model_v07_fp8_…`) z pipeline'ami skompilowanymi pod konsolę (części `ACCC`, `DeserializeComputePipelineStateX`,
+  „ACO-cooked”, z zapasową ścieżką „NewBE”). Gra nie potrzebuje go do działania – przy exe: HLE API FFX
+  (ffxCreateContext/ffxDispatch → prosty upscaling naszym shaderem albo przekazanie do PC-towego FSR na RDNA4).
+  Tabele deskryptorów i tekstury – do ustalenia na grze.
 - FSR: loader ma standardowe API FFX (ffxCreateContext/Configure/Query/Dispatch/DestroyContext) jak PC-towy
   `amd_fidelityfx_loader_dx12.dll`; upscaler to **FSR4** (`…fsr4_full_720p1080p_input_sanitize_scarlett_opt2.dll`). Plan:
   alias loadera → FFX DX12 z PC (FSR4 na RDNA4 = RX 9070 użytkownika); sprawdzić dopiero z exe.
