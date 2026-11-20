@@ -198,6 +198,8 @@ const OBJECT_BYTES: usize = 0x1000;
 
 struct ListState {
     pc: usize,
+    /// allocator the current recording uses (its Reset frees `uma`)
+    allocator: usize,
     refs: u32,
     /// record chunks: (start, bytes used – filled in when the next chunk starts / at close)
     chunks: Vec<(Box<[u8]>, usize)>,
@@ -206,6 +208,16 @@ struct ListState {
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
+/// unified-memory blocks of finished recordings, freed when their allocator is reset
+static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
+
+/// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
+pub fn allocator_reset(allocator: *mut c_void) {
+    let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
+    if let Some(b) = blocks {
+        unsafe { free_uma(&b) };
+    }
+}
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
     LISTS.lock().unwrap().as_mut()?.get_mut(&obj).map(f)
@@ -272,6 +284,45 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     }
     left
 }
+/// ID3D12Object / DeviceChild / CommandList methods 3..=8 go to the PC list
+macro_rules! list_forward {
+    ($($name:ident = $slot:literal),*) => {$(
+        unsafe extern "system" fn $name(this: *mut c_void, a: usize, b: usize, c: usize) -> usize {
+            let Some(pc) = with_list(this as usize, |st| st.pc) else { return 0 };
+            let f: unsafe extern "system" fn(usize, usize, usize, usize) -> usize = std::mem::transmute(pc_vtable_call(pc, $slot));
+            f(pc, a, b, c)
+        }
+    )*};
+}
+list_forward!(cl_3 = 3, cl_4 = 4, cl_5 = 5, cl_6 = 6, cl_7 = 7, cl_8 = 8);
+
+unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    match close(this) {
+        Ok(_) => S_OK,
+        Err(e) => {
+            crate::xlog_error!("lista konsoli: Close – {e}");
+            crate::util::E_FAIL
+        }
+    }
+}
+
+unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
+    let obj = this as usize;
+    let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
+        st.chunks.clear();
+        (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
+    }) else {
+        return crate::util::E_FAIL;
+    };
+    // what the previous recording left in unified memory lives until its allocator resets
+    if !blocks.is_empty() {
+        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
+    }
+    with_list(obj, |st| new_chunk(obj, st));
+    let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
+    f(pc, allocator, pc_pso(pso))
+}
+
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     push(this as usize, &[DISPATCH, x, y, z]);
 }
@@ -331,6 +382,14 @@ fn list_vtable() -> usize {
             (0, cl_qi as usize),
             (1, cl_addref as usize),
             (2, cl_release as usize),
+            (3, cl_3 as usize),
+            (4, cl_4 as usize),
+            (5, cl_5 as usize),
+            (6, cl_6 as usize),
+            (7, cl_7 as usize),
+            (8, cl_8 as usize),
+            (9, cl_close as usize),
+            (10, cl_reset as usize),
             (14, cl_dispatch as usize),
             (25, cl_set_pipeline_state as usize),
             (33, cl_set_compute_root_signature as usize),
@@ -351,9 +410,14 @@ fn list_vtable() -> usize {
 /// A console-shaped command list recording into `pc` (an open PC list; its reference moves
 /// into the console list).
 pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
+    create_with_allocator(pc, std::ptr::null_mut())
+}
+
+/// `create` for a list recording from `allocator` (its Reset frees the list's unified memory).
+pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, refs: 1, chunks: Vec::new(), uma: Vec::new() };
+    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new() };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -361,7 +425,18 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 
 /// The PC list behind a console list (for ExecuteCommandLists).
 pub fn pc_list(obj: *mut c_void) -> Option<*mut c_void> {
+    if obj.is_null() || unsafe { *(obj as *const usize) } != list_vtable() {
+        return None;
+    }
     with_list(obj as usize, |st| st.pc as *mut c_void)
+}
+
+/// The PC pipeline state behind a console-shaped one (others unchanged).
+pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
+    if pso.is_null() || unsafe { *(pso as *const usize) } != pso_vtable() {
+        return pso;
+    }
+    unsafe { (*(pso as *const ConsolePso)).pc as *mut c_void }
 }
 
 unsafe fn free_uma(blocks: &[usize]) {

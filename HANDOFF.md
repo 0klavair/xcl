@@ -412,8 +412,12 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
   u2 `mem` = cały bufor UMA, PSO przetłumaczony.
 - **Ważne: `mem` w trybie Compute jest `globallycoherent`** – bez tego budowa drzewa od dołu (atomiki + odczyt tego, co
   zapisały inne grupy) dawała złe wskaźniki dzieci (na konsoli kod używa GLC / unieważniania cache). Grafika ma zwykły widok.
-- Jeszcze nie: CreateCommandList / ExecuteCommandLists z kodu konsoli (test woła `create` / `close` / `pc_list` sam),
-  konsolowy slot Close/Reset, rekord `0x4003CC00` (dispatch pośredni, slot 80), opis bariery #146 (teraz zawsze globalna
+- **Podpięte automatycznie** (gdy `XCL_CONSOLE_LISTS=1`): urządzenie #12 CreateCommandList – thunk split: kod konsoli
+  dostaje listę konsolową (początkowy PSO rozpakowany do PC), kod XCL listę PC; lista: #9 Close (interpretacja),
+  #10 Reset, #3–8 → lista PC; kolejka ExecuteCommandLists zamienia listy konsolowe na PC; pamięć UMA nagrania zwalniana
+  przy Reset jej alokatora (`alloc_reset` → `console_list::allocator_reset`). Test robi 2 rundy przez vtable (64 i 200
+  trójkątów, Reset alokatora i listy między nimi) – obie zgodne z brute force.
+- Jeszcze nie: rekord `0x4003CC00` (dispatch pośredni, slot 80), opis bariery #146 (teraz zawsze globalna
   UAV), tabele deskryptorów, grafika (rekordy rysowania – do ustalenia na grze), zwalnianie pamięci UMA po wykonaniu
   (lista trzyma bloki do Release).
 

@@ -449,11 +449,28 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// Console vtable slots that differ from the PC layout (found on console code calling them):
 /// * device #62: `CreateComputePipelineState` with two extra arguments (XboxBvhBuilder.dll
 ///   passes a D3D12_COMPUTE_PIPELINE_STATE_DESC, NULL, NULL, riid, ppv); PC #62 = CreateStateObject.
+/// * device #12 `CreateCommandList` (only with console lists on): console code gets a
+///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
-        Kind::Device => vec![(62, dev_create_compute_pso_x as usize)],
+        Kind::Device => {
+            let mut v = vec![(62, dev_create_compute_pso_x as usize)];
+            if super::console_list::enabled() {
+                v.push((12, dev_create_command_list_x as usize));
+            }
+            v
+        }
         _ => vec![],
     }
+}
+
+unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usize, ty: usize, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let pc_pso = super::console_list::pc_pso(pso as *mut c_void) as usize;
+    let hr = dev_create_command_list(this, mask, ty, alloc, pc_pso, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        *ppv = super::console_list::create_with_allocator(*ppv, alloc as *mut c_void);
+    }
+    hr
 }
 
 unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -500,6 +517,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         ]),
         Kind::CommandList => v.push(("OMSetRenderTargets", cl_om_set_render_targets as usize)),
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
+        Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
         _ => {}
     }
     v
@@ -942,9 +960,28 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
+unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
+    let hr = f(this);
+    if hr >= 0 {
+        // the GPU is done with what lists recorded from this allocator used
+        super::console_list::allocator_reset(this);
+    }
+    hr
+}
+
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    // console-shaped lists run as the PC lists they were translated into
+    let mapped: Vec<*mut c_void>;
+    let lists = if n > 0 && !lists.is_null() {
+        mapped = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| super::console_list::pc_list(l).unwrap_or(l)).collect();
+        mapped.as_ptr()
+    } else {
+        lists
+    };
     f(this, n, lists);
     if n > 0 && !lists.is_null() {
         super::present::note_execute(this, std::slice::from_raw_parts(lists, n as usize));
