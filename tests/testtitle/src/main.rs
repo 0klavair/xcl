@@ -1,0 +1,446 @@
+//! XCL test title – a fake "console executable".
+//!
+//! Its import table names console DLLs (kernelx.dll, xgameruntime.dll, d3d12_xs.dll) and
+//! a DLL shipped "with the game" (testgame_mw.dll). Plain Windows cannot start it; XCL
+//! can. Every check prints [PASS]/[FAIL]; the exit code is the number of failures.
+
+use std::cell::Cell;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+type HRESULT = i32;
+
+#[repr(C)]
+struct TitleMemoryStatus {
+    dw_length: u32,
+    dw_reserved: u32,
+    v: [u64; 9],
+}
+
+#[repr(C)]
+struct SystemOsVersionInfo {
+    major: u8,
+    minor: u8,
+    build: u16,
+    revision: u16,
+}
+
+#[link(name = "kernelx", kind = "raw-dylib")]
+extern "system" {
+    fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void;
+    fn XMemFree(p: *mut c_void, attrs: u64);
+    fn GetConsoleType() -> u32;
+    fn SetThreadName(h: *mut c_void, name: *const u16) -> i32;
+    fn GetThreadName(h: *mut c_void, buf: *mut u16, len: usize, ret: *mut usize) -> i32;
+    fn TitleMemoryStatus(buf: *mut TitleMemoryStatus) -> i32;
+    fn GetSystemOSVersion(out: *mut SystemOsVersionInfo);
+    /// Not implemented anywhere – must become a logging stub returning 0.
+    fn XclDefinitelyMissingFunction(a: u64, b: u64) -> u64;
+}
+
+// Same DLL/names as Rust std's own imports, so no duplicate-symbol conflicts; XCL routes
+// kernel32 to its kernelx module, so these hit XCL's shims.
+#[link(name = "kernel32", kind = "raw-dylib")]
+extern "system" {
+    fn GetCurrentThread() -> *mut c_void;
+    fn GetModuleHandleW(name: *const u16) -> usize;
+    fn GetProcAddress(h: usize, name: *const u8) -> usize;
+    fn LoadLibraryW(name: *const u16) -> usize;
+}
+
+#[link(name = "gameinput", kind = "raw-dylib")]
+extern "system" {
+    fn GameInputCreate(out: *mut *mut c_void) -> HRESULT;
+}
+
+#[link(name = "xgameruntime", kind = "raw-dylib")]
+extern "system" {
+    fn XGameRuntimeInitialize() -> HRESULT;
+    fn XSystemGetDeviceType() -> u32;
+    fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *mut c_void) -> HRESULT;
+    fn XTaskQueueSubmitCallback(q: *mut c_void, port: u32, ctx: *mut c_void, cb: unsafe extern "system" fn(*mut c_void, bool)) -> HRESULT;
+    fn XTaskQueueSubmitDelayedCallback(q: *mut c_void, port: u32, ms: u32, ctx: *mut c_void, cb: unsafe extern "system" fn(*mut c_void, bool)) -> HRESULT;
+    fn XTaskQueueDispatch(q: *mut c_void, port: u32, timeout: u32) -> bool;
+    fn XTaskQueueTerminate(q: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT;
+    fn XTaskQueueCloseHandle(q: *mut c_void);
+    fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT;
+    fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT;
+    fn XUserAddResult(b: *mut XAsyncBlock, user: *mut *mut c_void) -> HRESULT;
+    fn XUserGetGamertag(u: *mut c_void, comp: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT;
+    fn XUserCloseHandle(u: *mut c_void);
+    fn XGameSaveFilesGetFolderWithUiAsync(u: *mut c_void, scid: *const u8, b: *mut XAsyncBlock) -> HRESULT;
+    fn XGameSaveFilesGetFolderWithUiResult(b: *mut XAsyncBlock, size: usize, buf: *mut u8) -> HRESULT;
+    fn XPersistentLocalStorageGetPath(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT;
+    fn XPackageGetCurrentProcessPackageIdentifier(size: usize, buf: *mut u8) -> HRESULT;
+}
+
+mod audio;
+mod gpu;
+
+#[link(name = "testgame_mw", kind = "raw-dylib")]
+extern "C" {
+    fn mw_add(a: i32, b: i32) -> i32;
+    fn mw_attached() -> u32;
+    fn mw_tls_bump() -> u32;
+    fn mw_xmem_roundtrip() -> u32;
+}
+
+#[link(name = "api-ms-win-crt-stdio-l1-1-0", kind = "raw-dylib")]
+extern "C" {
+    fn fopen(name: *const u8, mode: *const u8) -> *mut c_void;
+    fn fread(buf: *mut c_void, size: usize, n: usize, f: *mut c_void) -> usize;
+    fn fclose(f: *mut c_void) -> i32;
+}
+
+extern "C" {
+    static __ImageBase: u8;
+}
+
+#[repr(C)]
+struct XAsyncBlock {
+    queue: *mut c_void,
+    context: *mut c_void,
+    callback: usize,
+    internal: [u8; 32],
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn cstr(buf: &[u8]) -> String {
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+thread_local! {
+    static TL_VALUE: Cell<u64> = const { Cell::new(0x1122_3344_5566_7788) };
+}
+
+static FAILURES: AtomicU32 = AtomicU32::new(0);
+
+fn check(name: &str, f: impl FnOnce() -> Result<(), String>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(())) => println!("[PASS] {name}"),
+        Ok(Err(e)) => {
+            println!("[FAIL] {name}: {e}");
+            FAILURES.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(_) => {
+            println!("[FAIL] {name}: panic");
+            FAILURES.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+macro_rules! ensure {
+    ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
+}
+
+static FLAG: AtomicUsize = AtomicUsize::new(0);
+unsafe extern "system" fn set_flag(ctx: *mut c_void, canceled: bool) {
+    if !canceled {
+        FLAG.fetch_add(ctx as usize, Ordering::SeqCst);
+    }
+}
+
+fn main() {
+    println!("xcl_testtitle: start");
+
+    check("argv: command line belongs to the game", || {
+        let args: Vec<String> = std::env::args().collect();
+        ensure!(args[0].to_lowercase().ends_with("xcl_testtitle.exe"), "argv[0] = {}", args[0]);
+        ensure!(args.iter().any(|a| a == "--hello"), "args = {args:?}");
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        ensure!(exe.file_name().unwrap().to_string_lossy().eq_ignore_ascii_case("xcl_testtitle.exe"), "current_exe = {exe:?}");
+        Ok(())
+    });
+
+    check("static TLS: template on main thread", || {
+        ensure!(TL_VALUE.with(|v| v.get()) == 0x1122_3344_5566_7788, "got {:#x}", TL_VALUE.with(|v| v.get()));
+        TL_VALUE.with(|v| v.set(1));
+        Ok(())
+    });
+
+    check("static TLS: every new thread gets its own initialised copy", || {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let first = TL_VALUE.with(|v| v.get());
+                    TL_VALUE.with(|v| v.set(100 + i));
+                    std::thread::sleep(Duration::from_millis(10));
+                    (first, TL_VALUE.with(|v| v.get()), i)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (first, later, i) = h.join().map_err(|_| "thread panicked")?;
+            ensure!(first == 0x1122_3344_5566_7788, "thread {i} started with {first:#x}");
+            ensure!(later == 100 + i, "thread {i} saw {later} (shared TLS?)");
+        }
+        ensure!(TL_VALUE.with(|v| v.get()) == 1, "main thread value changed");
+        Ok(())
+    });
+
+    check("C++-style exceptions: panic is caught (RtlPcToFileHeader)", || {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(|| panic!("boom"));
+        std::panic::set_hook(prev);
+        ensure!(r.is_err(), "panic was not caught");
+        Ok(())
+    });
+
+    check("kernelx: GetConsoleType / XSystemGetDeviceType", || unsafe {
+        ensure!(GetConsoleType() == 6, "GetConsoleType = {}", GetConsoleType());
+        ensure!(XSystemGetDeviceType() == 7, "device type = {}", XSystemGetDeviceType());
+        let mut v = SystemOsVersionInfo { major: 0, minor: 0, build: 0, revision: 0 };
+        GetSystemOSVersion(&mut v);
+        ensure!(v.major >= 10, "os major {}", v.major);
+        Ok(())
+    });
+
+    check("kernelx: XMemAlloc alignment + zeroing", || unsafe {
+        let attrs = 8u64 << 24; // 256-byte alignment, heap
+        let p = XMemAlloc(1000, attrs);
+        ensure!(!p.is_null(), "null");
+        ensure!(p as usize % 256 == 0, "misaligned {p:?}");
+        ensure!(std::slice::from_raw_parts(p as *const u8, 1000).iter().all(|&b| b == 0), "not zeroed");
+        XMemFree(p, attrs);
+        Ok(())
+    });
+
+    check("kernelx: graphics memory lives in the GPU-visible 4 GiB-aligned region (UMA)", || unsafe {
+        let attrs = 1u64 << 29; // memory type 1: graphics
+        let a = XMemAlloc(0x20000, attrs);
+        let b = XMemAlloc(0x10000, attrs);
+        ensure!(!a.is_null() && !b.is_null(), "null");
+        // first graphics allocations: the start of the region, so low 32 bits = offset in it
+        ensure!(a as usize >> 32 >= 4 && a as usize & 0xFFFF_FFFF == 0, "a = {a:?}");
+        ensure!(b as usize == a as usize + 0x20000, "b = {b:?}, a = {a:?}");
+        *(b as *mut u64) = 0x1122_3344;
+        ensure!(*(b as *const u64) == 0x1122_3344, "read back");
+        XMemFree(b, attrs);
+        XMemFree(a, attrs);
+        let c = XMemAlloc(0x30000, attrs);
+        ensure!(c == a, "freed blocks merge and are reused: {c:?}");
+        ensure!(std::slice::from_raw_parts(c as *const u8, 0x30000).iter().all(|&x| x == 0), "reused block not zeroed");
+        XMemFree(c, attrs);
+        Ok(())
+    });
+
+    check("GameInput: GameInputCreate reaches the system GameInput (timestamps advance)", || unsafe {
+        let mut gi: *mut c_void = std::ptr::null_mut();
+        let hr = GameInputCreate(&mut gi);
+        ensure!(hr >= 0 && !gi.is_null(), "GameInputCreate {hr:#x}");
+        let vt = *(gi as *const *const usize);
+        // IGameInput: IUnknown (3 slots), then GetCurrentTimestamp
+        let ts: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(3));
+        let a = ts(gi);
+        std::thread::sleep(Duration::from_millis(2));
+        let b = ts(gi);
+        ensure!(a > 0 && b > a, "timestamps {a} {b}");
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        release(gi);
+        Ok(())
+    });
+
+    check("kernelx: TitleMemoryStatus", || unsafe {
+        let mut s = TitleMemoryStatus { dw_length: 80, dw_reserved: 0, v: [0; 9] };
+        ensure!(TitleMemoryStatus(&mut s) == 1, "failed");
+        ensure!(s.v[0] > 1 << 30, "total = {}", s.v[0]);
+        Ok(())
+    });
+
+    check("kernelx: SetThreadName / GetThreadName", || unsafe {
+        let h = std::thread::spawn(|| {
+            let ok = SetThreadName(GetCurrentThread(), wide("xcl-test-worker").as_ptr());
+            let mut buf = [0u16; 64];
+            let mut n = 0usize;
+            let ok2 = GetThreadName(GetCurrentThread(), buf.as_mut_ptr(), 64, &mut n);
+            (ok, ok2, String::from_utf16_lossy(&buf[..n]))
+        });
+        let (ok, ok2, name) = h.join().map_err(|_| "panic")?;
+        ensure!(ok != 0 && ok2 != 0, "ok={ok} ok2={ok2}");
+        ensure!(name == "xcl-test-worker", "name = {name}");
+        Ok(())
+    });
+
+    check("kernelx: unimplemented import becomes a stub and the title keeps running", || unsafe {
+        ensure!(XclDefinitelyMissingFunction(1, 2) == 0, "stub returned non-zero");
+        Ok(())
+    });
+
+    check("modules: GetModuleHandle(NULL) is the game image", || unsafe {
+        let me = &__ImageBase as *const u8 as usize;
+        ensure!(GetModuleHandleW(std::ptr::null()) == me, "{:#x} != {me:#x}", GetModuleHandleW(std::ptr::null()));
+        Ok(())
+    });
+
+    check("modules: LoadLibrary/GetProcAddress on an HLE module", || unsafe {
+        let h = LoadLibraryW(wide("kernelx.dll").as_ptr());
+        ensure!(h != 0, "LoadLibrary(kernelx) failed");
+        let f = GetProcAddress(h, b"XMemAlloc\0".as_ptr());
+        ensure!(f != 0, "XMemAlloc not found");
+        let alloc: unsafe extern "system" fn(usize, u64) -> *mut c_void = std::mem::transmute(f);
+        let p = alloc(64, 0);
+        ensure!(!p.is_null(), "alloc via GetProcAddress failed");
+        XMemFree(p, 0);
+        ensure!(GetProcAddress(h, b"XNoSuchApiAnywhere\0".as_ptr()) == 0, "missing API must return NULL");
+        Ok(())
+    });
+
+    check("game DLL: static import + DllMain + TLS + its own kernelx import", || unsafe {
+        ensure!(mw_attached() == 1, "DllMain(PROCESS_ATTACH) not run");
+        ensure!(mw_add(2, 3) == 5, "mw_add");
+        ensure!(mw_tls_bump() == 8, "DLL TLS template");
+        let t = std::thread::spawn(|| mw_tls_bump()).join().map_err(|_| "panic")?;
+        ensure!(t == 8, "DLL TLS in new thread = {t}");
+        ensure!(mw_xmem_roundtrip() == 1, "DLL kernelx import");
+        let h = LoadLibraryW(wide("testgame_mw.dll").as_ptr());
+        ensure!(h != 0, "LoadLibrary(testgame_mw)");
+        let f = GetProcAddress(h, b"mw_add\0".as_ptr());
+        ensure!(f != 0, "GetProcAddress(mw_add)");
+        let add: extern "C" fn(i32, i32) -> i32 = std::mem::transmute(f);
+        ensure!(add(40, 2) == 42, "dynamic mw_add");
+        Ok(())
+    });
+
+    check("files: console paths G:\\ and GAME: read from the game folder", || {
+        let a = std::fs::read_to_string("G:\\data\\hello.txt").map_err(|e| format!("G: {e}"))?;
+        ensure!(a.starts_with("hello from the game folder"), "content {a:?}");
+        let b = std::fs::read("GAME:\\data\\sub\\nested.bin").map_err(|e| format!("GAME: {e}"))?;
+        ensure!(b == [0u8, 1, 2, 3, 4, 5, 6, 7], "nested {b:?}");
+        let c = std::fs::read_to_string("data\\hello.txt").map_err(|e| format!("relative: {e}"))?;
+        ensure!(a == c, "relative differs");
+        Ok(())
+    });
+
+    check("files: CRT fopen goes through the VFS too", || unsafe {
+        let f = fopen(b"G:\\data\\hello.txt\0".as_ptr(), b"rb\0".as_ptr());
+        ensure!(!f.is_null(), "fopen failed");
+        let mut buf = [0u8; 64];
+        let n = fread(buf.as_mut_ptr() as *mut c_void, 1, 64, f);
+        fclose(f);
+        ensure!(buf[..n].starts_with(b"hello from the game folder"), "read {n} bytes");
+        Ok(())
+    });
+
+    check("files: writes go to the overlay, game folder untouched", || {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open("G:\\data\\hello.txt").map_err(|e| e.to_string())?;
+        f.write_all(b"+modified by title\n").map_err(|e| e.to_string())?;
+        drop(f);
+        let s = std::fs::read_to_string("G:\\data\\hello.txt").map_err(|e| e.to_string())?;
+        ensure!(s.contains("+modified by title"), "overlay not visible: {s:?}");
+        std::fs::write("G:\\data\\new_save.bin", b"save-data").map_err(|e| e.to_string())?;
+        ensure!(std::fs::read("G:\\data\\new_save.bin").map_err(|e| e.to_string())? == b"save-data", "new file");
+        std::fs::create_dir_all("G:\\data\\newdir\\deeper").map_err(|e| e.to_string())?;
+        ensure!(std::path::Path::new("G:\\data\\newdir\\deeper").is_dir(), "new dir");
+        std::fs::rename("G:\\data\\new_save.bin", "G:\\data\\renamed.bin").map_err(|e| format!("rename: {e}"))?;
+        ensure!(!std::path::Path::new("G:\\data\\new_save.bin").exists(), "rename source still visible");
+        ensure!(std::fs::read("G:\\data\\renamed.bin").map_err(|e| e.to_string())? == b"save-data", "rename target");
+        Ok(())
+    });
+
+    check("files: delete hides the file without touching the original", || {
+        std::fs::remove_file("G:\\data\\delete_me.txt").map_err(|e| e.to_string())?;
+        ensure!(!std::path::Path::new("G:\\data\\delete_me.txt").exists(), "still visible");
+        ensure!(std::fs::read("G:\\data\\delete_me.txt").is_err(), "still readable");
+        Ok(())
+    });
+
+    check("files: directory listing merges overlay and hides deleted files", || {
+        let mut names: Vec<String> = std::fs::read_dir("G:\\data")
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for want in ["hello.txt", "renamed.bin", "newdir", "sub"] {
+            ensure!(names.iter().any(|n| n == want), "missing {want} in {names:?}");
+        }
+        ensure!(!names.iter().any(|n| n == "delete_me.txt" || n == "new_save.bin"), "stale entries {names:?}");
+        Ok(())
+    });
+
+    check("files: T:\\ title scratch storage", || {
+        std::fs::write("T:\\scratch.tmp", b"tmp").map_err(|e| e.to_string())?;
+        ensure!(std::fs::read("T:\\scratch.tmp").map_err(|e| e.to_string())? == b"tmp", "readback");
+        Ok(())
+    });
+
+    check("XGameRuntime: initialize + package identity", || unsafe {
+        ensure!(XGameRuntimeInitialize() == 0, "init");
+        let mut buf = [0u8; 256];
+        ensure!(XPackageGetCurrentProcessPackageIdentifier(256, buf.as_mut_ptr()) == 0, "package id");
+        ensure!(cstr(&buf).starts_with("XCL.TestTitle"), "id = {}", cstr(&buf));
+        Ok(())
+    });
+
+    check("XTaskQueue: manual, delayed and thread-pool dispatch", || unsafe {
+        let mut q = std::ptr::null_mut();
+        ensure!(XTaskQueueCreate(0, 0, &mut q) == 0, "create manual");
+        FLAG.store(0, Ordering::SeqCst);
+        XTaskQueueSubmitCallback(q, 0, 1 as _, set_flag);
+        ensure!(FLAG.load(Ordering::SeqCst) == 0, "manual ran early");
+        ensure!(XTaskQueueDispatch(q, 0, 0), "dispatch");
+        ensure!(FLAG.load(Ordering::SeqCst) == 1, "manual did not run");
+        XTaskQueueSubmitDelayedCallback(q, 0, 20, 10 as _, set_flag);
+        ensure!(XTaskQueueDispatch(q, 0, 3000), "delayed dispatch");
+        ensure!(FLAG.load(Ordering::SeqCst) == 11, "delayed");
+        XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+        XTaskQueueCloseHandle(q);
+        let mut p = std::ptr::null_mut();
+        ensure!(XTaskQueueCreate(1, 1, &mut p) == 0, "create pool");
+        XTaskQueueSubmitCallback(p, 0, 100 as _, set_flag);
+        let t0 = Instant::now();
+        while FLAG.load(Ordering::SeqCst) != 111 && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        ensure!(FLAG.load(Ordering::SeqCst) == 111, "pool callback");
+        XTaskQueueTerminate(p, true, std::ptr::null_mut(), 0);
+        XTaskQueueCloseHandle(p);
+        Ok(())
+    });
+
+    check("XUser: silent sign-in of the offline user", || unsafe {
+        let mut b: XAsyncBlock = std::mem::zeroed();
+        ensure!(XUserAddAsync(1, &mut b) == 0, "XUserAddAsync");
+        ensure!(XAsyncGetStatus(&mut b, true) == 0, "status");
+        let mut u = std::ptr::null_mut();
+        ensure!(XUserAddResult(&mut b, &mut u) == 0 && !u.is_null(), "result");
+        let mut tag = [0u8; 16];
+        let mut used = 0usize;
+        ensure!(XUserGetGamertag(u, 0, 16, tag.as_mut_ptr(), &mut used) == 0, "gamertag");
+        ensure!(cstr(&tag) == "Player1", "gamertag = {}", cstr(&tag));
+        XUserCloseHandle(u);
+        Ok(())
+    });
+
+    check("storage: save folder + persistent local storage", || unsafe {
+        let mut b: XAsyncBlock = std::mem::zeroed();
+        ensure!(XGameSaveFilesGetFolderWithUiAsync(std::ptr::null_mut(), b"test-scid\0".as_ptr(), &mut b) == 0, "async");
+        ensure!(XAsyncGetStatus(&mut b, true) == 0, "status");
+        let mut buf = [0u8; 512];
+        ensure!(XGameSaveFilesGetFolderWithUiResult(&mut b, 512, buf.as_mut_ptr()) == 0, "result");
+        let dir = cstr(&buf);
+        std::fs::write(format!("{dir}\\slot0.sav"), b"progress").map_err(|e| format!("write save: {e}"))?;
+        let mut pls = [0u8; 512];
+        let mut used = 0usize;
+        ensure!(XPersistentLocalStorageGetPath(512, pls.as_mut_ptr(), &mut used) == 0, "pls");
+        ensure!(std::path::Path::new(&cstr(&pls)).is_dir(), "pls dir {}", cstr(&pls));
+        Ok(())
+    });
+
+    check("D3D12.X: queue + fence signal on the GPU", gpu::queue_fence);
+    check("D3D12.X: shaders captured; console shader gets a fallback PSO", gpu::pso_capture_and_fallback);
+    check("D3D12.X: retail-format console shader (XDAT/XBCH/FSSM) captured + fallback PSO", gpu::xbox_native_pso);
+    check("D3D12.X: triangle rendered on the real GPU and read back", gpu::render_triangle);
+    check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);
+
+    let failures = FAILURES.load(Ordering::SeqCst);
+    println!("xcl_testtitle: koniec, błędów: {failures}");
+    std::process::exit(failures as i32);
+}

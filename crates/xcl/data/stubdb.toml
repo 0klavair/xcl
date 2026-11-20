@@ -1,0 +1,37 @@
+# XCL stub database
+#
+# Default return values for automatically generated stubs (functions XCL does not
+# implement yet) and ordinal → name maps for DLLs that export by ordinal.
+# Values: "S_OK"/"0", "E_NOTIMPL", "E_FAIL", hex ("0x80004001"), decimal, "-1".
+# Users can override per title in xcl.toml [stub_returns].
+
+[module_defaults]
+# Almost every GDK API returns HRESULT – failing loudly is safer than a fake success.
+"xgameruntime.dll" = "E_NOTIMPL"
+"d3d12_xs.dll" = "E_NOTIMPL"
+"d3d12_x.dll" = "E_NOTIMPL"
+"xg_xs.dll" = "E_NOTIMPL"
+"acphal.dll" = "E_NOTIMPL"
+"gameinput.dll" = "E_NOTIMPL"
+
+[functions]
+# GDK / Xbox Live APIs that return HRESULT even when called through other modules
+"*!XblInitialize" = "E_NOTIMPL"
+"*!XblCleanupAsync" = "E_NOTIMPL"
+"*!HCInitialize" = "E_NOTIMPL"
+"*!XNetworkingQueryPreferredLocalUdpMultiplayerPort" = "E_NOTIMPL"
+"*!XGameUiShowErrorDialogAsync" = "E_ABORT"
+"*!XGameUiShowMessageDialogAsync" = "E_ABORT"
+"*!XGameUiShowTextEntryAsync" = "E_ABORT"
+"*!XGameUiShowAchievementsAsync" = "E_ABORT"
+"*!XGameUiShowPlayerProfileCardAsync" = "E_ABORT"
+
+[ordinals."d3d12_x.dll"]
+# Xbox One D3D12.X export ordinals (facts about the Microsoft DLL; looked up in WinDurango's D3D12X stub).
+7 = "D3D12CreateDevice"
+9 = "D3D12GetDebugInterface"
+10 = "D3D12SerializeRootSignature"
+11 = "D3D12XboxSetProcessDebugFlags"
+16 = "D3DMapEsramMemory"
+18 = "DXGIXPresentArray"
+20 = "DXGIXSetVLineNotification"
