@@ -127,6 +127,19 @@ static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
 
+/// XCL's shader ABI root signature, once a translated pipeline created it.
+pub fn abi_rs_cached() -> Option<*mut c_void> {
+    match ABI_RS.load(Ordering::Acquire) {
+        0 => None,
+        p => Some(p as *mut c_void),
+    }
+}
+
+thread_local! {
+    /// the last compute pipeline created on this thread runs a translated console shader
+    static LAST_COMPUTE_TRANSLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Root signature of the pipelines built from translated console shaders (bind it, then the
 /// XCL ABI root UAVs io / res / mem, to draw with them).
 pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
@@ -447,7 +460,12 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     if a != 0 || b != 0 {
         crate::xlog_warn!("CreateComputePipelineState (konsola, slot 62): nieznane parametry {a:#x} {b:#x} pominięte");
     }
-    dev_create_compute_pso(this, desc, riid, ppv)
+    let hr = dev_create_compute_pso(this, desc, riid, ppv);
+    // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
+    if hr >= 0 && super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
+        *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()));
+    }
+    hr
 }
 
 fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
@@ -791,6 +809,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let console = translated_compute_pso(this, f, desc, riid, ppv);
+    LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
         return hr;
     }
@@ -896,6 +915,9 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::RootSignature);
+        if !blob.is_null() {
+            super::console_list::note_root_signature(*ppv as usize, std::slice::from_raw_parts(blob as *const u8, len));
+        }
     }
     hr
 }

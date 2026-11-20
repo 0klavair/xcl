@@ -555,7 +555,23 @@ fn xbox_bvh_builder_records_into_a_fake_console_list() {
             }
         }
         let end = (list.as_ptr().add(0x18) as *const usize).read();
-        // what the pointers in the records are: the vtable each points to
+        // which interface the objects are: #33's argument and the first pointer of pipeline records
+        let kind = |p: usize| -> &'static str {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let raw = p as *mut std::ffi::c_void;
+            let Some(u) = <windows::core::IUnknown as windows::core::Interface>::from_raw_borrowed(&raw) else { return "?" };
+            if windows::core::Interface::cast::<ID3D12PipelineState>(u).is_ok() {
+                "PSO"
+            } else if windows::core::Interface::cast::<ID3D12RootSignature>(u).is_ok() {
+                "RootSignature"
+            } else {
+                "inny"
+            }
+        };
+        let args33: std::collections::BTreeSet<usize> = FAKE_CALLS.lock().unwrap().iter().filter(|c| c.0 == 33).map(|c| c.1[1]).collect();
+        for p in &args33 {
+            println!("  #33 argument {p:#x}: {}", kind(*p));
+        }
         println!("== urządzenie {dev:?}");
         let mut seen = std::collections::BTreeSet::new();
         let rec64 = std::slice::from_raw_parts(records as *const u32, (end - records) / 4);
@@ -563,7 +579,7 @@ fn xbox_bvh_builder_records_into_a_fake_console_list() {
             let p = (w[0] as usize) | (w[1] as usize) << 32;
             if (0x1_0000_0000..0x7FFF_0000_0000).contains(&p) && w[1] != 4 && seen.insert(p) {
                 let vt = (p as *const usize).read();
-                println!("  wskaźnik {p:#x}: vtable {vt:#x} = {}", xcl::modules::describe_address(vt));
+                println!("  wskaźnik {p:#x}: vtable {vt:#x} = {} ({})", xcl::modules::describe_address(vt), if xcl::modules::describe_address(vt).contains(".dll") { "?" } else { kind(p) });
             }
         }
         println!("== bufor rekordów: {} B", end - records);
@@ -571,5 +587,105 @@ fn xbox_bvh_builder_records_into_a_fake_console_list() {
         for (i, ch) in rec.chunks(8).enumerate().take(64) {
             println!("  {:#06x}: {:08x?}", i * 32, ch);
         }
+    }
+}
+
+/// The console BVH builder builds a bottom level ON THE GPU through XCL: its D3D12.X inline
+/// code records into a console-shaped list (`console_list`), XCL turns the records into PC
+/// commands running the translated console shaders, and the result is read back with XCL's
+/// own node decoder (`bvh::Bvh::trace`) against brute force.
+/// `XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_GPU=1` runs it.
+#[test]
+fn xbox_bvh_builder_builds_on_the_gpu() {
+    let Some(dir) = setup() else { return };
+    if std::env::var_os("XCL_PROBE_BVH_GPU").is_none() || !xcl::hle::d3d12x::console_list::enabled() {
+        return;
+    }
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let m = load(dir, "XboxBvhBuilder.dll");
+    unsafe {
+        let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert!(xcl::hle::d3d12x::D3D12XboxCreateDevice(std::ptr::null_mut(), std::ptr::null(), iid.as_ptr() as _, &mut dev) >= 0);
+        let ctor: extern "system" fn(*mut u8, *mut std::ffi::c_void, bool) -> *mut u8 = std::mem::transmute(proc(&m, "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z"));
+        let this = pages(0x10000);
+        ctor(this.as_mut_ptr(), dev, false);
+        let device = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let pc: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let console = xcl::hle::d3d12x::console_list::create(pc.clone().into_raw());
+        // 64 random triangles in unified memory
+        let uma = xcl::gpu::uma::get().expect("UMA");
+        let n = 64usize;
+        let mut seed = 12345u64;
+        let mut rnd = |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
+        };
+        let tris: Vec<[[f32; 3]; 3]> = (0..n)
+            .map(|_| {
+                let c = [rnd(-8.0, 8.0), rnd(-8.0, 8.0), rnd(-8.0, 8.0)];
+                [0; 3].map(|_| [0, 1, 2].map(|a| c[a] + rnd(-1.5, 1.5)))
+            })
+            .collect();
+        let vb = uma.alloc(n * 36, 256).unwrap();
+        std::ptr::copy_nonoverlapping(tris.as_ptr() as *const u8, vb, n * 36);
+        let geom = GeometryDesc { ty: 0, flags: 1, transform: 0, index_format: 0, vertex_format: 6, index_count: 0, vertex_count: 3 * n as u32, index_buffer: 0, vertex_buffer: vb as u64, vertex_stride: 12 };
+        let inputs = BuildInputs { ty: 1, flags: 0, num_descs: 1, layout: 0, descs: &geom as *const GeometryDesc as u64 };
+        let prebuild: extern "system" fn(*mut u8, *const BuildInputs, *const u8, *mut [u64; 3]) = std::mem::transmute(proc(&m, "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z"));
+        let mut sizes = [0u64; 3];
+        prebuild(this.as_mut_ptr(), &inputs, std::ptr::null(), &mut sizes);
+        let dest = uma.alloc(sizes[0] as usize, 256).unwrap();
+        let scratch = uma.alloc(sizes[1] as usize, 256).unwrap();
+        std::ptr::write_bytes(dest, 0, sizes[0] as usize);
+        std::ptr::write_bytes(scratch, 0, sizes[1] as usize);
+        let desc = BuildDesc { dest: dest as u64, inputs, source: 0, scratch: scratch as u64 };
+        let build: extern "system" fn(*mut u8, *mut std::ffi::c_void, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
+            &m,
+            "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z",
+        ));
+        build(this.as_mut_ptr(), console, &desc, 0, std::ptr::null());
+        let t = xcl::hle::d3d12x::console_list::close(console).unwrap();
+        println!("lista konsoli → PC: {t:?}");
+        assert!(t.unknown.is_none() && t.skipped_dispatches == 0 && t.dispatches > 0, "{t:?}");
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.ExecuteCommandLists(&[Some(pc.cast::<ID3D12CommandList>().unwrap())]);
+        queue.Signal(&fence, 1).unwrap();
+        let start = std::time::Instant::now();
+        while fence.GetCompletedValue() < 1 {
+            assert!(start.elapsed().as_secs() < 10, "GPU nie skończył w 10 s (usunięcie urządzenia: {:?})", device.GetDeviceRemovedReason());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let data = std::slice::from_raw_parts(dest, sizes[0] as usize).to_vec();
+        if let Some(out) = std::env::var_os("XCL_BVH_DUMP") {
+            std::fs::write(&out, &data).unwrap();
+            let t: Vec<u8> = tris.iter().flatten().flatten().flat_map(|f| f.to_le_bytes()).collect();
+            std::fs::write(format!("{}.tris", out.to_string_lossy()), t).unwrap();
+        }
+        let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        println!("nagłówek wyniku: {:x?}", (0..16).map(|k| word(4 * k)).collect::<Vec<_>>());
+        let bvh = xcl::gpu::bvh::Bvh { root: word(0x30), data: data.clone() };
+        let (mut hits, mut checked) = (0, 0);
+        for _ in 0..500 {
+            let o = [rnd(-12.0, 12.0), rnd(-12.0, 12.0), rnd(-12.0, 12.0)];
+            let to = [rnd(-6.0, 6.0), rnd(-6.0, 6.0), rnd(-6.0, 6.0)];
+            let d = [to[0] - o[0], to[1] - o[1], to[2] - o[2]];
+            let brute = tris
+                .iter()
+                .enumerate()
+                .filter_map(|(i, tri)| xcl::gpu::bvh::triangle_hit(tri, o, d).map(|h| (h[0] / h[1], i as u32)))
+                .filter(|h| (0.0..100.0).contains(&h.0))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let got = bvh.trace(o, d, 100.0);
+            checked += 1;
+            assert_eq!(got.map(|g| g.1), brute.map(|b| b.1), "ray {o:?} → {to:?}");
+            if brute.is_some() {
+                hits += 1;
+            }
+        }
+        println!("BVH zbudowany na GPU przez konsolowy builder: {checked} promieni zgodnych z brute force ({hits} trafień)");
+        assert!(hits > 20);
     }
 }

@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod console_list;
 pub mod guard;
 pub mod layout;
 pub mod null;

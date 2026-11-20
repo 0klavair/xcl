@@ -392,6 +392,31 @@ awarii; plus przegląd statyczny wszystkich 141 miejsc zapisu (`record_writers.p
   znaczniki** (np. 0xC0000000 | i << 8 | znacznik) i jednoznacznie czytać strumień; rekord pipeline rozpoznawać po znanym
   wskaźniku PSO.
 
+### ZROBIONE: konsolowa lista poleceń (compute) – konsolowy builder BVH działa na GPU PC
+`hle/d3d12x/console_list.rs` (NOWE, włączane `XCL_CONSOLE_LISTS=1`): test `xbox_bvh_builder_builds_on_the_gpu`
+(`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_GPU=1`, ~1 min przy pustym cache DXC, potem sekundy) – **prawdziwy XboxBvhBuilder.dll
+buduje BLAS z 64 losowych trójkątów na RX 9070 przez XCL**: kod inline D3D12.X nagrywa do listy w układzie konsoli,
+`console_list::close` zamienia rekordy na polecenia PC (10 dispatchy przetłumaczonych shaderów konsoli, 9 barier, 0
+nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 promieniach.
+- Obiekt listy: vtable 600 slotów (znane: 0–2, 14 Dispatch, 25 SetPipelineState, 33 SetComputeRootSignature,
+  37/39 stałe, 41/43/45 deskryptory, 146 bariera, 148 AllocateUploadMemory z UMA; reszta – logujące zaślepki), pola jak
+  w formacie wyżej, rekordy w kawałkach po 1 MB (zapas 4 KB za granicą, bo kod inline sprawdza `write < end` i dopiero
+  pisze).
+- Nagłówki parametrów root: `0xC0000000 | i << 10`; kod inline dodaje **przesunięcie stałej · 4** (bity 9:2) i
+  **(liczba − 1) << 16**; własne znaczniki `0x8C0FE0xx` (pipeline, root signature, bariera); dispatch `0x4002C400` /
+  `0x4002E800|4`.
+- PSO dla kodu konsoli: obiekt w kształcie konsoli (`wrap_pso`, pod +0x10 znacznik + wskaźnik na siebie, metody 3–8 →
+  PSO PC); tworzone na ścieżce konsolowej (urządzenie slot 62), gdy listy konsolowe są włączone. Układ argumentów root
+  zapamiętywany przy CreateRootSignature (`note_root_signature`, parser RTS0).
+- Dispatch: tablica argumentów root (układ z RTS0) w UMA, `io[0..1]` = jej adres, root signature ABI XCL, u0 io / u1 res /
+  u2 `mem` = cały bufor UMA, PSO przetłumaczony.
+- **Ważne: `mem` w trybie Compute jest `globallycoherent`** – bez tego budowa drzewa od dołu (atomiki + odczyt tego, co
+  zapisały inne grupy) dawała złe wskaźniki dzieci (na konsoli kod używa GLC / unieważniania cache). Grafika ma zwykły widok.
+- Jeszcze nie: CreateCommandList / ExecuteCommandLists z kodu konsoli (test woła `create` / `close` / `pc_list` sam),
+  konsolowy slot Close/Reset, rekord `0x4003CC00` (dispatch pośredni, slot 80), opis bariery #146 (teraz zawsze globalna
+  UAV), tabele deskryptorów, grafika (rekordy rysowania – do ustalenia na grze), zwalnianie pamięci UMA po wykonaniu
+  (lista trzyma bloki do Release).
+
 ### Plan: konsolowa lista poleceń w XCL (następne sesje)
 1. `hle/d3d12x/console_list.rs`: obiekt o układzie konsoli (pola jak wyżej, bufor rekordów, nagłówki parametrów), opakowujący
    listę PC; vtable konsolowy: 14 Dispatch, 25 SetPipelineState, 33 SetComputeRootSignature (wpisuje znaczniki, pamięta
