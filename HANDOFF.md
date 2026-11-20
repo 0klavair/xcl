@@ -439,6 +439,19 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
   brak pamięci); shader z wczorajszej awarii (1 589 instr.) – 0,3 s, 48 KB (wcześniej ~6 min i > 30 GB).
   **DXC znów optymalizuje wszystko** (`-O0` tylko > 8 MB HLSL). Próbka 64 shaderów gry: 0 błędów; mediana 0,29 s, p90 ~11 s.
 
+### FSR4 do nauki tekstur (sesja 5, w toku)
+- Sonda `fsr4_console_upscaler_creates_a_context_probe` (`XCL_PROBE_FSR=1`): `ffxCreateContext` z
+  `ffxCreateContextDescUpscale` (typ 0x10000) + opis backendu (typ **0x1000002**, urządzenie pod +0x10) – **kontekst
+  powstaje na urządzeniu XCL**. Jedyna konfiguracja w paczce (FSR sam to mówi przez OutputDebugString): render 1280×720
+  (albo 1920×1080), wyjście 1920×1080, flagi HDR | DEPTH_INVERTED | AUTO_EXPOSURE (1 | 8 | 32).
+- Kolejne różnice konsoli (tabela `real::console_slots`):
+  - urządzenie **#76 = CreateCommittedResource** (jak PC #27); **konsolowy opis zasobu**: Layout (+44) = **0x101** (tekstura
+    2D 1920×1080 R8G8B8A8, RT|UAV), +52 = 3, opis ≥ 64 B – układy konsoli → na PC UNKNOWN (log w
+    `dev_create_committed_resource_x`);
+  - sterta deskryptorów **#9 / #10 (GetCPU/GPUDescriptorHandleForHeapStart) zwracają uchwyt w rax** (PC: ukryty wskaźnik).
+- Tworzenie kontekstu: 14 zasobów, 16 UAV, 10 SRV, Map/Unmap, GetCopyableFootprints – wszystko przez metody (bez inline).
+- Następny krok: `ffxDispatch` z teksturami wejściowymi (FfxApiResource) na liście konsolowej → rekordy tabel deskryptorów.
+
 ### (archiwum) TLAS na GPU – blokada rozmiarem jednego shadera
 - Test `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): 2 BLAS + 16 instancji
   (część tylko przesunięta), `trace_scene` vs brute force w świecie. BLAS-y budują się, TLAS wychodzi pusty: 1 dispatch

@@ -449,19 +449,83 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// Console vtable slots that differ from the PC layout (found on console code calling them):
 /// * device #62: `CreateComputePipelineState` with two extra arguments (XboxBvhBuilder.dll
 ///   passes a D3D12_COMPUTE_PIPELINE_STATE_DESC, NULL, NULL, riid, ppv); PC #62 = CreateStateObject.
+/// * device #76: `CreateCommittedResource` (heap properties, flags, desc, state, clear value,
+///   riid, ppv) as on PC #27 (PC #76 = CreateCommittedResource3); the console resource desc
+///   carries more after the 52 PC bytes (amd_fidelityfx_upscaler_xbox.dll writes 3 at +52).
+/// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
 /// * device #12 `CreateCommandList` (only with console lists on): console code gets a
 ///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::Device => {
-            let mut v = vec![(62, dev_create_compute_pso_x as usize)];
+            let mut v = vec![(62, dev_create_compute_pso_x as usize), (76, dev_create_committed_resource_x as usize)];
             if super::console_list::enabled() {
                 v.push((12, dev_create_command_list_x as usize));
             }
             v
         }
+        Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         _ => vec![],
     }
+}
+
+/// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
+/// takes the handle in rax (only `this` passed); the PC methods return it through a hidden
+/// pointer
+unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 9));
+    let mut h = 0u64;
+    f(this, &mut h);
+    h
+}
+
+unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
+    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 10));
+    let mut h = 0u64;
+    f(this, &mut h);
+    h
+}
+
+unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if desc != 0 && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        let w = |o: usize| *((desc + o) as *const u32);
+        crate::xlog_info!(
+            "CreateCommittedResource (konsola, slot 76): wymiar {} {}x{} format {} flagi {:#x}; pola konsoli za opisem PC: +52 {:#x} +56 {:#x}",
+            w(0),
+            *((desc + 16) as *const u64),
+            w(24),
+            w(32),
+            w(48),
+            w(52),
+            w(56)
+        );
+        crate::xlog_info!("  opis (dwordy): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
+    }
+    // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
+    // its own (UNKNOWN); the console layout matters only where console code reads the memory
+    let mut pc_desc = [0u8; 56];
+    let mut desc = desc;
+    if desc != 0 {
+        std::ptr::copy_nonoverlapping(desc as *const u8, pc_desc.as_mut_ptr(), 56);
+        let layout = u32::from_le_bytes(pc_desc[44..48].try_into().unwrap());
+        if layout > 3 {
+            pc_desc[44..48].copy_from_slice(&0u32.to_le_bytes());
+            pc_desc[52..56].copy_from_slice(&0u32.to_le_bytes());
+            desc = pc_desc.as_ptr() as usize;
+        }
+    }
+    let hr = dev_create_committed_resource(this, props, flags, desc, state, clear, riid, ppv);
+    if hr < 0 && SEEN.load(Ordering::Relaxed) <= 8 {
+        let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
+        crate::xlog_warn!(
+            "CreateCommittedResource (konsola): {hr:#x}; sterta typ {} cpu {} pula {}, flagi sterty {flags:#x}, stan {state:#x}",
+            pw(0),
+            pw(4),
+            pw(8)
+        );
+    }
+    hr
 }
 
 unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usize, ty: usize, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {

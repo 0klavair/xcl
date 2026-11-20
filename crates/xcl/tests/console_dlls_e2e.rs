@@ -851,3 +851,58 @@ fn xbox_bvh_builder_builds_a_tlas_on_the_gpu() {
         assert!(hits > 30);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// FSR4 (console upscaler) for learning how console code binds textures / descriptor tables
+// ---------------------------------------------------------------------------------------
+
+#[repr(C)]
+struct FfxHeader {
+    ty: u64,
+    next: *mut FfxHeader,
+}
+
+#[repr(C)]
+struct FfxCreateUpscale {
+    header: FfxHeader,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+    message: usize,
+}
+
+#[repr(C)]
+struct FfxBackend {
+    header: FfxHeader,
+    device: *mut std::ffi::c_void,
+}
+
+/// Probe: the console FSR4 upscaler creates its context on XCL's device. With
+/// XCL_D3D12_TRACE=1 the device methods it calls are logged. `XCL_PROBE_FSR=1` runs it.
+#[test]
+fn fsr4_console_upscaler_creates_a_context_probe() {
+    let Some(dir) = setup() else { return };
+    if std::env::var_os("XCL_PROBE_FSR").is_none() {
+        return;
+    }
+    let m = load(dir, "amd_fidelityfx_upscaler_xbox.dll");
+    unsafe {
+        let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert!(xcl::hle::d3d12x::D3D12XboxCreateDevice(std::ptr::null_mut(), std::ptr::null(), iid.as_ptr() as _, &mut dev) >= 0);
+        let mut backend = FfxBackend { header: FfxHeader { ty: 0x0100_0002, next: std::ptr::null_mut() }, device: dev };
+        let mut desc = FfxCreateUpscale {
+            header: FfxHeader { ty: 0x0001_0000, next: &mut backend.header },
+            // the only configuration in the game's package (the DLL says so on its debug output):
+            // HDR | inverted depth | auto exposure, 1280x720 -> 1920x1080
+            flags: 1 | 1 << 3 | 1 << 5,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+            message: 0,
+        };
+        let create: extern "C" fn(*mut usize, *mut FfxHeader, *const u8) -> u32 = std::mem::transmute(proc(&m, "ffxCreateContext"));
+        let mut ctx = 0usize;
+        let rc = create(&mut ctx, &mut desc.header, std::ptr::null());
+        println!("ffxCreateContext: kod {rc:#x}, kontekst {ctx:#x}");
+    }
+}
