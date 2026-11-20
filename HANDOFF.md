@@ -345,8 +345,31 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. Exe g
     użytkownika (dziennik: „System ma za mało pamięci wirtualnej”, 23:27). Próg `-O0` w `dxc::compile` obniżony z 256 KB
     do 48 KB HLSL. DXIL tego shadera (314 KB) jest już w cache DXC. Przed kolejnymi sondami z dużymi shaderami: limit
     pamięci procesu testu (Job Object) albo kompilacja DXC w osobnym procesie.
-  - Następny krok: `GetRaytracingAccelerationStructurePrebuildInfo` / `BuildRaytracingAccelerationStructure` na liście
-    poleceń (wymaga mapowania argumentów root konsoli na ABI XCL przy dispatchu – układ user data sterownika konsoli).
+  - Testy nowych instrukcji: `gpu_global_atomics_and_sub_dword_access` (64 linie na tych samych adresach: add z GLC,
+    sub, fmax/fmin od ±inf, smax; short/byte w buforze i LDS z sąsiadami w jednym dwordzie, odczyt sąsiada po barierze).
+  - Testy z konsolowymi DLL działają pod **limitem pamięci 8 GB** (Job Object w `setup`, test `memory_cap_is_active`).
+
+### Wiązanie argumentów root na konsoli (ustalone na 52 shaderach XboxBvhBuilder.dll)
+- **s[0:1] = wskaźnik (40 bit, s1 & 0xFF) do tablicy argumentów root**: parametry spakowane w kolejności z root signature,
+  stała root = 4 B, deskryptor root (CBV/SRV/UAV) = 8 B adresu GPU, bez wyrównania (UAV po 19 stałych leży pod 76).
+  Shader sam składa V# z adresu (num_records −1). Sprawdzone automatycznie: 123 odczyty z tablicy w 50 shaderach – wszystkie
+  na granicach parametrów (skrypt `check_layout.py` w scratchpadzie; shadery wyciągane z DLL po sygnaturze DXBC).
+  Tabele deskryptorów – jeszcze nie widziane (builder ich nie używa). Id grup za user SGPR (s4 = TGID.x przy 4 user SGPR).
+- Dla XCL: przy dispatchu z przetłumaczonym PSO – złożyć tę tablicę z zapamiętanych argumentów root w UMA, s0/s1 = jej adres
+  w `io`, reszta jak w trybie Compute.
+
+### D3D12.X: lista poleceń jest częściowo „wkompilowana” w kod tytułu (sonda `XCL_PROBE_BVH_RECORD=1`)
+- Nagranie `BuildRaytracingAccelerationStructure` na liście z urządzenia XCL: builder woła **metodę konsolową listy #148**
+  = `AllocateUploadMemory(rozmiar, wyrównanie) → wskaźnik CPU` (u nas strażnik zwraca 0 → „D3D12 XDXR Error: Failed to
+  allocate upload buffer” → wyjątek C++), a potem **pisze bezpośrednio do wnętrza obiektu listy**: +0x18 wskaźnik zapisu,
+  +0x30 koniec bufora (dopisuje rekord 28 B), +0x140 flaga, +0x544 stan root signature; slot 33 to tu raczej
+  SetComputeRootSignature (na PC #29). W kodzie nie ma nagłówków PM4 – rekordy są w programowym formacie D3D12.X,
+  zamieniane na polecenia GPU przez sterownik konsoli przy Close/Execute.
+- **Wniosek architektoniczny (dotyczy też gry):** podmiana vtable na prawdziwym obiekcie PC nie wystarczy – kod konsoli
+  zapisałby po wnętrzu obiektu sterownika PC. Kod konsoli musi dostawać **własne obiekty listy XCL** o konsolowym układzie
+  pamięci (vtable przekazujący do listy PC + obszar „cienia” na pola i bufor rekordów), a XCL musi **interpretować rekordy**
+  przy Close/ExecuteCommandLists. Układ pól i format rekordów do ustalenia z kodu inline (najpierw builder: tylko compute,
+  potem gra). To prawdopodobnie największy pozostały kawałek pracy nad renderowaniem.
 
 ## W trakcie (niedokończone)
 Nic otwartego.

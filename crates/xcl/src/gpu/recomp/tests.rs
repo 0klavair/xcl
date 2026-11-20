@@ -1836,3 +1836,84 @@ fn gpu_triangle_pair_and_box16_nodes() {
     }
     assert!(checked > 5, "{checked} triangle hits");
 }
+
+/// Instructions first met in XboxBvhBuilder.dll's shaders: global atomics (float min / max by
+/// a CAS loop), 8 / 16-bit buffer loads / stores and 8 / 16-bit LDS accesses – neighbouring
+/// lanes share dwords, so a non-atomic read-modify-write would lose writes.
+#[test]
+fn gpu_global_atomics_and_sub_dword_access() {
+    if !gpu_ready() {
+        return;
+    }
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap();
+    let mubuf = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_MUBUF", f, None).unwrap();
+    let ds = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_DS", f, None).unwrap();
+    let mut code = Vec::new();
+    // global atomics on s[2:3] + v30 (= 0 for every lane) + offset
+    code.extend(glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 40), ("ADDR", 30), ("DATA", 31), ("SADDR", 2), ("OFFSET", 0), ("GLC", 1)]));
+    code.extend(glbl("GLOBAL_ATOMIC_SUB", &[("VDST", 41), ("ADDR", 30), ("DATA", 35), ("SADDR", 2), ("OFFSET", 4)]));
+    code.extend(glbl("GLOBAL_ATOMIC_FMAX", &[("VDST", 42), ("ADDR", 30), ("DATA", 32), ("SADDR", 2), ("OFFSET", 8)]));
+    code.extend(glbl("GLOBAL_ATOMIC_FMIN", &[("VDST", 43), ("ADDR", 30), ("DATA", 32), ("SADDR", 2), ("OFFSET", 12)]));
+    code.extend(glbl("GLOBAL_ATOMIC_SMAX", &[("VDST", 44), ("ADDR", 30), ("DATA", 33), ("SADDR", 2), ("OFFSET", 16)]));
+    // V# s[24:27]: raw at 0x700; short at lane*2, byte at 0x80 + lane (offen)
+    code.extend(mubuf("BUFFER_STORE_SHORT", &[("VDATA", 34), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_STORE_BYTE", &[("VDATA", 36), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_USHORT", &[("VDATA", 45), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_SSHORT", &[("VDATA", 46), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_UBYTE", &[("VDATA", 47), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_SBYTE", &[("VDATA", 48), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    // LDS: 16-bit at lane*2, 8-bit at 256 + lane; after the barrier read the neighbour's (lane ^ 1)
+    code.extend(ds("DS_WRITE_B16", &[("ADDR", 2), ("DATA0", 34)]));
+    code.extend(ds("DS_WRITE_B8", &[("ADDR", 4), ("DATA0", 36)]));
+    code.extend(encode("S_BARRIER", "ENC_SOPP", &[], None).unwrap());
+    code.extend(ds("DS_READ_U16", &[("VDST", 49), ("ADDR", 5)]));
+    code.extend(ds("DS_READ_I16", &[("VDST", 50), ("ADDR", 5)]));
+    code.extend(ds("DS_READ_U8", &[("VDST", 51), ("ADDR", 6)]));
+    code.extend(ds("DS_READ_I8", &[("VDST", 52), ("ADDR", 6)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x600;
+    st.sgpr[24..28].copy_from_slice(&[0x700, 0, 0x200, 0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l32 = l as u32;
+        r[2] = 2 * l32;
+        r[3] = 0x80 + l32;
+        r[4] = 256 + l32;
+        r[5] = 2 * (l32 ^ 1);
+        r[6] = 256 + (l32 ^ 1);
+        r[30] = 0;
+        r[31] = l32 + 1;
+        r[32] = f(l as f32 - 20.5);
+        r[33] = (l as i32 - 30) as u32;
+        r[34] = 0xAB00 + l32;
+        r[35] = 1;
+        r[36] = 0x90 + l32;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x604 / 4] = 1000;
+    mem[0x608 / 4] = f32::NEG_INFINITY.to_bits();
+    mem[0x60C / 4] = f32::INFINITY.to_bits();
+    mem[0x610 / 4] = (-100i32) as u32;
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    assert_eq!(r.mem[0x600 / 4], 64 * 65 / 2, "global_atomic_add");
+    let mut olds: Vec<u32> = r.vgpr.iter().map(|v| v[40]).collect();
+    olds.sort_unstable();
+    olds.dedup();
+    assert_eq!(olds.len(), 64, "global_atomic_add with GLC returns 64 distinct old values");
+    assert_eq!(r.mem[0x604 / 4], 1000 - 64, "global_atomic_sub");
+    assert_eq!(f32::from_bits(r.mem[0x608 / 4]), 42.5, "global_atomic_fmax");
+    assert_eq!(f32::from_bits(r.mem[0x60C / 4]), -20.5, "global_atomic_fmin");
+    assert_eq!(r.mem[0x610 / 4] as i32, 33, "global_atomic_smax");
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let (s, b) = (0xAB00 + l as u32, 0x90 + l as u32);
+        let n = l ^ 1;
+        assert_eq!((r.mem[(0x700 + 2 * l) / 4] >> (16 * (l % 2))) & 0xFFFF, s, "lane {l}: buffer_store_short");
+        assert_eq!((r.mem[(0x780 + l) / 4] >> (8 * (l % 4))) & 0xFF, b, "lane {l}: buffer_store_byte");
+        assert_eq!((v[45], v[46]), (s, s | 0xFFFF_0000), "lane {l}: buffer_load_ushort / sshort");
+        assert_eq!((v[47], v[48]), (b, b | 0xFFFF_FF00), "lane {l}: buffer_load_ubyte / sbyte");
+        let (sn, bn) = (0xAB00 + n as u32, 0x90 + n as u32);
+        assert_eq!((v[49], v[50]), (sn, sn | 0xFFFF_0000), "lane {l}: ds_read_u16 / i16 of the neighbour");
+        assert_eq!((v[51], v[52]), (bn, bn | 0xFFFF_FF00), "lane {l}: ds_read_u8 / i8 of the neighbour");
+    }
+}

@@ -12,6 +12,7 @@ fn setup() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = PathBuf::from(std::env::var_os("XCL_SAMPLE_DLLS")?);
+        cap_memory(8 << 30);
         xcl::stubs::init_db(&Default::default());
         xcl::hle::init(&xcl::config::Config::default());
         xcl::resolver::set_search_dirs(vec![dir.clone()]);
@@ -20,6 +21,28 @@ fn setup() -> Option<&'static PathBuf> {
         Some(dir)
     })
     .as_ref()
+}
+
+/// Limit this test process's committed memory: a runaway shader compile (DXC / driver) on
+/// a big translated program once exhausted the machine's commit and took the user's session
+/// down – with the cap only the test fails.
+fn cap_memory(bytes: usize) {
+    use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = bytes;
+        let ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32) != 0
+            && AssignProcessToJobObject(job, GetCurrentProcess()) != 0;
+        if !ok {
+            eprintln!("cap_memory: nie udało się ustawić limitu pamięci");
+        }
+    }
 }
 
 fn load(dir: &std::path::Path, name: &str) -> std::sync::Arc<MappedModule> {
@@ -378,5 +401,53 @@ fn xbox_bvh_builder_on_xcl_device_probe() {
         let this = pages(0x10000);
         ctor(this.as_mut_ptr(), dev, false);
         println!("XboxBvhBuilder skonstruowany");
+        if std::env::var_os("XCL_PROBE_BVH_RECORD").is_none() {
+            return;
+        }
+        // record (not execute) a bottom-level build of 64 triangles into a command list made
+        // on XCL's device; buffers in the unified memory (console GPU address = CPU address)
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::*;
+        let device = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+        let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let uma = xcl::gpu::uma::get().expect("UMA");
+        let n = 64u32;
+        let vb = uma.alloc(n as usize * 36, 256).unwrap();
+        for (i, v) in std::slice::from_raw_parts_mut(vb as *mut f32, n as usize * 9).iter_mut().enumerate() {
+            *v = (i % 9) as f32 * 0.1 + (i / 9) as f32;
+        }
+        let geom = GeometryDesc { ty: 0, flags: 1, transform: 0, index_format: 0, vertex_format: 6, index_count: 0, vertex_count: 3 * n, index_buffer: 0, vertex_buffer: vb as u64, vertex_stride: 12 };
+        let inputs = BuildInputs { ty: 1, flags: 0, num_descs: 1, layout: 0, descs: &geom as *const GeometryDesc as u64 };
+        let prebuild: extern "system" fn(*mut u8, *const BuildInputs, *const u8, *mut [u64; 3]) = std::mem::transmute(proc(&m, "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z"));
+        let mut sizes = [0u64; 3];
+        prebuild(this.as_mut_ptr(), &inputs, std::ptr::null(), &mut sizes);
+        let dest = uma.alloc(sizes[0] as usize, 256).unwrap();
+        let scratch = uma.alloc(sizes[1] as usize, 256).unwrap();
+        println!("rozmiary: wynik {} B, scratch {} B; dest {dest:?}, scratch {scratch:?}", sizes[0], sizes[1]);
+        let desc = BuildDesc { dest: dest as u64, inputs, source: 0, scratch: scratch as u64 };
+        let build: extern "system" fn(*mut u8, *mut std::ffi::c_void, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
+            &m,
+            "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z",
+        ));
+        build(this.as_mut_ptr(), list.as_raw(), &desc, 0, std::ptr::null());
+        list.Close().unwrap();
+        println!("budowa BLAS nagrana na liście poleceń (niewykonana)");
+    }
+}
+
+/// The memory cap of `setup` holds: committing 9 GB in this process fails.
+#[test]
+fn memory_cap_is_active() {
+    if setup().is_none() {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::*;
+    unsafe {
+        let p = VirtualAlloc(std::ptr::null(), 9 << 30, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if !p.is_null() {
+            VirtualFree(p, 0, MEM_RELEASE);
+        }
+        assert!(p.is_null(), "a 9 GB commit went through – the job memory cap is not active");
     }
 }
