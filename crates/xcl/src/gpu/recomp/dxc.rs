@@ -100,11 +100,12 @@ fn compiler() -> Result<IDxcCompiler3, String> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser is superlinear on big translated programs (1.2 MB HLSL: 140 s at
-    // -O1..-O3, 5 s at -O0; a 1589-instruction XboxBvhBuilder CS under 256 KB ran ~6 min and
-    // exhausted 38 GB of commit, taking the user's session down); the driver optimises the
-    // DXIL again anyway
-    if src.len() > 48 * 1024 && !extra.iter().any(|a| a.starts_with("-O")) {
+    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
+    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
+    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
+    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
+    // compile). -O0 only as a safety net for enormous sources.
+    if src.len() > 8 * 1024 * 1024 && !extra.iter().any(|a| a.starts_with("-O")) {
         args.push(crate::util::wide("-O0"));
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));

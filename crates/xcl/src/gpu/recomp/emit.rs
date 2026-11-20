@@ -255,10 +255,11 @@ impl Em {
     }
 
     fn act(&self) -> &'static str {
+        // no short-circuit `?:` (HLSL 2021 makes it a branch – one per instruction at -O0)
         if self.opt.wave64 {
             "lanebit(exec_lo, exec_hi)"
         } else {
-            "lanebit(exec_lo, 0u)"
+            "(((exec_lo >> lane_id) & 1u) != 0u)"
         }
     }
 
@@ -303,11 +304,11 @@ impl Em {
             }
             251 => {
                 let (l, h) = (self.sreg(106), self.sreg(107));
-                format!("((({l} | {h}) == 0u) ? 1u : 0u)")
+                format!("(uint)(({l} | {h}) == 0u)")
             }
             252 => {
                 let (l, h) = (self.sreg(126), self.sreg(127));
-                format!("((({l} | {h}) == 0u) ? 1u : 0u)")
+                format!("(uint)(({l} | {h}) == 0u)")
             }
             253 => "scc".into(),
             255 => hex(lit?),
@@ -462,7 +463,7 @@ impl Em {
     fn write_mask(&mut self, dst: &Dst, cond: &str) {
         let a = self.act();
         let m = self.t();
-        self.line(&format!("uint2 {m} = ballot({a} && ({cond}));"));
+        self.line(&format!("uint2 {m} = ballot(and({a}, ({cond})));"));
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
         } else {
@@ -625,7 +626,7 @@ impl Em {
                 _ if name.starts_with("s_cmpk_") => {
                     let (op, signed) = cmp_op(&name[7..]).ok_or("porównanie")?;
                     let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
-                    self.line(&format!("scc = ({a} {op} {b}) ? 1u : 0u;"));
+                    self.line(&format!("scc = (uint)({a} {op} {b});"));
                 }
                 _ => return Err("SOPK"),
             }
@@ -641,18 +642,18 @@ impl Em {
                     _ => return Err("SOPC"),
                 };
                 let j = if op == "==" { "&&" } else { "||" };
-                self.line(&format!("scc = ({} {op} {} {j} {} {op} {}) ? 1u : 0u;", a.0, b.0, a.1, b.1));
+                self.line(&format!("scc = (uint)({} {op} {} {j} {} {op} {});", a.0, b.0, a.1, b.1));
                 return Ok(());
             }
             let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
             if let Some(rest) = name.strip_prefix("s_cmp_") {
                 let (op, signed) = cmp_op(rest).ok_or("porównanie")?;
                 let (a, b) = if signed { (format!("(int){a}"), format!("(int){b}")) } else { (a, b) };
-                self.line(&format!("scc = ({a} {op} {b}) ? 1u : 0u;"));
+                self.line(&format!("scc = (uint)({a} {op} {b});"));
                 return Ok(());
             }
             match name {
-                "s_bitcmp0_b32" => self.line(&format!("scc = ((({a} >> ({b} & 31u)) & 1u) == 0u) ? 1u : 0u;")),
+                "s_bitcmp0_b32" => self.line(&format!("scc = (uint)((({a} >> ({b} & 31u)) & 1u) == 0u);")),
                 "s_bitcmp1_b32" => self.line(&format!("scc = (({a} >> ({b} & 31u)) & 1u);")),
                 _ => return Err("SOPC"),
             }
@@ -684,12 +685,12 @@ impl Em {
             self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
             if !self.opt.wave64 || name.ends_with("_b32") {
                 self.line(&format!("{el} = {t0};"));
-                self.line(&format!("scc = ({t0} != 0u) ? 1u : 0u;"));
+                self.line(&format!("scc = (uint)({t0} != 0u);"));
                 let v = if name.contains("wrexec") { t0.clone() } else { o0.clone() };
                 self.write32(&dst, &v);
             } else {
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
-                self.line(&format!("scc = (({t0} | {t1}) != 0u) ? 1u : 0u;"));
+                self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
                 let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
                 self.write64(&dst, &a, &b);
             }
@@ -797,7 +798,7 @@ impl Em {
         };
         self.line(&format!("uint {t} = {res};"));
         if let Some(c) = scc {
-            self.line(&format!("scc = ({c}) ? 1u : 0u;"));
+            self.line(&format!("scc = (uint)({c});"));
         }
         self.write32(&dst, &t);
         Ok(())
@@ -882,7 +883,7 @@ impl Em {
         };
         self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
         if let Some(c) = scc {
-            self.line(&format!("scc = ({c}) ? 1u : 0u;"));
+            self.line(&format!("scc = (uint)({c});"));
         }
         if name == "s_bcnt1_i32_b64" || name == "s_ff1_i32_b64" {
             self.write32(dst, &t0);
@@ -971,12 +972,12 @@ impl Em {
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         let act = self.act();
-        let in_range = |bytes: String| format!("(({t}_stride == 0u) ? ({t}_off + {bytes} <= {d2}) : ({index} < {d2}))");
+        let in_range = |bytes: String| format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})");
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
             let v = self.vreg(vdata);
             if store {
-                self.line(&format!("if ({act} && {ok}) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
+                self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
                 let bits = 8 * n;
                 let val = if signed {
@@ -1012,7 +1013,7 @@ impl Em {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
-                self.line(&format!("bool {t}_ok = ({t}_info & 7u) != 0u && {};", in_range(format!("fmt_bytes({t}_info)"))));
+                self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
@@ -1020,16 +1021,16 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = {t}_ok ? dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int) : 0u;", 3 * i));
+                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
             BufKind::FormatStore => {
                 let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
-                self.line(&format!("bool {t}_ok = ({t}_info & 7u) != 0u && {};", in_range(format!("fmt_bytes({t}_info)"))));
+                self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 let vals: Vec<String> = (0..4).map(|i| if i < count { self.vreg(vdata + i) } else { "0u".into() }).collect();
-                self.line(&format!("if ({act} && {t}_ok) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
+                self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
             }
         }
         Ok(())
@@ -1762,14 +1763,14 @@ impl Em {
                     let src = dpp16_src(ctrl).ok_or("DPP_CTRL")?;
                     self.line(&format!("int {t}_l = {src};"));
                     self.line(&format!(
-                        "bool {t}_ok = {t}_l >= 0 && ({fi} || lanebit_at({el}, {eh}, (uint){t}_l));"
+                        "bool {t}_ok = and({t}_l >= 0, or({fi}, lanebit_at({el}, {eh}, (uint){t}_l)));"
                     ));
                     self.line(&format!("uint {t} = rla({v}, (uint)max({t}_l, 0));"));
                     let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
                     // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
                     let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
                     if bound {
-                        self.line(&format!("{t} = {t}_ok ? {t} : 0u;"));
+                        self.line(&format!("{t} = select({t}_ok, {t}, 0u);"));
                     } else {
                         en = format!("({en} && {t}_ok)");
                     }
@@ -1780,7 +1781,7 @@ impl Em {
                     self.line(&format!("uint {t}_l = (lane_id & ~7u) | (({sel}u >> (3u * (lane_id & 7u))) & 7u);"));
                     self.line(&format!("uint {t} = rla({v}, {t}_l);"));
                     if !fi {
-                        self.line(&format!("{t} = lanebit_at({el}, {eh}, {t}_l) ? {t} : 0u;"));
+                        self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                     }
                 }
                 if !u.is_empty() {
@@ -1807,7 +1808,7 @@ impl Em {
             (Some(en), Dst::V(n)) => {
                 let v = self.vreg(*n);
                 let a = self.act();
-                self.line(&format!("if ({a} && {en}) {v} = {val};"));
+                self.line(&format!("{v} = select(and({a}, {en}), {val}, {v});"));
             }
             _ => self.write32(dst, &val),
         }
@@ -2412,7 +2413,7 @@ impl Em {
             "v_cndmask_b32" => {
                 let (l, h) = u.get(2).ok_or("maska")?.split_once('|').ok_or("maska")?;
                 let bit = self.lane_of(l, h);
-                format!("{bit} ? {b} : {a}")
+                format!("select({bit}, {b}, {a})")
             }
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 // lane i of each row reads lane sel[i] of the same / the other row (32-lane halves)
@@ -2420,17 +2421,17 @@ impl Em {
                 let t = self.t();
                 let other = if name == "v_permlanex16_b32" { "^ 16u" } else { "" };
                 self.line(&format!(
-                    "uint {t}_n = (lane_id & 15u) < 8u ? (({b} >> (4u * (lane_id & 7u))) & 15u) : (({c} >> (4u * (lane_id & 7u))) & 15u);"
+                    "uint {t}_n = (select((lane_id & 15u) < 8u, {b}, {c}) >> (4u * (lane_id & 7u))) & 15u;"
                 ));
                 self.line(&format!("uint {t}_l = (lane_id & ~31u) | (((lane_id & 16u) {other}) & 16u) | {t}_n;"));
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
-                self.line(&format!("bool {t}_ok = {fi} || lanebit_at({el}, {eh}, {t}_l);"));
+                self.line(&format!("bool {t}_ok = or({fi}, lanebit_at({el}, {eh}, {t}_l));"));
                 self.line(&format!("uint {t} = rla({a}, {t}_l);"));
                 if bound {
-                    format!("{t}_ok ? {t} : 0u")
+                    format!("select({t}_ok, {t}, 0u)")
                 } else {
-                    format!("{t}_ok ? {t} : {cur}")
+                    format!("select({t}_ok, {t}, {cur})")
                 }
             }
             "v_readfirstlane_b32" => {
@@ -2472,7 +2473,7 @@ impl Em {
             }
             "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
                 let (l, h) = u.get(2).ok_or("maska")?.split_once('|').ok_or("maska")?;
-                let cin = format!("({} ? 1u : 0u)", self.lane_of(l, h));
+                let cin = format!("(uint)({})", self.lane_of(l, h));
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
                 let t = self.t();
                 if name == "v_add_co_ci_u32" {
@@ -2488,9 +2489,9 @@ impl Em {
             }
             _ => return Err("VALU"),
         };
-        let t = self.t();
-        self.line(&format!("uint {t} = {res};"));
-        self.vwrite(d, &dst, &t);
+        // the value straight into the write (a named temporary is one more local per
+        // instruction – tens of thousands on big programs at -O0)
+        self.vwrite(d, &dst, &format!("({res})"));
         Ok(())
     }
 
@@ -2621,7 +2622,7 @@ impl Em {
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
         self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~3u;"));
-        self.line(&format!("bool {t}_ok = ({t}_stride == 0u) ? ({t}_off + 4u <= {d2}) : ({index} < {d2});"));
+        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + 4u <= {d2}, {index} < {d2});"));
         let v = self.vreg(vdata);
         let act = self.act();
         let signed = op == "smin" || op == "smax";
@@ -2635,9 +2636,9 @@ impl Em {
         } else {
             format!("mem.{func}({t}_a, {v}, {t}_old);")
         };
-        self.line(&format!("if ({act} && {t}_ok) {{ {call} }}"));
+        self.line(&format!("if (and({act}, {t}_ok)) {{ {call} }}"));
         if f("GLC") == 1 {
-            self.line(&format!("if ({act}) {v} = {t}_ok ? (uint){t}_old : 0u;"));
+            self.line(&format!("{v} = select({act}, select({t}_ok, (uint){t}_old, 0u), {v});"));
         }
         Ok(())
     }
@@ -3414,10 +3415,10 @@ static uint lane_id;
 // wave32 program in a 64-lane hardware wave: each half is its own wave (xcl_half = 0 / 1)
 static bool xcl_w32 = false;
 static uint xcl_half = 0u;
-bool lanebit(uint lo, uint hi) { return lane_id < 32u ? ((lo >> lane_id) & 1u) != 0u : ((hi >> (lane_id - 32u)) & 1u) != 0u; }
+bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
 uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return xcl_w32 ? uint2(xcl_half != 0u ? m.y : m.x, 0u) : m.xy; }
 uint rla(uint v, uint l) { return WaveReadLaneAt(v, l + 32u * xcl_half); }
-bool lanebit_at(uint lo, uint hi, uint l) { return l < 32u ? ((lo >> l) & 1u) != 0u : ((hi >> (l - 32u)) & 1u) != 0u; }
+bool lanebit_at(uint lo, uint hi, uint l) { return ((select(l < 32u, lo, hi) >> (l & 31u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
     if (sel >= 6u) return x;
     uint sh = sel < 4u ? 8u * sel : 16u * (sel - 4u); uint w = sel < 4u ? 8u : 16u;

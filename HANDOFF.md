@@ -426,7 +426,20 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
   UAV), tabele deskryptorów, grafika (rekordy rysowania – do ustalenia na grze), zwalnianie pamięci UMA po wykonaniu
   (lista trzyma bloki do Release).
 
-### TLAS na GPU – zablokowany przez rozmiar jednego shadera (sesja 5)
+### TLAS na GPU – DZIAŁA (sesja 5): format węzła instancji potwierdzony na wyniku konsoli
+- `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): konsolowy builder buduje na GPU
+  2 BLAS + TLAS z 16 instancji (obrócone/skalowane i tylko przesunięte), `bvh::Bvh::trace_scene` (układ instancji z kodu
+  RT gry: @48 id|maska, @56 korzeń BLAS | bit „tylko translacja”, @60 adres BLAS >> 8, @64 świat→obiekt [t, wiersze])
+  = brute force w świecie na 800 promieniach. Odblokowało to **wyrzucenie gałęzi z generowanego HLSL** (niżej).
+- **Kod bez gałęzi (najważniejsza zmiana wydajności tłumacza):** w HLSL 2021 `?:`, `&&`, `||` na skalarach są skracane,
+  więc każde było prawdziwą gałęzią – `lanebit` (aktywność linii, przy każdej instrukcji), `scc = (…) ? 1u : 0u`,
+  `v_cndmask`, DPP/permlane, warunki zakresu buforów. Teraz `select()`/`and()`/`or()`/`(uint)(bool)` (odczyty/zapisy
+  pamięci nadal za `if`), zapis VGPR `v = select(aktywna, wartość, v)`, ścieżka VALU bez nazwanej zmiennej tymczasowej.
+  Efekt na shaderach buildera: 15 720 instrukcji – DXC `-O3` 5,8 s, 585 KB DXIL (wcześniej > 150 s / sterownik:
+  brak pamięci); shader z wczorajszej awarii (1 589 instr.) – 0,3 s, 48 KB (wcześniej ~6 min i > 30 GB).
+  **DXC znów optymalizuje wszystko** (`-O0` tylko > 8 MB HLSL). Próbka 64 shaderów gry: 0 błędów; mediana 0,29 s, p90 ~11 s.
+
+### (archiwum) TLAS na GPU – blokada rozmiarem jednego shadera
 - Test `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): 2 BLAS + 16 instancji
   (część tylko przesunięta), `trace_scene` vs brute force w świecie. BLAS-y budują się, TLAS wychodzi pusty: 1 dispatch
   pominięty, bo **sterownik AMD odrzuca PSO z przetłumaczonym CS 15 720 instrukcji (0x8007000E, brak pamięci)** – także
