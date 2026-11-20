@@ -408,6 +408,19 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             }
         }
     }
+    // slots where the console's method differs from the PC one at the same index
+    for (slot, f) in console_slots(kind) {
+        if slot < public {
+            v[1 + slot] = super::guard::make_split(f, v[1 + slot]);
+        }
+    }
+    // XCL_D3D12_TRACE: every public method called from console code is logged
+    if std::env::var_os("XCL_D3D12_TRACE").is_some() {
+        for i in 0..public {
+            let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
+            v[1 + i] = super::guard::make_tracer(v[1 + i], name);
+        }
+    }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     let ext = leaked.as_ptr() as usize + 8;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
@@ -418,6 +431,23 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     );
     CLASSES.lock().unwrap().push(Class { orig, ext, iface, public, scanned });
     ext
+}
+
+/// Console vtable slots that differ from the PC layout (found on console code calling them):
+/// * device #62: `CreateComputePipelineState` with two extra arguments (XboxBvhBuilder.dll
+///   passes a D3D12_COMPUTE_PIPELINE_STATE_DESC, NULL, NULL, riid, ppv); PC #62 = CreateStateObject.
+fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
+    match kind {
+        Kind::Device => vec![(62, dev_create_compute_pso_x as usize)],
+        _ => vec![],
+    }
+}
+
+unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    if a != 0 || b != 0 {
+        crate::xlog_warn!("CreateComputePipelineState (konsola, slot 62): nieznane parametry {a:#x} {b:#x} pominięte");
+    }
+    dev_create_compute_pso(this, desc, riid, ppv)
 }
 
 fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
@@ -643,6 +673,41 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A graphics pipeline whose VS (and PS) are console shaders: recompiled VS/PS + the XCL
 /// shader ABI root signature. None: not console shaders, or not translatable (the caller
 /// goes on with the title's description and the stand-in fallback).
+/// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
+/// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
+/// driver's verdict on it).
+unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let cs = shader_bytes(&d.CS)?;
+    if !is_console(cs) {
+        return None;
+    }
+    let dxil = match console_to_dxil(cs, Stage::Compute) {
+        Ok(b) => b,
+        Err(e) => {
+            note_translation_error(format!("CS: {e}"));
+            return Some(Err(()));
+        }
+    };
+    let Some(rs) = abi_rs_raw(this) else { return Some(Err(())) };
+    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
+    copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    copy.CS = bytecode(&dxil);
+    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if hr < 0 {
+        note_translation_error(format!("sterownik odrzucił obliczeniowy PSO z przetłumaczonym CS ({hr:#x})"));
+        return Some(Err(()));
+    }
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    crate::xlog_info!("D3D12.X: obliczeniowy PSO z przetłumaczonym CS konsoli ({} B DXIL)", dxil.len());
+    Some(Ok(hr))
+}
+
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
@@ -725,7 +790,13 @@ unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *cons
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let hr = finish_pso(this, f, desc, riid, ppv);
+    let console = translated_compute_pso(this, f, desc, riid, ppv);
+    if let Some(Ok(hr)) = console {
+        return hr;
+    }
+    // a console shader the recompiler could not take must not reach the driver: AMD's shader
+    // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
+    let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
     }

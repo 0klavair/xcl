@@ -15,6 +15,7 @@ use crate::gpu::xbox;
 pub enum Stage {
     Vertex,
     Pixel,
+    Compute,
 }
 
 /// A console (xbox-native) shader container?
@@ -30,6 +31,7 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
     let want = match stage {
         Stage::Vertex => 4,
         Stage::Pixel => 5,
+        Stage::Compute => 6,
     };
     let f = sh
         .fssm
@@ -40,11 +42,12 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
     let profile = match (&mode, stage) {
         (Mode::Vertex(_), Stage::Vertex) => "vs_6_6",
         (Mode::Pixel(_), Stage::Pixel) => "ps_6_6",
+        (Mode::Compute(_), Stage::Compute) => "cs_6_6",
         _ => return Err("etap shadera nie pasuje do miejsca w PSO".into()),
     };
     let p = f.programs.first().ok_or("FSSM bez programu")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code) })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));

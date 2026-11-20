@@ -42,6 +42,15 @@ fn status_text(s: Status) -> String {
 
 fn run_cli(args: &[String]) -> Result<(), String> {
     match args[0].as_str() {
+        "tile" if args.len() == 4 => {
+            let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
+            let index: usize = args[2].parse().map_err(|_| "bad texture index")?;
+            if index >= arc.textures.len() {
+                return Err(format!("texture index {index} out of range ({})", arc.textures.len()));
+            }
+            let image = arc.best_image(index).map_err(|e| format!("texture {index}: {e:?}"))?;
+            archive::save_png(&image, &PathBuf::from(&args[3]))
+        }
         "extract" if args.len() >= 3 => {
             let arc = Archive::open(&PathBuf::from(&args[1]), &Progress::default())?;
             let all: Vec<usize> = (0..arc.textures.len()).collect();
@@ -101,7 +110,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|a| a == "extract" || a == "list" || a == "videos" || a == "dump-raw" || a == "--help" || a == "-h") {
+    if args.first().is_some_and(|a| a == "tile" || a == "extract" || a == "list" || a == "videos" || a == "dump-raw" || a == "--help" || a == "-h") {
         attach_console();
         if let Err(e) = run_cli(&args) {
             eprintln!("{e}");

@@ -109,12 +109,58 @@ pub unsafe extern "system" fn D3D12SerializeRootSignature(d: *const c_void, v: u
 }
 
 pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_void, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
-    forward!(
-        "D3D12SerializeVersionedRootSignature",
-        unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
-        null::D3D12SerializeVersionedRootSignature,
-        (d, blob, err)
-    )
+    let mut own_err: *mut c_void = std::ptr::null_mut();
+    let e = if err.is_null() { &mut own_err as *mut _ } else { err };
+    // console-only root signature flags (seen: 0x3000000 from XboxBvhBuilder.dll) – Windows
+    // rejects unknown bits; the flags sit at +40 in every version of the desc (48 bytes)
+    const PC_FLAGS: u32 = 0xFFF;
+    let mut copy = [0u8; 48];
+    let mut d = d;
+    if !d.is_null() && *(d as *const u8).add(40).cast::<u32>() & !PC_FLAGS != 0 {
+        std::ptr::copy_nonoverlapping(d as *const u8, copy.as_mut_ptr(), 48);
+        let f = copy.as_mut_ptr().add(40).cast::<u32>();
+        crate::xlog_info!("D3D12SerializeVersionedRootSignature: flagi konsoli {:#x} pominięte", *f & !PC_FLAGS);
+        *f &= PC_FLAGS;
+        d = copy.as_ptr() as *const c_void;
+    }
+    type Serialize = unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    let hr = match sys("D3D12SerializeVersionedRootSignature").filter(|_| backend() == Backend::Real) {
+        Some(f) => std::mem::transmute::<_, Serialize>(f)(d, blob, e),
+        None => null::D3D12SerializeVersionedRootSignature(d, blob, e),
+    };
+    if hr < 0 && !d.is_null() {
+        // D3D12_VERSIONED_ROOT_SIGNATURE_DESC: version, then (1.1 / 1.2) parameters, samplers, flags
+        let w = |o: usize| *(d as *const u8).add(o).cast::<u32>();
+        let text = blob_text(*e);
+        crate::xlog_warn!(
+            "D3D12SerializeVersionedRootSignature: {hr:#x} (wersja {}, parametrów {}, samplerów {}, flagi {:#x}): {text}",
+            w(0),
+            w(8),
+            w(24),
+            w(40)
+        );
+    }
+    if err.is_null() && !own_err.is_null() {
+        blob_release(own_err);
+    }
+    hr
+}
+
+/// text of an ID3DBlob (error messages)
+unsafe fn blob_text(b: *mut c_void) -> String {
+    if b.is_null() {
+        return String::new();
+    }
+    let vt = *(b as *const *const usize);
+    let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 = std::mem::transmute(*vt.add(3));
+    let len: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(*vt.add(4));
+    String::from_utf8_lossy(std::slice::from_raw_parts(ptr(b), len(b))).trim_end_matches('\0').trim().to_string()
+}
+
+unsafe fn blob_release(b: *mut c_void) {
+    let vt = *(b as *const *const usize);
+    let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+    release(b);
 }
 
 pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(d: *const c_void, l: usize, r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {

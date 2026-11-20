@@ -86,6 +86,10 @@ pub struct Psv {
     pub ms_topology: u8,
     pub min_wave: u32,
     pub max_wave: u32,
+    /// GS: input primitive (3 = triangle), output topology (5 = triangle strip), max vertices
+    pub gs_input_primitive: u32,
+    pub gs_output_topology: u32,
+    pub gs_max_vertex_count: u16,
     /// v2+
     pub numthreads: Option<[u32; 3]>,
 }
@@ -107,6 +111,11 @@ pub fn psv(blob: &[u8]) -> Option<Psv> {
         v.ms_max_vertices = u16at(12)?;
         v.ms_max_primitives = u16at(14)?;
         v.ms_topology = r[27];
+    }
+    if v.kind == Some(2) {
+        v.gs_input_primitive = rd32(r, 0)?;
+        v.gs_output_topology = rd32(r, 4)?;
+        v.gs_max_vertex_count = u16at(26)?;
     }
     if size >= 48 {
         v.numthreads = Some([rd32(r, 36)?, rd32(r, 40)?, rd32(r, 44)?]);

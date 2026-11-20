@@ -36,6 +36,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemAllocDefault,
         XMemFreeDefault,
         XMemSetAllocationHooks,
+        XMemVirtualQuery,
+        XMemGetWorkingSetStatistics,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
         ToolingMemoryStatus,
@@ -48,6 +50,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         SetThreadpoolAffinityMask,
         QueryProcessorSchedulingStatistics,
         GetConsoleType,
+        OutputDebugStringA,
+        OutputDebugStringW,
         GetSystemOSVersion,
         // modules
         LoadLibraryW,
@@ -227,6 +231,45 @@ pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
     }
 }
 
+/// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
+/// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
+/// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
+/// cached) for committed readable memory. The caller zeroes the rest.
+pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const c_void, info: *mut c_void) -> BOOL {
+    if info.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
+    if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
+        return 0;
+    }
+    const READABLE: u32 = mem::PAGE_READONLY | mem::PAGE_READWRITE | mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_READ | mem::PAGE_EXECUTE_READWRITE;
+    let cpu = (*mbi).State == mem::MEM_COMMIT && (*mbi).Protect & READABLE != 0;
+    *(info as *mut u8).add(48).cast::<u32>() = cpu as u32;
+    1
+}
+
+/// `BOOL XMemGetWorkingSetStatistics(UINT32 allocator, void* stats)` (as FSR's upscaler calls
+/// it: allocator 0x20000001, 128-byte buffer, reads +8 only on success). No statistics:
+/// FALSE, which the caller reports as 0 bytes.
+pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_allocator: u32, _stats: *mut c_void) -> BOOL {
+    0
+}
+
+/// The title's debug output (console builds print a lot there) goes to XCL's log as well.
+pub unsafe extern "system" fn OutputDebugStringA(s: *const u8) {
+    if let Some(m) = from_ansi_ptr(s) {
+        crate::xlog_info!("[debug] {}", m.trim_end());
+    }
+}
+
+pub unsafe extern "system" fn OutputDebugStringW(s: *const u16) {
+    if let Some(m) = from_wide_ptr(s) {
+        crate::xlog_info!("[debug] {}", m.trim_end());
+    }
+}
+
 pub unsafe extern "system" fn XMemSetAllocationHooks(alloc: usize, free: usize) {
     if alloc == 0 {
         XMEM_ALLOC_HOOK.store(0, Ordering::Release);
@@ -298,19 +341,78 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
     1
 }
 
-pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, _arr: *mut usize) -> BOOL {
-    crate::xlog_warn!("AllocateTitlePhysicalPages({}) – strony fizyczne nie są jeszcze emulowane", if num.is_null() { 0 } else { *num });
-    fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
-    0
+/// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
+/// contiguous UMA block, page numbers = offset / 64 KiB in UMA. Mapping consecutive pages
+/// returns their UMA address (GPU-visible, no copy); mapping at an address of the title's
+/// choice or scattered pages cannot alias memory this way – logged and refused.
+const PHYS_PAGE: usize = 0x1_0000;
+
+/// first page number → (pages in the block, pages still allocated)
+static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
+    if num.is_null() || arr.is_null() || *num == 0 {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let n = *num;
+    let Some(u) = crate::gpu::uma::get() else {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
+    let Some(block) = u.alloc(n * PHYS_PAGE, PHYS_PAGE) else {
+        crate::xlog_warn!("AllocateTitlePhysicalPages({n}): brak miejsca w UMA");
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
+    let first = (block as usize - u.base()) / PHYS_PAGE;
+    for i in 0..n {
+        *arr.add(i) = first + i;
+    }
+    PHYS_BLOCKS.lock().unwrap().insert(first, (n, n));
+    1
 }
 
-pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, _n: usize, _arr: *mut usize) -> BOOL {
-    fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
-    0
+pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: *mut usize) -> BOOL {
+    let Some(u) = crate::gpu::uma::get() else { return 0 };
+    if arr.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let mut g = PHYS_BLOCKS.lock().unwrap();
+    for i in 0..n {
+        let page = *arr.add(i);
+        // the block holding this page
+        let Some((&first, &(count, _))) = g.range(..=page).next_back() else { continue };
+        if page >= first + count {
+            continue;
+        }
+        let e = g.get_mut(&first).unwrap();
+        e.1 = e.1.saturating_sub(1);
+        if e.1 == 0 {
+            g.remove(&first);
+            u.free(u.base() + first * PHYS_PAGE);
+        }
+    }
+    1
 }
 
-pub unsafe extern "system" fn MapTitlePhysicalPages(_va: *mut c_void, _n: usize, _t: u32, _p: u32, _arr: *mut usize) -> *mut c_void {
-    crate::xlog_warn!("MapTitlePhysicalPages – strony fizyczne nie są jeszcze emulowane");
+pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
+    if n == 0 || arr.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let first = *arr;
+    let consecutive = (1..n).all(|i| *arr.add(i) == first + i);
+    let at = (u.base() + first * PHYS_PAGE) as *mut c_void;
+    if consecutive && (va.is_null() || va == at) {
+        return at;
+    }
+    static WARNED: AtomicU32 = AtomicU32::new(0);
+    if WARNED.fetch_add(1, Ordering::Relaxed) < 5 {
+        crate::xlog_warn!("MapTitlePhysicalPages({va:?}, {n} stron, ciągłe: {consecutive}) – mapowanie pod wybrany adres / rozproszonych stron jeszcze nieobsługiwane");
+    }
     fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
     std::ptr::null_mut()
 }
@@ -645,6 +747,51 @@ mod tests {
             assert!(!g.is_null());
             assert_eq!(g as usize % 0x10000, 0);
             XMemFree(g, attrs(0, 1));
+        }
+    }
+
+    #[test]
+    fn xmem_virtual_query_marks_cpu_readable_memory() {
+        unsafe {
+            let mut info = [0u8; 64];
+            let x = 5u32;
+            let proc_ = thr::GetCurrentProcess();
+            assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, info.as_mut_ptr() as _), 1);
+            let mbi = &*(info.as_ptr() as *const mem::MEMORY_BASIC_INFORMATION);
+            assert_eq!(mbi.State, mem::MEM_COMMIT);
+            assert_eq!(u32::from_le_bytes(info[48..52].try_into().unwrap()) & 3, 1);
+            // reserved, not committed: not CPU-readable
+            let r = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
+            let mut info = [0u8; 64];
+            assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr() as _), 1);
+            assert_eq!(info[48] & 3, 0);
+            mem::VirtualFree(r, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn physical_pages_in_uma() {
+        unsafe {
+            let Some(u) = crate::gpu::uma::get() else { return };
+            let mut n = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            assert_eq!(pages[1], pages[0] + 1);
+            let p = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr());
+            assert!(!p.is_null() && u.contains(p as usize) && (p as usize - u.base()) % PHYS_PAGE == 0);
+            *(p as *mut u32).add(PHYS_PAGE / 4) = 0x55AA; // page 1
+            // the same pages mapped again: the same memory
+            let q = MapTitlePhysicalPages(p, 3, 0, 4, pages.as_mut_ptr());
+            assert_eq!(q, p);
+            // a single page of the block maps to its own place
+            let r = MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, pages.as_mut_ptr().add(1));
+            assert_eq!(*(r as *const u32), 0x55AA);
+            // scattered pages: refused
+            let mut scattered = [pages[2], pages[0]];
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr()).is_null());
+            let used = u.used();
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+            assert_eq!(u.used(), used - 3 * PHYS_PAGE);
         }
     }
 

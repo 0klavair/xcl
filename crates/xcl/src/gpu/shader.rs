@@ -312,11 +312,13 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
             recomp::Mode::Vertex(_) => ("VS", "vs_6_6"),
             recomp::Mode::Pixel(_) => ("PS", "ps_6_6"),
             recomp::Mode::Mesh(_) => ("MS", "cs_6_6"),
+            recomp::Mode::Geometry(_) => ("GS", "cs_6_6"),
+            recomp::Mode::Compute(_) => ("CS", "cs_6_6"),
             recomp::Mode::Kernel => ("kernel", "cs_6_6"),
         };
         for (j, p) in f.programs.iter().enumerate() {
             let code = &f.data[p.offset..p.offset + p.len];
-            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code) };
+            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
             let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
             let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };

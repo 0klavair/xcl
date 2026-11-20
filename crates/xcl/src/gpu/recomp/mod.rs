@@ -28,6 +28,21 @@
 //!   compute, and the console code relies on 64-lane ballots, hence two passes. Inputs:
 //!   s3[27:24] = wave index in the group, v5 = group · threads + thread (the group id is v5 >> 7
 //!   in the retail code, as in RADV's gfx10.3 mesh emulation), other SGPRs from `io`.
+//! * GS (legacy on-chip GS, `GS_*` + the ES variant of its VS): ES and GS code of one pipeline
+//!   become one compute shader (wave64, one group = up to 21 triangles = 63 ES vertices); the
+//!   ES writes its vertices to LDS (`groupshared`, one item of 16 bytes per ES output
+//!   register – the ESGS item size the console driver derives from the ES) and `s_setpc_b64`
+//!   continues into the GS code; GS inputs v0/v1 = LDS dword offsets of the triangle's
+//!   vertices (packed 16-bit), s3 = vertices | primitives << 8, s2 = start of the GS output
+//!   area in LDS (after 64 ES items); `s_sendmsg`
+//!   emit/cut builds triangles from the output strips, and the emitted vertices (found from
+//!   the lowest LDS address each GS lane wrote) go to the mesh-mode record, drawn by
+//!   [`mesh_passthrough`]. ES vertex attributes come pre-fetched from `mem` (float4 per ISG1
+//!   register, address in io[`IO_GS_VERTICES`]); the primitive count is io[`IO_GS_PRIMS`].
+//! * CS (real compute ABI): the FSSM stage descriptor holds COMPUTE_PGM_RSRC2 at +0x38 (user
+//!   SGPR count, TGID_X/Y/Z and TG_SIZE enables, thread-id components) and numthreads at
+//!   +0x3C (= PSV0 on all 36 retail CS checked); user SGPRs come from `io`, then the enabled
+//!   group ids, v0..v2 = thread id in the group.
 //! Memory instructions use a flat model: descriptor/base addresses index one
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
@@ -97,12 +112,126 @@ impl MsInterface {
     }
 }
 
+/// Legacy geometry shader emulated in compute (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GsInterface {
+    /// ES (vertex) inputs: ISG1 of the VS whose ES variant feeds the GS
+    pub es_inputs: Vec<SigElement>,
+    /// ES outputs (OSG1 of that VS): their registers make the ESGS item size
+    pub es_outputs: Vec<SigElement>,
+    /// GS outputs (OSG1): LDS layout = one 16-byte slot per register
+    pub outputs: Vec<SigElement>,
+    /// vertices one GS invocation may emit (PSV0)
+    pub max_vertex_count: u32,
+    /// byte offset of the GS code in the program (the ES code comes first and its
+    /// `s_setpc_b64` jumps here); None: ES alone (`s_setpc_b64` ends it); Some(0): GS alone
+    pub gs_start: Option<u64>,
+}
+
+/// triangles per thread group (their 3 vertices each fit the 64 ES lanes)
+pub const GS_PRIMS_PER_GROUP: u32 = 21;
+/// io slots (trap-temp SGPR range, unused by titles): primitive count, address of the
+/// pre-fetched vertex attributes in `mem`
+pub const IO_GS_PRIMS: usize = 110;
+pub const IO_GS_VERTICES: usize = 111;
+
+impl GsInterface {
+    /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
+    pub fn es_item_bytes(&self) -> u32 {
+        16 * (self.es_outputs.iter().map(|e| e.register).max().unwrap_or(0) + 1)
+    }
+    /// LDS bytes for the ES vertices of a group; the GS output area follows (s2)
+    pub fn es_ring_bytes(&self) -> u32 {
+        64 * self.es_item_bytes()
+    }
+    /// bytes of one output vertex in LDS
+    pub fn vertex_bytes(&self) -> u32 {
+        16 * (self.outputs.iter().map(|e| e.register).max().unwrap_or(0) + 1)
+    }
+    /// float4 slots per pre-fetched input vertex
+    pub fn input_registers(&self) -> u32 {
+        self.es_inputs.iter().filter(|e| e.system_value == 0).map(|e| e.register + 1).max().unwrap_or(0)
+    }
+    /// The record the emulation writes per group (drawn by `mesh_passthrough`).
+    pub fn record(&self) -> MsInterface {
+        let mvc = self.max_vertex_count.max(1);
+        MsInterface {
+            outputs: self.outputs.clone(),
+            threads: 64,
+            max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
+            max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+        }
+    }
+}
+
+/// Compute shader with the console's dispatch ABI (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CsInterface {
+    pub threads: [u32; 3],
+    pub user_sgprs: u32,
+    /// TGID_X / Y / Z enabled: the group id follows the user SGPRs in this order
+    pub tgid: [bool; 3],
+    /// TG_SIZE SGPR after the group ids (wave count | wave index << 6 – not used by the pack)
+    pub tg_size: bool,
+    /// thread id VGPRs: 1 (v0), 2 (v0, v1) or 3 (v0..v2)
+    pub tid_components: u32,
+}
+
+impl CsInterface {
+    /// From the FSSM stage descriptor at `desc` (COMPUTE_PGM_RSRC2 at +0x38, numthreads +0x3C).
+    pub fn from_descriptor(fssm: &[u8], desc: usize) -> Option<CsInterface> {
+        let rd = |o: usize| fssm.get(desc + o..desc + o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let r = rd(0x38)?;
+        let threads = [rd(0x3C)?, rd(0x40)?, rd(0x44)?];
+        if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
+            return None;
+        }
+        Some(CsInterface {
+            threads,
+            user_sgprs: (r >> 1) & 31,
+            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
+            tg_size: (r >> 10) & 1 == 1,
+            tid_components: ((r >> 11) & 3) + 1,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Kernel,
+    Compute(CsInterface),
     Vertex(VsInterface),
     Pixel(PsInterface),
     Mesh(MsInterface),
+    Geometry(GsInterface),
+}
+
+/// ES variant of a VS container + a GS container → one program (ES code, then GS code) and
+/// its interface. Triangle input and triangle-strip output only.
+pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsInterface), String> {
+    use super::xbox;
+    let pick = |blob: &[u8], hw: u8| -> Result<Vec<u8>, String> {
+        let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
+        let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)).ok_or_else(|| format!("brak wariantu {}", xbox::hw_stage_name(hw)))?;
+        let p = f.programs.first().ok_or("FSSM bez programu")?;
+        Ok(f.data[p.offset..p.offset + p.len].to_vec())
+    };
+    let (es, gs) = (pick(es_blob, 2)?, pick(gs_blob, 3)?);
+    let psv = super::dxbc::psv(gs_blob).ok_or("GS bez PSV0")?;
+    if psv.gs_input_primitive != 3 || psv.gs_output_topology != 5 {
+        return Err(format!("GS: wejście {} / wyjście {} – obsługiwane trójkąty → triangle strip", psv.gs_input_primitive, psv.gs_output_topology));
+    }
+    let (es_inputs, es_outputs) = super::dxbc::signatures(es_blob);
+    let g = GsInterface {
+        es_inputs,
+        es_outputs,
+        outputs: super::dxbc::signatures(gs_blob).1,
+        max_vertex_count: psv.gs_max_vertex_count as u32,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend_from_slice(&gs);
+    Ok((code, g))
 }
 
 /// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.
@@ -136,11 +265,17 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
     let hw = f.stages.first()?.hw;
     match (sh.stage.as_str(), hw) {
         ("VS", 4) => Some(Mode::Vertex(VsInterface { inputs, outputs, attr_base: 4 })),
-        ("VS", 2) => Some(Mode::Vertex(VsInterface { inputs, outputs, attr_base: 9 })),
         ("PS", 5) => {
             let ena = f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
             Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena }))
         }
+        // ES variant of a VS (before a GS) and the GS itself, each translatable on its own
+        ("VS", 2) => Some(Mode::Geometry(GsInterface { es_inputs: inputs, es_outputs: outputs, max_vertex_count: 1, ..Default::default() })),
+        ("GS", 3) => {
+            let p = super::dxbc::psv(blob)?;
+            Some(Mode::Geometry(GsInterface { outputs, max_vertex_count: p.gs_max_vertex_count.max(1) as u32, gs_start: Some(0), ..Default::default() }))
+        }
+        ("CS", 6) => Some(Mode::Compute(CsInterface::from_descriptor(&f.data, f.stages.first()?.offset)?)),
         ("MS", 7) => {
             let p = super::dxbc::psv(blob)?;
             let threads = p.numthreads.map(|t| t[0] * t[1].max(1) * t[2].max(1)).filter(|&t| t > 0).unwrap_or(128);
@@ -163,11 +298,14 @@ pub struct Options {
     pub mode: Mode,
     /// wave64 (64-bit EXEC/VCC) or wave32 program
     pub wave64: bool,
+    /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
+    /// two independent halves – the wave-size independent form VS/PS always get (tests)
+    pub hw_wave: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0 }
     }
 }
 
@@ -238,6 +376,40 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
     }
 }
 
+/// Instructions of a wave64 program that break when the GPU runs it in waves of 32 lanes
+/// (VS / PS: the driver picks the wave size): reads of a lane ≥ 32 or of a lane chosen at run
+/// time. A wave32 program in 64-lane waves is handled (the halves act as separate waves).
+pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
+    let mut out = BTreeSet::new();
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+        off += d.len;
+        match d.inst.name {
+            "V_READLANE_B32" | "V_WRITELANE_B32" => {
+                let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
+                match lane {
+                    0..=105 => {
+                        out.insert("v_readlane/writelane: numer wątku z SGPR");
+                    }
+                    160..=192 => {
+                        out.insert("v_readlane/writelane: wątek ≥ 32");
+                    }
+                    255 if d.literal.is_some_and(|l| l & 63 >= 32) => {
+                        out.insert("v_readlane/writelane: wątek ≥ 32");
+                    }
+                    _ => {}
+                }
+            }
+            "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
+                out.insert("ds_(b)permute: dowolny wątek");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;
@@ -276,8 +448,21 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
     let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
     let mut branches = 0usize;
+    // geometry mode: the ES's s_setpc_b64 continues into the GS code (or ends the ES alone)
+    let gs_jump = match &opt.mode {
+        Mode::Geometry(g) => Some(g.gs_start.filter(|&s| s > 0)),
+        _ => None,
+    };
     for d in &insts {
         let next = d.pc + d.len as u64;
+        if let (Some(target), "S_SETPC_B64") = (gs_jump, d.inst.name) {
+            if let Some(t) = target.filter(|t| starts.contains(t)) {
+                leaders.insert(t);
+                branches += 1;
+            }
+            leaders.insert(next);
+            continue;
+        }
         if let Some(t) = rdna2::branch_target(d) {
             if !starts.contains(&t) {
                 return Err(format!("+{:#x}: skok do {t:#x}, który nie jest początkiem instrukcji", d.pc));

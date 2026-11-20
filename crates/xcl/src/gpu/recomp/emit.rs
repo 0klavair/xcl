@@ -482,8 +482,17 @@ impl Em {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
-        // s_sendmsg is a no-op except GS_ALLOC_REQ in the mesh mode (handled in sopp)
-        let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_));
+        // geometry mode: the ES's s_setpc_b64 continues into the GS code (ES alone: the end)
+        if name == "s_setpc_b64" {
+            if let Mode::Geometry(g) = &self.opt.mode {
+                return match g.gs_start {
+                    Some(s) if s > 0 => Flow::Jump(s),
+                    _ => Flow::End,
+                };
+            }
+        }
+        // s_sendmsg is a no-op except GS_ALLOC_REQ (mesh) and GS emit/cut (geometry)
+        let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
         if NOOPS.contains(&name.as_str()) && !mesh_msg {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
@@ -527,8 +536,27 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
-                if matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_)) {
+                if matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
+                }
+                Flow::Next
+            }
+            "s_sendmsg" if matches!(self.opt.mode, Mode::Geometry(_)) => {
+                // MSG_GS (2): op 1 cut, 2 emit, 3 emit + cut (stream 0); GS_DONE (3) – nothing to do
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0);
+                let (msg, op, stream) = (simm & 0xF, (simm >> 4) & 3, (simm >> 8) & 3);
+                if let (2, 0, Mode::Geometry(g)) = (msg, stream, &self.opt.mode) {
+                    let maxt = g.max_vertex_count.saturating_sub(2).max(1);
+                    let act = self.act();
+                    if op & 2 != 0 {
+                        // strip triangle j = (j, j+1, j+2), odd j with the first two swapped
+                        self.line(&format!(
+                            "if ({act}) {{ uint k = xcl_emitted; if (xcl_strip >= 2u && xcl_ntri < {maxt}u) {{ xcl_tri[xcl_ntri] = ((xcl_strip & 1u) == 0u) ? ((k - 2u) | ((k - 1u) << 10) | (k << 20)) : ((k - 1u) | ((k - 2u) << 10) | (k << 20)); xcl_ntri++; }} xcl_emitted++; xcl_strip++; }}"
+                        ));
+                    }
+                    if op & 1 != 0 {
+                        self.line(&format!("if ({act}) xcl_strip = 0u;"));
+                    }
                 }
                 Flow::Next
             }
@@ -912,7 +940,20 @@ impl Em {
         if name.starts_with("buffer_atomic_") {
             return self.buffer_atomic(d, name);
         }
-        let (kind, count) = buffer_op(name).ok_or("MUBUF")?;
+        // sub-dword accesses: (bytes, signed load?, store?)
+        let small = match name {
+            "buffer_load_ubyte" => Some((1u32, false, false)),
+            "buffer_load_sbyte" => Some((1, true, false)),
+            "buffer_load_ushort" => Some((2, false, false)),
+            "buffer_load_sshort" => Some((2, true, false)),
+            "buffer_store_byte" => Some((1, false, true)),
+            "buffer_store_short" => Some((2, false, true)),
+            _ => None,
+        };
+        let (kind, count) = match small {
+            Some(_) => (BufKind::Load, 1),
+            None => buffer_op(name).ok_or("MUBUF")?,
+        };
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         if f("LDS") != 0 || f("TFE") != 0 {
             return Err("MUBUF lds/tfe");
@@ -929,6 +970,22 @@ impl Em {
         self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         let act = self.act();
         let in_range = |bytes: String| format!("(({t}_stride == 0u) ? ({t}_off + {bytes} <= {d2}) : ({index} < {d2}))");
+        if let Some((n, signed, store)) = small {
+            let ok = in_range(format!("{n}u"));
+            let v = self.vreg(vdata);
+            if store {
+                self.line(&format!("if ({act} && {ok}) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
+            } else {
+                let bits = 8 * n;
+                let val = if signed {
+                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                } else {
+                    format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
+                };
+                self.line(&format!("if ({act}) {v} = {ok} ? {val} : 0u;"));
+            }
+            return Ok(());
+        }
         match kind {
             BufKind::Load => {
                 let mut assigns = Vec::new();
@@ -1000,7 +1057,7 @@ impl Em {
             if en & bit == 0 {
                 continue;
             }
-            st.push(format!("res.Store(({}u + (({tgt}u * {}u + lane_id) * 4u + {c}u)) * 4u, {val});", KERNEL_EXPORTS, KERNEL_LANES));
+            st.push(format!("res.Store(({}u + (({tgt}u * {}u + xcl_hw_lane) * 4u + {c}u)) * 4u, {val});", KERNEL_EXPORTS, KERNEL_LANES));
         }
         if !st.is_empty() {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -1194,9 +1251,40 @@ impl Em {
                 _ => f("VADDR") + j,
             }
         };
+        let base = name.trim_start_matches("image_");
+        if base == "bvh_intersect_ray" || base == "bvh64_intersect_ray" {
+            // ray tracing: one BVH node per instruction (public RDNA2 / RADV node format)
+            let r = |s: &mut Self, j: u64| s.vreg(addr_reg(j));
+            let wide = base == "bvh64_intersect_ray";
+            let node = r(self, 0);
+            let k = if wide { 2 } else { 1 };
+            let fl = |s: &mut Self, j: u64| format!("asfloat({})", r(s, j));
+            let extent = fl(self, k);
+            let origin = format!("float3({}, {}, {})", fl(self, k + 1), fl(self, k + 2), fl(self, k + 3));
+            let (dir, inv) = if a16 {
+                // A16: dir.xy | dir.z inv.x | inv.yz as half pairs
+                let (h0, h1, h2) = (r(self, k + 4), r(self, k + 5), r(self, k + 6));
+                (
+                    format!("float3(f16tof32({h0}), f16tof32({h0} >> 16), f16tof32({h1}))"),
+                    format!("float3(f16tof32({h1} >> 16), f16tof32({h2}), f16tof32({h2} >> 16))"),
+                )
+            } else {
+                (
+                    format!("float3({}, {}, {})", fl(self, k + 4), fl(self, k + 5), fl(self, k + 6)),
+                    format!("float3({}, {}, {})", fl(self, k + 7), fl(self, k + 8), fl(self, k + 9)),
+                )
+            };
+            let (d0, d1) = (self.sreg(srsrc), self.sreg(srsrc + 1));
+            let t = self.t();
+            let act = self.act();
+            // descriptor: base address in 256-byte units (word 0), box sorting = word 1 bit 31
+            self.line(&format!("uint4 {t} = bvh_intersect({node}, {d0} << 8, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
+            self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
+            return Ok(());
+        }
         // body coordinates per DIM: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
         let body = [1u64, 2, 3, 3, 2, 3, 3, 4][dim as usize];
-        let base = name.trim_start_matches("image_");
         let sampling = base.starts_with("sample") || base.starts_with("gather4");
         let rest = base.trim_start_matches("sample").trim_start_matches("gather4");
         let mods: Vec<&str> = if sampling { rest.split('_').filter(|x| !x.is_empty()).collect() } else { Vec::new() };
@@ -1674,7 +1762,7 @@ impl Em {
                     self.line(&format!(
                         "bool {t}_ok = {t}_l >= 0 && ({fi} || lanebit_at({el}, {eh}, (uint){t}_l));"
                     ));
-                    self.line(&format!("uint {t} = WaveReadLaneAt({v}, (uint)max({t}_l, 0));"));
+                    self.line(&format!("uint {t} = rla({v}, (uint)max({t}_l, 0));"));
                     let (rm, bm) = (fv("ROW_MASK"), fv("BANK_MASK"));
                     // write enable: row/bank masks, and an invalid source either reads 0 (bound_ctrl) or disables
                     let mut en = format!("((({rm}u >> (lane_id >> 4)) & 1u) != 0u && (({bm}u >> ((lane_id >> 2) & 3u)) & 1u) != 0u)");
@@ -1688,7 +1776,7 @@ impl Em {
                     let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
                     self.line(&format!("uint {t}_l = (lane_id & ~7u) | (({sel}u >> (3u * (lane_id & 7u))) & 7u);"));
-                    self.line(&format!("uint {t} = WaveReadLaneAt({v}, {t}_l);"));
+                    self.line(&format!("uint {t} = rla({v}, {t}_l);"));
                     if !fi {
                         self.line(&format!("{t} = lanebit_at({el}, {eh}, {t}_l) ? {t} : 0u;"));
                     }
@@ -2336,7 +2424,7 @@ impl Em {
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 self.line(&format!("bool {t}_ok = {fi} || lanebit_at({el}, {eh}, {t}_l);"));
-                self.line(&format!("uint {t} = WaveReadLaneAt({a}, {t}_l);"));
+                self.line(&format!("uint {t} = rla({a}, {t}_l);"));
                 if bound {
                     format!("{t}_ok ? {t} : 0u")
                 } else {
@@ -2347,13 +2435,13 @@ impl Em {
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
-                self.line(&format!("uint {t} = WaveReadLaneAt({a}, first_lane({el}, {eh}));"));
+                self.line(&format!("uint {t} = rla({a}, first_lane({el}, {eh}));"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
-                self.line(&format!("uint {t} = WaveReadLaneAt({a}, {b} & {wmask}u);"));
+                self.line(&format!("uint {t} = rla({a}, {b} & {wmask}u);"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -2556,6 +2644,9 @@ impl Em {
     fn flat(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let op = name.trim_start_matches("global_").trim_start_matches("flat_");
+        if let Some(a) = op.strip_prefix("atomic_") {
+            return self.flat_atomic(d, a);
+        }
         let (store, count) = match op {
             "load_dword" => (false, 1),
             "load_dwordx2" => (false, 2),
@@ -2595,6 +2686,53 @@ impl Em {
         Ok(())
     }
 
+    /// FLAT / global atomics on the flat memory (dword ops; float min / max by a CAS loop).
+    fn flat_atomic(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+        let global = d.enc.name == "ENC_FLAT_GLBL";
+        let addr = self.vreg(f("ADDR"));
+        let saddr = f("SADDR");
+        let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
+        let raw = f("OFFSET") as u32;
+        let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
+        let t = self.t();
+        self.line(&format!("uint {t}_a = ({base} + {}) & ~3u;", hex(off)));
+        let v = self.vreg(f("DATA"));
+        let act = self.act();
+        self.line(&format!("uint {t}_old = 0u;"));
+        let body = match op {
+            "add" => format!("mem.InterlockedAdd({t}_a, {v}, {t}_old);"),
+            "sub" => format!("mem.InterlockedAdd({t}_a, 0u - {v}, {t}_old);"),
+            "and" => format!("mem.InterlockedAnd({t}_a, {v}, {t}_old);"),
+            "or" => format!("mem.InterlockedOr({t}_a, {v}, {t}_old);"),
+            "xor" => format!("mem.InterlockedXor({t}_a, {v}, {t}_old);"),
+            "swap" => format!("mem.InterlockedExchange({t}_a, {v}, {t}_old);"),
+            "umin" => format!("mem.InterlockedMin({t}_a, {v}, {t}_old);"),
+            "umax" => format!("mem.InterlockedMax({t}_a, {v}, {t}_old);"),
+            "smin" => format!("int {t}_s; mem.InterlockedMin({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
+            "smax" => format!("int {t}_s; mem.InterlockedMax({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
+            "cmpswap" => {
+                let cmp = self.vreg(f("DATA") + 1);
+                format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
+            }
+            "fmin" | "fmax" => {
+                let m = if op == "fmin" { "min" } else { "max" };
+                format!(
+                    "{t}_old = mem.Load({t}_a); [loop] for (uint {t}_k = 0u; {t}_k < 64u; {t}_k++) {{ uint {t}_p; \
+mem.InterlockedCompareExchange({t}_a, {t}_old, asuint({m}(asfloat({t}_old), asfloat({v}))), {t}_p); \
+if ({t}_p == {t}_old) break; {t}_old = {t}_p; }}"
+                )
+            }
+            _ => return Err("FLAT atomic"),
+        };
+        self.line(&format!("if ({act}) {{ {body} }}"));
+        if f("GLC") == 1 {
+            let dst = self.vreg(f("VDST"));
+            self.line(&format!("if ({act}) {dst} = {t}_old;"));
+        }
+        Ok(())
+    }
+
     /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
@@ -2614,7 +2752,7 @@ impl Em {
                 } else {
                     return Err("ds_swizzle: tryb FFT/rotacji");
                 };
-                self.line(&format!("uint {t} = WaveReadLaneAt({a}, {src});"));
+                self.line(&format!("uint {t} = rla({a}, {src});"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
@@ -2622,18 +2760,26 @@ impl Em {
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let m = if self.opt.wave64 { 63 } else { 31 };
-                self.line(&format!("uint {t} = WaveReadLaneAt({v}, (({a} + {off16}u) >> 2) & {m}u);"));
+                self.line(&format!("uint {t} = rla({v}, (({a} + {off16}u) >> 2) & {m}u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
             _ => {}
         }
-        if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_)) {
+        if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
             return Err("LDS poza compute");
         }
+        // geometry mode: where each GS lane puts its output vertices (lowest LDS address written)
+        let gs_phase = match &self.opt.mode {
+            Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
+            _ => false,
+        };
         self.uses_lds = true;
-        let a = self.vreg(f("ADDR"));
+        // the address is read before any result is written (ds_read2_b32 v[0:1], v0 …)
+        let addr = self.vreg(f("ADDR"));
+        let a = format!("{t}_ad");
+        self.line(&format!("uint {a} = {addr};"));
         let lds = |at: String| format!("xcl_lds[(({at}) >> 2) & 8191u]");
         let mut st = Vec::new();
         let rw = |n: &str| -> Option<(bool, u64, u64, bool)> {
@@ -2658,6 +2804,37 @@ impl Em {
                 _ => return None,
             })
         };
+        // 8 / 16-bit LDS accesses: atomic and / or keep the rest of the dword intact
+        let small = match name {
+            "ds_write_b8" => Some((8u32, false, true)),
+            "ds_write_b16" => Some((16, false, true)),
+            "ds_read_u8" => Some((8, false, false)),
+            "ds_read_i8" => Some((8, true, false)),
+            "ds_read_u16" => Some((16, false, false)),
+            "ds_read_i16" => Some((16, true, false)),
+            _ => None,
+        };
+        if let Some((bits, signed, write)) = small {
+            let at = format!("{a} + {off16}u");
+            let slot = lds(at.clone());
+            let sh = format!("((({at}) & 3u) * 8u)");
+            let mask = (1u64 << bits) - 1;
+            if write {
+                let v = self.vreg(f("DATA0"));
+                self.line(&format!(
+                    "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"
+                ));
+            } else {
+                let v = self.vreg(f("VDST"));
+                let val = if signed {
+                    format!("(uint)(((int)((({slot} >> {sh}) & {mask}u) << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                } else {
+                    format!("(({slot} >> {sh}) & {mask}u)")
+                };
+                self.line(&format!("if ({act}) {v} = {val};"));
+            }
+            return Ok(());
+        }
         if let Some((write, n, stride, two)) = rw(name) {
             let addrs: Vec<String> = if two {
                 vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
@@ -2678,6 +2855,10 @@ impl Em {
                 }
             }
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
+            if write && gs_phase {
+                let lowest = addrs.iter().map(|x| format!("({x})")).reduce(|p, q| format!("min({p}, {q})")).unwrap_or_default();
+                self.line(&format!("if ({act}) xcl_gs_base = min(xcl_gs_base, {lowest});"));
+            }
             return Ok(());
         }
         let (op, rtn) = match name.strip_prefix("ds_") {
@@ -2729,26 +2910,32 @@ impl Em {
         };
         match &self.opt.mode {
             Mode::Kernel => {
-                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                // hw_wave 64 with a wave32 program: the wave-size independent form (two halves)
+                let split = self.opt.hw_wave == 64 && !self.opt.wave64;
+                let lanes = if self.opt.wave64 || split { 64 } else { 32 };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({lanes}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                if split {
+                    h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
+                } else {
+                    h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    lane_id = xcl_hw_lane;\n");
+                }
                 load_sgprs(&mut h);
                 let _ = writeln!(h, "    uint scc = io.Load({}u);", KERNEL_SCC_SLOT * 4);
                 for &v in &self.vgprs {
-                    let _ = writeln!(h, "    uint v{v} = io.Load(({}u + lane_id * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
+                    let _ = writeln!(h, "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
                 h.push_str(body);
-                h.push_str("    if (lane_id == 0u) {\n");
+                h.push_str("    if (xcl_hw_lane == 0u) {\n");
                 for &c in &sg {
                     let _ = writeln!(h, "        res.Store({}u, {});", c * 4, sname(c).unwrap());
                 }
                 let _ = writeln!(h, "        res.Store({}u, scc);", KERNEL_SCC_SLOT * 4);
                 h.push_str("    }\n");
                 for &v in &self.vgprs {
-                    let _ = writeln!(h, "    res.Store(({}u + lane_id * {}u + {v}u) * 4u, v{v});", KERNEL_SGPRS, KERNEL_VGPRS);
+                    let _ = writeln!(h, "    res.Store(({}u + xcl_hw_lane * {}u + {v}u) * 4u, v{v});", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
                 h.push_str("}\n");
             }
@@ -2760,14 +2947,20 @@ impl Em {
                 }
                 h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
-                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    lane_id = WaveGetLaneIndex();\n");
+                h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
+                h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
+                    // SV_VertexID / SV_InstanceID listed in ISG1 come through the fetch shader like an
+                    // attribute: v[base + 4r] (retail VInstanced* read the instance id in v8 = r1)
+                    let sv_at = vs.inputs.iter().find(|e| matches!(e.system_value, 6 | 8) && v == vs.attr_base + 4 * e.register as u64);
                     let init = if v == 0 {
                         "xi.xcl_vid".to_string()
                     } else if v == 3 {
                         "xi.xcl_iid".to_string()
+                    } else if let Some(e) = sv_at {
+                        if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
                         inputs
                             .iter()
@@ -2779,6 +2972,44 @@ impl Em {
                 }
                 h.push_str(body);
                 h.push_str("    return xo;\n}\n");
+            }
+            Mode::Compute(cs) => {
+                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                if self.uses_lds {
+                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                }
+                let [x, y, z] = cs.threads;
+                let _ = writeln!(
+                    h,
+                    "[WaveSize({lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                );
+                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                load_sgprs(&mut h);
+                // system SGPRs after the user data: enabled group ids, then TG_SIZE
+                let mut next = cs.user_sgprs as u64;
+                for (k, c) in ["x", "y", "z"].iter().enumerate() {
+                    if cs.tgid[k] {
+                        if sg.contains(&next) {
+                            let _ = writeln!(h, "    {} = gid.{c};", sname(next).unwrap());
+                        }
+                        next += 1;
+                    }
+                }
+                if cs.tg_size && sg.contains(&next) {
+                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
+                }
+                h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                for &v in &self.vgprs {
+                    let init = match v {
+                        0 => "gtid.x",
+                        1 if cs.tid_components >= 2 => "gtid.y",
+                        2 if cs.tid_components >= 3 => "gtid.z",
+                        _ => "0u",
+                    };
+                    let _ = writeln!(h, "    uint v{v} = {init};");
+                }
+                h.push_str(body);
+                h.push_str("}\n");
             }
             Mode::Mesh(ms) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
@@ -2803,6 +3034,68 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
+                h.push_str("}\n");
+            }
+            Mode::Geometry(g) => {
+                let pg = super::GS_PRIMS_PER_GROUP;
+                let rec = g.record();
+                let (vd, vb) = (rec.vert_dwords(), g.vertex_bytes());
+                let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
+                let maxt = g.max_vertex_count.saturating_sub(2).max(1);
+                let nreg = g.input_registers();
+                h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
+                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
+                let _ = writeln!(h, "    uint xcl_p0 = gid.x * {pg}u;\n    uint xcl_np = xcl_total > xcl_p0 ? min({pg}u, xcl_total - xcl_p0) : 0u;\n    uint xcl_nv = 3u * xcl_np;");
+                let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", rec.record_dwords());
+                let _ = writeln!(h, "    uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n    uint xcl_tri[{maxt}];");
+                load_sgprs(&mut h);
+                if sg.contains(&2) {
+                    let _ = writeln!(h, "    s2 = {}u; // GS output area in LDS (after the ES items)", g.es_ring_bytes());
+                }
+                let item = g.es_item_bytes() / 4; // dwords per ES vertex
+                if sg.contains(&3) {
+                    h.push_str("    s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
+                }
+                h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                for &v in &self.vgprs {
+                    let init = match v {
+                        // LDS dword offsets of the triangle's vertices (ES vertex i at i · item)
+                        0 => format!("(lane_id < xcl_np) ? ((lane_id * 3u * {item}u) | ((lane_id * 3u + 1u) * {item}u << 16)) : 0u"),
+                        1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
+                        2 => "xcl_p0 + lane_id".to_string(),
+                        5 => "xcl_p0 * 3u + lane_id".to_string(),
+                        v if v >= 9 && v < 9 + 4 * nreg as u64 => {
+                            let (r, c) = ((v - 9) / 4, (v - 9) % 4);
+                            format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
+                        }
+                        _ => "0u".to_string(),
+                    };
+                    let _ = writeln!(h, "    uint v{v} = {init};");
+                }
+                h.push_str(body);
+                // emitted vertices (LDS, register r at +16·r) and strip triangles → the record
+                let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
+                let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
+                h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tb = WavePrefixSum(xcl_ntri);\n");
+                // wave sums with every lane active (not inside the lane-0 branch)
+                h.push_str("    uint xcl_tv = WaveActiveSum(xcl_emitted);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
+                let _ = writeln!(h, "    if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, min(xcl_tv, {maxv}u)); res.Store(xcl_rec * 4u + 4u, min(xcl_tt, {maxp}u)); }}");
+                let _ = writeln!(h, "    for (uint k = 0u; k < xcl_emitted && xcl_gs_base != 0xFFFFFFFFu; k++) {{\n        uint vi = xcl_vb + k;\n        if (vi >= {maxv}u) break;");
+                let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
+                for (slot, r) in regs.iter().enumerate() {
+                    for c in 0..4 {
+                        let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                    }
+                }
+                h.push_str("    }\n");
+                let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
+                let _ = writeln!(
+                    h,
+                    "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
+                    MESH_HEADER + maxv as usize * vd
+                );
                 h.push_str("}\n");
             }
             Mode::Pixel(ps) => {
@@ -2835,7 +3128,8 @@ impl Em {
                 if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
-                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n    lane_id = WaveGetLaneIndex();\n");
+                h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
+                h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);
@@ -3020,6 +3314,54 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     if (ty == 5u) return (uint)sv;
     return w == 32u ? v : (w == 16u ? asuint(f16tof32(v)) : asuint(uf_small(v, w == 11u ? 6u : 5u)));
 }
+// image_bvh(64)_intersect_ray: node = id (low 3 bits: type), at base + (id & ~7) * 8.
+// box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
+// misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
+// instance / AABB nodes are left to the shader (all 0xFFFFFFFF).
+uint4 bvh_intersect(uint node, uint base, float tmax, float3 o, float3 d, float3 inv, bool sort) {
+    uint type = node & 7u;
+    uint at = base + ((node & ~7u) << 3);
+    if (type == 4u || type == 5u) {
+        uint4 child = mem.Load4(at);
+        float tn[4]; uint id[4];
+        [unroll] for (uint k = 0u; k < 4u; k++) {
+            float3 mn, mx;
+            if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
+            else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
+            float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
+            float a = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
+            float b = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
+            bool hit = child[k] != 0xFFFFFFFFu && a <= b && b >= 0.0f && a <= tmax;
+            tn[k] = hit ? a : asfloat(0x7F800000u);
+            id[k] = hit ? child[k] : 0xFFFFFFFFu;
+        }
+        if (sort) {
+            // sorting network for 4: (0,1) (2,3) (0,2) (1,3) (1,2)
+            uint2 pairs[5] = { uint2(0, 1), uint2(2, 3), uint2(0, 2), uint2(1, 3), uint2(1, 2) };
+            [unroll] for (uint p = 0u; p < 5u; p++) {
+                uint i = pairs[p].x, j = pairs[p].y;
+                if (tn[j] < tn[i]) { float ft = tn[i]; tn[i] = tn[j]; tn[j] = ft; uint ui = id[i]; id[i] = id[j]; id[j] = ui; }
+            }
+        }
+        return uint4(id[0], id[1], id[2], id[3]);
+    }
+    if (type <= 3u) {
+        // GPURT gfx10 node: a pair of triangles, type 0 = (v0, v1, v2), type 1 = (v1, v3, v2)
+        bool t1 = type == 1u;
+        float3 v0 = asfloat(mem.Load3(at + (t1 ? 12u : 0u))), v1 = asfloat(mem.Load3(at + (t1 ? 36u : 12u))), v2 = asfloat(mem.Load3(at + 24u));
+        float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
+        float det = dot(e1, p);
+        float3 sv = o - v0, q = cross(sv, e1);
+        float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding)
+        bool hit = det != 0.0f && i * det >= 0.0f && j * det >= 0.0f && (i + j) * det <= det * det;
+        // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
+        float bc[4] = { det - i - j, i, j, 0.0f };
+        uint tid = mem.Load(at + 60u) >> (8u * type);
+        return hit ? uint4(asuint(t), asuint(det), asuint(bc[tid & 3u]), asuint(bc[(tid >> 2) & 3u])) : uint4(0x7F800000u, asuint(1.0f), 0u, 0u);
+    }
+    return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+}
 uint img_cls(uint fmt) { uint ty = fmt <= 77u ? ((FMT_INFO[fmt] >> 3) & 7u) : 6u; return ty == 4u ? 1u : (ty == 5u ? 2u : 0u); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
@@ -3057,8 +3399,12 @@ uint dst_sel(uint4 c, uint sel, bool isint) { return sel == 0u ? 0u : (sel == 1u
 
 const PRELUDE: &str = r#"
 static uint lane_id;
+// wave32 program in a 64-lane hardware wave: each half is its own wave (xcl_half = 0 / 1)
+static bool xcl_w32 = false;
+static uint xcl_half = 0u;
 bool lanebit(uint lo, uint hi) { return lane_id < 32u ? ((lo >> lane_id) & 1u) != 0u : ((hi >> (lane_id - 32u)) & 1u) != 0u; }
-uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return m.xy; }
+uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return xcl_w32 ? uint2(xcl_half != 0u ? m.y : m.x, 0u) : m.xy; }
+uint rla(uint v, uint l) { return WaveReadLaneAt(v, l + 32u * xcl_half); }
 bool lanebit_at(uint lo, uint hi, uint l) { return l < 32u ? ((lo >> l) & 1u) != 0u : ((hi >> (l - 32u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
     if (sel >= 6u) return x;

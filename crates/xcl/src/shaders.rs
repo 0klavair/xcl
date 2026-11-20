@@ -252,8 +252,11 @@ impl IfaceAgg {
                         packed.extend(next..next + n);
                         next += n;
                     }
+                    // system values with a register (SV_VertexID / SV_InstanceID) arrive like attributes
+                    let sv_regs: Vec<u32> = isg.iter().filter(|e| matches!(e.system_value, 6 | 8)).map(|e| e.register).collect();
                     for b in [4u64, 9] {
-                        let all: std::collections::BTreeSet<u64> = u.iter().flat_map(|(r, _, _)| (0..4).map(move |c| b + 4 * *r as u64 + c)).collect();
+                        let all: std::collections::BTreeSet<u64> =
+                            u.iter().map(|x| x.0).chain(sv_regs.iter().copied()).flat_map(|r| (0..4).map(move |c| b + 4 * r as u64 + c)).collect();
                         if ins.is_subset(&all) {
                             *self.vs_base.entry(format!("{} pasuje v{b}+4r+c", xbox::hw_stage_name(hw))).or_default() += 1;
                         } else if b == 4 && hw == 4 && self.vs_input_examples.len() < 8 {
@@ -296,6 +299,11 @@ struct RecompAgg {
     /// programs translated in a graphics mode (VS / PS interface from the container)
     by_mode: BTreeMap<String, (usize, usize)>,
     hlsl_bytes: usize,
+    /// VS / PS (the driver picks the wave size): wave32 programs (run split in 64-lane waves)
+    /// and wave64 programs whose cross-lane reads break in 32-lane waves (kind → programs)
+    graphics_wave32: usize,
+    graphics_wave64: usize,
+    wave_hazards: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
 }
@@ -324,6 +332,11 @@ impl RecompAgg {
         if self.example.is_none() {
             self.example = o.example;
         }
+        self.graphics_wave32 += o.graphics_wave32;
+        self.graphics_wave64 += o.graphics_wave64;
+        for (k, v) in o.wave_hazards {
+            *self.wave_hazards.entry(k).or_default() += v;
+        }
         for (k, (a, b)) in o.by_mode {
             let e = self.by_mode.entry(k).or_default();
             e.0 += a;
@@ -341,8 +354,24 @@ impl RecompAgg {
             recomp::Mode::Pixel(_) => ("PS", "ps_6_6"),
             recomp::Mode::Kernel => ("kernel", "cs_6_6"),
             recomp::Mode::Mesh(_) => ("MS", "cs_6_6"),
+            recomp::Mode::Geometry(_) => ("GS", "cs_6_6"),
+            recomp::Mode::Compute(_) => ("CS", "cs_6_6"),
         };
-        match recomp::translate(code, &recomp::Options { mode, wave64 }) {
+        if matches!(label, "VS" | "PS") {
+            if wave64 {
+                self.graphics_wave64 += 1;
+                let hz = recomp::wave_hazards(code);
+                for k in &hz {
+                    *self.wave_hazards.entry(k.to_string()).or_default() += 1;
+                }
+                if !hz.is_empty() {
+                    *self.wave_hazards.entry("(programów z ryzykiem)".into()).or_default() += 1;
+                }
+            } else {
+                self.graphics_wave32 += 1;
+            }
+        }
+        match recomp::translate(code, &recomp::Options { mode, wave64, ..Default::default() }) {
             Ok(t) => {
                 let e = self.by_mode.entry(label.to_string()).or_default();
                 e.0 += 1;
@@ -663,9 +692,88 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "pojedynczy plik", a, top, json, t0, compile);
         }
     };
+    if args.iter().any(|a| a == "--precompile") {
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), t0);
+    }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
+}
+
+/// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
+/// (`recomp::dxc::cache_dir()`), the same HLSL the runtime will ask for, so a title does not
+/// wait for DXC on first use. Resumable: cached programs are skipped. GS halves need their
+/// pipeline partner and are left to the runtime.
+fn precompile(input: &Input, limit: usize, t0: std::time::Instant) -> i32 {
+    let n = input.len().min(limit);
+    let next = AtomicUsize::new(0);
+    let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+    println!("prekompilacja {n} shaderów do {} ({threads} wątków)", recomp::dxc::cache_dir().display());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let (name, blob) = input.get(i);
+                let Some(blob) = blob else { continue };
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                for f in &sh.fssm {
+                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    let jobs: Vec<(&str, Option<String>)> = match &mode {
+                        recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
+                        recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
+                        recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
+                        recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
+                        _ => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    for p in &f.programs {
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
+                        let Ok(t) = recomp::translate(code, &opt) else { continue };
+                        if !t.complete() {
+                            continue;
+                        }
+                        for (profile, src) in &jobs {
+                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
+                                Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
+                                Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                                Err(e) => {
+                                    let mut g = errors.lock().unwrap();
+                                    if g.len() < 10 {
+                                        g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or("")));
+                                    }
+                                    failed.fetch_add(1, Ordering::Relaxed)
+                                }
+                            };
+                        }
+                    }
+                }
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 200 == 0 {
+                    eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                }
+            });
+        }
+    });
+    println!(
+        "skompilowane {}, już w cache {}, błędy {}, pominięte (GS – w parze przy tworzeniu potoku) {}, czas {:.1} s",
+        compiled.into_inner(),
+        cached.into_inner(),
+        failed.into_inner(),
+        skipped.into_inner(),
+        t0.elapsed().as_secs_f64()
+    );
+    for e in errors.into_inner().unwrap() {
+        println!("  {e}");
+    }
+    0
 }
 
 /// Compile the kept HLSL samples with DXC on all cores: (ok, failures with the first error line).
@@ -927,6 +1035,10 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         for (k, v) in why.iter().take(top) {
             println!("  {k:<60} {v:>6}");
         }
+        println!(
+            "VS/PS a szerokość fali (wybiera ją sterownik): wave32 {} (obsłużone – połówki fali 64 działają osobno), wave64 {}; ryzyko w falach 32-wątkowych: {:?}",
+            rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards
+        );
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("przykład:
 {x}");

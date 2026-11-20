@@ -506,8 +506,8 @@ fn gpu_graphics_vs_ps_draw() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
     };
-    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true }).unwrap();
-    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true }).unwrap();
+    let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
+    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(vt.complete() && pt.complete(), "{:?} {:?}", vt.unsupported, pt.unsupported);
     let vs = super::dxc::compile(&vt.hlsl, "main", "vs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", vt.hlsl));
     let ps = super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
@@ -929,7 +929,7 @@ fn gpu_mesh_mode_two_passes() {
     list.push(exp(20, 1, [21, 0, 0, 0], 1));
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let t = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true }).unwrap();
+    let t = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
     let pass = mesh_passthrough(&ms);
@@ -1056,7 +1056,7 @@ fn retail_ps_gallery() {
             continue;
         }
         let code = &fs.data[p.offset..p.offset + p.len];
-        let Ok(t) = translate(code, &Options { mode, wave64: super::detect_wave64(code) }) else { continue };
+        let Ok(t) = translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() }) else { continue };
         if !t.complete() || t.hlsl.contains("ResourceDescriptorHeap") || t.hlsl.len() > 150_000 {
             continue;
         }
@@ -1239,4 +1239,600 @@ fn gpu_tsharp_to_d3d12_resources() {
         let (res, _srv) = desc::image_d3d12(&img).unwrap();
         runner::try_create_texture(&res).unwrap_or_else(|e| panic!("{name}: {e} ({res:?})"));
     }
+}
+
+/// Prints signatures / PSV0 of named retail shaders (`XCL_SAMPLE_RPF`, `XCL_DUMP=a,b`).
+#[test]
+#[ignore]
+fn dump_retail_interfaces() {
+    let (Ok(path), Ok(names)) = (std::env::var("XCL_SAMPLE_RPF"), std::env::var("XCL_DUMP")) else { return };
+    let data = std::fs::read(path).unwrap();
+    for r in crate::gpu::pack::scan(&data, 0x40) {
+        if !names.split(',').any(|n| r.name.contains(n)) {
+            continue;
+        }
+        let blob = crate::gpu::pack::inflate(&data, &r).unwrap();
+        let (i, o) = crate::gpu::dxbc::signatures(&blob);
+        let sh = crate::gpu::xbox::parse(&blob).unwrap();
+        println!("{} hw {:?}", r.name, sh.fssm.iter().map(|f| f.stage_label()).collect::<Vec<_>>());
+        println!("  ISG1: {:?}", i.iter().map(|e| format!("{}@r{}:{:x} sv{} t{}", e.semantic(), e.register, e.mask, e.system_value, e.component_type)).collect::<Vec<_>>());
+        println!("  OSG1: {:?}", o.iter().map(|e| format!("{}@r{}:{:x} sv{} t{}", e.semantic(), e.register, e.mask, e.system_value, e.component_type)).collect::<Vec<_>>());
+        if let Some(parts) = crate::gpu::shader::container_parts(&blob) {
+            if let Some(p) = parts.iter().find(|p| p.fourcc == "PSV0") {
+                let d = &blob[p.offset..p.offset + p.size];
+                println!("  PSV0 {:02x?}", &d[..d.len().min(60)]);
+            }
+        }
+    }
+}
+
+/// Geometry mode end to end: an ES program (vertex → LDS, s_setpc to the GS) and a GS
+/// program (triangle from LDS through the v0/v1 offsets, a 4-vertex strip = 2 triangles,
+/// emit / cut) run as one compute shader; 25 triangles = 2 groups (21 + 4); records checked
+/// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
+#[test]
+fn gpu_geometry_mode_es_gs_strip() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap();
+    // ES: vertex (v9..v12) → LDS at lane·32, then into the GS
+    let mut es = Vec::new();
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 133), ("VSRC1", 20)], None));
+    es.extend(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 21), ("DATA0", 9), ("DATA1", 10), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+    es.extend(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 21), ("DATA0", 11), ("DATA1", 12), ("OFFSET0", 2), ("OFFSET1", 3)], None));
+    es.extend(e("S_BARRIER", "ENC_SOPP", &[], None));
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None));
+    // GS: EXEC = primitives of this wave (s3[15:8]), vertices from LDS, parallelogram strip
+    let mut gs = Vec::new();
+    gs.extend(e("S_BFE_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 3), ("SSRC1", 255)], Some(0x80008)));
+    gs.extend(e("S_BFM_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 0), ("SSRC1", 128)], None));
+    gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    gs.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None));
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)], None));
+    gs.extend(e("V_AND_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 255), ("VSRC1", 30)], Some(0x3FFFC)));
+    gs.extend(e("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 31), ("SRC0", 144), ("VSRC1", 0)], None));
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 31), ("SRC0", 130), ("VSRC1", 31)], None));
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 130), ("VSRC1", 1)], None));
+    gs.extend(e("DS_READ2_B32", "ENC_DS", &[("VDST", 40), ("ADDR", 30), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+    gs.extend(e("DS_READ2_B32", "ENC_DS", &[("VDST", 42), ("ADDR", 31), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+    gs.extend(e("DS_READ2_B32", "ENC_DS", &[("VDST", 44), ("ADDR", 32), ("OFFSET0", 0), ("OFFSET1", 1)], None));
+    for (d, a, b) in [(46u64, 42u64, 44u64), (47, 43, 45)] {
+        gs.extend(e("V_ADD_F32", "ENC_VOP2", &[("VDST", d), ("SRC0", V + a), ("VSRC1", b)], None));
+        gs.extend(e("V_SUB_F32", "ENC_VOP2", &[("VDST", d), ("SRC0", V + d), ("VSRC1", d - 6)], None)); // − x0 / − y0
+    }
+    // output base: s2 + lane · (4 vertices · 32 bytes)
+    gs.extend(e("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 20), ("SRC1", 255), ("SRC2", 2)], Some(128)));
+    gs.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 51), ("SRC0", 240)], None)); // 0.5
+    gs.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 52), ("SRC0", 242)], None)); // 1.0
+    for (k, (x, y)) in [(40u64, 41u64), (42, 43), (44, 45), (46, 47)].into_iter().enumerate() {
+        let o = 8 * k as u64;
+        gs.extend(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", x), ("DATA1", y), ("OFFSET0", o), ("OFFSET1", o + 1)], None));
+        gs.extend(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 51), ("DATA1", 52), ("OFFSET0", o + 2), ("OFFSET1", o + 3)], None));
+        gs.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 53), ("SRC0", 128 + k as u64)], None));
+        gs.extend(e("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 50), ("DATA0", 2), ("DATA1", 53), ("OFFSET0", o + 4), ("OFFSET1", o + 5)], None));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)], None)); // emit
+    }
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)], None)); // cut
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None)); // GS done
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
+
+    let sig = |name: &str, sv: u32, reg: u32, ty: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: ty,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0, 3)],
+        // two ES output registers: 32-byte ESGS items (the ES above writes at lane · 32)
+        es_outputs: vec![sig("SV_Position", 1, 0, 3), sig("TEXCOORD", 0, 1, 3)],
+        outputs: vec![sig("SV_Position", 1, 0, 3), sig("TEXCOORD", 0, 1, 1)],
+        max_vertex_count: 4,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend_from_slice(&gs);
+    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let rec = g.record();
+    let msb = dxc::compile(&mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+    let ps_src = "struct V { float4 pos : SV_Position; nointerpolation uint4 p0 : TEXCOORD0; };\nfloat4 main(V v) : SV_Target0 { return float4(1.0, (float)v.p0.y, 0.0, 1.0); }\n";
+    let ps = dxc::compile(ps_src, "main", "ps_6_6", &[]).unwrap();
+
+    // 25 triangles, vertex attributes pre-fetched at 0x1000 (one float4 per vertex)
+    let total = 25usize;
+    let vtx = |p: usize, i: usize| [p as f32 * 0.03 - 0.6 + i as f32 * 0.2, p as f32 * 0.02 - 0.5 + (i == 2) as u32 as f32 * 0.25, 0.5, 1.0];
+    let mut mem = vec![0u32; 0x1000 / 4 + total * 3 * 4];
+    for p in 0..total {
+        for i in 0..3 {
+            let at = 0x1000 / 4 + (p * 3 + i) * 4;
+            mem[at..at + 4].copy_from_slice(&vtx(p, i).map(f32::to_bits));
+        }
+    }
+    let mut io = vec![0u32; 128];
+    io[IO_GS_PRIMS] = total as u32;
+    io[IO_GS_VERTICES] = 0x1000;
+    let (px, recs) = runner::mesh_draw(&cs, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
+    let (rd, vd) = (rec.record_dwords(), rec.vert_dwords());
+    for grp in 0..2usize {
+        let r = &recs[grp * rd..(grp + 1) * rd];
+        let np = if grp == 0 { 21 } else { 4 };
+        assert_eq!((r[0], r[1]), (4 * np as u32, 2 * np as u32), "group {grp}: vertices / triangles");
+        for lane in 0..np {
+            let p = grp * 21 + lane;
+            let (a, b, c) = (vtx(p, 0), vtx(p, 1), vtx(p, 2));
+            let xy = [[a[0], a[1]], [b[0], b[1]], [c[0], c[1]], [b[0] + c[0] - a[0], b[1] + c[1] - a[1]]];
+            for (k, want) in xy.iter().enumerate() {
+                let v = MESH_HEADER + (4 * lane + k) * vd;
+                let pos = [f32::from_bits(r[v]), f32::from_bits(r[v + 1]), f32::from_bits(r[v + 2]), f32::from_bits(r[v + 3])];
+                assert_eq!(pos, [want[0], want[1], 0.5, 1.0], "group {grp} lane {lane} vertex {k}");
+                assert_eq!((r[v + 4], r[v + 5]), (p as u32, k as u32), "group {grp} lane {lane} vertex {k}: TEXCOORD0");
+            }
+            let pk = |i: usize, j: usize, l: usize| (i | j << 10 | l << 20) as u32;
+            let tris = MESH_HEADER + rec.max_vertices as usize * vd;
+            let b0 = 4 * lane;
+            assert_eq!(r[tris + 2 * lane], pk(b0, b0 + 1, b0 + 2), "group {grp} lane {lane}: strip triangle 0");
+            assert_eq!(r[tris + 2 * lane + 1], pk(b0 + 2, b0 + 1, b0 + 3), "group {grp} lane {lane}: strip triangle 1 (odd: swapped)");
+        }
+    }
+    let covered = px.iter().filter(|p| p[0] == 1.0).count();
+    assert!(covered > 20, "pass-through drew the GS output: {covered} pixels");
+}
+
+/// A DS read whose destination overlaps its address register reads the address first
+/// (retail GS code: `ds_read2_b32 v[0:1], v0 offset1:1`).
+#[test]
+fn gpu_ds_read_destination_overlaps_address() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut code = Vec::new();
+    code.extend(encode("DS_WRITE2_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 2), ("DATA1", 3), ("OFFSET0", 0), ("OFFSET1", 1)], None).unwrap());
+    code.extend(encode("DS_READ2_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 1), ("OFFSET0", 0), ("OFFSET1", 1)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = 8 * l as u32; // address
+        r[2] = 1000 + l as u32;
+        r[3] = 2000 + l as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1000 + l as u32, 2000 + l as u32), "lane {l}");
+    }
+}
+
+/// Ray tracing: image_bvh(64)_intersect_ray on a hand-built BVH (box32 root with 4 children,
+/// a box16 node, triangles), several rays; sorted and unsorted box results, triangle hit as
+/// (t, denominator, i, j) numerators, misses, and the 64-bit node pointer form.
+#[test]
+fn gpu_bvh_intersect_ray() {
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let (root, box16, tri_a, tri_b) = (5u32, (0x80u32 >> 3) | 4, 0xC0u32 >> 3, 0x100u32 >> 3);
+    // root box32 at 0: children + boxes (min xyz, max xyz)
+    w(&mut mem, 0, &[tri_a, box16, 0xFFFF_FFFF, tri_b]);
+    w(&mut mem, 16, &ff(&[-1.0, -1.0, 5.0, 1.0, 1.0, 6.0])); // triangle A's box: entry t = 5
+    w(&mut mem, 40, &ff(&[-1.0, -1.0, 2.0, 1.0, 1.0, 3.0])); // box16 node's box: t = 2
+    w(&mut mem, 64, &ff(&[-1.0, -1.0, 0.5, 1.0, 1.0, 0.7])); // invalid child: never reported
+    w(&mut mem, 88, &ff(&[10.0, -1.0, 8.0, 11.0, 1.0, 9.0])); // off the ray
+    // box16 node at 0x80: one child (triangle B) in z 6..7, half floats
+    let h = |x: f32| half_bits(x);
+    w(&mut mem, 0x80, &[tri_b, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF]);
+    w(&mut mem, 0x90, &[h(-1.0) | h(-1.0) << 16, h(6.0) | h(1.0) << 16, h(1.0) | h(7.0) << 16]);
+    // triangles: A in z = 5 (hit at u = v = 0.5 from the origin), B in z = 6.5
+    w(&mut mem, 0xC0, &ff(&[-1.0, -1.0, 5.0, 1.0, -1.0, 5.0, -1.0, 1.0, 5.0]));
+    w(&mut mem, 0x100, &ff(&[-1.0, -1.0, 6.5, 1.0, -1.0, 6.5, -1.0, 1.0, 6.5]));
+    // triangle id 9: I = vertex 1, J = vertex 2 (no rotation)
+    w(&mut mem, 0xC0 + 60, &[9]);
+    w(&mut mem, 0x100 + 60, &[9]);
+    let mimg = |n: &'static str, vdata: u64, vaddr: u64, srsrc: u64| encode(n, "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", 15)], None).unwrap();
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 100, 0, 2)); // root, sorting
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 104, 0, 3)); // root, no sorting
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 20, 2)); // box16 node
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 112, 40, 2)); // triangle A
+    code.extend(mimg("IMAGE_BVH64_INTERSECT_RAY", 116, 60, 2)); // triangle A, 64-bit node id
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    st.sgpr[12..16].copy_from_slice(&[(base >> 8) as u32, 0, u32::MAX, 0]);
+    // lane 0: ray along +z from the origin; lane 1: the same with t max 3.5; lane 2: from (5, 5)
+    let ray = |l: usize| -> ([f32; 3], f32) {
+        match l % 3 {
+            0 => ([0.0, 0.0, 0.0], 100.0),
+            1 => ([0.0, 0.0, 0.0], 3.5),
+            _ => ([5.0, 5.0, 0.0], 100.0),
+        }
+    };
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (o, tmax) = ray(l);
+        let rest = |r: &mut Vec<u32>, at: usize| {
+            let v = [tmax, o[0], o[1], o[2], 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY, 1.0];
+            for (k, x) in v.iter().enumerate() {
+                r[at + k] = x.to_bits();
+            }
+        };
+        r[0] = root;
+        rest(r, 1);
+        r[20] = box16;
+        rest(r, 21);
+        r[40] = tri_a;
+        rest(r, 41);
+        r[60] = tri_a;
+        r[61] = 0;
+        rest(r, 62);
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    const F: u32 = 0xFFFF_FFFF;
+    for l in 0..64usize {
+        let v = &res.vgpr[l];
+        let q = |at: usize| [v[at], v[at + 1], v[at + 2], v[at + 3]];
+        match l % 3 {
+            0 => {
+                assert_eq!(q(100), [box16, tri_a, F, F], "lane {l}: box32, closest first");
+                assert_eq!(q(104), [tri_a, box16, F, F], "lane {l}: box32 without sorting keeps child order");
+                assert_eq!(q(108), [tri_b, F, F, F], "lane {l}: box16");
+            }
+            1 => {
+                assert_eq!(q(100), [box16, F, F, F], "lane {l}: t max 3.5 excludes the box at t = 5");
+                assert_eq!(q(108), [F, F, F, F], "lane {l}: box16 at t = 6 beyond t max");
+            }
+            _ => {
+                assert_eq!(q(100), [F, F, F, F], "lane {l}: ray from (5, 5) misses every box");
+                assert_eq!(q(112)[0], f32::INFINITY.to_bits(), "lane {l}: triangle missed → t = inf");
+            }
+        }
+        if l % 3 != 2 {
+            let tri = q(112).map(f32::from_bits);
+            let (t, i, j) = (tri[0] / tri[1], tri[2] / tri[1], tri[3] / tri[1]);
+            assert_eq!((t, i, j), (5.0, 0.5, 0.5), "lane {l}: triangle hit (t, i, j)");
+            assert_eq!(q(116), q(112), "lane {l}: 64-bit node pointer gives the same");
+        }
+    }
+}
+
+/// Checks the compute ABI read from the FSSM stage descriptor (+0x38 COMPUTE_PGM_RSRC2,
+/// +0x3C.. numthreads) on every CS of the pack against PSV0 and the SGPRs/VGPRs the code reads.
+#[test]
+#[ignore]
+fn compute_abi_survey() {
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let data = std::fs::read(path).unwrap();
+    let (mut n, mut threads_ok, mut sgpr_ok, mut vgpr_ok) = (0, 0, 0, 0);
+    for r in crate::gpu::pack::scan(&data, 0x40) {
+        if !r.name.starts_with("CS_") && !r.name.starts_with("S_") {
+            continue;
+        }
+        let Some(blob) = crate::gpu::pack::inflate(&data, &r) else { continue };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
+        let d = f.stages[0].offset;
+        let rd = |o: usize| u32::from_le_bytes(f.data[d + o..d + o + 4].try_into().unwrap());
+        let rsrc2 = rd(0x38);
+        let nt = [rd(0x3C), rd(0x40), rd(0x44)];
+        let user = (rsrc2 >> 1) & 31;
+        let tg = [(rsrc2 >> 7) & 1, (rsrc2 >> 8) & 1, (rsrc2 >> 9) & 1, (rsrc2 >> 10) & 1];
+        let tid = (rsrc2 >> 11) & 3;
+        let sys = tg.iter().sum::<u32>();
+        n += 1;
+        let psv = crate::gpu::dxbc::psv(&blob).and_then(|p| p.numthreads);
+        threads_ok += (psv == Some(nt)) as usize;
+        // registers read before written
+        let p = f.programs[0];
+        let code = &f.data[p.offset..p.offset + p.len];
+        let (mut sr, mut sw, mut vr, mut vw) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let Ok(dd) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { break };
+            off += dd.len;
+            let (r, w) = crate::gpu::rdna2::sgpr_uses(&dd);
+            sr.extend(r.into_iter().filter(|x| !sw.contains(x) && *x < 106));
+            sw.extend(w);
+            let (r, w) = crate::gpu::rdna2::vgpr_uses(&dd);
+            vr.extend(r.into_iter().filter(|x| !vw.contains(x)));
+            vw.extend(w);
+        }
+        let max_s = sr.iter().max().copied().unwrap_or(0);
+        let s_in = max_s < (user + sys) as u64;
+        sgpr_ok += s_in as usize;
+        let v_in = vr.iter().all(|&v| v <= tid as u64);
+        vgpr_ok += v_in as usize;
+        if !(s_in && v_in && psv == Some(nt)) {
+            println!("{}: rsrc2 {rsrc2:#x} user {user} tgid {tg:?} tid {tid} threads {nt:?} psv {psv:?} SGPR czytane {sr:?} VGPR {vr:?}", r.name);
+        }
+    }
+    println!("CS: {n}, numthreads = PSV0: {threads_ok}, SGPR w user+system: {sgpr_ok}, VGPR w ID wątku: {vgpr_ok}");
+}
+
+/// Compute mode with the console dispatch ABI: numthreads 16×8 (two wave64 waves per group),
+/// 2×3 groups; group ids from the SGPRs after the user data, thread ids in v0/v1; LDS shared
+/// across the two waves through a barrier.
+#[test]
+fn gpu_compute_mode_dispatch_abi() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let cs = CsInterface { threads: [16, 8, 1], user_sgprs: 2, tgid: [true, true, false], tg_size: false, tid_components: 2 };
+    let p = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 132), ("VSRC1", 1)], None), // y · 16
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 2), ("VSRC1", 0)], None), // index in group
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 2), ("SSRC1", 132)], None), // group x · 16
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 4), ("VSRC1", 0)], None), // global x
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 3), ("SSRC1", 131)], None), // group y · 8
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 5), ("VSRC1", 1)], None), // global y
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 144), ("VSRC1", 4)], None),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 5), ("VSRC1", 3)], None), // x | y << 16
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 2)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 6), ("DATA0", 5)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 255), ("VSRC1", 2)], Some(127)), // partner in the other wave
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 130), ("VSRC1", 7)], None),
+        ("DS_READ_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 5)], None),
+        ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 4), ("SRC1", 1)], None), // y · width
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 9), ("VSRC1", 3)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 131), ("VSRC1", 9)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 0), ("VSRC1", 9)], None), // + output base
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 9), ("DATA", 11), ("SADDR", 0x7D)], None),
+    ]);
+    let t = translate(&p, &Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let (w, h, base) = (32usize, 24usize, 0x100usize);
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    io[1] = w as u32;
+    let out = runner::dispatch(&dxil, [2, 3, 1], &io, &vec![0u32; (base + w * h * 8) / 4]).unwrap();
+    for y in 0..h {
+        for x in 0..w {
+            let at = (base + (y * w + x) * 8) / 4;
+            assert_eq!(out[at], (x | y << 16) as u32, "({x}, {y}): own value");
+            let (gx, gy, i) = (x / 16, y / 8, (y % 8) * 16 + x % 16);
+            let (px, py) = (gx * 16 + (127 - i) % 16, gy * 8 + (127 - i) / 16);
+            assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
+        }
+    }
+}
+
+/// A wave32 program in a 64-lane hardware wave (what VS / PS may get from the driver): the
+/// two halves behave as separate waves – ballots, lane counts, readlane and mbcnt per half.
+#[test]
+fn gpu_wave32_program_in_wave64_hardware() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 138), ("VSRC1", 0)], None), // vcc_lo = lanes with v0 < 10
+        ("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 0)], None),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 131)], None), // s1 = v0 of lane 3
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 1)], None),
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 193), ("SRC1", 128)], None),
+    ]);
+    let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64 }).unwrap();
+    assert!(t.hlsl.contains("[WaveSize(64)]") && t.hlsl.contains("xcl_half"), "{}", t.hlsl);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let mut st = KernelState::default();
+    st.sgpr[126] = u32::MAX; // exec of each half
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = (l % 32 + if l >= 32 { 5 } else { 0 }) as u32; // second half shifted by 5
+    }
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    for l in 0..64 {
+        let half = l / 32;
+        let v = &r.vgpr[l];
+        assert_eq!(v[1], if half == 0 { 10 } else { 5 }, "lane {l}: active lanes of its own half");
+        assert_eq!(v[2], 3 + 5 * half as u32, "lane {l}: readlane 3 of its own half");
+        assert_eq!(v[3], (l % 32) as u32, "lane {l}: lane index within the half");
+    }
+}
+
+/// SV_VertexID / SV_InstanceID listed in ISG1 with a register arrive like attributes,
+/// v[4 + 4r] (retail VInstanced* shaders read the instance id in v8 = register 1).
+#[test]
+fn vs_system_values_in_isg1_registers() {
+    use super::VsInterface;
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: if sv == 0 { 3 } else { 1 },
+        register: reg,
+        mask: if sv == 0 { 7 } else { 1 },
+        rw_mask: 1,
+        stream: 0,
+    };
+    let vs = VsInterface {
+        inputs: vec![sig("POSITION", 0, 0), sig("SV_InstanceID", 8, 1), sig("SV_VertexID", 6, 2)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        attr_base: 4,
+    };
+    let code = prog(&[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 8), ("VSRC1", 12)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 21), ("SRC0", V + 4), ("VSRC1", 5)], None),
+    ]);
+    let t = translate(&code, &Options { mode: Mode::Vertex(vs), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("uint v8 = xi.xcl_iid;") && t.hlsl.contains("uint v12 = xi.xcl_vid;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("uint v4 = asuint(xi.a0[0]);"), "{}", t.hlsl);
+}
+
+#[test]
+#[ignore]
+fn probe_standard_swizzle_support() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut dev).unwrap();
+        let dev = dev.unwrap();
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut _, std::mem::size_of_val(&o) as u32).unwrap();
+        println!("StandardSwizzle64KBSupported = {:?}", o.StandardSwizzle64KBSupported);
+    }
+}
+
+/// A BVH from the builder (gpu::bvh) through the translated image_bvh_intersect_ray: every
+/// lane tests one built node (box32 or triangle) with its own ray; the GPU must agree with
+/// the CPU node test the builder's traversal uses.
+#[test]
+fn gpu_built_bvh_nodes_match_the_cpu_node_test() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let tris = bvh::tests::random_tris(40, 5);
+    let b = bvh::build(&tris, 0);
+    // every node id, root first
+    let mut nodes = vec![];
+    let mut todo = vec![b.root];
+    while let Some(n) = todo.pop() {
+        nodes.push(n);
+        if n & 7 == bvh::BOX32 {
+            let at = ((n & !7) as usize) << 3;
+            for k in 0..4 {
+                let c = u32::from_le_bytes(b.data[at + 4 * k..at + 4 * k + 4].try_into().unwrap());
+                if c != bvh::INVALID {
+                    todo.push(c);
+                }
+            }
+        }
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; (base + b.data.len()) / 4 + 64];
+    for (k, c) in b.data.chunks(4).enumerate() {
+        mem[base / 4 + k] = u32::from_le_bytes(c.try_into().unwrap());
+    }
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let mut r = bvh::tests::rng(17);
+    let mut rays = vec![];
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let node = nodes[l % nodes.len()];
+        let o = [r(-12.0, 12.0), r(-12.0, 12.0), r(-12.0, 12.0)];
+        let to = [r(-6.0, 6.0), r(-6.0, 6.0), r(-6.0, 6.0)];
+        let d = [to[0] - o[0], to[1] - o[1], to[2] - o[2]];
+        let inv = d.map(|x| 1.0 / x);
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+        rays.push((node, o, d, inv));
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let (mut boxes, mut tri_hits) = (0, 0);
+    for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
+        let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
+        let cpu = bvh::intersect_node(&b.data, node, 100.0, o, d, inv, true);
+        if node & 7 == bvh::BOX32 {
+            assert_eq!(gpu, cpu, "lane {l}: box node {node:#x}");
+            boxes += 1;
+        } else {
+            let (g, c) = (gpu.map(f32::from_bits), cpu.map(f32::from_bits));
+            assert_eq!(g[0].is_infinite(), c[0].is_infinite(), "lane {l}: triangle {node:#x} hit / miss");
+            if !c[0].is_infinite() {
+                assert!((g[0] / g[1] - c[0] / c[1]).abs() < 1e-4, "lane {l}: t {g:?} vs {c:?}");
+                tri_hits += 1;
+            }
+        }
+    }
+    assert!(boxes > 10 && tri_hits > 0, "boxes {boxes}, triangle hits {tri_hits}");
+}
+
+/// The console's node forms (seen in the console builder's output): a box16 node and a GPURT
+/// triangle pair – type 0 = (v0, v1, v2), type 1 = (v1, v3, v2), barycentrics put back in the
+/// original vertex order by the triangle id. GPU (HLSL emulation) = CPU mirror, and the
+/// barycentrics of a known point come out right.
+#[test]
+fn gpu_triangle_pair_and_box16_nodes() {
+    use crate::gpu::bvh;
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // corners of a quad in z = 5; triangle 0 = (p0, p1, p2) stored rotated: v0 = p1, v1 = p2,
+    // v2 = p0, so its I barycentric (weight of p1) is vertex 0 and J (p2) vertex 1
+    let (p0, p1, p2, p3) = ([-1.0f32, -1.0, 5.0], [1.0, -1.0, 5.0], [-1.0, 1.0, 5.0], [1.0, 1.0, 5.0]);
+    let pair = 0x40usize;
+    w(&mut mem, pair, &ff(&[p1, p2, p0, p3].concat()));
+    // triangle 1 = (v1, v3, v2) = (p2, p3, p0), original order (p0, p3, p2): I (p3) is vertex 1
+    // of the triple, J (p2) vertex 0. Triangle id: byte 0 = 0x04, byte 1 = 0x01
+    w(&mut mem, pair + 48, &[0, 11, 12, 0x0104]);
+    // box16 root with the two triangles
+    let h = |x: f32| half_bits(x);
+    let (t0, t1) = ((pair as u32) >> 3, (pair as u32) >> 3 | 1);
+    w(&mut mem, 0, &[t0, t1, 0xFFFF_FFFF, 0xFFFF_FFFF]);
+    for k in 0..2 {
+        w(&mut mem, 16 + 12 * k, &[h(-1.0) | h(-1.0) << 16, h(4.5) | h(1.0) << 16, h(1.0) | h(5.5) << 16]);
+    }
+    let root = 4u32; // box16 at 0
+    let mut code = encode("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 1 << 31, u32::MAX, 0]);
+    let mut r = bvh::tests::rng(5);
+    let nodes = [root, t0, t1];
+    let mut rays = vec![];
+    for (l, v) in st.vgpr.iter_mut().enumerate() {
+        let node = nodes[l % 3];
+        let o = [r(-1.5, 1.5), r(-1.5, 1.5), 0.0];
+        let d = [r(-0.1, 0.1), r(-0.1, 0.1), 1.0];
+        let inv = d.map(|x| 1.0 / x);
+        v[0] = node;
+        for (k, x) in [100.0f32, o[0], o[1], o[2], d[0], d[1], d[2], inv[0], inv[1], inv[2]].iter().enumerate() {
+            v[1 + k] = x.to_bits();
+        }
+        rays.push((node, o, d, inv));
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let data: Vec<u8> = mem[base / 4..].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let mut checked = 0;
+    for (l, &(node, o, d, inv)) in rays.iter().enumerate() {
+        let gpu: [u32; 4] = res.vgpr[l][100..104].try_into().unwrap();
+        let cpu = bvh::intersect_node(&data, node, 100.0, o, d, inv, true);
+        if node == root {
+            assert_eq!(gpu, cpu, "lane {l}: box16");
+            continue;
+        }
+        let (g, c) = (gpu.map(f32::from_bits), cpu.map(f32::from_bits));
+        assert_eq!(g[0].is_infinite(), c[0].is_infinite(), "lane {l}: hit / miss");
+        if c[0].is_infinite() {
+            continue;
+        }
+        for k in 0..4 {
+            assert!((g[k] / g[1] - c[k] / c[1]).abs() < 1e-5, "lane {l}: {g:?} vs {c:?}");
+        }
+        // hit point from the barycentrics in the ORIGINAL order of the stored triangle
+        let (t, bi, bj) = (c[0] / c[1], c[2] / c[1], c[3] / c[1]);
+        let hit = [0, 1, 2].map(|a| o[a] + t * d[a]);
+        if node == t0 {
+            let q = [0, 1, 2].map(|a| (1.0 - bi - bj) * p0[a] + bi * p1[a] + bj * p2[a]);
+            assert!((0..3).all(|a| (q[a] - hit[a]).abs() < 1e-4), "lane {l}: triangle 0 barycentrics {q:?} vs {hit:?}");
+        } else {
+            let q = [0, 1, 2].map(|a| (1.0 - bi - bj) * p0[a] + bi * p3[a] + bj * p2[a]);
+            assert!((0..3).all(|a| (q[a] - hit[a]).abs() < 1e-4), "lane {l}: triangle 1 barycentrics {q:?} vs {hit:?}");
+        }
+        checked += 1;
+    }
+    assert!(checked > 5, "{checked} triangle hits");
 }

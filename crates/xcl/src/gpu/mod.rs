@@ -1,6 +1,7 @@
 //! GPU side of XCL: console shader capture and the RDNA2 microcode toolchain
 //! (decoder / disassembler – the front-end of the shader recompiler).
 
+pub mod bvh;
 pub mod desc;
 pub mod dxbc;
 pub mod pack;
@@ -9,6 +10,8 @@ pub mod recomp;
 mod rdna2_spec;
 mod rdna2_xbox;
 pub mod shader;
+pub mod tiling;
+mod tiling_tables;
 pub mod uma;
 pub mod xbox;
 

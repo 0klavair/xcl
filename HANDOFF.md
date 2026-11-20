@@ -1,8 +1,8 @@
-# XCL – przekazanie pracy (stan na 2026-11-20, sesja 4)
+# XCL – przekazanie pracy (stan na 2026-11-20, sesja 5)
 
 Warstwa zgodności Xbox Series X|S → Windows (bez emulacji CPU), Rust, `<repo>`.
 Projekt: `docs/specs/2026-11-20-xcl-design.md` (sekcje 5.x, w tym 5.7a – format shaderów konsoli, 5.7b – stan recompilera). Instrukcja: `README.md`.
-Rozmowa z użytkownikiem po polsku. Brak repo git (użytkownik nie prosił o commity).
+Rozmowa z użytkownikiem po polsku. Repo git: `main`, jeden commit początkowy; commity tylko na prośbę użytkownika.
 
 ## Środowisko
 Windows 11, AMD Radeon RX 9070 (RDNA4) + iGPU, Rust 1.96 `x86_64-pc-windows-msvc`, VS 2022, Python 3.12.
@@ -185,6 +185,169 @@ UWAGA:
   prawa: B z DST_SEL zyxw) – `runner::draw_on_multi` + `runner::ViewTexture`/`Draw` (NOWE). 4096 pikseli = teksel (±0,005),
   2048/2048 po prawej różne od A. Sabotaż sprawdzony: DST_SEL ignorowany → pada; ta sama tabela w obu draw → pada.
 
+- **Emulacja GS** (`Mode::Geometry`, `GsInterface`, `recomp::geometry_program(es, gs)`): legacy on-chip GS z paczki
+  (195 `GS_VoxelizeGeneric` + 195 wariantów ES `VS_*`, para po sufiksie haszu). ES i GS jednego potoku = jeden CS
+  `[WaveSize(64)]`, grupa = do 21 trójkątów (63 wierzchołki ES); `s_setpc_b64` ES → kod GS; LDS = `groupshared`;
+  element ESGS = 16 B na rejestr OSG1 ES (zmierzone: wariant 6be01b34 zapisuje co 16 B, 912dfba0 co 32 B – sterownik konsoli
+  wylicza to z ES); wejścia GS: v0/v1 = offsety wierzchołków w dwordach (16-bit spakowane), s3 = wierzchołki | prymitywy<<8,
+  s2 = obszar wyjścia GS po 64 elementach ES; `s_sendmsg` emit/cut → trójkąty z pasa (nieparzyste z zamianą), baza wyjścia
+  wątku = najniższy adres zapisany przez niego w fazie GS (nie zależy od wartości spod [s8+0xB8]); wynik → rekord trybu mesh →
+  `mesh_passthrough`. Atrybuty ES pobrane wcześniej: float4 na rejestr ISG1 w `mem` pod io[111], liczba prymitywów io[110].
+  **Założenia do sprawdzenia na grze:** wartość [s8+0xB8] (baza wyjścia GS, w teście 0), znaczenie s19/s21/s16/s17 (dane
+  użytkownika), tylko trójkąty → triangle strip, brak PSO/rysowania GS w backendzie (potrzebne przechwytywanie list poleceń).
+- **Naprawiony błąd tłumacza:** `ds_read*` z rejestrem docelowym pokrywającym adres (`ds_read2_b32 v[0:1], v0`) liczył drugi
+  adres z nadpisanego rejestru – teraz adres najpierw do zmiennej. Ujawnił go dopiero prawdziwy GS; test regresji
+  `gpu_ds_read_destination_overlaps_address`.
+- Korpus: **24 056 / 24 064 (99,97%)** – GS 390/390, MS, PS, VS 100%; zostało 8 CS z `image_bvh*_intersect_ray`.
+- Testy GS: `gpu_geometry_mode_es_gs_strip` (syntetyczny ES+GS: 25 trójkątów = 2 grupy, pas 4 wierzchołków, każdy wierzchołek
+  i indeksy dokładnie, rysowanie) i `retail_es_gs_voxelize_geometry_mode` (prawdziwa para z paczki: rzut na płaszczyznę osi
+  dominującej dokładnie – z → (x, y), x → (z, y), głębokość 0,5·d+0,5, oś 4/0, TEXCOORD1 = (-1,-1,1,1), TEXCOORD3 = normalna
+  jednostkowa, 496 pikseli). Wszystkie testy: 98 jednostkowych + e2e + 3 w `gpu_pso_e2e` – PRZESZŁY.
+
+- **Ray tracing: `image_bvh(64)_intersect_ray`** (8 programów: `CS_RTShadowTrace*` wave32, `S_ScreenProbes_TraceRays_BVH`):
+  funkcja HLSL `bvh_intersect` w PRELUDE_MEM wg publicznego formatu RDNA2/RADV – węzeł = id (typ w bitach 2:0) pod
+  baza + (id & ~7)·8, baza z deskryptora w jednostkach 256 B (słowo 0), sortowanie = słowo 1 bit 31; box32 (5) / box16 (4,
+  f16): test slab 4 dzieci, trafione posortowane po odległości (sieć 5 porównań), chybione 0xFFFFFFFF; trójkąt (0..3):
+  (t, mianownik, i, j) jako liczniki (Möller–Trumbore), chybienie t = inf; instance/AABB → 0xFFFFFFFF (robi to shader).
+  A16 (dir/inv_dir jako połówki) obsłużone. Kod gry potwierdza układ (adres węzła = (id >> 3) << 6, triangle_id pod +48).
+  Test `gpu_bvh_intersect_ray` (ręczny BVH, 3 rodzaje promieni, sortowanie/bez, box16, trafienie t=5 i=j=0,5, chybienia,
+  wariant 64-bit). Przybliżenia: brzegowe przypadki NaN/równości i wariant watertight sprzętu, tryb zwrotu inny niż IJ.
+- **Korpus: 24 064 / 24 064 (100%)** programów tłumaczy się w całości; DXC kompiluje oba programy RT.
+  Testy: 99 jednostkowych + e2e + 3 w `gpu_pso_e2e` – PRZESZŁY.
+
+## Sesja 5 (2026-11-20) – wszystko, co da się zrobić bez exe
+- **Tryb Compute** (`Mode::Compute`, `CsInterface::from_descriptor`): COMPUTE_PGM_RSRC2 z deskryptora etapu +0x38
+  (USER_SGPR bity 5:1, TGID_X/Y/Z bity 7/8/9, TG_SIZE bit 10, TIDIG_COMP_CNT bity 12:11), numthreads z +0x3C/+0x40/+0x44
+  (= PSV0 we wszystkich 36 sprawdzonych CS); id grup za user SGPR, v0..v2 = id wątku. `runner::dispatch(dxil, grupy, sgpr, mem)`.
+- **Szerokość fali VS/PS** (wybiera ją sterownik PC): program wave32 w fali 64 działa jako dwie połówki (`xcl_w32`,
+  `xcl_half`, `rla()`, `ballot()` świadome połówki); Kernel z `hw_wave == 64 && !wave64` tak samo. Program wave64 w fali 32
+  psuje się tylko przy readlane linii ≥ 32, linii z SGPR i ds_bpermute – `recomp::wave_hazards` to raportuje, nie naprawia.
+  Korpus: 1127 wave32 VS/PS obsłużonych, 749 wave64 z ryzykiem (447 linia ≥ 32, 353 linia z SGPR).
+- `xcl shaders … --precompile [--limit N]`: DXIL do cache (`dxc::compile_cached`, `%LOCALAPPDATA%\xcl\dxil` albo
+  `XCL_DXIL_CACHE`); 60 rekordów w 4,6 s, powtórka 0,2 s (z cache).
+- **Wejścia VS:** SV_VertexID / SV_InstanceID z rejestrem w ISG1 trafiają jak atrybuty do v[4 + 4r] (`VInstanced*` czytają
+  id instancji w v8) – NAPRAWIONE, test `vs_system_values_in_isg1_registers`. Analiza `--iface` liczy z VADDR MUBUF/MTBUF
+  tylko używane rejestry (IDXEN + OFFEN) – większość „odstających” VS to były fałszywe alarmy (górna połowa 64-bit VADDR).
+  Układ v4 + 4·rejestr: 779 / 788 VS. Zostało 9 `VS_PassthroughComposite_*_Wrapped`: `image_load v[8:11]` przy ustawionym
+  tylko v8 – analiza liczy 4 adresy bez patrzenia na DIM, prawie na pewno też fałszywy alarm.
+- **Strony fizyczne** (`hle/kernelx.rs`): Allocate/Free/MapTitlePhysicalPages w UMA – strony 64 KiB, przydział = ciągły blok
+  UMA, numer strony = offset / 64 KiB; mapowanie kolejnych stron zwraca ich adres w UMA (widoczny dla GPU, bez kopii);
+  mapowanie pod adres wybrany przez grę lub rozproszonych stron → odmowa + log (aliasowanie wymagałoby sekcji pamięci).
+  Test `physical_pages_in_uma`.
+- **Tiling GFX10** (`gpu/tiling.rs`; `gpu/tiling_tables.rs` z `scripts/gen_tiling.py` – wzorce AMD addrlib z Mesy, MIT, źródła
+  ściągane z gitlab.freedesktop.org do scratchpada): 14 trybów 2D (256 B / 4 KB / 64 KB: S, D, S_T, D_T, S_X, D_X, Z_X, R_X)
+  × 5 rozmiarów elementu × konfiguracja pipe/packer (tablice RB+, gfx10.3). Offset liniowy nad GF(2): `ox[x] ^ oy[y]`;
+  `Layout::{new, offset, detile, tile, size}`, `tiling::element(IMG_FORMAT)`, `tiling::image_layout(&desc::Image, cfg)`
+  (`base_xor` z niskich bitów adresu T#). **Zweryfikowane na prawdziwych danych:** wzorce, które przeglądarka TTPF
+  (`tools/ttpf-viewer/src/tile.rs`) znalazła ręcznie na teksturach gry, to bit w bit SW_64KB_D (bloki 64 KB) i SW_4KB_S
+  (bloki 4 KB) dla elementów 1/2/4/8/16 B. Wszystkie tryby × konfiguracje dają permutację bloku (test). Niewiadome:
+  konfiguracja pipe/packer konsoli (GB_ADDR_CONFIG) dla trybów _X – parametr `PipeConfig`, do ustalenia na teksturze z gry
+  (np. wybrać konfigurację, która daje najgładszy obraz); łańcuch mipów i mip tail – nie (każdy poziom osobno).
+  `StandardSwizzle64KBSupported` na RX 9070 = 0, więc untiling i tak zostaje po naszej stronie.
+- **Builder BVH** (`gpu/bvh.rs`): BLAS w formacie RDNA2 (box32 128 B + trójkąt 64 B, id prymitywu @48, geometrii @52),
+  podział po medianie centroidów na najdłuższej osi, 4 dzieci na węzeł, 1 trójkąt na liść. `bvh::intersect_node` to lustro
+  CPU emulacji HLSL, `Bvh::trace` to trawersacja stosowa do najbliższego trafienia. Testy: trawersacja = brute force
+  (300 trójkątów, 2000 promieni) i `gpu_built_bvh_nodes_match_the_cpu_node_test` (64 linie, węzły z buildera przez
+  przetłumaczony `image_bvh_intersect_ray` = wynik CPU). Brakuje: węzłów instancji (TLAS – układ sterownika konsoli, przechodzi
+  go kod shadera, do odczytania z `CS_RTShadowTrace*`), box16 w builderze, podpięcia pod `BuildRaytracingAccelerationStructure`.
+- **Opus odłożony do exe** (decyzja użytkownika: „okaże się przy exe”). Patrz sekcja Audio.
+- Testy: 111 jednostkowych (7 ignorowanych pomocniczych) + e2e tytułu + 3 w `gpu_pso_e2e` – PRZESZŁY (pełny `cargo test --workspace`).
+
+### Konsolowe DLL z paczki gry (sesja 5, bez exe)
+Użytkownik dał 16 DLL z chunku 1002 (`<samples>\*.dll`, zwykłe PE): CRT konsoli (vcruntime140(_1),
+msvcp140(_1/_2/_atomic_wait/_codecvt_ids), concrt140, vcomp140, vccorlib140), Bink2Scarlett, XCurl, libHttpClient.GDK,
+amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. Exe gry (`game_scarlett_master.exe`) nadal brak.
+- `xcl inspect`: po poprawkach **0 brakujących importów we wszystkich 16**. Dopisane:
+  - `XMemVirtualQuery(proces, adres, info) → BOOL` (sygnatura z miejsc wywołania w XboxBvhBuilder, objdump z msys64):
+    info = MEMORY_BASIC_INFORMATION + pole @48, bity 0–1 = pamięć czytelna dla CPU (komunikat przy błędzie:
+    „pDesc->SourceAccelerationStructureData must be non-null and point to CPU-readable memory”);
+  - `XMemGetWorkingSetStatistics(alokator, stats) → FALSE` (upscaler FSR czyta +8 tylko przy sukcesie → raportuje 0);
+  - ordynały `xaudio2_9.dll` w `data/stubdb.toml` (z systemowej DLL; Bink importuje #1 = XAudio2Create).
+- `crates/xcl/tests/console_dlls_e2e.rs` (`XCL_SAMPLE_DLLS` = folder z DLL, bez niej test pomijany):
+  - CRT konsoli ładuje się loaderem XCL (importy HLE/Windows/DLL gry, TLS, DllMain) i **działa**: memcpy, `std::mutex`
+    (`_Mtx_*`) z 2 wątkami (40 000 inkrementacji), `_Thrd_hardware_concurrency` / `omp_get_num_procs` /
+    `Concurrency::GetProcessorCount` = liczba rdzeni;
+  - pozostałe DLL (Bink, XCurl, libHttpClient.GDK, FFX, XboxBvhBuilder, msvcp140_*, vccorlib140): mapowanie + TLS + DllMain OK;
+  - **prawdziwy builder BVH konsoli** (`GetRaytracingAccelerationStructurePrebuildInfo` liczy na CPU; wyzerowany obiekt
+    = ustawienia domyślne) – rozmiar wyniku pasuje dokładnie (17/17 przypadków) do
+    `align_1K(256 + N·liść + max(N−1,1)·128 + 4 B na każde 64 B węzłów)`: liść BLAS (trójkąt) 64 B, liść TLAS
+    (**węzeł instancji**) 128 B, box32 128 B, nagłówek 256 B, wskaźnik rodzica 4 B na 64 B (układ jak AMD GPURT / RADV).
+- XboxBvhBuilder.dll = klasa C++ `XboxBvhBuilder(ID3D12Device11*, bool)`: Build, BuildBatched2X, Copy, GetPrebuildInfo,
+  `Rehydrate*` (wczytywanie gotowych BVH – pewnie dane z `*_bvh4.rpf`), Set64BitMortonCodes, CpuValidateResultX. Buduje na GPU
+  (D3D12SerializeVersionedRootSignature → shadery compute w DLL).
+- **Format AS odczytany z kodu RT gry** (`CS_RTShadowTrace32TemporalHQ_…_0c84ea88`, listing przez `xcl shaders … --example`):
+  - adres AS z deskryptora (`s_load_dwordx4 [s80:81+0x40]`, słowa 0–1 >> 8 = baza dla `image_bvh`), **korzeń = dword @0x30
+    nagłówka** (`s_load_dword s55, [baza+48]`); id węzłów liczone od początku AS (nagłówek wliczony); korzeń typu 6
+    (instancja) też obsłużony;
+  - **węzeł instancji (typ 6, 128 B)**, czytany od +48: @48 id (24 b) | maska << 24 (test `& 0xE5`), @52 contribution
+    (24 b) | flagi << 24, @56 korzeń BLAS (30 b; 0x3FFFFFFF = brak) | bit 31 = sama translacja (shader dodaje t, nie
+    obraca), @60 adres BLAS >> 8, @64 świat → obiekt jako [t.xyz, wiersz 0, wiersz 1, wiersz 2] (o' = M·o + t,
+    d' = M·d); trójkąt BLAS: id prymitywu @48 (zgodne). Shader czyta też nagłówek BLAS @52 i @56
+    (`[52] >> 6 − [56] >> 2`) – znaczenie nieznane, piszemy 0. Założone (shader ich nie czyta): @0 obiekt → świat 3×4
+    jak w D3D12_RAYTRACING_INSTANCE_DESC, @112..127 zero.
+  - `gpu::bvh`: nagłówek 256 B z korzeniem @0x30, korzeń zawsze box32, `build_top(&[Instance])` (TLAS, pudełka instancji =
+    przekształcone granice BLAS, macierz odwrotna w f64), `Bvh::trace_scene(lookup adresu BLAS, …)` = trawersacja jak
+    w shaderze, `Bvh::bounds`. Testy: `scene_trace_matches_brute_force` (3 BLAS, 24 instancje obrócone/skalowane/
+    przesunięte, część tylko przesunięta, 3000 promieni = brute force po trójkątach w świecie), `instance_node_layout`
+    (każde pole), rozmiary ≤ model konsoli bez wskaźników rodzica. Wskaźników rodzica nie piszemy (miejsce nieznane,
+    żaden widziany shader ich nie czyta).
+- FSR: loader ma standardowe API FFX (ffxCreateContext/Configure/Query/Dispatch/DestroyContext) jak PC-towy
+  `amd_fidelityfx_loader_dx12.dll`; upscaler to **FSR4** (`…fsr4_full_720p1080p_input_sanitize_scarlett_opt2.dll`). Plan:
+  alias loadera → FFX DX12 z PC (FSR4 na RDNA4 = RX 9070 użytkownika); sprawdzić dopiero z exe.
+- **Bink działa:** prawdziwa `Bink2Scarlett.dll` pod XCL dekoduje film z `movies.rpf` (`bink2_console_dll_decodes_a_game_movie`,
+  `XCL_SAMPLE_BK2` = wyciągnięty `.bk2`: BinkOpen → BinkDoFrame/BinkCopyToBuffer(BINKSURFACE32 = 3)/BinkNextFrame; 1280×720,
+  60 klatek, obraz poprawny – sprawdzony na oko). Filmy w paczce: Bink 2 rewizja `n`, 720p/1080p, 30 fps, nieskompresowane w RPF.
+- **`core_bvh4.rpf` = skompresowane BLAS w formacie konsoli** (sesja 5): zasób RAGE = nagłówek wirtualny 208 B + blok
+  fizyczny (osobne strumienie zlib); blok fizyczny +0x100 = źródło dla `XboxBvhBuilder::Rehydrate…X` (funkcja czysto CPU,
+  ignoruje urządzenie): dword 0 = 0x81020006 (bit 24 = skompresowane, rehydracja go zeruje), @0x04 1503 (znaczenie?),
+  @0x08 CRC32 (tablica standardowa, start 0, bez końcowego XOR) z NumDescs + per geometria Flags, IndexFormat, IndexCount,
+  VertexCount (sprawdza tylko Validate…), @0x0C liczba węzłów trójkątów, @0x10 AABB, @0x28 rozmiar, @0x30 korzeń,
+  @0x34 offset pierwszego węzła trójkątów, @0x38 ?, @0x3C wykładniki skali per oś (pozycje w BVH = pozycja · 2^(e−127)).
+  Blob nie ma wierzchołków – rehydracja czyta bufory wierzchołków / indeksów gry z opisów geometrii (standardowy
+  D3D12_RAYTRACING_GEOMETRY_DESC; bez indeksów 3p+k). Test `xbox_bvh_builder_rehydrates_game_geometry`
+  (`XCL_SAMPLE_BVH4` = paczka, zasób zlib @0xa4e26070, syntetyczny bufor wierzchołków): 4 geometrie (644/252/744/4
+  trójkątów), 287 box32, 54 box16, 832 węzły par – każdy trójkąt sprawdzony (wierzchołki, obrót I/J, prymityw unikalny,
+  zakresy prymitywów bez dziur).
+- **Format węzłów = AMD GPURT gfx10** (źródła MIT pobrane do scratchpada: `TriangleNode1_0.hlsli`, `IntersectCommon.hlsl`,
+  `Common.hlsl`), potwierdzony na wyjściu konsolowego buildera i kodzie RT gry:
+  - box16 (typ 4) w użyciu obok box32; trójkąt = **para**: v0..v3, typ 0 = (v0, v1, v2), typ 1 = (v1, v3, v2); @52/@56
+    prymityw 0/1 (indeks w obrębie geometrii), @60 triangle id (bajt na trójkąt: bity 1:0 I SRC, 3:2 J SRC, 7 opaque) –
+    sprzęt przestawia barycentryki (`SwizzleBarycentrics`);
+  - **@48 w wersji Xbox: geometria << 8 | drugi trójkąt << 7 | opaque** (różni się od GPURT): box-y wskazują tylko typ 0,
+    shader gry po teście typu 0 sprawdza bit 7 (`v76 = [węzeł+48] >> 7`) i testuje `węzeł | 1`; bit 0 idzie do decyzji
+    opaque/any-hit.
+  - Poprawione: emulacja HLSL `bvh_intersect` (typ 1, przestawianie barycentryk wg @60), lustro CPU (`bvh::intersect_node`:
+    box16, pary), `Bvh::trace` (bit 7 → typ 1), builder pisze @48 = geometria << 8 | 1, @52 prymityw, @56 0xFFFFFFFF,
+    @60 = 0x89. Testy: `gpu_triangle_pair_and_box16_nodes` (GPU = CPU, barycentryki obróconego trójkąta 0 i trójkąta 1 dają
+    dokładny punkt trafienia), stare testy BVH z triangle id 9.
+- **XboxBvhBuilder na urządzeniu XCL (sonda, `XCL_PROBE_BVH_DEVICE=1`, test `xbox_bvh_builder_on_xcl_device_probe`)**:
+  konstruktor na prawdziwym backendzie (RX 9070) → `D3D12SerializeVersionedRootSignature` z **flagami tylko konsolowymi
+  0x3000000** (Windows: „Unsupported bit-flag set”) – HLE zdejmuje bity spoza 0xFFF i loguje → root signature tworzona →
+  potem proces kończy się 0xC0000409 (fail-fast, bez wyjątku SEH – podejrzenie: metoda urządzenia zapisuje większą
+  strukturę niż konsolowa / ciasteczko /GS). `QueryInterface(0742a90b-c387-483f-b946-30a7e4e61458)` w logu nie pochodzi
+  z buildera (raczej runtime PC). **Następny krok:** śledzić wywołania vtable urządzenia z buildera (który slot, argumenty).
+- `OutputDebugStringA/W` (kernelx HLE) → log XCL `[debug] …` (konsolowe DLL i gry dużo tam piszą; tak wyszedł błąd XDXR).
+- **Konstruktor XboxBvhBuilder przechodzi w całości na urządzeniu XCL** (sonda `XCL_PROBE_BVH_DEVICE=1`):
+  - `XCL_D3D12_TRACE=1` (NOWE, `guard::make_tracer`): każda publiczna metoda vtable wołana z kodu konsoli → log
+    `D3D12 trace: Iface::Metoda (#slot) ← moduł+offset`. Tak wyszła sekwencja CreateRootSignature → SetName → slot 62.
+  - **Konsolowy vtable urządzenia różni się od PC:** slot 62 na konsoli = `CreateComputePipelineState(desc, NULL, NULL,
+    riid, ppv)` (dwa dodatkowe argumenty), na PC = CreateStateObject. `guard::make_split` (NOWE): wywołanie z obrazu gry →
+    wersja konsolowa, z runtime'u → PC; tabela `real::console_slots` (na razie tylko urządzenie #62).
+  - Compute PSO z konsolowym CS → `pso::console_to_dxil(…, Stage::Compute)` (cs_6_6) + root signature ABI XCL
+    (`real::translated_compute_pso`). Konsolowego bajtkodu nie wolno podawać sterownikowi: kompilator AMD (amdxc64.dll)
+    wywala się na DXIL z bitcode NOBC zamiast go odrzucić – nieudane tłumaczenie → od razu shader zastępczy.
+  - Nowe instrukcje w tłumaczu (z shaderów buildera, nie było ich w `shaders.rpf`): `global/flat_atomic_*` (add, sub, and,
+    or, xor, swap, s/umin, s/umax, cmpswap, **fmin/fmax pętlą CAS**), `buffer_load_ubyte/sbyte/ushort/sshort`,
+    `buffer_store_byte/short`, `ds_write_b8/b16`, `ds_read_u8/i8/u16/i16` (atomowe AND/OR na groupshared). Wynik: 53/53
+    shaderów buildera przetłumaczonych, 0 zastępczych. **Brak testów jednostkowych tych instrukcji** – do dopisania.
+  - **INCYDENT:** największy shader buildera (1589 instrukcji, HLSL < 256 KB → pełna optymalizacja DXC) kompilował się
+    ~6 min i wyczerpał 38 GB pamięci zadeklarowanej (32 GB RAM + 7 GB pliku stronicowania) – Windows ubił sesję
+    użytkownika (dziennik: „System ma za mało pamięci wirtualnej”, 23:27). Próg `-O0` w `dxc::compile` obniżony z 256 KB
+    do 48 KB HLSL. DXIL tego shadera (314 KB) jest już w cache DXC. Przed kolejnymi sondami z dużymi shaderami: limit
+    pamięci procesu testu (Job Object) albo kompilacja DXC w osobnym procesie.
+  - Następny krok: `GetRaytracingAccelerationStructurePrebuildInfo` / `BuildRaytracingAccelerationStructure` na liście
+    poleceń (wymaga mapowania argumentów root konsoli na ABI XCL przy dispatchu – układ user data sterownika konsoli).
+
 ## W trakcie (niedokończone)
 Nic otwartego.
 
@@ -198,6 +361,14 @@ Nic otwartego.
 - Wniosek: dekoder XMA2 ma dla tego tytułu niski priorytet. Otwarte: czy gra dekoduje Opus sama (wtedy PCM → XAudio2 już
   działa), czy używa sprzętowego dekodowania Opus konsoli (wtedy potrzebne API – sprawdzić `xcl inspect` na exe).
   Windows ma `C:\Windows\System32\MSOpusDecoder.dll` (MFT Media Foundation) – kandydat na dekoder bez dołączania libopus.
+  Zarejestrowany jako „Microsoft Opus Audio Decoder MFT” {63e17c10-2d43-4c42-8fe3-8d8b63e46a6a} (sesja 5).
+- AWC strumieniowe (sesja 5, z fragmentów paczki): flagi 0xFF25, przy bicie 0 indeksy chunków u16 na strumień, potem 12 B
+  o nieznanym znaczeniu; info strumieni u32 (liczba chunków = bity 31:29) leżą tuż przed tabelą chunków, a tabela kończy się
+  na `data_offset` z nagłówka. Chunk 0x48 = {liczba bloków u32, rozmiar bloku u32 (512 KB), kanały u32, na kanał 16 B: id,
+  próbki, u16, częstotliwość u16, kodek u8 …}; 0xA3 = próbka startu każdego bloku 512 KB. Blok 512 KB = nagłówek 2048 B
+  (−1, 254 podbloki, 0, próbki w bloku, …, od +24 próbka startu każdego podbloku) + podbloki 2048 B `[u16 długość][pakiet]…`.
+  Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
+  liczy chyba próbki × kanały.
 
 ## Shadery konsoli – otwarte pytania (z analizy `shaders.rpf`)
 - Nierozpoznane metadane FSSM: +0x10 (zawsze 6), +0x78/+0x80, +0xD0, +0xF8, +0x110 (przypomina SPI_SHADER_PGM_RSRC1,
@@ -213,17 +384,16 @@ Nic otwartego.
 - Kilka nazw w paczce jest uciętych (nazwy > 255 znaków nie mieszczą się w bajcie długości rekordu) – kosmetyka skanera RPF9.
 
 ## Dalsze kroki (priorytet)
-1. GS: 195 VS w wariancie ES (zapis wyjść do LDS + `s_setpc_b64` do części GS) i 195 GS – emulacja GS (np. CS jak w trybie
-   Mesh: ES → bufor, GS czyta wierzchołki, emituje do rekordu, przekaźnik MS rysuje).
-2. Model zasobów: powiązanie z `hle/d3d12x/real.rs` – user SGPR (s16–s24 w MS, s8–s18 w VS/PS) z root signature konsoli,
-   T#/S#/V# w pamięci deskryptorów konsoli, pamięć GPU konsoli → zasoby D3D12; cache DXIL (kompilacja dużych MS).
-3. Resztki: `image_sample_o`/`gather4_*_o` (offset z VGPR – SM 6.7 lub przybliżenie), `image_bvh*` (8 programów),
-   `s_add_i32: op` (10 programów – nieobsługiwany kod operandu), mniejszy HLSL (5,7 GB na korpus).
-4. Gdy użytkownik będzie miał legalny exe gry: `xcl inspect`, `xcl run`, analiza `report.json`
+Bez exe zostało niewiele – reszta potrzebuje prawdziwego wywołania gry.
+1. Gdy użytkownik będzie miał legalny exe gry: `xcl inspect`, `xcl run`, analiza `report.json`
    (`called_stubs` z `(spoza PC)` → mapowanie slotów konsolowych np. PresentX; `d3d12.unknown_iids`; brakujące XGameRuntime;
    `shaders.rdna2_mnemonics`; `audio` – formaty głosów, `unsupported_formats`; importy związane z Opus/XMA/AcpHal).
-5. Audio: zależnie od pkt 4 – dekoder Opus (MSOpusDecoder MFT lub libopus) dla głosów/API konsoli, ewentualnie XMA2
-   (FFmpeg libavcodec / port XmaDecoder z WinDurango, LGPL); IXAudio2 sloty > 12 (metody tylko konsolowe) – jak w D3D12
-   strażnicy, gdy gra ich użyje.
-6. Kolejne API XGameRuntime (XGameSave blob API, XGameUI, XNetworking…), GameInput (routing do systemowego GameInput.dll),
-   strony fizyczne pamięci (`MapTitlePhysicalPages`).
+2. Wiązanie przy rysowaniu: argumenty root gry → SGPR w `io`, `mem` → bufor UMA; przechwytywanie list poleceń dla GS
+   i dispatchy Compute; `XboxBvhBuilder` (lub `BuildRaytracingAccelerationStructure`) → `gpu::bvh::build/build_top`
+   (geometria z buforów GPU w UMA; Rehydrate = gotowe BVH z `*_bvh4.rpf` – format do sprawdzenia).
+3. Tekstury: konfiguracja pipe/packer konsoli dla trybów _X (`tiling::PipeConfig`), untiling przy tworzeniu zasobów
+   z pamięci konsoli, układ łańcucha mipów GFX10.
+4. Audio: Opus (MFT wyżej) dla głosów XAudio2 0x704F lub API konsoli – zależnie od tego, co pokaże exe; XMA2 niski priorytet.
+5. Mniejsze: 749 programów wave64 z ryzykiem w fali 32 (dopiero jeśli się objawią), `image_sample_o` z offsetem z VGPR,
+   mniejszy HLSL, kolejne API XGameRuntime (XGameUI, XNetworking…), GameInput → systemowe GameInput.dll,
+   mapowanie stron fizycznych pod adres gry.

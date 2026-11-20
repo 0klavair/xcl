@@ -469,7 +469,11 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if !vgpr {
             continue;
         }
-        let n = (o.size as u64).div_ceil(32).max(1);
+        let mut n = (o.size as u64).div_ceil(32).max(1);
+        // MUBUF / MTBUF VADDR: only the index and / or offset VGPRs actually used
+        if f == "VADDR" && matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") {
+            n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
+        }
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..v + n);
     }

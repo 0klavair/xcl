@@ -305,3 +305,106 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
     println!("sprawdzone piksele: {checked}; po zmianie deskryptora różnych od tekstury A: {changed} / {right}");
     assert!(changed > right * 9 / 10, "zmiana deskryptora między draw callami nie zmieniła wyniku: {changed} / {right}");
 }
+
+/// Retail legacy GS: `VS_VoxelizeGeneric` (ES variant) + `GS_VoxelizeGeneric` translated as
+/// one compute shader (geometry mode) → records → mesh pass-through. The GS projects each
+/// triangle onto the plane of its dominant normal axis (voxelisation); checked through
+/// properties that follow from its code: 3 vertices / 1 triangle per input triangle,
+/// TEXCOORD1 = (-1, -1, 1, 1), TEXCOORD3 = the unit normal, TEXCOORD0 = the axis (same for
+/// a triangle, different for differently oriented triangles), position = the two other
+/// coordinates (w = 1, z in [0, 1]), and pixels covered.
+#[test]
+fn retail_es_gs_voxelize_geometry_mode() {
+    let Some((blobs, _dev)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
+    let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("para ES + GS");
+    assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
+    let t = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let rec = g.record();
+    let ms = dxc::compile(&recomp::mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
+    let ps = dxc::compile("float4 main(float4 p : SV_Position) : SV_Target0 { return float4(1, 0, 0, 1); }", "main", "ps_6_6", &[]).unwrap();
+
+    // user data: s[8:9] → X (GS output base, ·256) at +0xB8; s16 → GS table (V# at +0x920 →
+    // scale at +0x40); s17 → ES table (V# at +0x60 → world 4×3); s19 = 0 (scale 1)
+    let (p_tab, gs_tab, es_tab, world, scale, vin) = (0x100u32, 0x200u32, 0x1200u32, 0x2000u32, 0x2100u32, 0x3000u32);
+    let mut mem = vec![0u32; 0x4000 / 4];
+    let vsharp = |base: u32| [base, 0, 0x1000, 0];
+    mem[(p_tab + 0xB8) as usize / 4] = 0;
+    mem[(gs_tab + 0x920) as usize / 4..(gs_tab + 0x920) as usize / 4 + 4].copy_from_slice(&vsharp(scale));
+    mem[(es_tab + 0x60) as usize / 4..(es_tab + 0x60) as usize / 4 + 4].copy_from_slice(&vsharp(world));
+    for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0].iter().enumerate() {
+        mem[world as usize / 4 + i] = v.to_bits();
+    }
+    for (i, v) in [1.0f32, 1.0, 1.0, 0.0].iter().enumerate() {
+        mem[(scale + 0x40) as usize / 4 + i] = v.to_bits();
+    }
+    // two triangles: in the plane z = 0.2 (normal z) and x = 0.3 (normal x)
+    let tris = [[[-0.5f32, -0.5, 0.2], [0.5, -0.5, 0.2], [-0.5, 0.5, 0.2]], [[0.3, -0.4, -0.4], [0.3, 0.4, -0.4], [0.3, -0.4, 0.4]]];
+    for (t, tri) in tris.iter().enumerate() {
+        for (i, p) in tri.iter().enumerate() {
+            let at = vin as usize / 4 + (t * 3 + i) * 4;
+            mem[at..at + 4].copy_from_slice(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 1.0f32.to_bits()]);
+        }
+    }
+    let mut io = vec![0u32; 128];
+    io[8] = p_tab;
+    io[16] = gs_tab;
+    io[17] = es_tab;
+    io[IO_GS_PRIMS] = 2;
+    io[IO_GS_VERTICES] = vin;
+    let (px, r) = runner::mesh_draw(&cs, &ms, &ps, 1, rec.record_dwords(), &io, &mem, 64, [0.0; 4]).expect("rysowanie");
+
+    let vd = rec.vert_dwords();
+    let fl = |i: usize| f32::from_bits(r[i]);
+    assert_eq!((r[0], r[1]), (6, 2), "3 wierzchołki i 1 trójkąt na trójkąt wejściowy");
+    let tri_at = MESH_HEADER + rec.max_vertices as usize * vd;
+    let mut axes = Vec::new();
+    for (t, tri) in tris.iter().enumerate() {
+        let base = 3 * t;
+        assert_eq!(r[tri_at + t], (base | (base + 1) << 10 | (base + 2) << 20) as u32, "trójkąt {t}: indeksy");
+        // true normal and the two coordinates that are not the dominant axis
+        let (e1, e2) = ([0, 1, 2].map(|k| tri[1][k] - tri[0][k]), [0, 1, 2].map(|k| tri[2][k] - tri[0][k]));
+        let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let dom = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())).unwrap();
+        let others: Vec<usize> = (0..3).filter(|&k| k != dom).collect();
+        let mut found = false;
+        for i in 0..3 {
+            let v = MESH_HEADER + (base + i) * vd;
+            let pos = [fl(v), fl(v + 1), fl(v + 2), fl(v + 3)];
+            let (axis, tc1, tc3) = (r[v + 4], [fl(v + 8), fl(v + 9), fl(v + 10), fl(v + 11)], [fl(v + 12), fl(v + 13), fl(v + 14)]);
+            println!("trójkąt {t} wierzchołek {i}: pos {pos:?} oś {axis} TEXCOORD1 {tc1:?} TEXCOORD3 {tc3:?}");
+            assert_eq!(tc1, [-1.0, -1.0, 1.0, 1.0], "TEXCOORD1");
+            let dot = (tc3[0] * n[0] + tc3[1] * n[1] + tc3[2] * n[2]) / len;
+            let unit = (tc3[0] * tc3[0] + tc3[1] * tc3[1] + tc3[2] * tc3[2]).sqrt();
+            assert!((unit - 1.0).abs() < 1e-3 && (dot.abs() - 1.0).abs() < 1e-3, "TEXCOORD3 = jednostkowa normalna: {tc3:?} vs {n:?}");
+            assert_eq!(pos[3], 1.0, "w");
+            assert!((0.0..=1.0).contains(&pos[2]), "z w [0, 1]: {pos:?}");
+            if i == 0 {
+                axes.push(axis);
+            } else {
+                assert_eq!(axis, axes[t], "oś jednakowa w trójkącie");
+            }
+            // position = the two non-dominant coordinates (any order, any sign)
+            let p = tri[i];
+            let ok = [(others[0], others[1]), (others[1], others[0])]
+                .iter()
+                .any(|&(a, b)| (pos[0].abs() - p[a].abs()).abs() < 1e-5 && (pos[1].abs() - p[b].abs()).abs() < 1e-5);
+            found |= ok;
+            assert!(ok, "pozycja = rzut na płaszczyznę osi dominującej: {pos:?} z {p:?} (oś {dom})");
+            // exactly, as the code selects: z-dominant → (x, y), x-dominant → (z, y); depth = 0.5·d + 0.5
+            let want = match dom {
+                2 => [p[0], p[1], 0.5 * p[2] + 0.5, 1.0],
+                _ => [p[2], p[1], 0.5 * p[0] + 0.5, 1.0],
+            };
+            assert_eq!(pos, want, "trójkąt {t} wierzchołek {i}");
+        }
+        assert!(found);
+    }
+    assert_eq!(axes, vec![4, 0], "oś dominująca: z → 4, x → 0");
+    let covered = px.iter().filter(|p| p[0] == 1.0).count();
+    println!("pokryte piksele: {covered}");
+    assert!(covered > 300, "pass-through narysował wyjście GS: {covered}");
+}
