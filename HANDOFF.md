@@ -426,6 +426,22 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
   UAV), tabele deskryptorów, grafika (rekordy rysowania – do ustalenia na grze), zwalnianie pamięci UMA po wykonaniu
   (lista trzyma bloki do Release).
 
+### TLAS na GPU – zablokowany przez rozmiar jednego shadera (sesja 5)
+- Test `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): 2 BLAS + 16 instancji
+  (część tylko przesunięta), `trace_scene` vs brute force w świecie. BLAS-y budują się, TLAS wychodzi pusty: 1 dispatch
+  pominięty, bo **sterownik AMD odrzuca PSO z przetłumaczonym CS 15 720 instrukcji (0x8007000E, brak pamięci)** – także
+  przy limicie 20 GB; drugi duży (6 302 instr.) przechodzi przy 20 GB, nie przy 8 GB. DXC `-O1`/`-O3` na nim > 150 s.
+- Ulepszenia tłumacza zrobione przy okazji (wszystkie testy zielone, budowa BLAS na GPU nadal 500/500):
+  - **strukturalny przepływ sterowania**: program w całości strukturalny (skoki do przodu zagnieżdżone, if/else przez
+    `s_branch`, pętle z jednym skokiem powrotnym na końcu, `s_endpgm` na końcu) → zwykłe `if`/`for(;;)` bez `pc`;
+    inaczej **hybryda**: najdłuższe odcinki z jednym wejściem/wyjściem strukturalnie pod jednym strażnikiem `pc`
+    (#19: 628 → 93 strażników). `XCL_RECOMP_NO_STRUCTURED=1` wyłącza, `XCL_RECOMP_WHY=1` mówi, czemu nie strukturalny;
+  - `global_atomic_fmin/fmax` jako jeden atomik całkowity (dodatnie → int, ujemne → uint odwrotnie) zamiast pętli CAS;
+  - zapis VGPR `v = select(aktywna, wartość, v)` zamiast `if` (kod liniowy);
+  - `pso::console_to_hlsl` + testy pomocnicze `blob_hlsl_shape` / `blob_dxc_cost` (`XCL_BLOB=…`).
+- **Do zrobienia:** chudszy HLSL (mniej zmiennych tymczasowych: przy `-O0` każda to osobna komórka pamięci, dziesiątki
+  tysięcy na tym shaderze) albo inny podział kompilacji; to samo przyspieszy kompilację dużych shaderów gry.
+
 ### Plan: konsolowa lista poleceń w XCL (następne sesje)
 1. `hle/d3d12x/console_list.rs`: obiekt o układzie konsoli (pola jak wyżej, bufor rekordów, nagłówki parametrów), opakowujący
    listę PC; vtable konsolowy: 14 Dispatch, 25 SetPipelineState, 33 SetComputeRootSignature (wpisuje znaczniki, pamięta

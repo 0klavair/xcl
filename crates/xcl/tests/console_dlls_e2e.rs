@@ -12,7 +12,8 @@ fn setup() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = PathBuf::from(std::env::var_os("XCL_SAMPLE_DLLS")?);
-        cap_memory(8 << 30);
+        let gb: usize = std::env::var("XCL_TEST_MEM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        cap_memory(gb << 30);
         xcl::stubs::init_db(&Default::default());
         xcl::hle::init(&xcl::config::Config::default());
         xcl::resolver::set_search_dirs(vec![dir.clone()]);
@@ -691,5 +692,162 @@ fn xbox_bvh_builder_builds_on_the_gpu() {
             println!("runda {round}: {n} trójkątów zbudowanych na GPU przez konsolowy builder – 500 promieni zgodnych z brute force ({hits} trafień)");
             assert!(hits > 20);
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InstanceDesc {
+    transform: [[f32; 4]; 3],
+    id_mask: u32,
+    contribution_flags: u32,
+    blas: u64,
+}
+
+/// Top level built on the GPU by the console builder (two bottom levels + instances, some
+/// rotated / scaled, some only moved) and traced with XCL's instance-node reading
+/// (bvh::Bvh::trace_scene, layout taken from the game's RT shader) against brute force in
+/// world space. XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1 runs it.
+#[test]
+fn xbox_bvh_builder_builds_a_tlas_on_the_gpu() {
+    let Some(dir) = setup() else { return };
+    if std::env::var_os("XCL_PROBE_BVH_TLAS").is_none() || !xcl::hle::d3d12x::console_list::enabled() {
+        return;
+    }
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let m = load(dir, "XboxBvhBuilder.dll");
+    unsafe {
+        let iid: [u8; 16] = [0xf1, 0x19, 0x98, 0x18, 0xb6, 0x1d, 0x57, 0x4b, 0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7];
+        let mut dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        assert!(xcl::hle::d3d12x::D3D12XboxCreateDevice(std::ptr::null_mut(), std::ptr::null(), iid.as_ptr() as _, &mut dev) >= 0);
+        let ctor: extern "system" fn(*mut u8, *mut std::ffi::c_void, bool) -> *mut u8 = std::mem::transmute(proc(&m, "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z"));
+        let this = pages(0x10000);
+        ctor(this.as_mut_ptr(), dev, false);
+        let device = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let pc: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        let console = xcl::hle::d3d12x::console_list::create_with_allocator(pc.into_raw(), alloc.as_raw());
+        let vt = *(console as *const *const usize);
+        let close: extern "system" fn(*mut std::ffi::c_void) -> i32 = std::mem::transmute(*vt.add(9));
+        let reset: extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32 = std::mem::transmute(*vt.add(10));
+        let q_vt = *(queue.as_raw() as *const *const usize);
+        let execute: extern "system" fn(*mut std::ffi::c_void, u32, *const *mut std::ffi::c_void) = std::mem::transmute(*q_vt.add(10));
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let uma = xcl::gpu::uma::get().expect("UMA");
+        let prebuild: extern "system" fn(*mut u8, *const BuildInputs, *const u8, *mut [u64; 3]) = std::mem::transmute(proc(&m, "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z"));
+        let build: extern "system" fn(*mut u8, *mut std::ffi::c_void, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
+            &m,
+            "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z",
+        ));
+        let mut round = 0u64;
+        // record one build, run it, return (result address, size)
+        let mut run = |inputs: &BuildInputs| -> (u64, usize) {
+            if round > 0 {
+                alloc.Reset().unwrap();
+                assert_eq!(reset(console, alloc.as_raw(), std::ptr::null_mut()), 0);
+            }
+            round += 1;
+            let mut sizes = [0u64; 3];
+            prebuild(this.as_mut_ptr(), inputs, std::ptr::null(), &mut sizes);
+            let dest = uma.alloc(sizes[0] as usize, 256).unwrap();
+            let scratch = uma.alloc(sizes[1].max(256) as usize, 256).unwrap();
+            std::ptr::write_bytes(dest, 0, sizes[0] as usize);
+            std::ptr::write_bytes(scratch, 0, sizes[1] as usize);
+            let desc = BuildDesc { dest: dest as u64, inputs: BuildInputs { ..*inputs }, source: 0, scratch: scratch as u64 };
+            build(this.as_mut_ptr(), console, &desc, 0, std::ptr::null());
+            assert_eq!(close(console), 0, "Close");
+            execute(queue.as_raw(), 1, [console].as_ptr());
+            queue.Signal(&fence, round).unwrap();
+            let start = std::time::Instant::now();
+            while fence.GetCompletedValue() < round {
+                assert!(start.elapsed().as_secs() < 10, "GPU nie skończył w 10 s ({:?})", device.GetDeviceRemovedReason());
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            (dest as u64, sizes[0] as usize)
+        };
+        let mut seed = 777u64;
+        let mut rnd = |lo: f32, hi: f32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
+        };
+        // two bottom levels (small objects around the origin)
+        let mut blases = Vec::new();
+        for n in [40usize, 60] {
+            let tris: Vec<[[f32; 3]; 3]> = (0..n)
+                .map(|_| {
+                    let c = [rnd(-2.0, 2.0), rnd(-2.0, 2.0), rnd(-2.0, 2.0)];
+                    [0; 3].map(|_| [0, 1, 2].map(|a| c[a] + rnd(-0.6, 0.6)))
+                })
+                .collect();
+            let vb = uma.alloc(n * 36, 256).unwrap();
+            std::ptr::copy_nonoverlapping(tris.as_ptr() as *const u8, vb, n * 36);
+            let geom = GeometryDesc { ty: 0, flags: 1, transform: 0, index_format: 0, vertex_format: 6, index_count: 0, vertex_count: 3 * n as u32, index_buffer: 0, vertex_buffer: vb as u64, vertex_stride: 12 };
+            let (addr, size) = run(&BuildInputs { ty: 1, flags: 0, num_descs: 1, layout: 0, descs: &geom as *const GeometryDesc as u64 });
+            blases.push((addr, std::slice::from_raw_parts(addr as *const u8, size).to_vec(), tris));
+        }
+        // instances: every 3rd only moved, the others rotated + scaled + moved
+        let count = 16;
+        let insts: Vec<InstanceDesc> = (0..count)
+            .map(|i| {
+                let k = i % 2;
+                let t = [rnd(-15.0, 15.0), rnd(-15.0, 15.0), rnd(-15.0, 15.0)];
+                let m3 = if i % 3 == 0 {
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                } else {
+                    let q = [rnd(-1.0, 1.0), rnd(-1.0, 1.0), rnd(-1.0, 1.0), rnd(-1.0, 1.0)];
+                    let l = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let [w, x, y, z] = q.map(|v| v / l);
+                    let s = [rnd(0.5, 2.0), rnd(0.5, 2.0), rnd(0.5, 2.0)];
+                    let r = [
+                        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+                        [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+                        [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+                    ];
+                    [0, 1, 2].map(|row| [r[row][0] * s[0], r[row][1] * s[1], r[row][2] * s[2]])
+                };
+                InstanceDesc {
+                    transform: [0, 1, 2].map(|row| [m3[row][0], m3[row][1], m3[row][2], t[row]]),
+                    id_mask: (100 + i as u32) | 0xFF << 24,
+                    contribution_flags: 0,
+                    blas: blases[k].0,
+                }
+            })
+            .collect();
+        let ib = uma.alloc(count * 64, 256).unwrap();
+        std::ptr::copy_nonoverlapping(insts.as_ptr() as *const u8, ib, count * 64);
+        let (tlas, tsize) = run(&BuildInputs { ty: 0, flags: 0, num_descs: count as u32, layout: 0, descs: ib as u64 });
+        let data = std::slice::from_raw_parts(tlas as *const u8, tsize).to_vec();
+        if let Some(out) = std::env::var_os("XCL_BVH_DUMP") {
+            std::fs::write(format!("{}.tlas", out.to_string_lossy()), &data).unwrap();
+        }
+        let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        println!("TLAS: {tsize} B, nagłówek {:x?}", (0..16).map(|k| word(4 * k)).collect::<Vec<_>>());
+        let top = xcl::gpu::bvh::Bvh { root: word(0x30), data: data.clone() };
+        let lookup = |a: u64| blases.iter().find(|b| b.0 == a).map(|b| b.1.as_slice());
+        let mut hits = 0;
+        for _ in 0..800 {
+            let o = [rnd(-25.0, 25.0), rnd(-25.0, 25.0), rnd(-25.0, 25.0)];
+            let to = [rnd(-15.0, 15.0), rnd(-15.0, 15.0), rnd(-15.0, 15.0)];
+            let d = [to[0] - o[0], to[1] - o[1], to[2] - o[2]];
+            let brute = insts
+                .iter()
+                .flat_map(|inst| {
+                    let b = blases.iter().find(|b| b.0 == inst.blas).unwrap();
+                    b.2.iter().enumerate().filter_map(move |(p, tri)| {
+                        let m = &inst.transform;
+                        let w = tri.map(|v| [0, 1, 2].map(|r| m[r][0] * v[0] + m[r][1] * v[1] + m[r][2] * v[2] + m[r][3]));
+                        xcl::gpu::bvh::triangle_hit(&w, o, d).map(|h| (h[0] / h[1], p as u32, inst.id_mask & 0xFF_FFFF))
+                    })
+                })
+                .filter(|h| (0.0..100.0).contains(&h.0))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let got = top.trace_scene(&lookup, o, d, 100.0);
+            assert_eq!(got.map(|g| (g.1, g.2)), brute.map(|b| (b.1, b.2)), "ray {o:?} → {to:?}");
+            hits += brute.is_some() as u32;
+        }
+        println!("TLAS zbudowany na GPU przez konsolowy builder: 800 promieni zgodnych z brute force ({hits} trafień)");
+        assert!(hits > 30);
     }
 }

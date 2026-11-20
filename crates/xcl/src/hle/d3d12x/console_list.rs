@@ -564,6 +564,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         }
     }
     drop(guard);
+    if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
+        crate::xlog_info!("lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier", out.dispatches, out.skipped_dispatches, out.barriers);
+    }
     if let Some((w, at)) = out.unknown {
         crate::xlog_warn!("lista konsoli: nieznany rekord {w:#010x} (słowo {at}) – reszta pominięta");
     }

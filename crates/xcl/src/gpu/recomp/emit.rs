@@ -428,10 +428,12 @@ impl Em {
 
     fn write32(&mut self, dst: &Dst, val: &str) {
         match dst {
+            // select, not `if`: straight-line code (a branch per VALU write was more than the
+            // driver's compiler could take on a 15 000-instruction console shader)
             Dst::V(n) => {
                 let v = self.vreg(*n);
                 let a = self.act();
-                self.line(&format!("if ({a}) {v} = {val};"));
+                self.line(&format!("{v} = select({a}, {val}, {v});"));
             }
             Dst::S(n) => {
                 let s = self.sreg(*n);
@@ -446,7 +448,7 @@ impl Em {
             Dst::V(n) => {
                 let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
                 let act = self.act();
-                self.line(&format!("if ({act}) {{ {a} = {lo}; {b} = {hi}; }}"));
+                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
@@ -2715,12 +2717,14 @@ impl Em {
                 let cmp = self.vreg(f("DATA") + 1);
                 format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
             }
+            // float min / max as one integer atomic: non-negative floats order like signed
+            // ints, negative ones like unsigned ints in reverse (no CAS loop – a program with
+            // 168 such loops was too much for the driver's compiler)
             "fmin" | "fmax" => {
-                let m = if op == "fmin" { "min" } else { "max" };
+                let (pos, neg) = if op == "fmin" { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
                 format!(
-                    "{t}_old = mem.Load({t}_a); [loop] for (uint {t}_k = 0u; {t}_k < 64u; {t}_k++) {{ uint {t}_p; \
-mem.InterlockedCompareExchange({t}_a, {t}_old, asuint({m}(asfloat({t}_old), asfloat({v}))), {t}_p); \
-if ({t}_p == {t}_old) break; {t}_old = {t}_p; }}"
+                    "if (asfloat({v}) >= 0.0f) {{ int {t}_s; mem.{pos}({t}_a, asint({v}), {t}_s); {t}_old = asuint({t}_s); }} \
+else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 )
             }
             _ => return Err("FLAT atomic"),

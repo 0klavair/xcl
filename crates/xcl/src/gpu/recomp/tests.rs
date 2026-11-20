@@ -43,8 +43,13 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported);
     assert_eq!(t.blocks, 3, "{}", t.hlsl);
-    // forward branches only: a chain of blocks, no loop
-    assert!(t.hlsl.contains("if (pc == 0u)") && !t.hlsl.contains("while") && t.hlsl.contains("[WaveSize(64)]"), "{}", t.hlsl);
+    // forward branches only: a plain `if`, no loop and no block dispatch on pc
+    assert!(t.hlsl.contains("if (!(") && !t.hlsl.contains("pc ==") && !t.hlsl.contains("for (;;)") && t.hlsl.contains("[WaveSize(64)]"), "{}", t.hlsl);
+    // the guarded block chain (fallback form) for the same program
+    unsafe { std::env::set_var("XCL_RECOMP_NO_STRUCTURED", "1") };
+    let g = translate(&code, &Options::default()).unwrap();
+    unsafe { std::env::remove_var("XCL_RECOMP_NO_STRUCTURED") };
+    assert!(g.hlsl.contains("if (pc == 0u)") && !g.hlsl.contains("while"), "{}", g.hlsl);
     // a backward branch: only its range becomes a loop
     let code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 133)], None),
@@ -54,7 +59,8 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 128)], None),
     ]);
     let t = translate(&code, &Options::default()).unwrap();
-    assert!(t.hlsl.contains("[loop] while (pc >= 4u && pc < 16u)"), "{}", t.hlsl);
+    // only the range of the backward branch loops; its condition is the loop's exit test
+    assert!(t.hlsl.contains("[loop] for (;;)") && t.hlsl.contains("break;") && !t.hlsl.contains("pc =="), "{}", t.hlsl);
     let t = translate(&prog(&[("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None)]), &Options::default()).unwrap();
     assert!(!t.hlsl.contains("pc =="), "{}", t.hlsl);
     // unknown to the recompiler: reported, HLSL still produced
@@ -1916,4 +1922,45 @@ fn gpu_global_atomics_and_sub_dword_access() {
         assert_eq!((v[49], v[50]), (sn, sn | 0xFFFF_0000), "lane {l}: ds_read_u16 / i16 of the neighbour");
         assert_eq!((v[51], v[52]), (bn, bn | 0xFFFF_FF00), "lane {l}: ds_read_u8 / i8 of the neighbour");
     }
+}
+
+/// `XCL_BLOB=<console CS container>`: HLSL size and shape of its translation.
+#[test]
+#[ignore]
+fn blob_hlsl_shape() {
+    let Some(p) = std::env::var_os("XCL_BLOB") else { return };
+    let blob = std::fs::read(p).unwrap();
+    let (h, _) = super::pso::console_to_hlsl(&blob, super::pso::Stage::Compute).unwrap();
+    println!("HLSL {} KB, pc-dispatch: {}, if: {}, for(;;): {}", h.len() / 1024, h.matches("pc ==").count(), h.matches("if (!(").count(), h.matches("for (;;)").count());
+    if let Some(out) = std::env::var_os("XCL_HLSL_OUT") {
+        std::fs::write(out, &h).unwrap();
+    }
+}
+
+/// `XCL_BLOB=<console CS>` `XCL_DXC_ARGS="-O3"`: DXC time and DXIL size for its HLSL (this
+/// process is capped at 8 GB of commit).
+#[test]
+#[ignore]
+fn blob_dxc_cost() {
+    let Some(p) = std::env::var_os("XCL_BLOB") else { return };
+    unsafe {
+        use windows_sys::Win32::System::JobObjects::*;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = 8 << 30;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+        AssignProcessToJobObject(job, GetCurrentProcess());
+    }
+    let blob = std::fs::read(p).unwrap();
+    let (h, profile) = super::pso::console_to_hlsl(&blob, super::pso::Stage::Compute).unwrap();
+    let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+    let extra: Vec<&str> = args.split_whitespace().collect();
+    let t0 = std::time::Instant::now();
+    let r = super::dxc::compile(&h, "main", profile, &extra);
+    println!("HLSL {} KB, DXC {args}: {:.1} s → {}", h.len() / 1024, t0.elapsed().as_secs_f32(), match r {
+        Ok(b) => format!("DXIL {} KB", b.len() / 1024),
+        Err(e) => format!("błąd: {}", e.chars().take(200).collect::<String>()),
+    });
 }

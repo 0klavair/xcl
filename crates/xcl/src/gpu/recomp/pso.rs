@@ -26,6 +26,12 @@ pub fn is_console(blob: &[u8]) -> bool {
 /// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached).
 /// Fails when the blob is not a console shader or the program is not fully translated.
 pub fn console_to_dxil(blob: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
+    let (hlsl, profile) = console_to_hlsl(blob, stage)?;
+    dxc::compile_cached(&hlsl, "main", profile).map(|(b, _)| b)
+}
+
+/// The HLSL (and its DXC profile) `console_to_dxil` compiles.
+pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
     let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
@@ -52,7 +58,7 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));
     }
-    dxc::compile_cached(&t.hlsl, "main", profile).map(|(b, _)| b)
+    Ok((t.hlsl, profile))
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.

@@ -334,6 +334,194 @@ struct Ctx<'a> {
     starts: &'a BTreeSet<u64>,
     leaders: &'a [u64],
     loops: &'a [(u64, u64)],
+    /// every branch: (address of the branch, target)
+    edges: &'a [(u64, u64)],
+}
+
+/// How a block ends (from its last instruction).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Term {
+    Next,
+    Cond(u64),
+    Jump(u64),
+    End,
+    /// s_setpc and other terminators the structured form does not handle
+    Other,
+}
+
+fn block_end(c: &Ctx, i: usize) -> u64 {
+    c.leaders.get(i + 1).copied().unwrap_or(u64::MAX)
+}
+
+fn term(c: &Ctx, start: u64, end: u64) -> Term {
+    let Some(d) = c.insts.iter().rev().find(|d| d.pc >= start && d.pc < end) else { return Term::Next };
+    match (rdna2::branch_target(d), d.inst.name) {
+        (Some(t), n) if n.starts_with("S_CBRANCH") => Term::Cond(t),
+        (Some(t), "S_BRANCH") => Term::Jump(t),
+        (Some(_), _) => Term::Other,
+        (None, "S_ENDPGM") => Term::End,
+        (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => Term::Other,
+        _ => Term::Next,
+    }
+}
+
+/// `XCL_RECOMP_WHY`: print why a program stays on the guarded block chain.
+fn why(_at: u64, msg: &str) {
+    if std::env::var_os("XCL_RECOMP_WHY").is_some() {
+        eprintln!("niestrukturalne: {msg}");
+    }
+}
+
+/// Can [lo, hi) be emitted as structured code (no `pc` guards)? Linear blocks, forward
+/// conditional skips that nest inside the range, loops whose only way back is a branch at
+/// their end, and s_endpgm only as the very last block (`top`).
+fn structurable(c: &Ctx, lo: u64, hi: u64, top: bool) -> bool {
+    structurable_to(c, lo, hi, top, None)
+}
+
+/// The else branch of `if (cond) { [then_lo, t) } else { [t, u) }`: the last block of the
+/// then branch ends with `s_branch u`, u past t and inside `hi`.
+fn else_end(c: &Ctx, then_lo: u64, t: u64, hi: u64) -> Option<u64> {
+    let last = c.leaders.partition_point(|&l| l < t).checked_sub(1)?;
+    let lb = c.leaders[last];
+    if lb < then_lo {
+        return None;
+    }
+    match term(c, lb, t) {
+        Term::Jump(u) if u > t && u <= hi && (u == hi || c.leaders.binary_search(&u).is_ok()) => Some(u),
+        _ => None,
+    }
+}
+
+fn structurable_to(c: &Ctx, lo: u64, hi: u64, top: bool, exit: Option<u64>) -> bool {
+    let mut i = c.leaders.partition_point(|&l| l < lo);
+    while i < c.leaders.len() && c.leaders[i] < hi {
+        let start = c.leaders[i];
+        let end = block_end(c, i);
+        if let Some(&(a, b)) = c.loops.iter().find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)) {
+            // the latch is the last block of the loop: a branch back to its start
+            let last = c.leaders.partition_point(|&l| l < b) - 1;
+            let latch = c.leaders[last];
+            if !matches!(term(c, latch, b), Term::Cond(t) if t == a) {
+                why(start, &format!("pętla {a:#x}..{b:#x}: koniec {:?}", term(c, latch, b)));
+                return false;
+            }
+            if !structurable_to(c, a, latch, false, None) {
+                return false;
+            }
+            i = c.leaders.partition_point(|&l| l < b);
+            continue;
+        }
+        match term(c, start, end) {
+            Term::Next => i += 1,
+            Term::Cond(t) if t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) => {
+                // if / else: the skipped range ends with a jump over the else range
+                if let Some(u) = else_end(c, end, t, hi) {
+                    if !structurable_to(c, end, t, false, Some(u)) || !structurable_to(c, t, u, false, None) {
+                        return false;
+                    }
+                    i = c.leaders.partition_point(|&l| l < u);
+                    continue;
+                }
+                if !structurable_to(c, end, t, false, None) {
+                    return false;
+                }
+                i = c.leaders.partition_point(|&l| l < t);
+            }
+            Term::Jump(u) if Some(u) == exit && end == hi => i += 1,
+            Term::End if top && end == u64::MAX => i += 1,
+            Term::End if top && c.insts.iter().all(|d| d.pc < end) => i += 1,
+            other => {
+                why(start, &format!("blok {start:#x}..{end:#x} w {lo:#x}..{hi:#x}: {other:?}"));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The instructions of block [start, end) at `depth`; the flow of the last one.
+fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
+    em.indent = depth;
+    let mut flow = emit::Flow::Next;
+    let block: Vec<&Decoded> = c.insts.iter().filter(|d| d.pc >= start && d.pc < end).collect();
+    for (k, d) in block.iter().enumerate() {
+        let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
+        flow = em.inst(d, next);
+        if !matches!(flow, emit::Flow::Next) {
+            break;
+        }
+    }
+    body.push_str(&em.take());
+    *blocks += 1;
+    flow
+}
+
+/// Emit a range `structurable` accepted.
+fn emit_structured(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize) {
+    let pad = "    ".repeat(depth);
+    let mut i = c.leaders.partition_point(|&l| l < lo);
+    while i < c.leaders.len() && c.leaders[i] < hi {
+        let start = c.leaders[i];
+        let end = block_end(c, i);
+        if let Some(&(a, b)) = c.loops.iter().find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)) {
+            let last = c.leaders.partition_point(|&l| l < b) - 1;
+            let latch = c.leaders[last];
+            body.push_str(&format!("{pad}[loop] for (;;) {{\n"));
+            emit_structured(c, em, body, a, latch, depth + 1, blocks);
+            match emit_block(c, em, body, latch, b, depth + 1, blocks) {
+                emit::Flow::Cond(cond, _) => body.push_str(&format!("{pad}    if (!({cond})) break;\n")),
+                _ => body.push_str(&format!("{pad}    break;\n")),
+            }
+            body.push_str(&format!("{pad}}}\n"));
+            i = c.leaders.partition_point(|&l| l < b);
+            continue;
+        }
+        match emit_block(c, em, body, start, end, depth, blocks) {
+            emit::Flow::Cond(cond, t) => {
+                body.push_str(&format!("{pad}if (!({cond})) {{\n"));
+                emit_structured(c, em, body, end, t, depth + 1, blocks);
+                if let Some(u) = else_end(c, end, t, hi) {
+                    body.push_str(&format!("{pad}}} else {{\n"));
+                    emit_structured(c, em, body, t, u, depth + 1, blocks);
+                    body.push_str(&format!("{pad}}}\n"));
+                    i = c.leaders.partition_point(|&l| l < u);
+                } else {
+                    body.push_str(&format!("{pad}}}\n"));
+                    i = c.leaders.partition_point(|&l| l < t);
+                }
+            }
+            // the jump at the end of an if branch over the else branch: nothing to emit
+            _ => i += 1,
+        }
+    }
+}
+
+/// The longest range [start, x) (x ≤ hi) entered only at `start`, left only by falling into
+/// x, that `structurable` accepts – emitted as plain structured code under one `pc` guard.
+fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
+    let start = c.leaders[i];
+    // candidate ends: block boundaries where every forward branch from inside is resolved
+    let mut ends = Vec::new();
+    let mut reach = start;
+    let mut j = i;
+    while j < c.leaders.len() && c.leaders[j] < hi {
+        let (s, e) = (c.leaders[j], block_end(c, j));
+        match term(c, s, e) {
+            Term::End | Term::Other => break,
+            Term::Cond(t) | Term::Jump(t) if t > s => reach = reach.max(t),
+            Term::Cond(t) | Term::Jump(t) if t < start => break,
+            _ => {}
+        }
+        let x = e.min(hi);
+        if reach <= x && x > block_end(c, i) {
+            ends.push(x);
+        }
+        j += 1;
+    }
+    // entered only at start: no branch from outside lands strictly inside
+    let entered_inside = |x: u64| c.edges.iter().any(|&(src, dst)| dst > start && dst < x && (src < start || src >= x));
+    ends.iter().rev().take(64).copied().find(|&x| !entered_inside(x) && structurable_to(c, start, x, false, None))
 }
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
@@ -348,6 +536,15 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
             emit_range(c, em, body, a, b, depth + 1, blocks);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);
+            continue;
+        }
+        // a single-entry, single-exit stretch: structured code under one guard
+        if let Some(x) = structured_span(c, i, hi) {
+            body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
+            emit_structured(c, em, body, start, x, depth + 1, blocks);
+            let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
+            body.push_str(&format!("{pad}    pc = {next};\n{pad}}}\n"));
+            i = c.leaders.partition_point(|&l| l < x);
             continue;
         }
         let end = c.leaders.get(i + 1).copied().unwrap_or(u64::MAX);
@@ -533,9 +730,16 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         loops.sort();
         loops.dedup();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops };
-        body.push_str("    uint pc = 0;\n");
-        emit_range(&ctx, &mut em, &mut body, 0, u64::MAX, 1, &mut blocks);
+        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
+        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges };
+        if gs_jump.is_none() && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX, true) {
+            // structured control flow: plain if / loops, no block dispatch on `pc` (much
+            // smaller for DXC and the driver on big programs)
+            emit_structured(&ctx, &mut em, &mut body, 0, u64::MAX, 1, &mut blocks);
+        } else {
+            body.push_str("    uint pc = 0;\n");
+            emit_range(&ctx, &mut em, &mut body, 0, u64::MAX, 1, &mut blocks);
+        }
     }
     let hlsl = em.finish(&body);
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks })
