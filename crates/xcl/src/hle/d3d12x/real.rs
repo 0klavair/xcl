@@ -1225,6 +1225,18 @@ unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv:
     let f: QiFn = std::mem::transmute(orig_fn(this, 0));
     let hr = f(this, riid, ppv);
     if hr == E_NOINTERFACE && !riid.is_null() {
+        // the console device is also an IDXGIDevice (`dxgi_device`)
+        let iid: windows::core::GUID = std::mem::transmute(*riid);
+        if super::dxgi_device::answers(&iid) && !ppv.is_null() {
+            let device: GUID = std::mem::transmute(ID3D12Device::IID);
+            let mut d = std::ptr::null_mut();
+            if f(this, &device, &mut d) >= 0 && !d.is_null() {
+                let release: RefFn = std::mem::transmute(orig_fn(d, 2));
+                release(d);
+                *ppv = super::dxgi_device::create(this);
+                return S_OK;
+            }
+        }
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
             crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");

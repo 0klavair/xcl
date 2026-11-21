@@ -30,6 +30,8 @@ struct SystemOsVersionInfo {
 extern "system" {
     fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void;
     fn XMemFree(p: *mut c_void, attrs: u64);
+    fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, attrs: u64, protect: u32) -> *mut c_void;
+    fn VirtualFree(p: *mut c_void, size: usize, t: u32) -> i32;
     fn GetConsoleType() -> u32;
     fn SetThreadName(h: *mut c_void, name: *const u16) -> i32;
     fn GetThreadName(h: *mut c_void, buf: *mut u16, len: usize, ret: *mut usize) -> i32;
@@ -208,6 +210,18 @@ fn main() {
         ensure!(p as usize % 256 == 0, "misaligned {p:?}");
         ensure!(std::slice::from_raw_parts(p as *const u8, 1000).iter().all(|&b| b == 0), "not zeroed");
         XMemFree(p, attrs);
+        Ok(())
+    });
+
+    check("kernelx: XMemVirtualAlloc – graphics memory type in UMA, others from Windows", || unsafe {
+        let (commit, rw) = (0x3000u32, 4u32);
+        let g = XMemVirtualAlloc(std::ptr::null(), 0x1_0000, commit, 1u64 << 29, rw);
+        let p = XMemVirtualAlloc(std::ptr::null(), 0x1_0000, commit, 0, rw);
+        ensure!(!g.is_null() && !p.is_null(), "null: {g:?} {p:?}");
+        ensure!(g as usize >> 32 >= 4, "graphics memory outside UMA: {g:?}");
+        *(g as *mut u32) = 7;
+        *(p as *mut u32) = 7;
+        ensure!(VirtualFree(g, 0, 0x8000) != 0 && VirtualFree(p, 0, 0x8000) != 0, "VirtualFree");
         Ok(())
     });
 

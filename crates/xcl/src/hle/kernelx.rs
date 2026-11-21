@@ -42,6 +42,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemFreeDefault,
         XMemSetAllocationHooks,
         XMemVirtualQuery,
+        XMemVirtualAlloc,
         XMemGetWorkingSetStatistics,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
@@ -234,6 +235,14 @@ pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
         0 => XMemFreeDefault(p, attrs),
         f => std::mem::transmute::<usize, XMemFreeFn>(f)(p, attrs),
     }
+}
+
+/// `void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD type, XALLOC_ATTRIBUTES attributes,
+/// DWORD protect)`: VirtualAlloc with an allocator's attributes – a graphics memory type is
+/// GPU-visible memory (as MEM_GRAPHICS: unified memory).
+pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, attrs: u64, p: u32) -> *mut c_void {
+    let t = if XAllocAttrs::decode(attrs).memory_type != 0 { t | MEM_GRAPHICS } else { t };
+    VirtualAlloc(addr, size, t, p)
 }
 
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`

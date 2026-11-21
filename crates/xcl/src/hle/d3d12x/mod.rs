@@ -12,6 +12,7 @@
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
+pub mod dxgi_device;
 pub mod frame;
 pub mod guard;
 pub mod layout;

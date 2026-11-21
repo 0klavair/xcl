@@ -243,7 +243,9 @@ pub fn pso_capture_and_fallback() -> Result<(), String> {
     }
 }
 
-/// Console presentation as a title does it: a 60 Hz frame clock (device #78 / #79), the
+/// Console presentation as a title does it (as Microsoft's GDK samples): the display output
+/// through the device's IDXGIDevice1 → adapter → output, a 60 Hz frame clock on it (device
+/// #78 / #79), the
 /// origin wait that hands out the frame token (#80), a cleared 640×360 back buffer handed to
 /// `PresentX` (queue #30) with that token, then the frame's statistics (#81).
 pub fn present_x_frame() -> Result<(), String> {
@@ -256,7 +258,17 @@ pub fn present_x_frame() -> Result<(), String> {
         let schedule: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32) -> HRESULT = std::mem::transmute(slot(d, 79));
         let wait_event: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32, *mut u64) -> HRESULT = std::mem::transmute(slot(d, 80));
         let statistics: unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u8) -> HRESULT = std::mem::transmute(slot(d, 81));
-        ensure!(set_interval(d, std::ptr::null_mut(), 16667, 1, 0) >= 0, "SetFrameIntervalX");
+        let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice1 = dev.cast().map_err(|x| format!("IDXGIDevice1 from the device: {x}"))?;
+        let adapter = dxgi.GetAdapter().map_err(e)?;
+        let desc = adapter.GetDesc().map_err(e)?;
+        let luid = dev.GetAdapterLuid();
+        ensure!((desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart) == (luid.LowPart, luid.HighPart), "IDXGIDevice1::GetAdapter: another adapter");
+        let back: ID3D12Device = dxgi.cast().map_err(e)?;
+        ensure!(back.as_raw() == dev.as_raw(), "IDXGIDevice1 → ID3D12Device is not the device");
+        // an adapter without a display (e.g. a laptop's discrete GPU) has no output
+        let output = adapter.EnumOutputs(0).ok();
+        let output_raw = output.as_ref().map_or(std::ptr::null_mut(), |o| o.as_raw());
+        ensure!(set_interval(d, output_raw, 16667, 1, 0) >= 0, "SetFrameIntervalX");
         ensure!(schedule(d, 0, 0, std::ptr::null(), 0) >= 0, "ScheduleFrameEventX (origin)");
         let mut token = 0u64;
         let hr = wait_event(d, 0, 500, std::ptr::null(), 0, &mut token);

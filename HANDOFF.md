@@ -594,6 +594,17 @@ Console GPU addresses in unified memory are the title's own: memory operations g
 - The test title writes / fills / copies its own graphics memory through #60–#89, takes a GPU timestamp, draws
   through DrawIndexedX and #47 with indices in its memory, and nests occlusion queries (outer = 2 × a single draw's).
 
+## Device as IDXGIDevice, XMemVirtualAlloc (session 5, 2026-11-21)
+- The console D3D12 device is also an IDXGIDevice / 1 / 2: Microsoft's public GDK samples (ATG DeviceResources) take the
+  output for SetFrameIntervalX through `device.As(&dxgiDevice) → GetAdapter → EnumOutputs(0)` and ThrowIfFailed –
+  a PC D3D12 device answers E_NOINTERFACE. `d3d12x/dxgi_device.rs`: a small object with the device's real adapter
+  (by LUID); every other interface is the device's. EnqueueSetEvent is not supported (needs the title's queues).
+- `XMemVirtualAlloc(address, size, type, XALLOC_ATTRIBUTES, protect)` (kernelx; also found by name for `xmem.dll`
+  imports): a graphics memory type allocates in unified memory, as MEM_GRAPHICS. It was a stub returning null.
+- Looked at (independent projects, only facts taken): GDKScarlett (Xbox One `d3d12_x` titles, GCN shaders; its
+  PIX / AcpHal / mfplat stubs answer what XCL's automatic stubs already answer) and SlimEra (XDK-era kernelx:
+  Era* / Etx* functions – no GDK title seen importing them).
+
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
   sqrt / rsq / class, v_swaprel, pknorm f16…) with tests. Fixed on the GPU (RX 9070), where its GPU tests had not run:
