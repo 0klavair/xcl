@@ -17,18 +17,20 @@ struct Heap {
     shadow: usize,
     n: u32,
     pc_cpu: u64,
+    /// 0: not shader visible
+    pc_gpu: u64,
     inc: u32,
 }
 
 static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 
-/// `obj` is a PC heap with 2·`n` descriptors from `pc_cpu` (increment `inc`): give it `n`
-/// console slots in unified memory.
-pub fn register(obj: usize, n: u32, pc_cpu: u64, inc: u32) -> bool {
+/// `obj` is a PC heap with 2·`n` descriptors from `pc_cpu` / `pc_gpu` (increment `inc`;
+/// `pc_gpu` 0 when not shader visible): give it `n` console slots in unified memory.
+pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     let Some(p) = u.alloc((n.max(1) * SLOT) as usize, 256) else { return false };
     unsafe { std::ptr::write_bytes(p, 0, (n * SLOT) as usize) };
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, inc });
+    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc });
     true
 }
 
@@ -45,6 +47,8 @@ pub struct Slot {
     pub index: u32,
     pub pc_srv: u64,
     pub pc_uav: u64,
+    /// PC GPU handle of the UAV (0: heap not shader visible)
+    pub pc_gpu_uav: u64,
 }
 
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps).
@@ -52,7 +56,14 @@ pub fn slot(cpu: u64) -> Option<Slot> {
     let heaps = HEAPS.lock().unwrap();
     let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * SLOT) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / SLOT as u64) as u32;
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index: 2 * k, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + ((2 * k + 1) * h.inc) as u64 })
+    let uav = ((2 * k + 1) * h.inc) as u64;
+    Some(Slot {
+        at: h.shadow + (k * SLOT) as usize,
+        index: 2 * k,
+        pc_srv: h.pc_cpu + (2 * k * h.inc) as u64,
+        pc_uav: h.pc_cpu + uav,
+        pc_gpu_uav: if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav },
+    })
 }
 
 pub fn write(s: &Slot, words: &[u32]) {

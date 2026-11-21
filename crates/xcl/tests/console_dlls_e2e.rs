@@ -971,6 +971,8 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         let words = console_list::recorded_words(console);
         let mut tables = 0;
         let mut formats = std::collections::BTreeSet::new();
+        let (mut buffers, mut buffers_in_uma) = (0, 0);
+        let uma = xcl::gpu::uma::get().unwrap();
         for &w in &words {
             if console_heap::words_at(w).is_none() {
                 continue;
@@ -981,11 +983,24 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
                     if d[3] >> 28 == 9 {
                         assert_eq!(d[0] % 2, 0, "słowo 0 = indeks SRV w stercie PC (parzysty)");
                         formats.insert((d[1] >> 20) & 0x1FF);
+                    } else if d[3] & 0xFFF == 0xFAC && d[3] >> 30 == 0 {
+                        // V#: base address in UMA, num_records set
+                        buffers += 1;
+                        let a = d[0] as usize | ((d[1] & 0xFFFF) as usize) << 32;
+                        if uma.contains(a) && d[2] != 0 {
+                            buffers_in_uma += 1;
+                        }
                     }
                 }
             }
         }
-        println!("strumień FSR: {} słów, {tables} wskaźników tabel, formaty obrazów 2D w tabelach: {formats:?}", words.len());
+        println!(
+            "strumień FSR: {} słów, {tables} wskaźników tabel, formaty obrazów 2D w tabelach: {formats:?}, V# w tabelach: {buffers} (w UMA: {buffers_in_uma}), bufory konsoli w UMA: {}",
+            words.len(),
+            xcl::hle::d3d12x::real::console_buffers()
+        );
+        assert!(xcl::hle::d3d12x::real::console_buffers() > 0, "bufory FSR w UMA");
+        assert_eq!(buffers, buffers_in_uma, "każdy V# w tabelach wskazuje bufor w UMA");
         assert!(tables > 0);
         for f in [71, 22, 29] {
             assert!(formats.contains(&f), "format {f} (wejście FSR) w tabelach");
@@ -993,5 +1008,6 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         let t = console_list::close(console).unwrap();
         println!("lista konsoli → PC: {t:?}");
         assert!(t.unknown.is_none(), "wszystkie rekordy FSR rozpoznane");
+        assert!(t.clears > 0 && t.copies > 0 && t.skipped == 0, "czyszczenia UAV i kopie przełożone na PC");
     }
 }

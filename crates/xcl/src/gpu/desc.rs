@@ -419,5 +419,28 @@ mod view_tests {
         assert_eq!((i.format, i.width, i.height, i.depth, i.ty, i.last_level, i.max_mip), (71, 1920, 1080, 1, ImageType::D2, 2, 2));
         assert_eq!(i.dst_sel, [4, 5, 6, 7]);
         assert_eq!(t[0], 14);
+        let v = buffer(&buffer_words(0x5_1234_5670, 16, 100, 77));
+        assert_eq!((v.address, v.stride, v.num_records, v.format, v.dst_sel), (0x5_1234_5670, 16, 100, 77, [4, 5, 6, 7]));
+        assert_eq!((format_bytes(22), format_bytes(29), format_bytes(71), format_bytes(77)), (4, 4, 8, 16));
     }
+}
+
+/// Bytes per element of a GFX10 buffer / image format (0–77: 8, 16, 32, 64, 96, 128 bits).
+pub fn format_bytes(f: u32) -> u32 {
+    match f {
+        1..=6 => 1,
+        7..=19 => 2,
+        20..=61 => 4,
+        62..=71 => 8,
+        72..=74 => 12,
+        75..=77 => 16,
+        _ => 4,
+    }
+}
+
+/// A V# for a buffer view: `stride` 0 = raw (num_records in bytes), else structured / typed
+/// (num_records in elements); `format` = GFX10 format for typed loads (raw: 32_FLOAT).
+pub fn buffer_words(address: u64, stride: u32, num_records: u32, format: u32) -> [u32; 4] {
+    let oob = if stride == 0 { 3 } else { 0 };
+    [address as u32, (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16, num_records, 0xFAC | (format & 0x7F) << 12 | 1 << 24 | oob << 28]
 }

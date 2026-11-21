@@ -18,7 +18,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -152,6 +152,20 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// UMA as one D3D12 buffer (placed in a heap opened over the process memory): the `mem`
 /// of recompiled shaders. Kept for the process lifetime.
 static UMA_BUFFER: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+/// the unified memory opened as a D3D12 heap (console buffers are placed in it)
+static UMA_HEAP: AtomicU64 = AtomicU64::new(0);
+/// console buffers placed in unified memory: resource → (address, bytes)
+static UMA_BUFFERS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+
+/// Where a console-created buffer lives in unified memory (its console GPU address).
+pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
+    UMA_BUFFERS.lock().unwrap().as_ref()?.get(&res).copied()
+}
+
+/// Number of live console buffers in unified memory.
+pub fn console_buffers() -> usize {
+    UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+}
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
 /// GPU virtual address of the unified memory buffer (0: not available).
@@ -182,7 +196,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
         device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
         let buf = buf.ok_or("CreatePlacedResource")?;
         let va = buf.GetGPUVirtualAddress();
-        std::mem::forget(heap);
+        UMA_HEAP.store(heap.into_raw() as u64, Ordering::Release);
         Ok((buf.into_raw() as usize, va))
     })();
     match r {
@@ -453,6 +467,8 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 ///   riid, ppv) as on PC #27 (PC #76 = CreateCommittedResource3); the console resource desc
 ///   carries more after the 52 PC bytes (amd_fidelityfx_upscaler_xbox.dll writes 3 at +52).
 /// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
+/// * resource #11 GetGPUVirtualAddress: console buffers live in unified memory; their console
+///   address (= CPU address, low 32 bits = offset in `mem`) is what console code gets.
 /// * device #14 / #15 / #18 / #19 (CreateDescriptorHeap, GetDescriptorHandleIncrementSize,
 ///   CreateShaderResourceView, CreateUnorderedAccessView): CBV/SRV/UAV heaps of console code
 ///   get 32-byte slots in unified memory (`console_heap`).
@@ -475,6 +491,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
             v
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
+        Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         _ => vec![],
     }
 }
@@ -514,8 +531,9 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        let gpu = if d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        if !super::console_heap::register(raw as usize, d[1], cpu, inc) {
+        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc) {
             crate::xlog_warn!("sterta deskryptorów konsoli: brak miejsca w UMA na {} slotów", d[1]);
         }
     }
@@ -582,6 +600,97 @@ fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
 
 static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 
+/// V# of a buffer view (raw: 4-byte elements, num_records in bytes; structured / typed:
+/// stride = element size, num_records in elements); empty when the buffer is not in UMA.
+fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+    let Some((at, bytes)) = console_buffer(res) else {
+        note_buffer_view();
+        return [0; 4];
+    };
+    let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
+    let (stride, elem) = if raw {
+        (0, 4)
+    } else if stride > 0 {
+        (stride, stride)
+    } else {
+        let e = crate::gpu::desc::format_bytes(fmt);
+        (e, e)
+    };
+    let base = at as u64 + first * elem as u64;
+    let room = (bytes as u64).saturating_sub(first * elem as u64);
+    let records = if stride == 0 { (n as u64 * 4).min(room) } else { (n as u64).min(room / stride as u64) };
+    crate::gpu::desc::buffer_words(base, stride, records as u32, fmt)
+}
+
+/// Console buffer → a placed resource in the unified memory heap, so its console address is
+/// what the recompiled shaders read through `mem`. None: not placed (fall back to committed).
+unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let heap = UMA_HEAP.load(Ordering::Acquire) as usize;
+    let u = crate::gpu::uma::get()?;
+    if heap == 0 || ppv.is_null() {
+        return None;
+    }
+    let mut d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 {
+        return None;
+    }
+    // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + this flag
+    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    d.Alignment = 0;
+    let bytes = d.Width as usize;
+    let p = u.alloc((bytes + 0xFFFF) & !0xFFFF, 0x1_0000)? as usize;
+    let hr = dev_create_placed_resource(this, heap, p - u.base(), &d as *const _ as usize, state, clear, riid, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        u.free(p);
+        static ONCE: AtomicU64 = AtomicU64::new(0);
+        if ONCE.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("bufor konsoli w UMA: CreatePlacedResource {hr:#x} – zostaje zasób osobny (shader go nie zobaczy)");
+        }
+        return None;
+    }
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes));
+    // Map must hand out the same memory the shaders read (checked once)
+    static CHECKED: AtomicU64 = AtomicU64::new(0);
+    if CHECKED.fetch_add(1, Ordering::Relaxed) == 0 {
+        let raw = *ppv;
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) {
+            let mut m: *mut c_void = std::ptr::null_mut();
+            if r.Map(0, None, Some(&mut m)).is_ok() {
+                r.Unmap(0, None);
+                if m as usize != p {
+                    crate::xlog_warn!("bufor konsoli w UMA: Map zwraca {m:?}, a nie {p:#x} – zapisy CPU nie trafią pod adres konsoli");
+                } else {
+                    crate::xlog_info!("bufory konsoli w UMA: Map = adres konsoli ({p:#x})");
+                }
+            }
+        }
+    }
+    Some(hr)
+}
+
+/// resource Release (every caller): a console buffer's unified memory goes with it
+unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+        if let (Some((p, _)), Some(u)) = (gone, crate::gpu::uma::get()) {
+            u.free(p);
+        }
+    }
+    n
+}
+
+/// resource #11 GetGPUVirtualAddress for console code
+unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
+    if let Some((p, _)) = console_buffer(this as usize) {
+        return p as u64;
+    }
+    let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
+    f(this)
+}
+
 fn note_buffer_view() {
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("widok bufora w stercie konsoli: bufor nie jest w UMA – shader dostanie pusty V# (num_records 0)");
@@ -595,6 +704,11 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
+    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    }
     let (format, dim, array, mips) = match desc.as_ref() {
         Some(v) => {
             let a = &v.Anonymous;
@@ -632,6 +746,11 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         return super::console_heap::write(&slot, &[0; 8]);
     };
     let rd = r.GetDesc();
+    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
+    }
     // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
     let (format, dim, array, mip) = match desc.as_ref() {
         Some(v) => {
@@ -694,6 +813,11 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             pc_desc[44..48].copy_from_slice(&0u32.to_le_bytes());
             pc_desc[52..56].copy_from_slice(&0u32.to_le_bytes());
             desc = pc_desc.as_ptr() as usize;
+        }
+    }
+    if desc != 0 {
+        if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
+            return hr;
         }
     }
     let hr = dev_create_committed_resource(this, props, flags, desc, state, clear, riid, ppv);
@@ -763,6 +887,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandList => v.push(("OMSetRenderTargets", cl_om_set_render_targets as usize)),
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
+        Kind::Resource => v.push(("Release", res_release as usize)),
         _ => {}
     }
     v

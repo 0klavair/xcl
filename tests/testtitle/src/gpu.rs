@@ -269,7 +269,10 @@ pub fn render_triangle() -> Result<(), String> {
         let heap: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
             .map_err(e)?;
-        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        // D3D12.X: the heap start handle comes back in rax (the PC method returns it through
+        // a hidden pointer) – console code calls slot 9 like this
+        let start: unsafe extern "system" fn(*mut c_void) -> usize = transmute_copy(&(*(*(heap.as_raw() as *const *const usize)).add(9)));
+        let rtv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
         dev.CreateRenderTargetView(&rt, None, rtv);
 
         let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();

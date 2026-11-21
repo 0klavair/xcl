@@ -31,6 +31,8 @@ const BARRIER_MARKER: u32 = 0x8C0F_E005;
 const HEAPS_MARKER: u32 = 0x8C0F_E006;
 const TRANSITIONS_MARKER: u32 = 0x8C0F_E007;
 const COPY_BUFFER_MARKER: u32 = 0x8C0F_E008;
+const CLEAR_UAV_MARKER: u32 = 0x8C0F_E009;
+const COPY_TEXTURE_MARKER: u32 = 0x8C0F_E00A;
 /// root parameter header: 0xC0000000 | i << 10 (bits 31:30 set: the inline code leaves its
 /// dirty flag alone); the inline code adds the constant offset · 4 (bits 9:2) and
 /// (count − 1) << 16
@@ -389,6 +391,36 @@ unsafe extern "system" fn cl_copy_buffer_region(this: *mut c_void, dst: usize, d
     }
     push(this as usize, &w);
 }
+/// #53 / #54 ClearUnorderedAccessViewUint / Float(gpu handle, cpu handle, resource, values[4],
+/// rect count, rects) – amd_fidelityfx_upscaler_xbox.dll picks #54 for float targets
+unsafe fn clear_uav(this: *mut c_void, float: bool, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32) {
+    if rects != 0 {
+        crate::xlog_warn!("lista konsoli: ClearUnorderedAccessView z {rects} prostokątami – czyszczę całość");
+    }
+    let mut w = vec![CLEAR_UAV_MARKER, float as u32];
+    for v in [gpu, cpu, res as u64] {
+        w.extend([v as u32, (v >> 32) as u32]);
+    }
+    w.extend_from_slice(std::slice::from_raw_parts(values, 4));
+    push(this as usize, &w);
+}
+unsafe extern "system" fn cl_clear_uav_uint(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32, _r: *const c_void) {
+    clear_uav(this, false, gpu, cpu, res, values, rects);
+}
+unsafe extern "system" fn cl_clear_uav_float(this: *mut c_void, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32, _r: *const c_void) {
+    clear_uav(this, true, gpu, cpu, res, values, rects);
+}
+/// #85 CopyTextureRegion(dst location, x, y, z, src location, box) – 48-byte
+/// D3D12_TEXTURE_COPY_LOCATION, 24-byte D3D12_BOX
+unsafe extern "system" fn cl_copy_texture_region(this: *mut c_void, dst: *const [u32; 12], x: u32, y: u32, z: u32, src: *const [u32; 12], bx: *const [u32; 6]) {
+    let mut w = vec![COPY_TEXTURE_MARKER];
+    w.extend_from_slice(&*dst);
+    w.extend([x, y, z]);
+    w.extend_from_slice(&*src);
+    w.push(!bx.is_null() as u32);
+    w.extend_from_slice(&bx.as_ref().copied().unwrap_or([0; 6]));
+    push(this as usize, &w);
+}
 unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *const c_void) {
     push(this as usize, &[BARRIER_MARKER]);
 }
@@ -425,6 +457,9 @@ fn list_vtable() -> usize {
             (25, cl_set_pipeline_state as usize),
             (26, cl_resource_barrier as usize),
             (32, cl_set_descriptor_heaps as usize),
+            (53, cl_clear_uav_uint as usize),
+            (54, cl_clear_uav_float as usize),
+            (85, cl_copy_texture_region as usize),
             (33, cl_set_compute_root_signature as usize),
             (37, cl_set_root_constant as usize),
             (39, cl_set_root_constants as usize),
@@ -509,6 +544,10 @@ pub struct Translation {
     pub dispatches: u32,
     pub skipped_dispatches: u32,
     pub barriers: u32,
+    pub clears: u32,
+    pub copies: u32,
+    /// records whose resources / descriptors were not XCL's (skipped)
+    pub skipped: u32,
     pub unknown: Option<(u32, usize)>,
 }
 
@@ -574,8 +613,55 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let (dst, src) = (q(0) as *mut c_void, q(2) as *mut c_void);
                 if let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&dst), ID3D12Resource::from_raw_borrowed(&src)) {
                     list.CopyBufferRegion(d, q(1), s, q(3), q(4));
+                    out.copies += 1;
+                } else {
+                    out.skipped += 1;
                 }
                 at += 11;
+            } else if w0 == CLEAR_UAV_MARKER {
+                let q = |k: usize| get(2 + 2 * k) as u64 | (get(3 + 2 * k) as u64) << 32;
+                let values = [get(8), get(9), get(10), get(11)];
+                let res = q(2) as *mut c_void;
+                let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
+                match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
+                    (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
+                        let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
+                        if get(1) != 0 {
+                            let f = values.map(f32::from_bits);
+                            list.ClearUnorderedAccessViewFloat(gh, ch, r, &f, &[]);
+                        } else {
+                            list.ClearUnorderedAccessViewUint(gh, ch, r, &values, &[]);
+                        }
+                        out.clears += 1;
+                    }
+                    _ => out.skipped += 1,
+                }
+                at += 12;
+            } else if w0 == COPY_TEXTURE_MARKER {
+                // aligned copies of the two 48-byte locations and the box (borrowed pointers)
+                let loc = |from: usize| -> [u64; 6] {
+                    let mut b = [0u64; 6];
+                    let src = &words[(at + from).min(words.len())..(at + from + 12).min(words.len())];
+                    std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 4 * src.len());
+                    b
+                };
+                let (dst, src) = (loc(1), loc(16));
+                let bx: [u32; 6] = [get(29), get(30), get(31), get(32), get(33), get(34)];
+                let (pd, ps) = (dst[0] as *mut c_void, src[0] as *mut c_void);
+                if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() {
+                    list.CopyTextureRegion(
+                        dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
+                        get(13),
+                        get(14),
+                        get(15),
+                        src.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
+                        if get(28) != 0 { Some(bx.as_ptr() as *const D3D12_BOX) } else { None },
+                    );
+                    out.copies += 1;
+                } else {
+                    out.skipped += 1;
+                }
+                at += 35;
             } else if w0 == BARRIER_MARKER {
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -649,7 +735,15 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     }
     drop(guard);
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
-        crate::xlog_info!("lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier", out.dispatches, out.skipped_dispatches, out.barriers);
+        crate::xlog_info!(
+            "lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier, {} czyszczeń, {} kopii, {} pominiętych rekordów",
+            out.dispatches,
+            out.skipped_dispatches,
+            out.barriers,
+            out.clears,
+            out.copies,
+            out.skipped
+        );
     }
     if let Some((w, at)) = out.unknown {
         crate::xlog_warn!("lista konsoli: nieznany rekord {w:#010x} (słowo {at}) – reszta pominięta");

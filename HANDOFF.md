@@ -466,14 +466,26 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
   T# w ABI XCL (`desc::xcl_image_for_view`: słowo 0 = 2k, format/rozmiar/typ/mipy jak w T#; UAV 2D dostaje też SRV pod 2k,
   bo RDNA nie rozróżnia). Lista: #32 SetDescriptorHeaps, #26 ResourceBarrier (przejścia przekazane na PC), #15
   CopyBufferRegion. Test sondy sprawdza, że tabele ze strumienia wskazują sloty z teksturami wejściowymi (formaty 71/22/29).
-  - Brakuje: **bufory w UMA** (V# dostaje adres tylko z UMA; dziś pusty V#, log „widok bufora … nie jest w UMA”),
-    CBV przez #17 (nie widziany), sterty samplerów, zwalnianie slotów przy Release sterty, CopyDescriptors.
+  - **Bufory w UMA (zrobione):** bufor tworzony przez kod konsoli (#76, wymiar BUFFER) = zasób umieszczony
+    (CreatePlacedResource) na stercie UMA (`UMA_HEAP`, flaga ALLOW_CROSS_ADAPTER, wyrównanie 64 KB); zasób #11
+    GetGPUVirtualAddress (konsola) zwraca adres w UMA (= adres CPU, młodsze 32 bity = offset w `mem`); **Map na PC zwraca
+    ten sam adres** (sprawdzane raz, log); Release (wszyscy wołający) zwalnia blok. Widoki buforów (SRV/UAV) dostają V#
+    (`desc::buffer_words`: raw → stride 0, num_records w bajtach; structured/typed → stride, num_records w elementach,
+    format GFX10). FSR: 3 bufory w UMA, wszystkie V# w tabelach wskazują UMA.
+    - Uwaga na przyszłość: wszystkie bufory konsoli (też DEFAULT) leżą w pamięci systemowej (UMA) – GPU czyta je przez
+      PCIe; dla dużych buforów gry może to być wolne.
+  - Brakuje: CBV przez #17 (nie widziany), sterty samplerów, zwalnianie slotów przy Release sterty, CopyDescriptors.
 - **PSO FSR4 = ACCC (kontener „FSPX”)** – CreateComputePipelineState (NewBE) dostaje blob SFI0/ISG1/OSG1/PSV0/RTS0/HASH/ACCC
   bez DXIL. FSPX: nagłówek 'FSPX', wersja 1, n wpisów, rozmiar; wpisy 16 B (typ, offset, rozmiar, 0): **0** (0x1C B:
   numthreads u16×3 @+0x0C (256,1,1), RSRC1 @+0x14, RSRC2 @+0x18), **1** (0x14, skrót), **6 = kod RDNA2** (początek 0x24 B =
   nagłówek ze skrótem), **7** (deklaracje zasobów: rekordy 32 B typ 0x41/0x42/0x43, offset w dwordach = slot·8).
   Tłumacz jeszcze ich nie czyta → dispatche pominięte. Pomocnik: `raw_rdna2_listing` (`XCL_RAW=<kod>`).
-- Sloty listy jeszcze nieznane: #85 (wskaźnik struktury), #53 (struktura z polami +0x8C..0x94) – zaślepki.
+- Sloty listy rozpoznane z kodu FSR: **#53 / #54 = ClearUnorderedAccessViewUint / Float** (uchwyt GPU, uchwyt CPU, zasób,
+  wartości[4], 0, NULL; FSR wybiera #54 dla celu w formacie 0x12) i **#85 = CopyTextureRegion** (cel: COPY_LOCATION
+  SUBRESOURCE_INDEX, źródło: PLACED_FOOTPRINT, x/y/z = 0, box NULL; PC #16 – konsola ma tę metodę gdzie indziej).
+  Rekordy → PC przy Close (uchwyty konsoli → deskryptory PC slotu: UAV 2k+1). FSR: 2 czyszczenia, 4 kopie, 0 pominiętych.
+- **Tytuł testowy** woła #9 sterty jak kod konsoli (uchwyt w rax) – wcześniej przez windows-rs (ABI PC) i od 7919cdc padał.
+  Test XAudio2: dolna granica XMA2 80 → 70 ms (jitter kwantu 10 ms, raz wyszło 79 ms).
 
 ### (archiwum) TLAS na GPU – blokada rozmiarem jednego shadera
 - Test `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): 2 BLAS + 16 instancji
