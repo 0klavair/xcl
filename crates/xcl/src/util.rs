@@ -48,7 +48,10 @@ pub fn parse_ret(s: &str) -> Option<u64> {
         return u64::from_str_radix(h, 16).ok();
     }
     if let Some(n) = t.strip_prefix('-') {
-        return n.parse::<u64>().ok().map(|v| (v as i64).wrapping_neg() as u64);
+        return n
+            .parse::<u64>()
+            .ok()
+            .map(|v| (v as i64).wrapping_neg() as u64);
     }
     t.parse::<u64>().ok()
 }
@@ -91,7 +94,9 @@ pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    let len = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_bytes().len();
+    let len = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char)
+        .to_bytes()
+        .len();
     if len == 0 {
         return Some(String::new());
     }
@@ -118,7 +123,9 @@ pub fn dll_key(name: &str) -> String {
 pub fn glob_match(pattern: &str, s: &str) -> bool {
     match pattern.split_once('*') {
         None => pattern == s,
-        Some((pre, post)) => s.len() >= pre.len() + post.len() && s.starts_with(pre) && s.ends_with(post),
+        Some((pre, post)) => {
+            s.len() >= pre.len() + post.len() && s.starts_with(pre) && s.ends_with(post)
+        }
     }
 }
 
@@ -184,13 +191,22 @@ mod tests {
     fn dll_keys() {
         assert_eq!(dll_key("KERNELX"), "kernelx.dll");
         assert_eq!(dll_key("G:\\Bin\\Foo.DLL"), "foo.dll");
-        assert_eq!(dll_key("api-ms-win-core-file-l1-1-0.dll"), "api-ms-win-core-file-l1-1-0.dll");
+        assert_eq!(
+            dll_key("api-ms-win-core-file-l1-1-0.dll"),
+            "api-ms-win-core-file-l1-1-0.dll"
+        );
     }
 
     #[test]
     fn globbing() {
-        assert!(glob_match("api-ms-win-core-*", "api-ms-win-core-file-l1-1-0.dll"));
-        assert!(!glob_match("api-ms-win-core-*", "api-ms-win-crt-runtime-l1-1-0.dll"));
+        assert!(glob_match(
+            "api-ms-win-core-*",
+            "api-ms-win-core-file-l1-1-0.dll"
+        ));
+        assert!(!glob_match(
+            "api-ms-win-core-*",
+            "api-ms-win-crt-runtime-l1-1-0.dll"
+        ));
         assert!(glob_match("xgameruntime*.dll", "xgameruntime.thunks.dll"));
         assert!(glob_match("kernelx.dll", "kernelx.dll"));
     }
@@ -212,7 +228,10 @@ mod tests {
             assert_eq!(write_cstr_out("abc", buf.as_mut_ptr(), 8, &mut used), S_OK);
             assert_eq!(used, 4);
             assert_eq!(&buf[..4], b"abc\0");
-            assert_eq!(write_cstr_out("toolongstr", buf.as_mut_ptr(), 8, &mut used), E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(
+                write_cstr_out("toolongstr", buf.as_mut_ptr(), 8, &mut used),
+                E_NOT_SUFFICIENT_BUFFER
+            );
             assert_eq!(used, 11);
         }
     }

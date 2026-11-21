@@ -28,6 +28,9 @@ const DLL: &str = "d3d12_xs.dll";
 const PIPE_MARKER: u32 = 0x8C0F_E002;
 const RS_MARKER: u32 = 0x8C0F_E003;
 const BARRIER_MARKER: u32 = 0x8C0F_E005;
+const HEAPS_MARKER: u32 = 0x8C0F_E006;
+const TRANSITIONS_MARKER: u32 = 0x8C0F_E007;
+const COPY_BUFFER_MARKER: u32 = 0x8C0F_E008;
 /// root parameter header: 0xC0000000 | i << 10 (bits 31:30 set: the inline code leaves its
 /// dirty flag alone); the inline code adds the constant offset · 4 (bits 9:2) and
 /// (count − 1) << 16
@@ -54,7 +57,8 @@ pub enum Param {
     Constants { at: u32, count: u32 },
     /// root CBV / SRV / UAV: 64-bit GPU address at `at`
     Descriptor { at: u32 },
-    /// descriptor table (not seen yet in console code; assumed 8 bytes)
+    /// descriptor table: 32-bit GPU address of its first descriptor (console shaders load
+    /// it with the high half 0; amd_fidelityfx_upscaler_xbox.dll writes 1 word)
     Table { at: u32 },
 }
 
@@ -73,19 +77,26 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         }
         None => blob.to_vec(),
     };
-    let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let r = |o: usize| {
+        rts0.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
     let mut l = Layout::default();
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
-            1 => Param::Constants { at: l.size, count: r(pay + 8)? },
+            1 => Param::Constants {
+                at: l.size,
+                count: r(pay + 8)?,
+            },
             2..=4 => Param::Descriptor { at: l.size },
             _ => Param::Table { at: l.size },
         };
         l.size += match p {
             Param::Constants { count, .. } => 4 * count,
-            _ => 8,
+            Param::Table { .. } => 4,
+            Param::Descriptor { .. } => 8,
         };
         l.params.push(p);
     }
@@ -97,7 +108,11 @@ static LAYOUTS: Mutex<Option<HashMap<usize, Arc<Layout>>>> = Mutex::new(None);
 /// A root signature was created from `blob`: remember its argument layout.
 pub fn note_root_signature(rs: usize, blob: &[u8]) {
     if let Some(l) = layout_from_blob(blob) {
-        LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(rs, Arc::new(l));
+        LAYOUTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(rs, Arc::new(l));
     }
 }
 
@@ -127,19 +142,27 @@ fn pc_vtable_call(obj: usize, slot: usize) -> usize {
     unsafe { *(*(obj as *const *const usize)).add(slot) }
 }
 
-unsafe extern "system" fn pso_qi(this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn pso_qi(
+    this: *mut c_void,
+    _riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     *ppv = this;
     pso_addref(this);
     S_OK
 }
 unsafe extern "system" fn pso_addref(this: *mut c_void) -> u32 {
-    (*(this as *mut ConsolePso)).refs.fetch_add(1, Ordering::AcqRel) + 1
+    (*(this as *mut ConsolePso))
+        .refs
+        .fetch_add(1, Ordering::AcqRel)
+        + 1
 }
 unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let p = this as *mut ConsolePso;
     let n = (*p).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if n == 0 {
-        let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call((*p).pc, 2));
+        let release: unsafe extern "system" fn(usize) -> u32 =
+            std::mem::transmute(pc_vtable_call((*p).pc, 2));
         release((*p).pc);
         drop(Box::from_raw(p));
     }
@@ -155,13 +178,35 @@ macro_rules! pso_forward {
         }
     )*};
 }
-pso_forward!(pso_3 = 3, pso_4 = 4, pso_5 = 5, pso_6 = 6, pso_7 = 7, pso_8 = 8);
+pso_forward!(
+    pso_3 = 3,
+    pso_4 = 4,
+    pso_5 = 5,
+    pso_6 = 6,
+    pso_7 = 7,
+    pso_8 = 8
+);
 
 fn pso_vtable() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        let mut v: Vec<usize> = (0..PSO_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12PipelineState(konsola)::#{i}"), 0).0).collect();
-        let known: [usize; 9] = [pso_qi as usize, pso_addref as usize, pso_release as usize, pso_3 as usize, pso_4 as usize, pso_5 as usize, pso_6 as usize, pso_7 as usize, pso_8 as usize];
+        let mut v: Vec<usize> = (0..PSO_SLOTS)
+            .map(|i| {
+                crate::stubs::make_stub_info(DLL, &format!("ID3D12PipelineState(konsola)::#{i}"), 0)
+                    .0
+            })
+            .collect();
+        let known: [usize; 9] = [
+            pso_qi as usize,
+            pso_addref as usize,
+            pso_release as usize,
+            pso_3 as usize,
+            pso_4 as usize,
+            pso_5 as usize,
+            pso_6 as usize,
+            pso_7 as usize,
+            pso_8 as usize,
+        ];
         v[..9].copy_from_slice(&known);
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
     })
@@ -213,7 +258,11 @@ static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
 
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
-    let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
+    let blocks = PENDING
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
     }
@@ -255,7 +304,11 @@ fn header(i: usize) -> u32 {
     PARAM_BASE | (i as u32) << 10
 }
 
-unsafe extern "system" fn cl_qi(this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn cl_qi(
+    this: *mut c_void,
+    _riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     *ppv = this;
     cl_addref(this);
     S_OK
@@ -277,10 +330,14 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if left == 0 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
-            let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
+            let release: unsafe extern "system" fn(usize) -> u32 =
+                std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
         }
-        drop(Box::from_raw(std::slice::from_raw_parts_mut(obj as *mut u8, OBJECT_BYTES)));
+        drop(Box::from_raw(std::slice::from_raw_parts_mut(
+            obj as *mut u8,
+            OBJECT_BYTES,
+        )));
     }
     left
 }
@@ -306,20 +363,35 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     }
 }
 
-unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, pso: *mut c_void) -> HRESULT {
+unsafe extern "system" fn cl_reset(
+    this: *mut c_void,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+) -> HRESULT {
     let obj = this as usize;
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
-        (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
+        (
+            st.pc,
+            std::mem::replace(&mut st.allocator, allocator as usize),
+            std::mem::take(&mut st.uma),
+        )
     }) else {
         return crate::util::E_FAIL;
     };
     // what the previous recording left in unified memory lives until its allocator resets
     if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
+        PENDING
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(old_alloc)
+            .or_default()
+            .extend(blocks);
     }
     with_list(obj, |st| new_chunk(obj, st));
-    let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
+    let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT =
+        std::mem::transmute(pc_vtable_call(pc, 10));
     f(pc, allocator, pc_pso(pso))
 }
 
@@ -328,7 +400,9 @@ unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32)
 }
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     if pso.is_null() || *(pso as *const usize) != pso_vtable() {
-        crate::xlog_warn!("lista konsoli: SetPipelineState z obiektem spoza XCL ({pso:?}) – pomijam");
+        crate::xlog_warn!(
+            "lista konsoli: SetPipelineState z obiektem spoza XCL ({pso:?}) – pomijam"
+        );
         return;
     }
     let words: [u32; 7] = std::ptr::read((pso as usize + 0x10) as *const [u32; 7]);
@@ -343,12 +417,21 @@ unsafe extern "system" fn cl_set_compute_root_signature(this: *mut c_void, rs: *
     for i in 0..MAX_PARAMS {
         *((obj + F_HEADERS + 4 * i) as *mut u32) = header(i);
     }
-    push(obj, &[RS_MARKER, 0, rs as usize as u32, (rs as usize >> 32) as u32]);
+    push(
+        obj,
+        &[RS_MARKER, 0, rs as usize as u32, (rs as usize >> 32) as u32],
+    );
 }
 unsafe extern "system" fn cl_set_root_constant(this: *mut c_void, i: u32, value: u32, offset: u32) {
     push(this as usize, &[header(i as usize) + 4 * offset, value]);
 }
-unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u32, data: *const u32, offset: u32) {
+unsafe extern "system" fn cl_set_root_constants(
+    this: *mut c_void,
+    i: u32,
+    n: u32,
+    data: *const u32,
+    offset: u32,
+) {
     if n == 0 {
         return;
     }
@@ -357,13 +440,58 @@ unsafe extern "system" fn cl_set_root_constants(this: *mut c_void, i: u32, n: u3
     push(this as usize, &w);
 }
 unsafe extern "system" fn cl_set_root_descriptor(this: *mut c_void, i: u32, va: u64) {
-    push(this as usize, &[header(i as usize), va as u32, (va >> 32) as u32]);
+    push(
+        this as usize,
+        &[header(i as usize), va as u32, (va >> 32) as u32],
+    );
+}
+/// #32 SetDescriptorHeaps(n, heaps)
+unsafe extern "system" fn cl_set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const usize) {
+    let mut w = vec![HEAPS_MARKER, n];
+    for k in 0..n as usize {
+        let h = *heaps.add(k);
+        w.extend([h as u32, (h >> 32) as u32]);
+    }
+    push(this as usize, &w);
+}
+/// #26 ResourceBarrier(n, barriers): D3D12_RESOURCE_BARRIER, 32 bytes each
+unsafe extern "system" fn cl_resource_barrier(
+    this: *mut c_void,
+    n: u32,
+    barriers: *const [u32; 8],
+) {
+    let mut w = vec![TRANSITIONS_MARKER, n];
+    for k in 0..n as usize {
+        w.extend_from_slice(&*barriers.add(k));
+    }
+    push(this as usize, &w);
+}
+/// #15 CopyBufferRegion(dst, dst offset, src, src offset, bytes)
+unsafe extern "system" fn cl_copy_buffer_region(
+    this: *mut c_void,
+    dst: usize,
+    dst_off: u64,
+    src: usize,
+    src_off: u64,
+    n: u64,
+) {
+    let mut w = vec![COPY_BUFFER_MARKER];
+    for v in [dst as u64, dst_off, src as u64, src_off, n] {
+        w.extend([v as u32, (v >> 32) as u32]);
+    }
+    push(this as usize, &w);
 }
 unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *const c_void) {
     push(this as usize, &[BARRIER_MARKER]);
 }
-unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
-    let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
+unsafe extern "system" fn cl_allocate_upload_memory(
+    this: *mut c_void,
+    size: usize,
+    align: usize,
+) -> *mut u8 {
+    let Some(u) = crate::gpu::uma::get() else {
+        return std::ptr::null_mut();
+    };
     match u.alloc(size.max(16), align.max(16)) {
         Some(p) => {
             with_list(this as usize, |st| st.uma.push(p as usize));
@@ -376,7 +504,16 @@ unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usi
 fn list_vtable() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        let mut v: Vec<usize> = (0..LIST_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12GraphicsCommandList(konsola)::#{i}"), 0).0).collect();
+        let mut v: Vec<usize> = (0..LIST_SLOTS)
+            .map(|i| {
+                crate::stubs::make_stub_info(
+                    DLL,
+                    &format!("ID3D12GraphicsCommandList(konsola)::#{i}"),
+                    0,
+                )
+                .0
+            })
+            .collect();
         // console slots found on XboxBvhBuilder.dll (HANDOFF)
         for (slot, f) in [
             (0, cl_qi as usize),
@@ -391,7 +528,10 @@ fn list_vtable() -> usize {
             (9, cl_close as usize),
             (10, cl_reset as usize),
             (14, cl_dispatch as usize),
+            (15, cl_copy_buffer_region as usize),
             (25, cl_set_pipeline_state as usize),
+            (26, cl_resource_barrier as usize),
+            (32, cl_set_descriptor_heaps as usize),
             (33, cl_set_compute_root_signature as usize),
             (37, cl_set_root_constant as usize),
             (39, cl_set_root_constants as usize),
@@ -417,9 +557,19 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new() };
+    let mut st = ListState {
+        pc: pc as usize,
+        allocator: allocator as usize,
+        refs: 1,
+        chunks: Vec::new(),
+        uma: Vec::new(),
+    };
     new_chunk(obj, &mut st);
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
+    LISTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(obj, st);
     obj as *mut c_void
 }
 
@@ -455,6 +605,29 @@ unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
     Some(p as usize)
 }
 
+/// The recorded words so far (diagnostics: what console code wrote).
+pub fn recorded_words(obj: *mut c_void) -> Vec<u32> {
+    let o = obj as usize;
+    with_list(o, |st| {
+        let mut out = Vec::new();
+        let n = st.chunks.len();
+        for (k, (c, used)) in st.chunks.iter().enumerate() {
+            let used = if k + 1 == n {
+                unsafe { *field(o, F_WRITE) - c.as_ptr() as usize }
+            } else {
+                *used
+            };
+            out.extend(
+                c[..used]
+                    .chunks(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+            );
+        }
+        out
+    })
+    .unwrap_or_default()
+}
+
 /// What `close` produced (for tests and logs).
 #[derive(Debug, Default, Clone)]
 pub struct Translation {
@@ -468,13 +641,19 @@ pub struct Translation {
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
     let mut guard = LISTS.lock().unwrap();
-    let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("to nie jest lista konsoli XCL")?;
+    let st = guard
+        .as_mut()
+        .and_then(|m| m.get_mut(&obj))
+        .ok_or("to nie jest lista konsoli XCL")?;
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("brak listy PC")?.clone();
-    let rs = super::real::abi_rs_cached().ok_or("brak root signature ABI XCL (żaden PSO nie był tłumaczony)")?;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature ABI")?.clone();
+    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void))
+        .ok_or("brak listy PC")?
+        .clone();
+    // created with the first translated pipeline (without one every dispatch is skipped)
+    let rs = super::real::abi_rs_cached()
+        .and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
     let uma_va = super::real::uma_gpu_va();
     let u = crate::gpu::uma::get().ok_or("brak UMA")?;
     if uma_va == 0 {
@@ -485,7 +664,16 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
-    let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
+    let chunks: Vec<Vec<u32>> = st
+        .chunks
+        .iter()
+        .map(|(c, used)| {
+            c[..*used]
+                .chunks(4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        })
+        .collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
         while at < words.len() {
@@ -499,11 +687,55 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 layout = layout_of(r);
                 table = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
                 at += 4;
+            } else if w0 == HEAPS_MARKER {
+                let n = get(1) as usize;
+                let heaps: Vec<Option<ID3D12DescriptorHeap>> = (0..n)
+                    .map(|k| {
+                        let p = (get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32)
+                            as *mut c_void;
+                        ID3D12DescriptorHeap::from_raw_borrowed(&p).cloned()
+                    })
+                    .collect();
+                list.SetDescriptorHeaps(&heaps);
+                at += 2 + 2 * n;
+            } else if w0 == TRANSITIONS_MARKER {
+                let n = get(1) as usize;
+                let words = &words[(at + 2).min(words.len())..(at + 2 + 8 * n).min(words.len())];
+                if words.len() == 8 * n && n > 0 {
+                    // 4-byte aligned in the stream: copy out; the resource pointers are
+                    // borrowed (ManuallyDrop fields, nothing released)
+                    let mut b: Vec<u64> = vec![0; 4 * n];
+                    std::ptr::copy_nonoverlapping(
+                        words.as_ptr() as *const u8,
+                        b.as_mut_ptr() as *mut u8,
+                        32 * n,
+                    );
+                    list.ResourceBarrier(std::slice::from_raw_parts(
+                        b.as_ptr() as *const D3D12_RESOURCE_BARRIER,
+                        n,
+                    ));
+                }
+                out.barriers += n as u32;
+                at += 2 + 8 * n;
+            } else if w0 == COPY_BUFFER_MARKER {
+                let q = |k: usize| get(1 + 2 * k) as u64 | (get(2 + 2 * k) as u64) << 32;
+                let (dst, src) = (q(0) as *mut c_void, q(2) as *mut c_void);
+                if let (Some(d), Some(s)) = (
+                    ID3D12Resource::from_raw_borrowed(&dst),
+                    ID3D12Resource::from_raw_borrowed(&src),
+                ) {
+                    list.CopyBufferRegion(d, q(1), s, q(3), q(4));
+                }
+                at += 11;
             } else if w0 == BARRIER_MARKER {
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
                 }]);
                 out.barriers += 1;
                 at += 1;
@@ -518,7 +750,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[1] = (table_at >> 32) as u32;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
-                        list.SetComputeRootSignature(&rs);
+                        list.SetComputeRootSignature(
+                            rs.as_ref().ok_or("brak root signature ABI XCL")?,
+                        );
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         list.SetComputeRootUnorderedAccessView(2, uma_va);
@@ -544,7 +778,14 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         at += 1 + n;
                     }
-                    Some(Param::Descriptor { at: o }) | Some(Param::Table { at: o }) => {
+                    Some(Param::Table { at: o }) => {
+                        let o = o as usize;
+                        if let Some(t) = table.get_mut(o..o + 4) {
+                            t.copy_from_slice(&get(1).to_le_bytes());
+                        }
+                        at += 2;
+                    }
+                    Some(Param::Descriptor { at: o }) => {
                         let o = o as usize;
                         if let Some(t) = table.get_mut(o..o + 8) {
                             t[..4].copy_from_slice(&get(1).to_le_bytes());
@@ -565,10 +806,17 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     }
     drop(guard);
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
-        crate::xlog_info!("lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier", out.dispatches, out.skipped_dispatches, out.barriers);
+        crate::xlog_info!(
+            "lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier",
+            out.dispatches,
+            out.skipped_dispatches,
+            out.barriers
+        );
     }
     if let Some((w, at)) = out.unknown {
-        crate::xlog_warn!("lista konsoli: nieznany rekord {w:#010x} (słowo {at}) – reszta pominięta");
+        crate::xlog_warn!(
+            "lista konsoli: nieznany rekord {w:#010x} (słowo {at}) – reszta pominięta"
+        );
     }
     list.Close().map_err(|e| format!("Close: {e}"))?;
     Ok(out)
@@ -587,11 +835,32 @@ mod tests {
         // RTS0 v2: consts b0 x19 | UAV u0 | UAV u1 | SRV t0
         let mut r = vec![2u32, 4, 24, 0, 0, 0];
         let pay = 24 + 4 * 12;
-        r.extend([1, 0, pay as u32, 4, 0, pay as u32 + 12, 4, 0, pay as u32 + 24, 3, 0, pay as u32 + 36]);
+        r.extend([
+            1,
+            0,
+            pay as u32,
+            4,
+            0,
+            pay as u32 + 12,
+            4,
+            0,
+            pay as u32 + 24,
+            3,
+            0,
+            pay as u32 + 36,
+        ]);
         r.extend([0, 0, 19, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
         let bytes: Vec<u8> = r.iter().flat_map(|w| w.to_le_bytes()).collect();
         let l = layout_from_blob(&bytes).unwrap();
-        assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76 }, Param::Descriptor { at: 84 }, Param::Descriptor { at: 92 }]);
+        assert_eq!(
+            l.params,
+            vec![
+                Param::Constants { at: 0, count: 19 },
+                Param::Descriptor { at: 76 },
+                Param::Descriptor { at: 84 },
+                Param::Descriptor { at: 92 }
+            ]
+        );
         assert_eq!(l.size, 100);
     }
 }

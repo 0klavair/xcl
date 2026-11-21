@@ -92,7 +92,12 @@ pub fn run(path: &Path, json: bool) -> i32 {
     for d in &all {
         for e in &d.entries {
             let s = resolver::classify(&d.dll, &e.what);
-            imports.push(Entry { dll: d.dll.clone(), function: e.what.to_string(), delay: d.delay, status: status(&s) });
+            imports.push(Entry {
+                dll: d.dll.clone(),
+                function: e.what.to_string(),
+                delay: d.delay,
+                status: status(&s),
+            });
         }
     }
     let tls = pe.tls().ok().flatten().map(|t| t.total_len());
@@ -116,10 +121,28 @@ pub fn run(path: &Path, json: bool) -> i32 {
         return 0;
     }
     println!("Plik:          {}", out.file);
-    println!("Typ:           {} x64, podsystem {}", if out.is_dll { "DLL" } else { "EXE" }, out.subsystem);
-    println!("ImageBase:     {}  (rozmiar {}, wejście +{})", out.image_base, out.size_of_image, out.entry_rva);
-    println!("Relokacje:     {}", if out.has_relocations { "tak" } else { "NIE (obraz musi trafić pod ImageBase)" });
-    println!("Statyczny TLS: {}", tls.map(|n| format!("{n} B (obsługiwany przez nośnik TLS)")).unwrap_or_else(|| "brak".into()));
+    println!(
+        "Typ:           {} x64, podsystem {}",
+        if out.is_dll { "DLL" } else { "EXE" },
+        out.subsystem
+    );
+    println!(
+        "ImageBase:     {}  (rozmiar {}, wejście +{})",
+        out.image_base, out.size_of_image, out.entry_rva
+    );
+    println!(
+        "Relokacje:     {}",
+        if out.has_relocations {
+            "tak"
+        } else {
+            "NIE (obraz musi trafić pod ImageBase)"
+        }
+    );
+    println!(
+        "Statyczny TLS: {}",
+        tls.map(|n| format!("{n} B (obsługiwany przez nośnik TLS)"))
+            .unwrap_or_else(|| "brak".into())
+    );
     println!("Wyjątki:       {} wpisów .pdata", out.exception_entries);
     println!("Stos:          {}", out.stack_reserve);
     match console_imports(path) {
@@ -128,10 +151,26 @@ pub fn run(path: &Path, json: bool) -> i32 {
     }
     let mut per_dll: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     for e in &out.imports {
-        per_dll.entry(format!("{}{}", e.dll, if e.delay { " (delay-load)" } else { "" })).or_default().push(e);
+        per_dll
+            .entry(format!(
+                "{}{}",
+                e.dll,
+                if e.delay { " (delay-load)" } else { "" }
+            ))
+            .or_default()
+            .push(e);
     }
-    let total_stub = out.imports.iter().filter(|e| e.status == "ZAŚLEPKA").count();
-    println!("\nImporty: {} funkcji z {} DLL, z czego {} bez implementacji (zaślepki):", out.imports.len(), per_dll.len(), total_stub);
+    let total_stub = out
+        .imports
+        .iter()
+        .filter(|e| e.status == "ZAŚLEPKA")
+        .count();
+    println!(
+        "\nImporty: {} funkcji z {} DLL, z czego {} bez implementacji (zaślepki):",
+        out.imports.len(),
+        per_dll.len(),
+        total_stub
+    );
     for (dll, entries) in &per_dll {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for e in entries {

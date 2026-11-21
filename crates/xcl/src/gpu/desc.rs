@@ -167,56 +167,108 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
         ImageType::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
         _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
     };
-    let samples = if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) { 1u32 << t.last_level.min(4) } else { 1 };
+    let samples = if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
+        1u32 << t.last_level.min(4)
+    } else {
+        1
+    };
     let res = D3D12_RESOURCE_DESC {
         Dimension: dim,
         Width: t.width as u64,
-        Height: if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D { 1 } else { t.height },
+        Height: if dim == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+            1
+        } else {
+            t.height
+        },
         DepthOrArraySize: depth.min(u16::MAX as u32) as u16,
         MipLevels: if samples > 1 { 1 } else { mips as u16 },
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: samples,
+            Quality: 0,
+        },
         ..Default::default()
     };
     let levels = t.last_level.saturating_sub(t.base_level) + 1;
     let slices = depth.saturating_sub(t.base_array).max(1);
-    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, Shader4ComponentMapping: component_mapping(t.dst_sel, order), ..Default::default() };
+    let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: component_mapping(t.dst_sel, order),
+        ..Default::default()
+    };
     let lod = t.min_lod;
     match t.ty {
         ImageType::D1 => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
-            v.Anonymous.Texture1D = D3D12_TEX1D_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
+            v.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::D1Array => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
-            v.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MostDetailedMip: t.base_level, MipLevels: levels, FirstArraySlice: t.base_array, ArraySize: slices, ResourceMinLODClamp: lod };
+            v.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                FirstArraySlice: t.base_array,
+                ArraySize: slices,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::D2 => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: t.base_level, MipLevels: levels, PlaneSlice: 0, ResourceMinLODClamp: lod };
+            v.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::D2Array => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-            v.Anonymous.Texture2DArray =
-                D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: t.base_level, MipLevels: levels, FirstArraySlice: t.base_array, ArraySize: slices, PlaneSlice: 0, ResourceMinLODClamp: lod };
+            v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                FirstArraySlice: t.base_array,
+                ArraySize: slices,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::D3 => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-            v.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
+            v.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::Cube if depth > 6 => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-            v.Anonymous.TextureCubeArray =
-                D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: t.base_level, MipLevels: levels, First2DArrayFace: t.base_array, NumCubes: slices / 6, ResourceMinLODClamp: lod };
+            v.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                First2DArrayFace: t.base_array,
+                NumCubes: slices / 6,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::Cube => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
+            v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV {
+                MostDetailedMip: t.base_level,
+                MipLevels: levels,
+                ResourceMinLODClamp: lod,
+            };
         }
         ImageType::D2Msaa => v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
         ImageType::D2MsaaArray => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
-            v.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: t.base_array, ArraySize: slices };
+            v.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                FirstArraySlice: t.base_array,
+                ArraySize: slices,
+            };
         }
     }
     Some((res, v))
@@ -266,7 +318,11 @@ pub fn sampler_d3d12(w: &[u32; 4], comparison: bool) -> D3D12_SAMPLER_DESC {
         ComparisonFunc: D3D12_COMPARISON_FUNC(((w[0] >> 12) & 7) as i32 + 1),
         BorderColor: border,
         MinLOD: (w[1] & 0xFFF) as f32 / 256.0,
-        MaxLOD: if mip == 0 { (w[1] & 0xFFF) as f32 / 256.0 } else { ((w[1] >> 12) & 0xFFF) as f32 / 256.0 },
+        MaxLOD: if mip == 0 {
+            (w[1] & 0xFFF) as f32 / 256.0
+        } else {
+            ((w[1] >> 12) & 0xFFF) as f32 / 256.0
+        },
     }
 }
 
@@ -331,23 +387,49 @@ mod tests {
     fn decodes_tsharp() {
         let t = image(&tsharp()).unwrap();
         assert_eq!(t.address, 0x1200_1234_5600); // BASE_ADDRESS (incl. hi byte) counts 256-byte units
-        assert_eq!((t.format, t.width, t.height, t.ty), (56, 256, 128, ImageType::D2));
-        assert_eq!((t.base_level, t.last_level, t.max_mip, t.dst_sel), (1, 3, 7, [6, 5, 4, 7]));
+        assert_eq!(
+            (t.format, t.width, t.height, t.ty),
+            (56, 256, 128, ImageType::D2)
+        );
+        assert_eq!(
+            (t.base_level, t.last_level, t.max_mip, t.dst_sel),
+            (1, 3, 7, [6, 5, 4, 7])
+        );
         assert!((t.min_lod - 3.0 / 256.0).abs() < 1e-6);
         let (res, srv) = image_d3d12(&t).unwrap();
-        assert_eq!((res.Width, res.Height, res.MipLevels, res.Format), (256, 128, 8, DXGI_FORMAT_R8G8B8A8_UNORM));
+        assert_eq!(
+            (res.Width, res.Height, res.MipLevels, res.Format),
+            (256, 128, 8, DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
         assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
-        assert_eq!(unsafe { (srv.Anonymous.Texture2D.MostDetailedMip, srv.Anonymous.Texture2D.MipLevels) }, (1, 3));
+        assert_eq!(
+            unsafe {
+                (
+                    srv.Anonymous.Texture2D.MostDetailedMip,
+                    srv.Anonymous.Texture2D.MipLevels,
+                )
+            },
+            (1, 3)
+        );
         // r ← z (channel 2), g ← y, b ← x, a ← w
-        assert_eq!(srv.Shader4ComponentMapping, 2 | 1 << 3 | 0 << 6 | 3 << 9 | 1 << 12);
+        assert_eq!(
+            srv.Shader4ComponentMapping,
+            2 | 1 << 3 | 0 << 6 | 3 << 9 | 1 << 12
+        );
         assert!(image(&[0; 8]).is_none());
     }
 
     #[test]
     fn packed_formats_reorder_channels() {
         // 5_6_5: x lives in the blue bits of DXGI B5G6R5; identity DST_SEL → r ← B channel
-        assert_eq!(dxgi_format(133), Some((DXGI_FORMAT_B5G6R5_UNORM, [2, 1, 0, 3])));
-        assert_eq!(component_mapping([4, 5, 6, 1], [2, 1, 0, 3]), 2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12);
+        assert_eq!(
+            dxgi_format(133),
+            Some((DXGI_FORMAT_B5G6R5_UNORM, [2, 1, 0, 3]))
+        );
+        assert_eq!(
+            component_mapping([4, 5, 6, 1], [2, 1, 0, 3]),
+            2 | 1 << 3 | 0 << 6 | 5 << 9 | 1 << 12
+        );
         assert_eq!(dxgi_format(181).map(|x| x.0), Some(DXGI_FORMAT_BC7_UNORM));
         assert!(dxgi_format(44).is_none()); // 2_10_10_10: no DXGI equivalent
     }
@@ -355,13 +437,31 @@ mod tests {
     #[test]
     fn decodes_ssharp() {
         // clamp/wrap/border, aniso 8, compare LESS, bias -1.5, mag/min linear, mip linear, lod 0..13
-        let w = [2 | 0 << 3 | 6 << 6 | 3 << 9 | 1 << 12, 0 | (13 * 256) << 12, (((-384i32) as u32) & 0x3FFF) | 1 << 20 | 1 << 22 | 2 << 26, 2 << 30];
+        let w = [
+            2 | 0 << 3 | 6 << 6 | 3 << 9 | 1 << 12,
+            0 | (13 * 256) << 12,
+            (((-384i32) as u32) & 0x3FFF) | 1 << 20 | 1 << 22 | 2 << 26,
+            2 << 30,
+        ];
         let s = sampler_d3d12(&w, false);
-        assert_eq!((s.AddressU, s.AddressV, s.AddressW), (D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_BORDER));
+        assert_eq!(
+            (s.AddressU, s.AddressV, s.AddressW),
+            (
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                D3D12_TEXTURE_ADDRESS_MODE_BORDER
+            )
+        );
         assert_eq!(s.Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
-        assert_eq!((s.MipLODBias, s.MinLOD, s.MaxLOD, s.BorderColor), (-1.5, 0.0, 13.0, [1.0; 4]));
+        assert_eq!(
+            (s.MipLODBias, s.MinLOD, s.MaxLOD, s.BorderColor),
+            (-1.5, 0.0, 13.0, [1.0; 4])
+        );
         assert_eq!(s.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS);
-        assert_eq!(sampler_d3d12(&w, true).Filter, D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR);
+        assert_eq!(
+            sampler_d3d12(&w, true).Filter,
+            D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR
+        );
         let mut a = w;
         a[2] = 2 << 20 | 2 << 22 | 2 << 26;
         assert_eq!(sampler_d3d12(&a, false).Filter, D3D12_FILTER_ANISOTROPIC);
@@ -369,7 +469,92 @@ mod tests {
 
     #[test]
     fn decodes_vsharp() {
-        let b = buffer(&[0x1000, 0x12 | 16 << 16, 64, 4 | 5 << 3 | 6 << 6 | 7 << 9 | 77 << 12]);
-        assert_eq!((b.address, b.stride, b.num_records, b.format, b.dst_sel), (0x12_0000_1000, 16, 64, 77, [4, 5, 6, 7]));
+        let b = buffer(&[
+            0x1000,
+            0x12 | 16 << 16,
+            64,
+            4 | 5 << 3 | 6 << 6 | 7 << 9 | 77 << 12,
+        ]);
+        assert_eq!(
+            (b.address, b.stride, b.num_records, b.format, b.dst_sel),
+            (0x12_0000_1000, 16, 64, 77, [4, 5, 6, 7])
+        );
+    }
+}
+
+/// GFX10 IMG_FORMAT of a DXGI format (the inverse of `dxgi_format`; typeless → None).
+pub fn gfx10_format(f: DXGI_FORMAT) -> Option<u32> {
+    (0..=182).find(|&g| dxgi_format(g).map(|(d, _)| d) == Some(f))
+}
+
+/// A T# in the XCL shader ABI (see `xcl_image_words`) for a D3D12 view: SRV at
+/// `srv_heap_index`, UAV at + 1. Size, format, type and mips as the console fields, so
+/// shaders that read them (image class, resinfo) see the real values.
+pub fn xcl_image_for_view(
+    srv_heap_index: u32,
+    format: u32,
+    ty: ImageType,
+    width: u32,
+    height: u32,
+    depth: u32,
+    mips: u32,
+) -> [u32; 8] {
+    let (w, h, d) = (width.max(1) - 1, height.max(1) - 1, depth.max(1) - 1);
+    let ty = match ty {
+        ImageType::D1 => 8,
+        ImageType::D2 => 9,
+        ImageType::D3 => 10,
+        ImageType::Cube => 11,
+        ImageType::D1Array => 12,
+        ImageType::D2Array => 13,
+        ImageType::D2Msaa => 14,
+        ImageType::D2MsaaArray => 15,
+    };
+    let last = mips.max(1) - 1;
+    let mut t = [0u32; 8];
+    t[0] = srv_heap_index;
+    t[1] = (format & 0x1FF) << 20 | (w & 3) << 30;
+    t[2] = (w >> 2) & 0xFFF | (h & 0x3FFF) << 14;
+    t[3] = 4 | 5 << 3 | 6 << 6 | 7 << 9 | (last & 0xF) << 16 | ty << 28;
+    t[4] = d & 0x1FFF;
+    t[5] = (last & 0xF) << 4;
+    t
+}
+
+/// A raw-buffer V# (as console code builds them inline: DST_SEL xyzw, 32-bit format).
+pub fn raw_buffer(address: u64, bytes: u32) -> [u32; 4] {
+    [
+        address as u32,
+        (address >> 32) as u32 & 0xFFFF,
+        bytes,
+        0x3101_6FAC,
+    ]
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn view_descriptors_decode_back() {
+        assert_eq!(gfx10_format(DXGI_FORMAT_R16G16B16A16_FLOAT), Some(71));
+        assert_eq!(gfx10_format(DXGI_FORMAT_R32_FLOAT), Some(22));
+        assert_eq!(gfx10_format(DXGI_FORMAT_R16G16_TYPELESS), None);
+        let t = xcl_image_for_view(14, 71, ImageType::D2, 1920, 1080, 1, 3);
+        let i = image(&t).unwrap();
+        assert_eq!(
+            (
+                i.format,
+                i.width,
+                i.height,
+                i.depth,
+                i.ty,
+                i.last_level,
+                i.max_mip
+            ),
+            (71, 1920, 1080, 1, ImageType::D2, 2, 2)
+        );
+        assert_eq!(i.dst_sel, [4, 5, 6, 7]);
+        assert_eq!(t[0], 14);
     }
 }

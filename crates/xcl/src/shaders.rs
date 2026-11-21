@@ -74,14 +74,23 @@ impl IfaceAgg {
         for (k, v) in o.vs_base {
             *self.vs_base.entry(k).or_default() += v;
         }
-        for (a, b) in [(&mut self.ps_examples, o.ps_examples), (&mut self.vs_param_examples, o.vs_param_examples), (&mut self.vs_input_examples, o.vs_input_examples)] {
+        for (a, b) in [
+            (&mut self.ps_examples, o.ps_examples),
+            (&mut self.vs_param_examples, o.vs_param_examples),
+            (&mut self.vs_input_examples, o.vs_input_examples),
+        ] {
             a.extend(b);
             a.truncate(8);
         }
         for (k, x) in o.inputs {
             let e = self.inputs.entry(k).or_default();
             e.programs += x.programs;
-            for (a, b) in [(&mut e.vgpr, x.vgpr), (&mut e.sgpr, x.sgpr), (&mut e.exports, x.exports), (&mut e.sendmsg, x.sendmsg)] {
+            for (a, b) in [
+                (&mut e.vgpr, x.vgpr),
+                (&mut e.sgpr, x.sgpr),
+                (&mut e.exports, x.exports),
+                (&mut e.sendmsg, x.sendmsg),
+            ] {
                 for (r, n) in b {
                     *a.entry(r).or_default() += n;
                 }
@@ -98,22 +107,43 @@ impl IfaceAgg {
     fn add(&mut self, name: &str, blob: &[u8], sh: &xbox::XboxShader) {
         let (isg, osg) = dxbc::signatures(blob);
         let user = |s: &[dxbc::SigElement]| -> Vec<(u32, u8, String)> {
-            s.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).map(|e| (e.register, e.mask, e.semantic())).collect()
+            s.iter()
+                .filter(|e| e.system_value == 0 && !e.name.starts_with("SV_"))
+                .map(|e| (e.register, e.mask, e.semantic()))
+                .collect()
         };
-        let sig_txt = |s: &[dxbc::SigElement]| s.iter().map(|e| format!("{}@r{}:{:x}", e.semantic(), e.register, e.mask)).collect::<Vec<_>>().join(" ");
+        let sig_txt = |s: &[dxbc::SigElement]| {
+            s.iter()
+                .map(|e| format!("{}@r{}:{:x}", e.semantic(), e.register, e.mask))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         for f in &sh.fssm {
-            let Some(p) = f.programs.first() else { continue };
+            let Some(p) = f.programs.first() else {
+                continue;
+            };
             let code = &f.data[p.offset..p.offset + p.len];
             let mut attrs = std::collections::BTreeSet::new();
             let mut ij = std::collections::BTreeSet::new();
             let mut params = std::collections::BTreeSet::new();
-            let (mut read, mut written) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
-            let (mut sread, mut swritten) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
-            let (mut exps, mut msgs) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+            let (mut read, mut written) = (
+                std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::new(),
+            );
+            let (mut sread, mut swritten) = (
+                std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::new(),
+            );
+            let (mut exps, mut msgs) = (
+                std::collections::BTreeSet::new(),
+                std::collections::BTreeSet::new(),
+            );
             let mut first: Vec<String> = Vec::new();
             let mut off = 0;
             while off + 4 <= code.len() {
-                let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+                let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+                    break;
+                };
                 off += d.len;
                 let n = d.inst.name;
                 if n.starts_with("V_INTERP") {
@@ -163,7 +193,10 @@ impl IfaceAgg {
             }
             {
                 let hw0 = f.stages.first().map(|s| s.hw).unwrap_or(99);
-                let e = self.inputs.entry(format!("{} {}", sh.stage, xbox::hw_stage_name(hw0))).or_default();
+                let e = self
+                    .inputs
+                    .entry(format!("{} {}", sh.stage, xbox::hw_stage_name(hw0)))
+                    .or_default();
                 e.programs += 1;
                 for &v in &read {
                     *e.vgpr.entry(v).or_default() += 1;
@@ -180,9 +213,18 @@ impl IfaceAgg {
                 let key = match dxbc::psv(blob) {
                     Some(p) if p.kind == Some(13) => format!(
                         "MS v{} p{} topo{} threads{:?} lds{} fala{}-{}",
-                        p.ms_max_vertices, p.ms_max_primitives, p.ms_topology, p.numthreads.unwrap_or_default(), p.ms_groupshared, p.min_wave, p.max_wave
+                        p.ms_max_vertices,
+                        p.ms_max_primitives,
+                        p.ms_topology,
+                        p.numthreads.unwrap_or_default(),
+                        p.ms_groupshared,
+                        p.min_wave,
+                        p.max_wave
                     ),
-                    Some(p) => format!("rodzaj {:?} threads{:?} fala{}-{}", p.kind, p.numthreads, p.min_wave, p.max_wave),
+                    Some(p) => format!(
+                        "rodzaj {:?} threads{:?} fala{}-{}",
+                        p.kind, p.numthreads, p.min_wave, p.max_wave
+                    ),
                     None => "brak PSV0".into(),
                 };
                 *e.psv.entry(key).or_default() += 1;
@@ -193,14 +235,19 @@ impl IfaceAgg {
             let hw = f.stages.first().map(|s| s.hw).unwrap_or(99);
             if sh.stage == "PS" && hw == 5 && !attrs.is_empty() {
                 self.ps += 1;
-                let regs: std::collections::BTreeSet<u32> = user(&isg).iter().map(|x| x.0).collect();
+                let regs: std::collections::BTreeSet<u32> =
+                    user(&isg).iter().map(|x| x.0).collect();
                 let inside = attrs.is_subset(&regs);
                 self.ps_in_regs += inside as usize;
                 self.ps_eq_regs += (attrs == regs) as usize;
                 let n = user(&isg).len() as u32;
                 self.ps_rank += attrs.iter().all(|&a| a < n) as usize;
                 // VGPR layout of the enabled PS inputs (hardware order, sizes 2/2/2/3/2/2/2/1…)
-                let ena = f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+                let ena = f
+                    .data
+                    .get(0x248..0x24C)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
                 let sizes = [2u64, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1];
                 let (mut at, mut pairs) = (0u64, std::collections::BTreeSet::new());
                 for (bit, sz) in sizes.iter().enumerate() {
@@ -217,15 +264,20 @@ impl IfaceAgg {
                 self.ps_ena_ij += ij_ok as usize;
                 self.ps_ena_reads += rd_ok as usize;
                 if (!ij_ok || !rd_ok) && self.ps_ena_examples.len() < 8 {
-                    self.ps_ena_examples.push(format!("{name}: ena {ena:#x} ({at} VGPR) I/J {ij:?} czytane przed zapisem {:?}", read.iter().take(12).collect::<Vec<_>>()));
+                    self.ps_ena_examples.push(format!(
+                        "{name}: ena {ena:#x} ({at} VGPR) I/J {ij:?} czytane przed zapisem {:?}",
+                        read.iter().take(12).collect::<Vec<_>>()
+                    ));
                 }
                 if !inside && self.ps_examples.len() < 8 {
-                    self.ps_examples.push(format!("{name}: attr {attrs:?} vs ISG1 {}", sig_txt(&isg)));
+                    self.ps_examples
+                        .push(format!("{name}: attr {attrs:?} vs ISG1 {}", sig_txt(&isg)));
                 }
             }
             if sh.stage == "VS" && (hw == 4 || hw == 2) {
                 self.vs += 1;
-                let regs: std::collections::BTreeSet<u32> = user(&osg).iter().map(|x| x.0).collect();
+                let regs: std::collections::BTreeSet<u32> =
+                    user(&osg).iter().map(|x| x.0).collect();
                 let inside = params.is_subset(&regs);
                 self.vs_param_in_regs += inside as usize;
                 self.vs_param_eq += (params == regs) as usize;
@@ -233,16 +285,27 @@ impl IfaceAgg {
                 let rank_ok = params.iter().all(|&a| a < n);
                 self.vs_rank += rank_ok as usize;
                 if !rank_ok && self.vs_param_examples.len() < 8 {
-                    self.vs_param_examples.push(format!("RANGA {name} [{}]: param {params:?} vs OSG1 {}", xbox::hw_stage_name(hw), sig_txt(&osg)));
+                    self.vs_param_examples.push(format!(
+                        "RANGA {name} [{}]: param {params:?} vs OSG1 {}",
+                        xbox::hw_stage_name(hw),
+                        sig_txt(&osg)
+                    ));
                 }
 
                 // attribute VGPRs the fetch shader fills: read before written, above the 4 system VGPRs
-                let ins: std::collections::BTreeSet<u64> = read.iter().copied().filter(|&v| v >= 4).collect();
+                let ins: std::collections::BTreeSet<u64> =
+                    read.iter().copied().filter(|&v| v >= 4).collect();
                 let u = user(&isg);
                 if !ins.is_empty() && !u.is_empty() {
                     self.vs_inputs += 1;
-                    let vec4: std::collections::BTreeSet<u64> =
-                        u.iter().flat_map(|(r, m, _)| (0..4).filter(move |c| m >> c & 1 == 1).map(move |c| 4 + 4 * *r as u64 + c)).collect();
+                    let vec4: std::collections::BTreeSet<u64> = u
+                        .iter()
+                        .flat_map(|(r, m, _)| {
+                            (0..4)
+                                .filter(move |c| m >> c & 1 == 1)
+                                .map(move |c| 4 + 4 * *r as u64 + c)
+                        })
+                        .collect();
                     let mut packed = std::collections::BTreeSet::new();
                     let mut sorted = u.clone();
                     sorted.sort();
@@ -253,23 +316,40 @@ impl IfaceAgg {
                         next += n;
                     }
                     // system values with a register (SV_VertexID / SV_InstanceID) arrive like attributes
-                    let sv_regs: Vec<u32> = isg.iter().filter(|e| matches!(e.system_value, 6 | 8)).map(|e| e.register).collect();
+                    let sv_regs: Vec<u32> = isg
+                        .iter()
+                        .filter(|e| matches!(e.system_value, 6 | 8))
+                        .map(|e| e.register)
+                        .collect();
                     for b in [4u64, 9] {
-                        let all: std::collections::BTreeSet<u64> =
-                            u.iter().map(|x| x.0).chain(sv_regs.iter().copied()).flat_map(|r| (0..4).map(move |c| b + 4 * r as u64 + c)).collect();
+                        let all: std::collections::BTreeSet<u64> = u
+                            .iter()
+                            .map(|x| x.0)
+                            .chain(sv_regs.iter().copied())
+                            .flat_map(|r| (0..4).map(move |c| b + 4 * r as u64 + c))
+                            .collect();
                         if ins.is_subset(&all) {
-                            *self.vs_base.entry(format!("{} pasuje v{b}+4r+c", xbox::hw_stage_name(hw))).or_default() += 1;
+                            *self
+                                .vs_base
+                                .entry(format!("{} pasuje v{b}+4r+c", xbox::hw_stage_name(hw)))
+                                .or_default() += 1;
                         } else if b == 4 && hw == 4 && self.vs_input_examples.len() < 8 {
                             let extra: Vec<u64> = ins.difference(&all).copied().collect();
-                            self.vs_input_examples.push(format!("v4 NIE: {name}: reads {ins:?} poza: {extra:?} | ISG1 {}", sig_txt(&isg)));
+                            self.vs_input_examples.push(format!(
+                                "v4 NIE: {name}: reads {ins:?} poza: {extra:?} | ISG1 {}",
+                                sig_txt(&isg)
+                            ));
                         }
                     }
-                    *self.vs_base.entry(format!("{} razem", xbox::hw_stage_name(hw))).or_default() += 1;
+                    *self
+                        .vs_base
+                        .entry(format!("{} razem", xbox::hw_stage_name(hw)))
+                        .or_default() += 1;
                     let a = ins.is_subset(&vec4);
                     let b = ins.is_subset(&packed);
                     self.vs_in_vec4 += a as usize;
                     self.vs_in_packed += b as usize;
-let _ = b;
+                    let _ = b;
                 }
             }
         }
@@ -365,13 +445,23 @@ impl RecompAgg {
                     *self.wave_hazards.entry(k.to_string()).or_default() += 1;
                 }
                 if !hz.is_empty() {
-                    *self.wave_hazards.entry("(programów z ryzykiem)".into()).or_default() += 1;
+                    *self
+                        .wave_hazards
+                        .entry("(programów z ryzykiem)".into())
+                        .or_default() += 1;
                 }
             } else {
                 self.graphics_wave32 += 1;
             }
         }
-        match recomp::translate(code, &recomp::Options { mode, wave64, ..Default::default() }) {
+        match recomp::translate(
+            code,
+            &recomp::Options {
+                mode,
+                wave64,
+                ..Default::default()
+            },
+        ) {
             Ok(t) => {
                 let e = self.by_mode.entry(label.to_string()).or_default();
                 e.0 += 1;
@@ -386,7 +476,10 @@ impl RecompAgg {
                     *self.why.entry(k.clone()).or_default() += 1;
                 }
                 if t.unsupported.len() == 1 {
-                    *self.sole.entry(t.unsupported.keys().next().unwrap().clone()).or_default() += 1;
+                    *self
+                        .sole
+                        .entry(t.unsupported.keys().next().unwrap().clone())
+                        .or_default() += 1;
                 }
                 if let (Some(want), None) = (EXAMPLE_FOR.get(), &self.example) {
                     // `--example MNEMONIC` (first program missing it) or `--example name=SUBSTR`
@@ -396,11 +489,17 @@ impl RecompAgg {
                     };
                     if hit {
                         let why: Vec<&String> = t.unsupported_why.keys().collect();
-                        let mut txt = format!("{name} (tryb {label}, wave{}): {why:?}
-", if wave64 { 64 } else { 32 });
+                        let mut txt = format!(
+                            "{name} (tryb {label}, wave{}): {why:?}
+",
+                            if wave64 { 64 } else { 32 }
+                        );
                         for l in crate::gpu::rdna2::disassemble(code, 0, false) {
-                            txt.push_str(&format!("  {:04x}: {}
-", l.pc, l.text));
+                            txt.push_str(&format!(
+                                "  {:04x}: {}
+",
+                                l.pc, l.text
+                            ));
                         }
                         self.example = Some((txt, t.hlsl.clone(), profile));
                     }
@@ -510,15 +609,29 @@ impl Agg {
         if multi > 0 || st.undecoded > 0 {
             self.odd_count += 1;
             if self.odd.len() < 20 {
-                self.odd.push(format!("{name}: FSSM z kilkoma programami: {multi}, niezdekodowane dwordy: {}", st.undecoded));
+                self.odd.push(format!(
+                    "{name}: FSSM z kilkoma programami: {multi}, niezdekodowane dwordy: {}",
+                    st.undecoded
+                ));
             }
         }
         if failed {
             self.failed_count += 1;
             if self.failed.len() < 20 {
-                let why: Vec<String> =
-                    sh.notes.iter().cloned().chain(sh.fssm.iter().filter_map(|f| f.error.clone())).collect();
-                self.failed.push(format!("{name}: {}", if why.is_empty() { "brak kodu / kod znaleziony skanowaniem".into() } else { why.join("; ") }));
+                let why: Vec<String> = sh
+                    .notes
+                    .iter()
+                    .cloned()
+                    .chain(sh.fssm.iter().filter_map(|f| f.error.clone()))
+                    .collect();
+                self.failed.push(format!(
+                    "{name}: {}",
+                    if why.is_empty() {
+                        "brak kodu / kod znaleziony skanowaniem".into()
+                    } else {
+                        why.join("; ")
+                    }
+                ));
             }
         }
         if self.iface_on {
@@ -534,17 +647,36 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    self.rc.add(
+                        &format!("{name} FSSM#{fi}"),
+                        &f.data[p.offset..p.offset + p.len],
+                        keep,
+                        mode.clone(),
+                    );
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
-                    if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
-                        let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
-                        let mut txt = format!("nagłówek FSSM {name} (do kodu, {end:#x} B):
-");
+                    if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name="))
+                        && !HEADER_SHOWN.swap(true, Ordering::Relaxed)
+                    {
+                        let end = f
+                            .code
+                            .map(|c| c.0)
+                            .unwrap_or(0x400)
+                            .min(f.data.len())
+                            .min(0x800);
+                        let mut txt = format!(
+                            "nagłówek FSSM {name} (do kodu, {end:#x} B):
+"
+                        );
                         for (i, c) in f.data[..end].chunks(4).enumerate() {
                             if i % 8 == 0 {
                                 txt.push_str(&format!("  {:04x}:", i * 4));
                             }
-                            let v = u32::from_le_bytes([c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0), *c.get(3).unwrap_or(&0)]);
+                            let v = u32::from_le_bytes([
+                                c[0],
+                                *c.get(1).unwrap_or(&0),
+                                *c.get(2).unwrap_or(&0),
+                                *c.get(3).unwrap_or(&0),
+                            ]);
                             txt.push_str(&format!(" {v:08x}"));
                             if i % 8 == 7 {
                                 txt.push(10 as char);
@@ -565,7 +697,10 @@ impl Agg {
 }
 
 enum Input {
-    Pack { data: Vec<u8>, records: Vec<pack::Record> },
+    Pack {
+        data: Vec<u8>,
+        records: Vec<pack::Record>,
+    },
     Files(Vec<PathBuf>),
 }
 
@@ -580,14 +715,19 @@ impl Input {
     /// (name, blob); blob is None when a record does not inflate
     fn get(&self, i: usize) -> (String, Option<Vec<u8>>) {
         match self {
-            Input::Pack { data, records } => (format!("{} @{:#x}", records[i].name, records[i].offset), pack::inflate(data, &records[i])),
+            Input::Pack { data, records } => (
+                format!("{} @{:#x}", records[i].name, records[i].offset),
+                pack::inflate(data, &records[i]),
+            ),
             Input::Files(f) => (f[i].display().to_string(), std::fs::read(&f[i]).ok()),
         }
     }
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort();
     for p in entries {
@@ -595,7 +735,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_files(&p, out);
             continue;
         }
-        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         // our own side files in <dane>\shaders\ (FSSM dumps, listings)
         if name.ends_with(".txt") || name.contains(".fssm") {
             continue;
@@ -607,12 +750,20 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
     let n = input.len();
     let next = AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(32);
     let parts: Vec<Agg> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(|| {
-                    let mut a = Agg { recomp_on, keep, iface_on, ..Default::default() };
+                    let mut a = Agg {
+                        recomp_on,
+                        keep,
+                        iface_on,
+                        ..Default::default()
+                    };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n {
@@ -629,7 +780,12 @@ fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut agg = Agg { recomp_on, keep, iface_on, ..Default::default() };
+    let mut agg = Agg {
+        recomp_on,
+        keep,
+        iface_on,
+        ..Default::default()
+    };
     for p in parts {
         agg.merge(p);
     }
@@ -639,32 +795,57 @@ fn analyze(input: &Input, recomp_on: bool, keep: usize, iface_on: bool) -> Agg {
 fn fmt_map(m: &BTreeMap<String, usize>) -> String {
     let mut v: Vec<_> = m.iter().collect();
     v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    v.iter().map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", ")
+    v.iter()
+        .map(|(k, c)| format!("{k} {c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Mnemonics in implementation order: used by the most shaders first (ties: more
 /// frequent first) – the order that unlocks whole shaders soonest.
 fn by_shader_count(agg: &Agg, ranked: &[(String, u64)]) -> Vec<String> {
-    let mut v: Vec<(&String, usize, u64)> = ranked.iter().map(|(m, c)| (m, agg.shader_count.get(m).copied().unwrap_or(0), *c)).collect();
+    let mut v: Vec<(&String, usize, u64)> = ranked
+        .iter()
+        .map(|(m, c)| (m, agg.shader_count.get(m).copied().unwrap_or(0), *c))
+        .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then_with(|| a.0.cmp(b.0)));
     v.into_iter().map(|x| x.0.clone()).collect()
 }
 
 /// Shaders whose every mnemonic is among the first `k` of `order`.
 fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
-    let rank: HashMap<&str, usize> = order.iter().enumerate().map(|(i, m)| (m.as_str(), i)).collect();
-    let max_rank: Vec<usize> = agg.sets.iter().map(|s| s.iter().map(|m| rank[m.as_str()] + 1).max().unwrap_or(0)).collect();
-    ks.iter().map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count())).collect()
+    let rank: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.as_str(), i))
+        .collect();
+    let max_rank: Vec<usize> = agg
+        .sets
+        .iter()
+        .map(|s| s.iter().map(|m| rank[m.as_str()] + 1).max().unwrap_or(0))
+        .collect();
+    ks.iter()
+        .map(|&k| (k, max_rank.iter().filter(|&&r| r <= k).count()))
+        .collect()
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
+    let opt = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<usize>().ok())
+    };
     let top = opt("--top").unwrap_or(60);
     let json = args.iter().any(|a| a == "--json");
     let compile = opt("--compile").unwrap_or(0);
     let recomp_on = compile > 0 || args.iter().any(|a| a == "--recomp");
     let iface_on = args.iter().any(|a| a == "--iface");
-    if let Some(m) = args.iter().position(|a| a == "--example").and_then(|i| args.get(i + 1)) {
+    if let Some(m) = args
+        .iter()
+        .position(|a| a == "--example")
+        .and_then(|i| args.get(i + 1))
+    {
         let _ = EXAMPLE_FOR.set(m.clone());
     }
     let t0 = std::time::Instant::now();
@@ -684,10 +865,19 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         };
         if data.starts_with(pack::RPF9_MAGIC) {
             let records = pack::scan(&data, 0x40);
-            let what = format!("paczka RPF9 {:.1} MB, {} rekordów shaderów", data.len() as f64 / 1048576.0, records.len());
+            let what = format!(
+                "paczka RPF9 {:.1} MB, {} rekordów shaderów",
+                data.len() as f64 / 1048576.0,
+                records.len()
+            );
             (Input::Pack { data, records }, what)
         } else {
-            let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
+            let mut a = Agg {
+                recomp_on,
+                keep: compile,
+                iface_on,
+                ..Default::default()
+            };
             a.add(&path.display().to_string(), &data);
             return print(path, "pojedynczy plik", a, top, json, t0, compile);
         }
@@ -707,10 +897,22 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 fn precompile(input: &Input, limit: usize, t0: std::time::Instant) -> i32 {
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
-    let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (done, compiled, cached, failed, skipped) = (
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    );
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-    println!("prekompilacja {n} shaderów do {} ({threads} wątków)", recomp::dxc::cache_dir().display());
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);
+    println!(
+        "prekompilacja {n} shaderów do {} ({threads} wątków)",
+        recomp::dxc::cache_dir().display()
+    );
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
@@ -720,14 +922,21 @@ fn precompile(input: &Input, limit: usize, t0: std::time::Instant) -> i32 {
                 }
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
-                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(sh) = xbox::parse(&blob) else {
+                    continue;
+                };
                 for f in &sh.fssm {
-                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    let Some(mode) = recomp::interface(&blob, &sh, f) else {
+                        continue;
+                    };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
                         recomp::Mode::Vertex(_) => vec![("vs_6_6", None)],
                         recomp::Mode::Pixel(_) => vec![("ps_6_6", None)],
                         recomp::Mode::Compute(_) => vec![("cs_6_6", None)],
-                        recomp::Mode::Mesh(ms) => vec![("cs_6_6", None), ("ms_6_6", Some(recomp::mesh_passthrough(ms)))],
+                        recomp::Mode::Mesh(ms) => vec![
+                            ("cs_6_6", None),
+                            ("ms_6_6", Some(recomp::mesh_passthrough(ms))),
+                        ],
                         _ => {
                             skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -735,19 +944,32 @@ fn precompile(input: &Input, limit: usize, t0: std::time::Instant) -> i32 {
                     };
                     for p in &f.programs {
                         let code = &f.data[p.offset..p.offset + p.len];
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
-                        let Ok(t) = recomp::translate(code, &opt) else { continue };
+                        let opt = recomp::Options {
+                            mode: mode.clone(),
+                            wave64: recomp::detect_wave64(code),
+                            ..Default::default()
+                        };
+                        let Ok(t) = recomp::translate(code, &opt) else {
+                            continue;
+                        };
                         if !t.complete() {
                             continue;
                         }
                         for (profile, src) in &jobs {
-                            match recomp::dxc::compile_cached(src.as_deref().unwrap_or(&t.hlsl), "main", profile) {
+                            match recomp::dxc::compile_cached(
+                                src.as_deref().unwrap_or(&t.hlsl),
+                                "main",
+                                profile,
+                            ) {
                                 Ok((_, true)) => cached.fetch_add(1, Ordering::Relaxed),
                                 Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
                                 Err(e) => {
                                     let mut g = errors.lock().unwrap();
                                     if g.len() < 10 {
-                                        g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or("")));
+                                        g.push(format!(
+                                            "{name}: {}",
+                                            e.lines().find(|l| l.contains("error")).unwrap_or("")
+                                        ));
                                     }
                                     failed.fetch_add(1, Ordering::Relaxed)
                                 }
@@ -781,7 +1003,10 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let times: Mutex<Vec<(f64, usize, String)>> = Mutex::new(Vec::new());
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16);
     let parts: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
@@ -789,13 +1014,24 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
                     let (mut ok, mut bad) = (0usize, Vec::new());
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((name, hlsl, profile)) = samples.get(i) else { break };
+                        let Some((name, hlsl, profile)) = samples.get(i) else {
+                            break;
+                        };
                         let t0 = std::time::Instant::now();
                         match recomp::dxc::compile(hlsl, "main", profile, &[]) {
                             Ok(_) => ok += 1,
-                            Err(e) => bad.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.as_str()))),
+                            Err(e) => bad.push(format!(
+                                "{name}: {}",
+                                e.lines()
+                                    .find(|l| l.contains("error"))
+                                    .unwrap_or(e.as_str())
+                            )),
                         }
-                        times.lock().unwrap().push((t0.elapsed().as_secs_f64(), hlsl.len(), name.clone()));
+                        times.lock().unwrap().push((
+                            t0.elapsed().as_secs_f64(),
+                            hlsl.len(),
+                            name.clone(),
+                        ));
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if n % 100 == 0 {
                             eprintln!("DXC: {n}/{}", samples.len());
@@ -828,13 +1064,29 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::time::Instant, compile: usize) -> i32 {
+fn print(
+    path: &Path,
+    what: &str,
+    agg: Agg,
+    top: usize,
+    json: bool,
+    t0: std::time::Instant,
+    compile: usize,
+) -> i32 {
     let rc = &agg.rc;
-    let compiled = if compile > 0 && !rc.samples.is_empty() { Some(compile_samples(&rc.samples)) } else { None };
+    let compiled = if compile > 0 && !rc.samples.is_empty() {
+        Some(compile_samples(&rc.samples))
+    } else {
+        None
+    };
     let mut missing: Vec<(&String, &(usize, usize))> = rc.missing.iter().collect();
     missing.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(b.0)));
     let ranked = agg.insts.sorted();
-    let ks: Vec<usize> = [10, 25, 50, 75, 100, 150, 200, 300].into_iter().filter(|&k| k < ranked.len()).chain([ranked.len()]).collect();
+    let ks: Vec<usize> = [10, 25, 50, 75, 100, 150, 200, 300]
+        .into_iter()
+        .filter(|&k| k < ranked.len())
+        .chain([ranked.len()])
+        .collect();
     let order = by_shader_count(&agg, &ranked);
     let cov = coverage(&agg, &order, &ks);
     let n_xbox = agg.sets.len();
@@ -887,40 +1139,73 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
     }
 
     println!("{} – {what}", path.display());
-    println!("shaderów: {}{}", agg.total, if agg.inflate_errors > 0 { format!(" (+{} rekordów nie dało się rozpakować)", agg.inflate_errors) } else { String::new() });
+    println!(
+        "shaderów: {}{}",
+        agg.total,
+        if agg.inflate_errors > 0 {
+            format!(
+                " (+{} rekordów nie dało się rozpakować)",
+                agg.inflate_errors
+            )
+        } else {
+            String::new()
+        }
+    );
     println!("formaty: {}", fmt_map(&agg.by_kind));
     if n_xbox == 0 {
         println!("brak kontenerów konsolowych (xbox-native)");
         return 0;
     }
     println!("etapy (DXIL): {}", fmt_map(&agg.by_stage));
-    println!("warianty FSSM wg etapu sprzętowego: {}", fmt_map(&agg.by_hw));
-    println!("FSSM: {}, programów: {}, bloków danych w kodzie: {}, FSSM bez kodu: {}", agg.fssm, agg.programs, agg.data_blocks, agg.no_code);
+    println!(
+        "warianty FSSM wg etapu sprzętowego: {}",
+        fmt_map(&agg.by_hw)
+    );
+    println!(
+        "FSSM: {}, programów: {}, bloków danych w kodzie: {}, FSSM bez kodu: {}",
+        agg.fssm, agg.programs, agg.data_blocks, agg.no_code
+    );
     println!(
         "instrukcje RDNA2: {}, niezdekodowane dwordy: {} ({:.4}%), różnych mnemoników: {}",
         agg.insts.instructions,
         agg.insts.undecoded,
-        agg.insts.undecoded as f64 * 100.0 / (agg.insts.instructions + agg.insts.undecoded).max(1) as f64,
+        agg.insts.undecoded as f64 * 100.0
+            / (agg.insts.instructions + agg.insts.undecoded).max(1) as f64,
         ranked.len()
     );
     if agg.failed_count > 0 {
-        println!("problemy z parsowaniem: {} kontenerów, np.:", agg.failed_count);
+        println!(
+            "problemy z parsowaniem: {} kontenerów, np.:",
+            agg.failed_count
+        );
         for f in &agg.failed {
             println!("  {f}");
         }
     }
     if agg.odd_count > 0 {
-        println!("nietypowe: {} kontenerów (kilka programów w FSSM lub niezdekodowane dwordy), np.:", agg.odd_count);
+        println!(
+            "nietypowe: {} kontenerów (kilka programów w FSSM lub niezdekodowane dwordy), np.:",
+            agg.odd_count
+        );
         for o in agg.odd.iter().take(10) {
             println!("  {o}");
         }
     }
     println!("pokrycie: shadery złożone wyłącznie z K pierwszych mnemoników (kolejność: w ilu shaderach występuje):");
     for (k, c) in &cov {
-        let last = order.get(k.saturating_sub(1)).map(String::as_str).unwrap_or("");
-        println!("  K = {k:>4}: {c:>6} / {n_xbox} ({:>5.1}%)   K-ty: {last}", *c as f64 * 100.0 / n_xbox as f64);
+        let last = order
+            .get(k.saturating_sub(1))
+            .map(String::as_str)
+            .unwrap_or("");
+        println!(
+            "  K = {k:>4}: {c:>6} / {n_xbox} ({:>5.1}%)   K-ty: {last}",
+            *c as f64 * 100.0 / n_xbox as f64
+        );
     }
-    println!("top {} mnemoników (liczba, % instrukcji, % narastająco, w ilu shaderach):", top.min(ranked.len()));
+    println!(
+        "top {} mnemoników (liczba, % instrukcji, % narastająco, w ilu shaderach):",
+        top.min(ranked.len())
+    );
     let mut cum = 0u64;
     for (i, (m, c)) in ranked.iter().take(top).enumerate() {
         cum += c;
@@ -985,7 +1270,11 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         for (k, e) in &i.inputs {
             let pct = |n: usize| n * 100 / e.programs.max(1);
             let list = |m: &BTreeMap<u64, usize>, f: &dyn Fn(u64) -> String| {
-                m.iter().filter(|(_, &n)| pct(n) >= 1).map(|(r, &n)| format!("{} {}%", f(*r), pct(n))).collect::<Vec<_>>().join(", ")
+                m.iter()
+                    .filter(|(_, &n)| pct(n) >= 1)
+                    .map(|(r, &n)| format!("{} {}%", f(*r), pct(n)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             println!("    {k}: {} programów", e.programs);
             println!("      VGPR: {}", list(&e.vgpr, &|r| format!("v{r}")));
@@ -994,9 +1283,21 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             println!("      sendmsg: {}", list(&e.sendmsg, &|m| m.to_string()));
             let mut ps: Vec<_> = e.psv.iter().collect();
             ps.sort_by(|a, b| b.1.cmp(a.1));
-            println!("      PSV0: {}", ps.iter().take(6).map(|(k, n)| format!("{k}: {n}")).collect::<Vec<_>>().join("; "));
+            println!(
+                "      PSV0: {}",
+                ps.iter()
+                    .take(6)
+                    .map(|(k, n)| format!("{k}: {n}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
             let mut fu: Vec<_> = e.first_use.iter().collect();
-            fu.sort_by(|a, b| a.0.split(':').next().cmp(&b.0.split(':').next()).then(b.1.cmp(a.1)));
+            fu.sort_by(|a, b| {
+                a.0.split(':')
+                    .next()
+                    .cmp(&b.0.split(':').next())
+                    .then(b.1.cmp(a.1))
+            });
             let mut shown: BTreeMap<String, usize> = BTreeMap::new();
             for (k, n) in fu {
                 let reg = k.split(':').next().unwrap_or("").to_string();
@@ -1007,7 +1308,10 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
                 *c += 1;
             }
         }
-        println!("  układ wejść VS (najmniejsza baza B: wejścia ⊆ B + 4·rejestr + komponent): {}", fmt_map(&i.vs_base));
+        println!(
+            "  układ wejść VS (najmniejsza baza B: wejścia ⊆ B + 4·rejestr + komponent): {}",
+            fmt_map(&i.vs_base)
+        );
     }
     if agg.recomp_on {
         println!(
@@ -1023,11 +1327,17 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             println!("  błąd: {e}");
         }
         for (m, (n, c)) in &rc.by_mode {
-            println!("  tryb {m}: {n} programów, w całości {c} ({:.1}%)", *c as f64 * 100.0 / (*n).max(1) as f64);
+            println!(
+                "  tryb {m}: {n} programów, w całości {c} ({:.1}%)",
+                *c as f64 * 100.0 / (*n).max(1) as f64
+            );
         }
         println!("brakujące instrukcje (w ilu programach; ile programów blokuje jako jedyna brakująca; liczba wystąpień):");
         for (m, (n, p)) in missing.iter().take(top) {
-            println!("  {m:<34} {p:>6} {:>6} {n:>9}", rc.sole.get(*m).copied().unwrap_or(0));
+            println!(
+                "  {m:<34} {p:>6} {:>6} {n:>9}",
+                rc.sole.get(*m).copied().unwrap_or(0)
+            );
         }
         let mut why: Vec<(&String, &usize)> = rc.why.iter().collect();
         why.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -1040,11 +1350,16 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards
         );
         if let Some((x, hlsl, profile)) = &rc.example {
-            println!("przykład:
-{x}");
+            println!(
+                "przykład:
+{x}"
+            );
             match recomp::dxc::compile(hlsl, "main", profile, &[]) {
                 Ok(b) => println!("DXC ({profile}): OK, {} B DXIL", b.len()),
-                Err(e) => println!("DXC ({profile}): {}", e.split("--- HLSL ---").next().unwrap_or("").trim()),
+                Err(e) => println!(
+                    "DXC ({profile}): {}",
+                    e.split("--- HLSL ---").next().unwrap_or("").trim()
+                ),
             }
             if let Ok(path) = std::env::var("XCL_EXAMPLE_HLSL") {
                 let _ = std::fs::write(&path, hlsl);
@@ -1052,7 +1367,10 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             }
         }
         if let Some((ok, bad)) = &compiled {
-            println!("DXC (vs/ps/cs_6_6) na próbce pełnych tłumaczeń: {ok} OK, {} błędów", bad.len());
+            println!(
+                "DXC (vs/ps/cs_6_6) na próbce pełnych tłumaczeń: {ok} OK, {} błędów",
+                bad.len()
+            );
             for b in bad.iter().take(10) {
                 println!("  {b}");
             }
@@ -1071,7 +1389,10 @@ mod tests {
     fn aggregates_console_shaders() {
         let mut a = Agg::default();
         a.add("PS_a", &sample(0, &[fssm(&CODE, &[(5, 1)])]));
-        a.add("VS_b", &sample(1, &[fssm(&CODE, &[(2, 0)]), fssm(&CODE, &[(4, 0)])]));
+        a.add(
+            "VS_b",
+            &sample(1, &[fssm(&CODE, &[(2, 0)]), fssm(&CODE, &[(4, 0)])]),
+        );
         a.add("junk", b"not a shader");
         assert_eq!(a.total, 3);
         assert_eq!(a.by_kind.get("xbox-native"), Some(&2));
@@ -1100,7 +1421,12 @@ mod tests {
         records.truncate(300);
         let agg = analyze(&Input::Pack { data, records }, false, 0, false);
         assert_eq!(agg.inflate_errors, 0);
-        assert_eq!(agg.by_kind.get("xbox-native"), Some(&agg.total), "{:?}", agg.by_kind);
+        assert_eq!(
+            agg.by_kind.get("xbox-native"),
+            Some(&agg.total),
+            "{:?}",
+            agg.by_kind
+        );
         assert_eq!(agg.failed_count, 0, "{:?}", agg.failed);
         assert_eq!(agg.insts.undecoded, 0);
     }

@@ -64,12 +64,22 @@ pub fn map_image(path: &Path) -> Result<Arc<MappedModule>, String> {
 fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String> {
     let file = std::fs::read(path).map_err(|e| format!("odczyt {}: {e}", path.display()))?;
     let pe = Pe::parse(&file, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
-    let name = crate::util::dll_key(&path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    let name = crate::util::dll_key(
+        &path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
     let size = pe.size_of_image as usize;
 
     // 1. reserve + commit
     let mut base = unsafe {
-        VirtualAlloc(pe.image_base as *const c_void, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        VirtualAlloc(
+            pe.image_base as *const c_void,
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
     } as usize;
     if base == 0 {
         if !pe.has_relocs() {
@@ -78,7 +88,14 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                 pe.image_base
             ));
         }
-        base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
         if base == 0 {
             return Err(format!("{name}: VirtualAlloc({size:#x}) nie powiodło się"));
         }
@@ -102,7 +119,11 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             if src + raw > file.len() || s.va as usize + raw > size {
                 return fail(format!("{name}: sekcja {} poza plikiem/obrazem", s.name));
             }
-            std::ptr::copy_nonoverlapping(file.as_ptr().add(src), (base + s.va as usize) as *mut u8, raw);
+            std::ptr::copy_nonoverlapping(
+                file.as_ptr().add(src),
+                (base + s.va as usize) as *mut u8,
+                raw,
+            );
         }
     }
 
@@ -124,7 +145,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                         let v = (p as *mut u32).read_unaligned();
                         (p as *mut u32).write_unaligned((v as i64 + delta) as u32);
                     }
-                    k => crate::xlog_warn!("{name}: nieobsługiwany typ relokacji {k} @ {:#x}", r.rva),
+                    k => {
+                        crate::xlog_warn!("{name}: nieobsługiwany typ relokacji {k} @ {:#x}", r.rva)
+                    }
                 }
             }
         }
@@ -173,7 +196,9 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         }
         if dll.delay && dll.module_handle_rva != 0 {
             let h = resolver::load_library(&dll.dll).unwrap_or(1);
-            unsafe { ((base + dll.module_handle_rva as usize) as *mut u64).write_unaligned(h as u64) };
+            unsafe {
+                ((base + dll.module_handle_rva as usize) as *mut u64).write_unaligned(h as u64)
+            };
         }
     }
 
@@ -199,13 +224,23 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     // 6. page protections
     unsafe {
         let mut old = 0u32;
-        VirtualProtect(base as *const c_void, pe.size_of_headers as usize, PAGE_READONLY, &mut old);
+        VirtualProtect(
+            base as *const c_void,
+            pe.size_of_headers as usize,
+            PAGE_READONLY,
+            &mut old,
+        );
         for s in &pe.sections {
             let len = ((s.mapped_size() as usize) + 0xFFF) & !0xFFF;
             if len == 0 {
                 continue;
             }
-            VirtualProtect((base + s.va as usize) as *const c_void, len, section_protection(s.characteristics), &mut old);
+            VirtualProtect(
+                (base + s.va as usize) as *const c_void,
+                len,
+                section_protection(s.characteristics),
+                &mut old,
+            );
         }
         windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -222,12 +257,22 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     Ok(module)
 }
 
-unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
+unsafe fn tls_install(
+    m: &MappedModule,
+    template: usize,
+    len: usize,
+    total: u64,
+    index_ptr: *mut u32,
+) -> Result<(), String> {
     crate::tls::install(&m.name, template, len, total, index_ptr, &cache_dir()).map(|_| ())
 }
 
 unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
-    let cbs = m.tls_callbacks.lock().map(|v| v.clone()).unwrap_or_default();
+    let cbs = m
+        .tls_callbacks
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
     for cb in cbs {
         let f: TlsCallback = std::mem::transmute(cb);
         f(m.base as *mut c_void, reason, std::ptr::null_mut());
@@ -258,7 +303,11 @@ impl LoadGuard {
             c.set(v + 1);
             v == 0
         });
-        let g = if outer { Some(LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner())) } else { None };
+        let g = if outer {
+            Some(LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
         (LoadGuard, g)
     }
 }
@@ -312,7 +361,8 @@ unsafe extern "system" fn main_thread(param: *mut c_void) -> u32 {
 pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
-        CreateThread, GetExitCodeThread, WaitForSingleObject, INFINITE, STACK_SIZE_PARAM_IS_A_RESERVATION,
+        CreateThread, GetExitCodeThread, WaitForSingleObject, INFINITE,
+        STACK_SIZE_PARAM_IS_A_RESERVATION,
     };
     unsafe {
         // PEB.ImageBaseAddress → GetModuleHandle(NULL), resources with NULL module, …
@@ -321,7 +371,9 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     }
     READY.store(true, Ordering::Release);
     let stack = (m.stack_reserve as usize).max(1 << 20);
-    let args = Box::into_raw(Box::new(EntryArgs { entry: m.base + m.entry_rva as usize }));
+    let args = Box::into_raw(Box::new(EntryArgs {
+        entry: m.base + m.entry_rva as usize,
+    }));
     crate::xlog_info!(
         "start {}: punkt wejścia {} , stos {:#x}",
         m.name,
@@ -362,7 +414,11 @@ pub fn on_tls_event(reason: u32) {
             }
             for m in modules::mapped_modules() {
                 run_tls_callbacks(&m, 2);
-                if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
+                if m.is_dll
+                    && m.initialized.load(Ordering::Acquire)
+                    && !m.no_thread_calls.load(Ordering::Relaxed)
+                    && m.entry_rva != 0
+                {
                     let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
                     f(m.base as *mut c_void, 2, std::ptr::null_mut());
                 }
@@ -373,7 +429,11 @@ pub fn on_tls_event(reason: u32) {
                 return;
             }
             for m in modules::mapped_modules().into_iter().rev() {
-                if m.is_dll && m.initialized.load(Ordering::Acquire) && !m.no_thread_calls.load(Ordering::Relaxed) && m.entry_rva != 0 {
+                if m.is_dll
+                    && m.initialized.load(Ordering::Acquire)
+                    && !m.no_thread_calls.load(Ordering::Relaxed)
+                    && m.entry_rva != 0
+                {
                     let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
                     f(m.base as *mut c_void, 3, std::ptr::null_mut());
                 }

@@ -38,8 +38,17 @@ pub struct HleModule {
 pub const SELF: &str = "@self";
 
 impl HleModule {
-    fn new(name: &'static str, list: Vec<(&'static str, usize)>, fallback: &'static [&'static str]) -> Self {
-        HleModule { name, exports: list.into_iter().collect(), ordinals: HashMap::new(), fallback }
+    fn new(
+        name: &'static str,
+        list: Vec<(&'static str, usize)>,
+        fallback: &'static [&'static str],
+    ) -> Self {
+        HleModule {
+            name,
+            exports: list.into_iter().collect(),
+            ordinals: HashMap::new(),
+            fallback,
+        }
     }
 
     /// Kernel family: the names routed here (kernel32.dll, api-ms-win-core-*) are real
@@ -73,7 +82,11 @@ pub const XAUDIO2: &str = "xaudio2_9.dll";
 
 fn build(config: &Config) -> Registry {
     let modules = vec![
-        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll"]),
+        HleModule::new(
+            KERNELX,
+            kernelx::exports(),
+            &[SELF, "kernelbase.dll", "kernel32.dll"],
+        ),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
@@ -97,7 +110,13 @@ fn build(config: &Config) -> Registry {
         }
     }
     let k = idx(KERNELX);
-    for p in ["kernelx.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-*", "ext-ms-win-core-*"] {
+    for p in [
+        "kernelx.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "api-ms-win-core-*",
+        "ext-ms-win-core-*",
+    ] {
         routes.push((p.into(), Route::Hle(k)));
     }
     let x = idx(XGAMERUNTIME);
@@ -125,7 +144,10 @@ pub fn registry() -> &'static Registry {
 
 impl Registry {
     pub fn route(&self, dll_key: &str) -> Option<&Route> {
-        self.routes.iter().find(|(p, _)| glob_match(p, dll_key)).map(|(_, r)| r)
+        self.routes
+            .iter()
+            .find(|(p, _)| glob_match(p, dll_key))
+            .map(|(_, r)| r)
     }
 
     pub fn module_by_name(&self, name: &str) -> Option<&HleModule> {
@@ -175,11 +197,15 @@ mod tests {
         let mut c = Config::default();
         c.aliases.insert("kernel32.dll".into(), "@system".into());
         c.aliases.insert("mystery*.dll".into(), "@stub".into());
-        c.aliases.insert("xboxthing.dll".into(), "xgameruntime".into());
+        c.aliases
+            .insert("xboxthing.dll".into(), "xgameruntime".into());
         let r = build(&c);
         assert_eq!(r.route("kernel32.dll"), Some(&Route::System));
         assert_eq!(r.route("mystery42.dll"), Some(&Route::Stub));
-        assert_eq!(r.hle_for("xboxthing.dll").map(|m| m.name), Some(XGAMERUNTIME));
+        assert_eq!(
+            r.hle_for("xboxthing.dll").map(|m| m.name),
+            Some(XGAMERUNTIME)
+        );
     }
 
     #[test]

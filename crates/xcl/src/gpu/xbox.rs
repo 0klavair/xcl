@@ -44,16 +44,32 @@ const S_CODE_END: u32 = 0xBF9F_0000;
 const MAX_FSSM: usize = 64 << 20;
 
 const DXIL_KINDS: [&str; 16] = [
-    "PS", "VS", "GS", "HS", "DS", "CS", "Library", "RayGen", "Intersection", "AnyHit", "ClosestHit", "Miss", "Callable",
-    "MS", "AS", "Node",
+    "PS",
+    "VS",
+    "GS",
+    "HS",
+    "DS",
+    "CS",
+    "Library",
+    "RayGen",
+    "Intersection",
+    "AnyHit",
+    "ClosestHit",
+    "Miss",
+    "Callable",
+    "MS",
+    "AS",
+    "Node",
 ];
 
 fn rd32(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o.checked_add(4)?).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    b.get(o..o.checked_add(4)?)
+        .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
 }
 
 fn rd64(b: &[u8], o: usize) -> Option<u64> {
-    b.get(o..o.checked_add(8)?).map(|x| u64::from_le_bytes(x.try_into().unwrap()))
+    b.get(o..o.checked_add(8)?)
+        .map(|x| u64::from_le_bytes(x.try_into().unwrap()))
 }
 
 /// PAL hardware stage numbering (Ls, Hs, Es, Gs, Vs, Ps, Cs); 7 only appears for mesh
@@ -102,7 +118,11 @@ pub struct HwStage {
 
 impl HwStage {
     pub fn label(&self) -> String {
-        format!("{} (API {})", hw_stage_name(self.hw), api_stage_name(self.api))
+        format!(
+            "{} (API {})",
+            hw_stage_name(self.hw),
+            api_stage_name(self.api)
+        )
     }
 }
 
@@ -147,7 +167,11 @@ impl Fssm {
         if self.stages.is_empty() {
             return "?".into();
         }
-        self.stages.iter().map(|s| hw_stage_name(s.hw)).collect::<Vec<_>>().join("+")
+        self.stages
+            .iter()
+            .map(|s| hw_stage_name(s.hw))
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
@@ -171,7 +195,9 @@ fn find_xdat(blob: &[u8]) -> Option<(super::shader::Part, usize)> {
     let dxil = parts.into_iter().find(|p| p.fourcc == "DXIL")?;
     let d = &blob[dxil.offset..dxil.offset + dxil.size];
     // XDAT normally sits right after the 24-byte program header
-    let x = (0..d.len().min(256).saturating_sub(3)).step_by(4).find(|&o| &d[o..o + 4] == b"XDAT")?;
+    let x = (0..d.len().min(256).saturating_sub(3))
+        .step_by(4)
+        .find(|&o| &d[o..o + 4] == b"XDAT")?;
     Some((dxil, x))
 }
 
@@ -187,24 +213,38 @@ pub fn parse(blob: &[u8]) -> Option<XboxShader> {
     let d = &blob[dxil.offset..dxil.offset + dxil.size];
     let pv = rd32(d, 0).unwrap_or(0);
     let mut sh = XboxShader {
-        stage: DXIL_KINDS.get((pv >> 16) as usize).map(|s| s.to_string()).unwrap_or_else(|| format!("kind#{}", pv >> 16)),
+        stage: DXIL_KINDS
+            .get((pv >> 16) as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("kind#{}", pv >> 16)),
         shader_model: (((pv >> 4) & 0xf) as u8, (pv & 0xf) as u8),
         dxil_offset: dxil.offset,
         xdat_offset: dxil.offset + x,
         ..Default::default()
     };
     if x != 0x18 {
-        sh.notes.push(format!("XDAT pod +{x:#x} w części DXIL (oczekiwano +0x18)"));
+        sh.notes
+            .push(format!("XDAT pod +{x:#x} w części DXIL (oczekiwano +0x18)"));
     }
     match xdat_entries(d, x) {
-        Some(e) => sh.entries = e.into_iter().map(|(id, o, s)| XdatEntry { id, offset: dxil.offset + o, size: s }).collect(),
+        Some(e) => {
+            sh.entries = e
+                .into_iter()
+                .map(|(id, o, s)| XdatEntry {
+                    id,
+                    offset: dxil.offset + o,
+                    size: s,
+                })
+                .collect()
+        }
         None => sh.notes.push("nie udało się odczytać tabeli XDAT".into()),
     }
     for e in &sh.entries {
         let data = &blob[e.offset..e.offset + e.size];
         if data.starts_with(b"XBCH") {
             if e.id != XDAT_XBCH {
-                sh.notes.push(format!("XBCH we wpisie o nieoczekiwanym id {:#x}", e.id));
+                sh.notes
+                    .push(format!("XBCH we wpisie o nieoczekiwanym id {:#x}", e.id));
             }
             sh.fssm.push(parse_xbch(data, e.offset));
         } else if e.id == XDAT_HASH && e.size == 16 {
@@ -214,7 +254,8 @@ pub fn parse(blob: &[u8]) -> Option<XboxShader> {
         }
     }
     if sh.fssm.is_empty() {
-        sh.notes.push("brak FSSM (kodu natywnego) w kontenerze".into());
+        sh.notes
+            .push("brak FSSM (kodu natywnego) w kontenerze".into());
     }
     Some(sh)
 }
@@ -232,11 +273,20 @@ fn xdat_entries(d: &[u8], x: usize) -> Option<Vec<(u32, usize, usize)>> {
             continue;
         }
         let raw: Vec<(u32, usize, usize)> = (0..count)
-            .map(|i| (rd32(d, table + i * 12).unwrap(), rd32(d, table + i * 12 + 4).unwrap() as usize, rd32(d, table + i * 12 + 8).unwrap() as usize))
+            .map(|i| {
+                (
+                    rd32(d, table + i * 12).unwrap(),
+                    rd32(d, table + i * 12 + 4).unwrap() as usize,
+                    rd32(d, table + i * 12 + 8).unwrap() as usize,
+                )
+            })
             .collect();
         // entry offsets: relative to the program header (seen in practice) or to XDAT
         for base in [0usize, x] {
-            if raw.iter().all(|&(_, o, s)| base + o >= table + count * 12 && base + o + s <= d.len()) {
+            if raw
+                .iter()
+                .all(|&(_, o, s)| base + o >= table + count * 12 && base + o + s <= d.len())
+            {
                 return Some(raw.iter().map(|&(id, o, s)| (id, base + o, s)).collect());
             }
         }
@@ -245,11 +295,19 @@ fn xdat_entries(d: &[u8], x: usize) -> Option<Vec<(u32, usize, usize)>> {
 }
 
 fn is_zlib_header(b: &[u8]) -> bool {
-    b.len() >= 2 && b[0] & 0x0f == 8 && b[0] >> 4 <= 7 && ((b[0] as u16) << 8 | b[1] as u16) % 31 == 0 && b[1] & 0x20 == 0
+    b.len() >= 2
+        && b[0] & 0x0f == 8
+        && b[0] >> 4 <= 7
+        && ((b[0] as u16) << 8 | b[1] as u16) % 31 == 0
+        && b[1] & 0x20 == 0
 }
 
 fn parse_xbch(x: &[u8], blob_offset: usize) -> Fssm {
-    let mut f = Fssm { xbch_offset: blob_offset, xbch_version: rd32(x, 4).unwrap_or(0), ..Default::default() };
+    let mut f = Fssm {
+        xbch_offset: blob_offset,
+        xbch_version: rd32(x, 4).unwrap_or(0),
+        ..Default::default()
+    };
     let csize = rd32(x, 8).unwrap_or(0) as usize;
     let rsize = rd32(x, 0x10).unwrap_or(0) as usize;
     let start = if x.len() > 0x18 && is_zlib_header(&x[0x18..]) {
@@ -261,13 +319,24 @@ fn parse_xbch(x: &[u8], blob_offset: usize) -> Fssm {
         f.error = Some("XBCH: nie znaleziono strumienia zlib".into());
         return f;
     };
-    let end = if csize > 0 && start + csize <= x.len() { start + csize } else { x.len() };
+    let end = if csize > 0 && start + csize <= x.len() {
+        start + csize
+    } else {
+        x.len()
+    };
     f.compressed = end - start;
-    let limit = if rsize > 0 && rsize <= MAX_FSSM { rsize } else { MAX_FSSM };
+    let limit = if rsize > 0 && rsize <= MAX_FSSM {
+        rsize
+    } else {
+        MAX_FSSM
+    };
     match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&x[start..end], limit) {
         Ok(data) => {
             if rsize != 0 && data.len() != rsize {
-                f.error = Some(format!("XBCH: rozpakowano {} B, nagłówek podaje {rsize} B", data.len()));
+                f.error = Some(format!(
+                    "XBCH: rozpakowano {} B, nagłówek podaje {rsize} B",
+                    data.len()
+                ));
             }
             f.data = data;
             analyze_fssm(&mut f);
@@ -285,8 +354,14 @@ fn analyze_fssm(f: &mut Fssm) {
         if let (Some(off), Some(len)) = (rd64(d, 0xC0), rd64(d, 0xC8)) {
             let (off, len) = (off as usize, len as usize);
             let start = off.wrapping_add(0x10);
-            if off < d.len() && len > 0 && start % 4 == 0 && start.checked_add(len).is_some_and(|e| e <= d.len()) {
-                let has_end = d[start..start + len].chunks_exact(4).any(|w| u32::from_le_bytes(w.try_into().unwrap()) == S_ENDPGM);
+            if off < d.len()
+                && len > 0
+                && start % 4 == 0
+                && start.checked_add(len).is_some_and(|e| e <= d.len())
+            {
+                let has_end = d[start..start + len]
+                    .chunks_exact(4)
+                    .any(|w| u32::from_le_bytes(w.try_into().unwrap()) == S_ENDPGM);
                 if has_end {
                     f.code = Some((start, len));
                     f.code_from_header = true;
@@ -302,7 +377,11 @@ fn analyze_fssm(f: &mut Fssm) {
         while o + 8 <= code_start {
             let q = rd64(d, o).unwrap();
             if q >> 16 == 0xC0_0002 && q & 0xff <= 7 {
-                f.stages.push(HwStage { offset: o, hw: q as u8, api: (q >> 8) as u8 });
+                f.stages.push(HwStage {
+                    offset: o,
+                    hw: q as u8,
+                    api: (q >> 8) as u8,
+                });
             }
             o += 8;
         }
@@ -318,7 +397,10 @@ fn analyze_fssm(f: &mut Fssm) {
         let mut targets: Vec<u64> = Vec::new();
         for (i, p) in split_segments(code).into_iter().enumerate() {
             if p.counted_data {
-                f.data_blocks.push(Program { offset: o + p.offset, len: p.len });
+                f.data_blocks.push(Program {
+                    offset: o + p.offset,
+                    len: p.len,
+                });
                 continue;
             }
             let seg = &code[p.offset..p.offset + p.len];
@@ -333,13 +415,21 @@ fn analyze_fssm(f: &mut Fssm) {
                 continue; // lone s_endpgm guarding the constant data block that follows
             }
             if i > 0 && !reached && !jumps_back && is_data_block(seg) {
-                f.data_blocks.push(Program { offset: o + p.offset, len: p.len });
+                f.data_blocks.push(Program {
+                    offset: o + p.offset,
+                    len: p.len,
+                });
                 continue;
             }
             targets.extend(own);
             match f.programs.last_mut() {
-                Some(last) if reached || jumps_back => last.len = o + p.offset + p.len - last.offset,
-                _ => f.programs.push(Program { offset: o + p.offset, len: p.len }),
+                Some(last) if reached || jumps_back => {
+                    last.len = o + p.offset + p.len - last.offset
+                }
+                _ => f.programs.push(Program {
+                    offset: o + p.offset,
+                    len: p.len,
+                }),
             }
         }
     }
@@ -363,7 +453,9 @@ fn branch_targets(seg: &[u8], pc: u64) -> Vec<u64> {
 
 /// u32 N, N dwords, s_endpgm – the exact layout of constant data embedded in code.
 fn counted_data_block(seg: &[u8]) -> bool {
-    rd32(seg, 0).is_some_and(|n| (n as usize).checked_mul(4).and_then(|x| x.checked_add(8)) == Some(seg.len()))
+    rd32(seg, 0).is_some_and(|n| {
+        (n as usize).checked_mul(4).and_then(|x| x.checked_add(8)) == Some(seg.len())
+    })
 }
 
 /// A segment after the first program that is constant data, not code. Retail layout:
@@ -399,7 +491,10 @@ pub fn is_data_block(seg: &[u8]) -> bool {
 /// (walking back to 0xDEADBEEF filler or a run of zero dwords).
 fn scan_code_region(d: &[u8]) -> Option<(usize, usize)> {
     let word = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
-    let ends: Vec<usize> = (0x10..d.len().saturating_sub(3)).step_by(4).filter(|&o| word(o) == S_ENDPGM).collect();
+    let ends: Vec<usize> = (0x10..d.len().saturating_sub(3))
+        .step_by(4)
+        .filter(|&o| word(o) == S_ENDPGM)
+        .collect();
     let first = *ends.first()?;
     let mut s = first;
     let mut zeros = 0;
@@ -452,7 +547,11 @@ pub fn split_segments(code: &[u8]) -> Vec<Segment> {
             let n = word(start) as usize;
             let end = start + 4 + 4 * n;
             if n > 0 && end + 4 <= code.len() && word(end) == S_ENDPGM {
-                out.push(Segment { offset: start, len: end + 4 - start, counted_data: true });
+                out.push(Segment {
+                    offset: start,
+                    len: end + 4 - start,
+                    counted_data: true,
+                });
                 off = end + 4;
                 continue;
             }
@@ -470,7 +569,11 @@ pub fn split_segments(code: &[u8]) -> Vec<Segment> {
                 Err(_) => off += 4,
             }
         }
-        out.push(Segment { offset: start, len: off.min(code.len()) - start, counted_data: false });
+        out.push(Segment {
+            offset: start,
+            len: off.min(code.len()) - start,
+            counted_data: false,
+        });
         if !ended {
             break;
         }
@@ -522,7 +625,11 @@ impl InstStats {
 
     /// Mnemonics sorted by count (descending).
     pub fn sorted(&self) -> Vec<(String, u64)> {
-        let mut v: Vec<(String, u64)> = self.by_mnemonic.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut v: Vec<(String, u64)> = self
+            .by_mnemonic
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         v
     }
@@ -533,17 +640,37 @@ pub fn listing(sh: &XboxShader) -> String {
     let mut out = String::new();
     for (i, f) in sh.fssm.iter().enumerate() {
         let Some((co, _)) = f.code else { continue };
-        let mut blocks: Vec<(bool, &Program)> = f.programs.iter().map(|p| (false, p)).chain(f.data_blocks.iter().map(|p| (true, p))).collect();
+        let mut blocks: Vec<(bool, &Program)> = f
+            .programs
+            .iter()
+            .map(|p| (false, p))
+            .chain(f.data_blocks.iter().map(|p| (true, p)))
+            .collect();
         blocks.sort_by_key(|b| b.1.offset);
         for (is_data, p) in blocks {
             if is_data {
-                out.push_str(&format!("; FSSM #{i}: dane w kodzie +{:#x} (FSSM +{:#x}), {} B\n", p.offset - co, p.offset, p.len));
-                for (k, w) in f.data[p.offset..p.offset + p.len].chunks_exact(4).enumerate() {
+                out.push_str(&format!(
+                    "; FSSM #{i}: dane w kodzie +{:#x} (FSSM +{:#x}), {} B\n",
+                    p.offset - co,
+                    p.offset,
+                    p.len
+                ));
+                for (k, w) in f.data[p.offset..p.offset + p.len]
+                    .chunks_exact(4)
+                    .enumerate()
+                {
                     let w = u32::from_le_bytes(w.try_into().unwrap());
                     // show a float only where the bits look like one (|x| ≈ 1e-10 … 1e10)
                     let exp = (w >> 23) & 0xff;
-                    let val = if (0x60..=0x9e).contains(&exp) { format!("{}", f32::from_bits(w)) } else { format!("{w}") };
-                    out.push_str(&format!("  {:08x}: .long {w:#010x}  ; {val}\n", p.offset - co + k * 4));
+                    let val = if (0x60..=0x9e).contains(&exp) {
+                        format!("{}", f32::from_bits(w))
+                    } else {
+                        format!("{w}")
+                    };
+                    out.push_str(&format!(
+                        "  {:08x}: .long {w:#010x}  ; {val}\n",
+                        p.offset - co + k * 4
+                    ));
                 }
                 continue;
             }
@@ -557,7 +684,12 @@ pub fn listing(sh: &XboxShader) -> String {
             let code = &f.data[p.offset..p.offset + p.len];
             for l in rdna2::disassemble(code, (p.offset - co) as u64, false) {
                 let hex: Vec<String> = l.bytes.iter().map(|b| format!("{b:02x}")).collect();
-                out.push_str(&format!("  {:08x}: {:<48} {}\n", l.pc, l.text, hex.join(" ")));
+                out.push_str(&format!(
+                    "  {:08x}: {:<48} {}\n",
+                    l.pc,
+                    l.text,
+                    hex.join(" ")
+                ));
             }
         }
     }
@@ -568,7 +700,10 @@ pub fn listing(sh: &XboxShader) -> String {
 /// reverse engineering the metadata.
 pub fn header_qwords(f: &Fssm, limit: usize) -> Vec<(usize, u64)> {
     let end = f.code.map(|c| c.0).unwrap_or(f.data.len()).min(limit);
-    (0..end / 8).map(|i| (i * 8, rd64(&f.data, i * 8).unwrap())).filter(|&(_, q)| q != 0 && q != 0xDEAD_BEEF_DEAD_BEEF).collect()
+    (0..end / 8)
+        .map(|i| (i * 8, rd64(&f.data, i * 8).unwrap()))
+        .filter(|&(_, q)| q != 0 && q != 0xDEAD_BEEF_DEAD_BEEF)
+        .collect()
 }
 
 #[cfg(test)]
@@ -678,10 +813,17 @@ pub(crate) mod tests {
     }
 
     /// s_mov_b32 s0, s1 ; v_add_f32 v0, v1, v5 ; s_endpgm
-    pub(crate) const CODE: [u8; 12] = [0x01, 0x03, 0x80, 0xbe, 0x01, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf];
+    pub(crate) const CODE: [u8; 12] = [
+        0x01, 0x03, 0x80, 0xbe, 0x01, 0x0b, 0x00, 0x06, 0x00, 0x00, 0x81, 0xbf,
+    ];
 
     pub(crate) fn sample(kind: u32, fssms: &[Vec<u8>]) -> Vec<u8> {
-        container(&[(b"SFI0", &[0; 8]), (b"HASH", &[0; 20]), (b"DXIL", &dxil_part(kind, fssms)), (b"PRIV", &[7; 16])])
+        container(&[
+            (b"SFI0", &[0; 8]),
+            (b"HASH", &[0; 20]),
+            (b"DXIL", &dxil_part(kind, fssms)),
+            (b"PRIV", &[7; 16]),
+        ])
     }
 
     #[test]
@@ -691,17 +833,36 @@ pub(crate) mod tests {
         assert_eq!(sh.stage, "PS");
         assert_eq!(sh.shader_model, (6, 6));
         assert!(sh.notes.is_empty(), "{:?}", sh.notes);
-        assert_eq!(sh.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![0x12, 0x0d, 0x07]);
+        assert_eq!(
+            sh.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![0x12, 0x0d, 0x07]
+        );
         assert_eq!(sh.hash, Some(core::array::from_fn(|i| i as u8)));
         assert_eq!(sh.fssm.len(), 1);
         let f = &sh.fssm[0];
         assert_eq!(f.error, None);
         assert_eq!(f.version, 0x101);
         assert!(f.code_from_header);
-        assert_eq!(f.stages, vec![HwStage { offset: 0x100, hw: 5, api: 1 }]);
-        assert_eq!(f.programs, vec![Program { offset: 0x308, len: 12 }]);
+        assert_eq!(
+            f.stages,
+            vec![HwStage {
+                offset: 0x100,
+                hw: 5,
+                api: 1
+            }]
+        );
+        assert_eq!(
+            f.programs,
+            vec![Program {
+                offset: 0x308,
+                len: 12
+            }]
+        );
         let l = listing(&sh);
-        assert!(l.contains("s_mov_b32 s0, s1") && l.contains("v_add_f32") && l.contains("s_endpgm"), "{l}");
+        assert!(
+            l.contains("s_mov_b32 s0, s1") && l.contains("v_add_f32") && l.contains("s_endpgm"),
+            "{l}"
+        );
         assert!(!l.contains("s_code_end"), "padding must not be listed: {l}");
         let mut st = InstStats::default();
         st.add_shader(&sh);
@@ -722,55 +883,123 @@ pub(crate) mod tests {
         assert_eq!(f.programs.len(), 2);
         assert_eq!(f.programs[1].offset - f.programs[0].offset, 16);
         // VS feeding a GS: two XBCH entries (ES + VS)
-        let vs = parse(&sample(1, &[fssm(&CODE, &[(2, 0)]), fssm(&CODE, &[(4, 0)])])).unwrap();
-        assert_eq!(vs.fssm.iter().map(|f| f.stage_label()).collect::<Vec<_>>(), vec!["ES", "VS"]);
+        let vs = parse(&sample(
+            1,
+            &[fssm(&CODE, &[(2, 0)]), fssm(&CODE, &[(4, 0)])],
+        ))
+        .unwrap();
+        assert_eq!(
+            vs.fssm.iter().map(|f| f.stage_label()).collect::<Vec<_>>(),
+            vec!["ES", "VS"]
+        );
     }
 
     #[test]
     fn branch_target_after_endpgm_belongs_to_the_program() {
         // s_cbranch_scc0 → +12 ; s_mov ; s_endpgm ; [+12] s_mov ; s_endpgm  (PS discard exit)
         let code = [
-            0x02, 0x00, 0x84, 0xbf, 0x01, 0x03, 0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf, 0x01, 0x03, 0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf,
+            0x02, 0x00, 0x84, 0xbf, 0x01, 0x03, 0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf, 0x01, 0x03,
+            0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf,
         ];
         let sh = parse(&sample(0, &[fssm(&code, &[(5, 1)])])).unwrap();
-        assert_eq!(sh.fssm[0].programs, vec![Program { offset: 0x308, len: 20 }]);
+        assert_eq!(
+            sh.fssm[0].programs,
+            vec![Program {
+                offset: 0x308,
+                len: 20
+            }]
+        );
         assert!(sh.fssm[0].data_blocks.is_empty());
         // without the branch the tail is a second program
         let mut code2 = code;
         code2[0..4].copy_from_slice(&[0x00, 0x00, 0x80, 0xbf]); // s_nop
-        assert_eq!(parse(&sample(0, &[fssm(&code2, &[(5, 1)])])).unwrap().fssm[0].programs.len(), 2);
+        assert_eq!(
+            parse(&sample(0, &[fssm(&code2, &[(5, 1)])])).unwrap().fssm[0]
+                .programs
+                .len(),
+            2
+        );
         // a branch into the middle of the next segment also links it
         let mut code3 = code;
         code3[0..4].copy_from_slice(&[0x03, 0x00, 0x82, 0xbf]); // s_branch → +16 (second s_mov... s_endpgm)
-        assert_eq!(parse(&sample(0, &[fssm(&code3, &[(5, 1)])])).unwrap().fssm[0].programs, vec![Program { offset: 0x308, len: 20 }]);
+        assert_eq!(
+            parse(&sample(0, &[fssm(&code3, &[(5, 1)])])).unwrap().fssm[0].programs,
+            vec![Program {
+                offset: 0x308,
+                len: 20
+            }]
+        );
     }
 
     #[test]
     fn counted_data_may_contain_endpgm_words() {
         let mut code = CODE.to_vec();
-        for w in [0xBF81_0000u32, 3, 0x3f80_0000, 0xBF81_0000, 0x1234_5678, 0xBF81_0000] {
+        for w in [
+            0xBF81_0000u32,
+            3,
+            0x3f80_0000,
+            0xBF81_0000,
+            0x1234_5678,
+            0xBF81_0000,
+        ] {
             code.extend_from_slice(&w.to_le_bytes());
         }
         let f = &parse(&sample(0, &[fssm(&code, &[(5, 1)])])).unwrap().fssm[0];
-        assert_eq!(f.programs, vec![Program { offset: 0x308, len: 12 }]);
-        assert_eq!(f.data_blocks, vec![Program { offset: 0x308 + 16, len: 20 }]);
+        assert_eq!(
+            f.programs,
+            vec![Program {
+                offset: 0x308,
+                len: 12
+            }]
+        );
+        assert_eq!(
+            f.data_blocks,
+            vec![Program {
+                offset: 0x308 + 16,
+                len: 20
+            }]
+        );
     }
 
     #[test]
     fn constant_data_after_program_is_not_code() {
         // as in retail data: program, guard s_endpgm, table (u32 N, N dwords), s_endpgm
         let mut code = CODE.to_vec();
-        for w in [0xBF81_0000u32, 4, 0x3e63_3333, 0x3df5_c28f, 0, 1, 0xBF81_0000] {
+        for w in [
+            0xBF81_0000u32,
+            4,
+            0x3e63_3333,
+            0x3df5_c28f,
+            0,
+            1,
+            0xBF81_0000,
+        ] {
             code.extend_from_slice(&w.to_le_bytes());
         }
         let sh = parse(&sample(1, &[fssm(&code, &[(4, 0)])])).unwrap();
         let f = &sh.fssm[0];
-        assert_eq!(f.programs, vec![Program { offset: 0x308, len: 12 }]);
-        assert_eq!(f.data_blocks, vec![Program { offset: 0x308 + 16, len: 24 }]);
+        assert_eq!(
+            f.programs,
+            vec![Program {
+                offset: 0x308,
+                len: 12
+            }]
+        );
+        assert_eq!(
+            f.data_blocks,
+            vec![Program {
+                offset: 0x308 + 16,
+                len: 24
+            }]
+        );
         let mut st = InstStats::default();
         st.add_shader(&sh);
         assert_eq!((st.instructions, st.undecoded), (3, 0));
-        assert!(listing(&sh).contains(".long 0x3e633333  ; 0.22"), "{}", listing(&sh));
+        assert!(
+            listing(&sh).contains(".long 0x3e633333  ; 0.22"),
+            "{}",
+            listing(&sh)
+        );
     }
 
     #[test]
@@ -780,12 +1009,20 @@ pub(crate) mod tests {
         let sh = parse(&sample(1, &[f])).unwrap();
         let f = &sh.fssm[0];
         assert!(!f.code_from_header);
-        assert!(f.programs.iter().any(|p| p.offset == 0x308), "{:?}", f.programs);
+        assert!(
+            f.programs.iter().any(|p| p.offset == 0x308),
+            "{:?}",
+            f.programs
+        );
     }
 
     #[test]
     fn pc_shaders_are_not_xbox() {
-        assert!(parse(&container(&[(b"DXIL", b"\x66\0\0\0\x04\0\0\0DXIL\0\0\0\0")])).is_none());
+        assert!(parse(&container(&[(
+            b"DXIL",
+            b"\x66\0\0\0\x04\0\0\0DXIL\0\0\0\0"
+        )]))
+        .is_none());
         assert!(parse(b"random").is_none());
         // truncated XDAT table must not panic
         let mut d = program_header(0, 8, 0x10);
@@ -800,7 +1037,14 @@ pub(crate) mod tests {
         code.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // undecodable
         code.extend_from_slice(&CODE);
         let p = split_segments(&code);
-        assert_eq!(p, vec![Segment { offset: 8, len: 16, counted_data: false }]);
+        assert_eq!(
+            p,
+            vec![Segment {
+                offset: 8,
+                len: 16,
+                counted_data: false
+            }]
+        );
         let mut st = InstStats::default();
         st.add_code(&code[8..24]);
         assert_eq!((st.instructions, st.undecoded), (3, 1));

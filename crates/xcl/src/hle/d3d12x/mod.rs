@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod console_heap;
 pub mod console_list;
 pub mod guard;
 pub mod layout;
@@ -67,7 +68,13 @@ pub fn backend() -> Backend {
 
 /// Call a function of the system d3d12.dll by name.
 unsafe fn sys(name: &str) -> Option<usize> {
-    crate::resolver::system_proc("d3d12.dll", &crate::pe::ImportName::Name { hint: 0, name: name.into() })
+    crate::resolver::system_proc(
+        "d3d12.dll",
+        &crate::pe::ImportName::Name {
+            hint: 0,
+            name: name.into(),
+        },
+    )
 }
 
 macro_rules! forward {
@@ -82,36 +89,72 @@ macro_rules! forward {
     }};
 }
 
-pub unsafe extern "system" fn D3D12CreateDevice(adapter: *mut c_void, fl: u32, riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateDevice(
+    adapter: *mut c_void,
+    fl: u32,
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if backend() == Backend::Real {
         return real::create_device(riid, ppv);
     }
     null::D3D12CreateDevice(adapter, fl, riid, ppv)
 }
 
-pub unsafe extern "system" fn D3D12XboxCreateDevice(adapter: *mut c_void, params: *const c_void, riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12XboxCreateDevice(
+    adapter: *mut c_void,
+    params: *const c_void,
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if backend() == Backend::Real {
         return real::create_device(riid, ppv);
     }
     null::D3D12XboxCreateDevice(adapter, params, riid, ppv)
 }
 
-pub unsafe extern "system" fn D3D12GetDebugInterface(riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
-    forward!("D3D12GetDebugInterface", unsafe extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT, null::D3D12GetDebugInterface, (riid, ppv))
+pub unsafe extern "system" fn D3D12GetDebugInterface(
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    forward!(
+        "D3D12GetDebugInterface",
+        unsafe extern "system" fn(*const c_void, *mut *mut c_void) -> HRESULT,
+        null::D3D12GetDebugInterface,
+        (riid, ppv)
+    )
 }
 
-pub unsafe extern "system" fn D3D12SerializeRootSignature(d: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12SerializeRootSignature(
+    d: *const c_void,
+    v: u32,
+    blob: *mut *mut c_void,
+    err: *mut *mut c_void,
+) -> HRESULT {
     forward!(
         "D3D12SerializeRootSignature",
-        unsafe extern "system" fn(*const c_void, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT,
+        unsafe extern "system" fn(
+            *const c_void,
+            u32,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> HRESULT,
         null::D3D12SerializeRootSignature,
         (d, v, blob, err)
     )
 }
 
-pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_void, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(
+    d: *const c_void,
+    blob: *mut *mut c_void,
+    err: *mut *mut c_void,
+) -> HRESULT {
     let mut own_err: *mut c_void = std::ptr::null_mut();
-    let e = if err.is_null() { &mut own_err as *mut _ } else { err };
+    let e = if err.is_null() {
+        &mut own_err as *mut _
+    } else {
+        err
+    };
     // console-only root signature flags (seen: 0x3000000 from XboxBvhBuilder.dll) – Windows
     // rejects unknown bits; the flags sit at +40 in every version of the desc (48 bytes)
     const PC_FLAGS: u32 = 0xFFF;
@@ -120,15 +163,20 @@ pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_v
     if !d.is_null() && *(d as *const u8).add(40).cast::<u32>() & !PC_FLAGS != 0 {
         std::ptr::copy_nonoverlapping(d as *const u8, copy.as_mut_ptr(), 48);
         let f = copy.as_mut_ptr().add(40).cast::<u32>();
-        crate::xlog_info!("D3D12SerializeVersionedRootSignature: flagi konsoli {:#x} pominięte", *f & !PC_FLAGS);
+        crate::xlog_info!(
+            "D3D12SerializeVersionedRootSignature: flagi konsoli {:#x} pominięte",
+            *f & !PC_FLAGS
+        );
         *f &= PC_FLAGS;
         d = copy.as_ptr() as *const c_void;
     }
-    type Serialize = unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
-    let hr = match sys("D3D12SerializeVersionedRootSignature").filter(|_| backend() == Backend::Real) {
-        Some(f) => std::mem::transmute::<_, Serialize>(f)(d, blob, e),
-        None => null::D3D12SerializeVersionedRootSignature(d, blob, e),
-    };
+    type Serialize =
+        unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    let hr =
+        match sys("D3D12SerializeVersionedRootSignature").filter(|_| backend() == Backend::Real) {
+            Some(f) => std::mem::transmute::<_, Serialize>(f)(d, blob, e),
+            None => null::D3D12SerializeVersionedRootSignature(d, blob, e),
+        };
     if hr < 0 && !d.is_null() {
         // D3D12_VERSIONED_ROOT_SIGNATURE_DESC: version, then (1.1 / 1.2) parameters, samplers, flags
         let w = |o: usize| *(d as *const u8).add(o).cast::<u32>();
@@ -155,7 +203,10 @@ unsafe fn blob_text(b: *mut c_void) -> String {
     let vt = *(b as *const *const usize);
     let ptr: unsafe extern "system" fn(*mut c_void) -> *const u8 = std::mem::transmute(*vt.add(3));
     let len: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(*vt.add(4));
-    String::from_utf8_lossy(std::slice::from_raw_parts(ptr(b), len(b))).trim_end_matches('\0').trim().to_string()
+    String::from_utf8_lossy(std::slice::from_raw_parts(ptr(b), len(b)))
+        .trim_end_matches('\0')
+        .trim()
+        .to_string()
 }
 
 unsafe fn blob_release(b: *mut c_void) {
@@ -164,7 +215,12 @@ unsafe fn blob_release(b: *mut c_void) {
     release(b);
 }
 
-pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(d: *const c_void, l: usize, r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(
+    d: *const c_void,
+    l: usize,
+    r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     forward!(
         "D3D12CreateRootSignatureDeserializer",
         unsafe extern "system" fn(*const c_void, usize, *const c_void, *mut *mut c_void) -> HRESULT,
@@ -173,7 +229,12 @@ pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(d: *const c_v
     )
 }
 
-pub unsafe extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(d: *const c_void, l: usize, r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(
+    d: *const c_void,
+    l: usize,
+    r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     forward!(
         "D3D12CreateVersionedRootSignatureDeserializer",
         unsafe extern "system" fn(*const c_void, usize, *const c_void, *mut *mut c_void) -> HRESULT,
@@ -182,7 +243,12 @@ pub unsafe extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(d: *
     )
 }
 
-pub unsafe extern "system" fn D3D12EnableExperimentalFeatures(n: u32, i: *const c_void, c: *mut c_void, s: *mut u32) -> HRESULT {
+pub unsafe extern "system" fn D3D12EnableExperimentalFeatures(
+    n: u32,
+    i: *const c_void,
+    c: *mut c_void,
+    s: *mut u32,
+) -> HRESULT {
     forward!(
         "D3D12EnableExperimentalFeatures",
         unsafe extern "system" fn(u32, *const c_void, *mut c_void, *mut u32) -> HRESULT,
@@ -191,7 +257,11 @@ pub unsafe extern "system" fn D3D12EnableExperimentalFeatures(n: u32, i: *const 
     )
 }
 
-pub unsafe extern "system" fn D3D12GetInterface(clsid: *const c_void, riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12GetInterface(
+    clsid: *const c_void,
+    riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     forward!(
         "D3D12GetInterface",
         unsafe extern "system" fn(*const c_void, *const c_void, *mut *mut c_void) -> HRESULT,

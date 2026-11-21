@@ -33,7 +33,7 @@ use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
 use crate::stubs;
-use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
+use crate::util::{E_INVALIDARG, E_NOINTERFACE, HRESULT, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
@@ -156,7 +156,11 @@ static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
 /// GPU virtual address of the unified memory buffer (0: not available).
 pub fn uma_gpu_va() -> u64 {
-    UMA_BUFFER.lock().ok().and_then(|g| g.map(|b| b.1)).unwrap_or(0)
+    UMA_BUFFER
+        .lock()
+        .ok()
+        .and_then(|g| g.map(|b| b.1))
+        .unwrap_or(0)
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {
@@ -166,20 +170,28 @@ unsafe fn open_uma(device: &ID3D12Device) {
     };
     let r = (|| -> Result<(usize, u64), String> {
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(u.base() as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress: {e}"))?;
+        let heap: ID3D12Heap = dev3
+            .OpenExistingHeapFromAddress(u.base() as *const c_void)
+            .map_err(|e| format!("OpenExistingHeapFromAddress: {e}"))?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: u.size() as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
             ..Default::default()
         };
         let mut buf: Option<ID3D12Resource> = None;
-        device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
+        device
+            .CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf)
+            .map_err(|e| format!("CreatePlacedResource: {e}"))?;
         let buf = buf.ok_or("CreatePlacedResource")?;
         let va = buf.GetGPUVirtualAddress();
         std::mem::forget(heap);
@@ -187,7 +199,11 @@ unsafe fn open_uma(device: &ID3D12Device) {
     })();
     match r {
         Ok(b) => {
-            crate::xlog_info!("D3D12.X: UMA ({} MB) otwarta jako sterta GPU, bufor pod VA {:#x}", u.size() >> 20, b.1);
+            crate::xlog_info!(
+                "D3D12.X: UMA ({} MB) otwarta jako sterta GPU, bufor pod VA {:#x}",
+                u.size() >> 20,
+                b.1
+            );
             *UMA_BUFFER.lock().unwrap() = Some(b);
         }
         Err(e) => {
@@ -202,7 +218,11 @@ pub fn stats() -> D3d12Stats {
         .lock()
         .map(|g| {
             g.iter()
-                .map(|c| ClassStat { interface: c.iface.name.to_string(), public_methods: c.public, internal_slots: c.scanned - c.public })
+                .map(|c| ClassStat {
+                    interface: c.iface.name.to_string(),
+                    public_methods: c.public,
+                    internal_slots: c.scanned - c.public,
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -211,21 +231,31 @@ pub fn stats() -> D3d12Stats {
         backend: format!("{:?}", super::backend()).to_lowercase(),
         adapter: ADAPTER.lock().map(|a| a.clone()).unwrap_or_default(),
         classes,
-        unknown_iids: UNKNOWN_IIDS.lock().map(|s| s.iter().cloned().collect()).unwrap_or_default(),
+        unknown_iids: UNKNOWN_IIDS
+            .lock()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default(),
         fallback_pipelines: FALLBACK_PSO.load(Ordering::Relaxed),
         failed_pipelines: FAILED_PSO.load(Ordering::Relaxed),
         fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
         presents,
         frame_boundaries: boundaries,
-        uma_mb: crate::gpu::uma::get().map(|u| (u.size() >> 20) as u64).unwrap_or(0),
-        uma_used_kb: crate::gpu::uma::get().map(|u| (u.used() >> 10) as u64).unwrap_or(0),
+        uma_mb: crate::gpu::uma::get()
+            .map(|u| (u.size() >> 20) as u64)
+            .unwrap_or(0),
+        uma_used_kb: crate::gpu::uma::get()
+            .map(|u| (u.used() >> 10) as u64)
+            .unwrap_or(0),
         uma_gpu_va: match uma_gpu_va() {
             0 => String::new(),
             v => format!("{v:#x}"),
         },
         uma_error: UMA_ERROR.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
-        translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
+        translation_errors: TRANSLATE_ERRORS
+            .lock()
+            .map(|e| e.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -240,7 +270,11 @@ pub fn device_raw() -> *mut c_void {
 }
 
 fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
-    let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    let n = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
     String::from_utf16_lossy(&desc.Description[..n])
 }
 
@@ -261,26 +295,39 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
-        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
+        let factory: IDXGIFactory6 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
         if !cfg.d3d12_adapter.eq_ignore_ascii_case("warp") {
             let mut i = 0;
-            while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+            while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                i,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) {
                 i += 1;
-                let Ok(desc) = adapter.GetDesc1() else { continue };
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
                     continue;
                 }
                 if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
-                    name = format!("{} ({} MiB VRAM)", adapter_name(&desc), desc.DedicatedVideoMemory >> 20);
+                    name = format!(
+                        "{} ({} MiB VRAM)",
+                        adapter_name(&desc),
+                        desc.DedicatedVideoMemory >> 20
+                    );
                     break;
                 }
             }
         }
         if device.is_none() {
-            let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
-            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| format!("D3D12CreateDevice(WARP): {e}"))?;
+            let warp: IDXGIAdapter = factory
+                .EnumWarpAdapter()
+                .map_err(|e| format!("WARP: {e}"))?;
+            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut device)
+                .map_err(|e| format!("D3D12CreateDevice(WARP): {e}"))?;
             name = "WARP (renderer programowy)".into();
         }
         let device = device.ok_or("brak urządzenia")?;
@@ -345,17 +392,24 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
 
 fn module_of(addr: usize) -> usize {
     use windows_sys::Win32::System::LibraryLoader::{
-        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
     let mut h = std::ptr::null_mut();
     unsafe {
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, addr as *const u16, &mut h);
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr as *const u16,
+            &mut h,
+        );
     }
     h as usize
 }
 
 fn is_ext(v: usize) -> bool {
-    EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
+    EXTS.lock()
+        .map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 /// Give a genuine D3D12 object the extended vtable for `kind`.
@@ -403,14 +457,19 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for i in 0..scanned {
         v.push(*ot.add(i));
     }
-    let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
+    let hook = if kind == Kind::CommandQueue {
+        super::present::on_queue_console_method as usize
+    } else {
+        0
+    };
     for i in public..scanned {
         let info = stubs::new_info(DLL, &format!("{}::#{i} (spoza PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v[1 + i] = super::guard::make_guard(v[1 + i], info);
     }
     for i in scanned..total {
-        let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (spoza PC)", iface.name), 0);
+        let (addr, info) =
+            stubs::make_stub_info(DLL, &format!("{}::#{i} (spoza PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v.push(addr);
     }
@@ -430,19 +489,32 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
-            let name = format!("{}::{} (#{i})", iface.name, iface.methods.get(i).copied().unwrap_or("?"));
+            let name = format!(
+                "{}::{} (#{i})",
+                iface.name,
+                iface.methods.get(i).copied().unwrap_or("?")
+            );
             v[1 + i] = super::guard::make_tracer(v[1 + i], name);
         }
     }
     let leaked: &'static [usize] = Box::leak(v.into_boxed_slice());
     let ext = leaked.as_ptr() as usize + 8;
-    EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
+    EXTS.lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(ext);
     crate::xlog_info!(
         "D3D12.X: {} – {public} metod PC, {} slotów wewnętrznych pod strażnikiem, +{EXTRA_SLOTS} zaślepek",
         iface.name,
         scanned - public
     );
-    CLASSES.lock().unwrap().push(Class { orig, ext, iface, public, scanned });
+    CLASSES.lock().unwrap().push(Class {
+        orig,
+        ext,
+        iface,
+        public,
+        scanned,
+    });
     ext
 }
 
@@ -453,18 +525,31 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 ///   riid, ppv) as on PC #27 (PC #76 = CreateCommittedResource3); the console resource desc
 ///   carries more after the 52 PC bytes (amd_fidelityfx_upscaler_xbox.dll writes 3 at +52).
 /// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
+/// * device #14 / #15 / #18 / #19 (CreateDescriptorHeap, GetDescriptorHandleIncrementSize,
+///   CreateShaderResourceView, CreateUnorderedAccessView): CBV/SRV/UAV heaps of console code
+///   get 32-byte slots in unified memory (`console_heap`).
 /// * device #12 `CreateCommandList` (only with console lists on): console code gets a
 ///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::Device => {
-            let mut v = vec![(62, dev_create_compute_pso_x as usize), (76, dev_create_committed_resource_x as usize)];
+            let mut v = vec![
+                (14, dev_create_descriptor_heap_x as usize),
+                (15, dev_increment_size_x as usize),
+                (18, dev_create_srv_x as usize),
+                (19, dev_create_uav_x as usize),
+                (62, dev_create_compute_pso_x as usize),
+                (76, dev_create_committed_resource_x as usize),
+            ];
             if super::console_list::enabled() {
                 v.push((12, dev_create_command_list_x as usize));
             }
             v
         }
-        Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
+        Kind::DescriptorHeap => vec![
+            (9, heap_cpu_start_x as usize),
+            (10, heap_gpu_start_x as usize),
+        ],
         _ => vec![],
     }
 }
@@ -473,22 +558,288 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
 /// takes the handle in rax (only `this` passed); the PC methods return it through a hidden
 /// pointer
 unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
-    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 9));
+    if let Some(p) = super::console_heap::start(this as usize) {
+        return p;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 =
+        std::mem::transmute(orig_fn(this, 9));
     let mut h = 0u64;
     f(this, &mut h);
     h
 }
 
 unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
-    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 10));
+    if let Some(p) = super::console_heap::start(this as usize) {
+        return p;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 =
+        std::mem::transmute(orig_fn(this, 10));
     let mut h = 0u64;
     f(this, &mut h);
     h
 }
 
-unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_descriptor_heap_x(
+    this: *mut c_void,
+    desc: *const [u32; 4],
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    let d = if desc.is_null() { [u32::MAX; 4] } else { *desc };
+    if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 {
+        return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
+    }
+    let pc = [d[0], d[1].saturating_mul(2), d[2], d[3]];
+    let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
+    if hr >= 0 {
+        let raw = *ppv;
+        let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
+        let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
+        let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if !super::console_heap::register(raw as usize, d[1], cpu, inc) {
+            crate::xlog_warn!(
+                "sterta deskryptorów konsoli: brak miejsca w UMA na {} slotów",
+                d[1]
+            );
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u32 {
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 {
+        return super::console_heap::SLOT;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
+        std::mem::transmute(orig_fn(this, 15));
+    f(this, ty)
+}
+
+/// What a console view slot describes: (GFX10 format, image type, width, height, depth, mips)
+/// from the view (or the resource when the view is NULL); None for buffers.
+unsafe fn view_shape(
+    res: &ID3D12Resource,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    dim: i32,
+    array: u32,
+    mips: u32,
+) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32)> {
+    use crate::gpu::desc::ImageType as T;
+    let r = res.GetDesc();
+    let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN {
+        r.Format
+    } else {
+        format
+    };
+    let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
+    let mips = if mips == 0 || mips == u32::MAX {
+        r.MipLevels as u32
+    } else {
+        mips
+    };
+    let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
+    let ty = match dim {
+        2 => T::D1,
+        3 => T::D1Array,
+        4 => T::D2,
+        5 => T::D2Array,
+        6 => T::D2Msaa,
+        7 => T::D2MsaaArray,
+        8 => T::D3,
+        9 | 10 => T::Cube,
+        _ => return None,
+    };
+    let depth = match ty {
+        T::D3 => d,
+        T::D1Array | T::D2Array | T::D2MsaaArray => array.max(1),
+        T::Cube => 6,
+        _ => 1,
+    };
+    Some((fmt, ty, w, h, depth, mips))
+}
+
+fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
+    match r.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if r.DepthOrArraySize > 1 {
+                3
+            } else {
+                2
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if r.DepthOrArraySize > 1 {
+                5
+            } else {
+                4
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => 8,
+        _ => 1,
+    }
+}
+
+static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
+
+fn note_buffer_view() {
+    if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_warn!("widok bufora w stercie konsoli: bufor nie jest w UMA – shader dostanie pusty V# (num_records 0)");
+    }
+}
+
+unsafe extern "system" fn dev_create_srv_x(
+    this: *mut c_void,
+    res: *mut c_void,
+    desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC,
+    cpu: u64,
+) {
+    let f: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_SHADER_RESOURCE_VIEW_DESC,
+        u64,
+    ) = std::mem::transmute(orig_fn(this, 18));
+    let Some(slot) = super::console_heap::slot(cpu) else {
+        return f(this, res, desc, cpu);
+    };
+    f(this, res, desc, slot.pc_srv);
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        return super::console_heap::write(&slot, &[0; 8]);
+    };
+    let (format, dim, array, mips) = match desc.as_ref() {
+        Some(v) => {
+            let a = &v.Anonymous;
+            let (array, mips) = match v.ViewDimension.0 {
+                2 => (1, a.Texture1D.MipLevels),
+                3 => (a.Texture1DArray.ArraySize, a.Texture1DArray.MipLevels),
+                4 => (1, a.Texture2D.MipLevels),
+                5 => (a.Texture2DArray.ArraySize, a.Texture2DArray.MipLevels),
+                7 => (a.Texture2DMSArray.ArraySize, 1),
+                8 => (1, a.Texture3D.MipLevels),
+                9 => (6, a.TextureCube.MipLevels),
+                _ => (1, 1),
+            };
+            (v.Format, v.ViewDimension.0, array, mips)
+        }
+        None => {
+            let d = r.GetDesc();
+            (
+                d.Format,
+                resource_dim_to_view(&d),
+                d.DepthOrArraySize as u32,
+                d.MipLevels as u32,
+            )
+        }
+    };
+    match view_shape(r, format, dim, array, mips) {
+        Some((fmt, ty, w, h, d, m)) => super::console_heap::write(
+            &slot,
+            &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, m),
+        ),
+        None => {
+            note_buffer_view();
+            super::console_heap::write(&slot, &[0; 8]);
+        }
+    }
+}
+
+unsafe extern "system" fn dev_create_uav_x(
+    this: *mut c_void,
+    res: *mut c_void,
+    counter: *mut c_void,
+    desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    cpu: u64,
+) {
+    let f: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+        u64,
+    ) = std::mem::transmute(orig_fn(this, 19));
+    let Some(slot) = super::console_heap::slot(cpu) else {
+        return f(this, res, counter, desc, cpu);
+    };
+    f(this, res, counter, desc, slot.pc_uav);
+    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+        return super::console_heap::write(&slot, &[0; 8]);
+    };
+    let rd = r.GetDesc();
+    // UAV dimensions: 1 buffer, 2 tex1d, 3 tex1d array, 4 tex2d, 5 tex2d array, 8 tex3d
+    let (format, dim, array, mip) = match desc.as_ref() {
+        Some(v) => {
+            let a = &v.Anonymous;
+            let (array, mip) = match v.ViewDimension.0 {
+                2 => (1, a.Texture1D.MipSlice),
+                3 => (a.Texture1DArray.ArraySize, a.Texture1DArray.MipSlice),
+                4 => (1, a.Texture2D.MipSlice),
+                5 => (a.Texture2DArray.ArraySize, a.Texture2DArray.MipSlice),
+                8 => (a.Texture3D.WSize, a.Texture3D.MipSlice),
+                _ => (1, 0),
+            };
+            (v.Format, v.ViewDimension.0, array, mip)
+        }
+        None => (
+            rd.Format,
+            resource_dim_to_view(&rd),
+            rd.DepthOrArraySize as u32,
+            0,
+        ),
+    };
+    let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
+        note_buffer_view();
+        return super::console_heap::write(&slot, &[0; 8]);
+    };
+    // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
+    if dim == 4 {
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN {
+                rd.Format
+            } else {
+                format
+            },
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: mip,
+                    MipLevels: 1,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let g: unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            *const D3D12_SHADER_RESOURCE_VIEW_DESC,
+            u64,
+        ) = std::mem::transmute(orig_fn(this, 18));
+        g(this, res, &srv, slot.pc_srv);
+    }
+    let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+    super::console_heap::write(
+        &slot,
+        &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1),
+    );
+}
+
+unsafe extern "system" fn dev_create_committed_resource_x(
+    this: *mut c_void,
+    props: usize,
+    flags: usize,
+    desc: usize,
+    state: usize,
+    clear: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
-    if desc != 0 && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+    if desc != 0
+        && std::env::var_os("XCL_D3D12_TRACE").is_some()
+        && SEEN.fetch_add(1, Ordering::Relaxed) < 8
+    {
         let w = |o: usize| *((desc + o) as *const u32);
         crate::xlog_info!(
             "CreateCommittedResource (konsola, slot 76): wymiar {} {}x{} format {} flagi {:#x}; pola konsoli za opisem PC: +52 {:#x} +56 {:#x}",
@@ -500,7 +851,10 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             w(52),
             w(56)
         );
-        crate::xlog_info!("  opis (dwordy): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
+        crate::xlog_info!(
+            "  opis (dwordy): {:x?}",
+            (0..16).map(|k| w(4 * k)).collect::<Vec<_>>()
+        );
     }
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
@@ -516,8 +870,14 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         }
     }
     let hr = dev_create_committed_resource(this, props, flags, desc, state, clear, riid, ppv);
-    if hr < 0 && SEEN.load(Ordering::Relaxed) <= 8 {
-        let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
+    if hr < 0 {
+        let pw = |o: usize| {
+            if props == 0 {
+                0
+            } else {
+                *((props + o) as *const u32)
+            }
+        };
         crate::xlog_warn!(
             "CreateCommittedResource (konsola): {hr:#x}; sterta typ {} cpu {} pula {}, flagi sterty {flags:#x}, stan {state:#x}",
             pw(0),
@@ -528,7 +888,15 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     hr
 }
 
-unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usize, ty: usize, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_command_list_x(
+    this: *mut c_void,
+    mask: usize,
+    ty: usize,
+    alloc: usize,
+    pso: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     let pc_pso = super::console_list::pc_pso(pso as *mut c_void) as usize;
     let hr = dev_create_command_list(this, mask, ty, alloc, pc_pso, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
@@ -537,7 +905,14 @@ unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usi
     hr
 }
 
-unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_compute_pso_x(
+    this: *mut c_void,
+    desc: *const c_void,
+    a: usize,
+    b: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if a != 0 || b != 0 {
         crate::xlog_warn!("CreateComputePipelineState (konsola, slot 62): nieznane parametry {a:#x} {b:#x} pominięte");
     }
@@ -554,29 +929,62 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     match kind {
         Kind::Device => v.extend_from_slice(&[
             ("CreateCommandQueue", dev_create_command_queue as usize),
-            ("CreateCommandAllocator", dev_create_command_allocator as usize),
-            ("CreateGraphicsPipelineState", dev_create_graphics_pso as usize),
-            ("CreateComputePipelineState", dev_create_compute_pso as usize),
+            (
+                "CreateCommandAllocator",
+                dev_create_command_allocator as usize,
+            ),
+            (
+                "CreateGraphicsPipelineState",
+                dev_create_graphics_pso as usize,
+            ),
+            (
+                "CreateComputePipelineState",
+                dev_create_compute_pso as usize,
+            ),
             ("CreateCommandList", dev_create_command_list as usize),
             ("CreateDescriptorHeap", dev_create_descriptor_heap as usize),
             ("CreateRootSignature", dev_create_root_signature as usize),
             ("CreateRenderTargetView", dev_create_rtv as usize),
-            ("CreateCommittedResource", dev_create_committed_resource as usize),
+            (
+                "CreateCommittedResource",
+                dev_create_committed_resource as usize,
+            ),
             ("CreateHeap", dev_create_heap as usize),
             ("CreatePlacedResource", dev_create_placed_resource as usize),
-            ("CreateReservedResource", dev_create_reserved_resource as usize),
+            (
+                "CreateReservedResource",
+                dev_create_reserved_resource as usize,
+            ),
             ("CreateFence", dev_create_fence as usize),
             ("CreateQueryHeap", dev_create_query_heap as usize),
-            ("CreateCommandSignature", dev_create_command_signature as usize),
-            ("CreatePipelineLibrary", dev_create_pipeline_library as usize),
+            (
+                "CreateCommandSignature",
+                dev_create_command_signature as usize,
+            ),
+            (
+                "CreatePipelineLibrary",
+                dev_create_pipeline_library as usize,
+            ),
             ("CreatePipelineState", dev_create_pipeline_state as usize),
             ("CreateCommandList1", dev_create_command_list1 as usize),
-            ("CreateCommittedResource1", dev_create_committed_resource1 as usize),
+            (
+                "CreateCommittedResource1",
+                dev_create_committed_resource1 as usize,
+            ),
             ("CreateHeap1", dev_create_heap1 as usize),
-            ("CreateReservedResource1", dev_create_reserved_resource1 as usize),
+            (
+                "CreateReservedResource1",
+                dev_create_reserved_resource1 as usize,
+            ),
             ("CreateStateObject", dev_create_state_object as usize),
-            ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
-            ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
+            (
+                "CreateCommittedResource2",
+                dev_create_committed_resource2 as usize,
+            ),
+            (
+                "CreatePlacedResource1",
+                dev_create_placed_resource1 as usize,
+            ),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
         Kind::CommandList => v.push(("OMSetRenderTargets", cl_om_set_render_targets as usize)),
@@ -595,13 +1003,19 @@ unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
     layout::slot(c.iface, method).expect("method in layout")
 }
 
-unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn qi_override(
+    this: *mut c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     let f: QiFn = std::mem::transmute(orig_fn(this, 0));
     let hr = f(this, riid, ppv);
     if hr == E_NOINTERFACE && !riid.is_null() {
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
-            crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interfejs nieznany na PC (konsolowy?)");
+            crate::xlog_warn!(
+                "D3D12.X: QueryInterface({s}) – interfejs nieznany na PC (konsolowy?)"
+            );
         }
     }
     hr
@@ -636,26 +1050,111 @@ macro_rules! creator {
     };
 }
 
-creator!(dev_create_command_queue, "CreateCommandQueue", Kind::CommandQueue, [a1]);
-creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [a1, a2]);
-creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
-creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
-creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
-creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
-creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
-creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
+creator!(
+    dev_create_command_queue,
+    "CreateCommandQueue",
+    Kind::CommandQueue,
+    [a1]
+);
+creator!(
+    dev_create_command_queue1,
+    "CreateCommandQueue1",
+    Kind::CommandQueue,
+    [a1, a2]
+);
+creator!(
+    dev_create_command_allocator,
+    "CreateCommandAllocator",
+    Kind::CommandAllocator,
+    [a1]
+);
+creator!(
+    dev_create_command_list,
+    "CreateCommandList",
+    Kind::CommandList,
+    [a1, a2, a3, a4]
+);
+creator!(
+    dev_create_command_list1,
+    "CreateCommandList1",
+    Kind::CommandList,
+    [a1, a2, a3]
+);
+creator!(
+    dev_create_descriptor_heap,
+    "CreateDescriptorHeap",
+    Kind::DescriptorHeap,
+    [a1]
+);
+creator!(
+    dev_create_committed_resource,
+    "CreateCommittedResource",
+    Kind::Resource,
+    [a1, a2, a3, a4, a5]
+);
+creator!(
+    dev_create_committed_resource1,
+    "CreateCommittedResource1",
+    Kind::Resource,
+    [a1, a2, a3, a4, a5, a6]
+);
+creator!(
+    dev_create_committed_resource2,
+    "CreateCommittedResource2",
+    Kind::Resource,
+    [a1, a2, a3, a4, a5, a6]
+);
+creator!(
+    dev_create_placed_resource,
+    "CreatePlacedResource",
+    Kind::Resource,
+    [a1, a2, a3, a4, a5]
+);
+creator!(
+    dev_create_placed_resource1,
+    "CreatePlacedResource1",
+    Kind::Resource,
+    [a1, a2, a3, a4, a5]
+);
+creator!(
+    dev_create_reserved_resource,
+    "CreateReservedResource",
+    Kind::Resource,
+    [a1, a2, a3]
+);
+creator!(
+    dev_create_reserved_resource1,
+    "CreateReservedResource1",
+    Kind::Resource,
+    [a1, a2, a3, a4]
+);
 creator!(dev_create_heap, "CreateHeap", Kind::Heap, [a1]);
 creator!(dev_create_heap1, "CreateHeap1", Kind::Heap, [a1, a2]);
 creator!(dev_create_fence, "CreateFence", Kind::Fence, [a1, a2]);
-creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
-creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
-creator!(dev_create_pipeline_library, "CreatePipelineLibrary", Kind::PipelineLibrary, [a1, a2]);
-creator!(dev_create_state_object, "CreateStateObject", Kind::StateObject, [a1]);
+creator!(
+    dev_create_query_heap,
+    "CreateQueryHeap",
+    Kind::QueryHeap,
+    [a1]
+);
+creator!(
+    dev_create_command_signature,
+    "CreateCommandSignature",
+    Kind::CommandSignature,
+    [a1, a2]
+);
+creator!(
+    dev_create_pipeline_library,
+    "CreatePipelineLibrary",
+    Kind::PipelineLibrary,
+    [a1, a2]
+);
+creator!(
+    dev_create_state_object,
+    "CreateStateObject",
+    Kind::StateObject,
+    [a1]
+);
 
 // ---------------------------------------------------------------------------------------
 // pipeline states: capture + fallback
@@ -685,7 +1184,10 @@ fn compile(src: &str, target: &str) -> Vec<u8> {
             None,
         );
         match (r, blob) {
-            (Ok(()), Some(b)) => std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec(),
+            (Ok(()), Some(b)) => {
+                std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize())
+                    .to_vec()
+            }
             _ => Vec::new(),
         }
     }
@@ -695,30 +1197,53 @@ fn compile(src: &str, target: &str) -> Vec<u8> {
 fn dummy() -> &'static Dummy {
     static D: OnceLock<Dummy> = OnceLock::new();
     D.get_or_init(|| Dummy {
-        vs: compile("float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }", "vs_5_0"),
-        ps: compile("float4 main() : SV_Target { return float4(1, 0, 1, 1); }", "ps_5_0"),
+        vs: compile(
+            "float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }",
+            "vs_5_0",
+        ),
+        ps: compile(
+            "float4 main() : SV_Target { return float4(1, 0, 1, 1); }",
+            "ps_5_0",
+        ),
         cs: compile("[numthreads(1, 1, 1)] void main() {}", "cs_5_0"),
     })
 }
 
 fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
-    D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as *const c_void, BytecodeLength: b.len() }
+    D3D12_SHADER_BYTECODE {
+        pShaderBytecode: b.as_ptr() as *const c_void,
+        BytecodeLength: b.len(),
+    }
 }
 
 fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
-    let n = if ok { FALLBACK_PSO.fetch_add(1, Ordering::Relaxed) } else { FAILED_PSO.fetch_add(1, Ordering::Relaxed) };
+    let n = if ok {
+        FALLBACK_PSO.fetch_add(1, Ordering::Relaxed)
+    } else {
+        FAILED_PSO.fetch_add(1, Ordering::Relaxed)
+    };
     if n < 5 || n % 1000 == 0 {
         if ok {
             crate::xlog_warn!("D3D12.X: {what} odrzucony przez sterownik ({hr:#x}) – użyto zastępczych shaderów (#{})", n + 1);
         } else {
-            crate::xlog_error!("D3D12.X: {what} odrzucony ({hr:#x}), także w wersji zastępczej (#{})", n + 1);
+            crate::xlog_error!(
+                "D3D12.X: {what} odrzucony ({hr:#x}), także w wersji zastępczej (#{})",
+                n + 1
+            );
         }
     }
 }
 
-type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+type PsoFn =
+    unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
-unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe fn finish_pso(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     let mut hr = f(this, desc, riid, ppv);
     if hr == E_NOINTERFACE {
         let iid = pc_iid(Kind::PipelineState);
@@ -742,7 +1267,8 @@ fn note_translation_error(e: String) {
 
 unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
     let (p, n) = (b.pShaderBytecode as usize, b.BytecodeLength);
-    (p != 0 && n > 0 && crate::gpu::shader::readable(p, n)).then(|| std::slice::from_raw_parts(p as *const u8, n))
+    (p != 0 && n > 0 && crate::gpu::shader::readable(p, n))
+        .then(|| std::slice::from_raw_parts(p as *const u8, n))
 }
 
 /// XCL ABI root signature, created once on the backend device.
@@ -776,9 +1302,18 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
-unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
+unsafe fn translated_compute_pso(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
-    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+    if !crate::gpu::shader::readable(
+        desc as usize,
+        std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>(),
+    ) {
         return None;
     }
     let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
@@ -793,24 +1328,41 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
             return Some(Err(()));
         }
     };
-    let Some(rs) = abi_rs_raw(this) else { return Some(Err(())) };
+    let Some(rs) = abi_rs_raw(this) else {
+        return Some(Err(()));
+    };
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
-    copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    copy.pRootSignature =
+        std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("sterownik odrzucił obliczeniowy PSO z przetłumaczonym CS ({hr:#x})"));
+        note_translation_error(format!(
+            "sterownik odrzucił obliczeniowy PSO z przetłumaczonym CS ({hr:#x})"
+        ));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    crate::xlog_info!("D3D12.X: obliczeniowy PSO z przetłumaczonym CS konsoli ({} B DXIL)", dxil.len());
+    crate::xlog_info!(
+        "D3D12.X: obliczeniowy PSO z przetłumaczonym CS konsoli ({} B DXIL)",
+        dxil.len()
+    );
     Some(Ok(hr))
 }
 
-unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+unsafe fn translated_graphics_pso(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
-    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+    if !crate::gpu::shader::readable(
+        desc as usize,
+        std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>(),
+    ) {
         return None;
     }
     let d = &*(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
@@ -818,7 +1370,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if !is_console(vs) {
         return None;
     }
-    if shader_bytes(&d.GS).is_some() || shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
+    if shader_bytes(&d.GS).is_some()
+        || shader_bytes(&d.HS).is_some()
+        || shader_bytes(&d.DS).is_some()
+    {
         note_translation_error("PSO z GS/HS/DS – jeszcze nieobsługiwane".into());
         return None;
     }
@@ -842,34 +1397,51 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     };
     let rs = abi_rs_raw(this)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
-    copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    copy.pRootSignature =
+        std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.VS = bytecode(&vs_dxil);
     copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("sterownik odrzucił PSO z przetłumaczonymi shaderami ({hr:#x})"));
+        note_translation_error(format!(
+            "sterownik odrzucił PSO z przetłumaczonymi shaderami ({hr:#x})"
+        ));
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: graficzny PSO z przetłumaczonych shaderów konsoli (#{})", n + 1);
+        crate::xlog_info!(
+            "D3D12.X: graficzny PSO z przetłumaczonych shaderów konsoli (#{})",
+            n + 1
+        );
     }
     Some(hr)
 }
 
-unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_graphics_pso(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
         return hr;
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+    if hr >= 0
+        || !crate::gpu::shader::readable(
+            desc as usize,
+            std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>(),
+        )
+    {
         return hr;
     }
     let d = dummy();
-    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC =
+        std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
     copy.VS = bytecode(&d.vs);
     copy.PS = bytecode(&d.ps);
     copy.DS = D3D12_SHADER_BYTECODE::default();
@@ -887,7 +1459,12 @@ unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *cons
     }
 }
 
-unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_compute_pso(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let console = translated_compute_pso(this, f, desc, riid, ppv);
@@ -897,11 +1474,21 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
     // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
-    let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+    let hr = if console.is_some() {
+        E_INVALIDARG
+    } else {
+        finish_pso(this, f, desc, riid, ppv)
+    };
+    if hr >= 0
+        || !crate::gpu::shader::readable(
+            desc as usize,
+            std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>(),
+        )
+    {
         return hr;
     }
-    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC =
+        std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
@@ -939,7 +1526,7 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             3 | 4 | 5 => put(&mut buf, &[]),
             24 | 25 => return None, // mesh pipelines need SM6.5 stand-ins
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
-            7 => buf[at..at + 32].fill(0),        // stream output
+            7 => buf[at..at + 32].fill(0), // stream output
             _ => {}
         }
         off += (poff + psize + 7) & !7;
@@ -947,7 +1534,12 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
-unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_pipeline_state(
+    this: *mut c_void,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let hr = finish_pso(this, f, desc, riid, ppv);
@@ -968,9 +1560,23 @@ unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *co
     }
 }
 
-unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32, blob: *const c_void, len: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn dev_create_root_signature(
+    this: *mut c_void,
+    mask: u32,
+    blob: *const c_void,
+    len: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     crate::gpu::shader::capture("rootsig", blob as usize, len);
-    type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+    type F = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const c_void,
+        usize,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRootSignature")));
     let mut hr = f(this, mask, blob, len, riid, ppv);
     if hr == E_NOINTERFACE {
@@ -979,16 +1585,30 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
     }
     if hr < 0 {
         // console root signature rejected → empty one so the title keeps going
-        let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            ..Default::default()
+        };
         let mut ser = None;
-        if D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).is_ok() {
+        if D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).is_ok()
+        {
             if let Some(b) = ser {
                 let iid = pc_iid(Kind::RootSignature);
-                let hr2 = f(this, mask, b.GetBufferPointer(), b.GetBufferSize(), &iid, ppv);
+                let hr2 = f(
+                    this,
+                    mask,
+                    b.GetBufferPointer(),
+                    b.GetBufferSize(),
+                    &iid,
+                    ppv,
+                );
                 if hr2 >= 0 {
                     let n = FALLBACK_RS.fetch_add(1, Ordering::Relaxed);
                     if n < 5 {
-                        crate::xlog_warn!("D3D12.X: root signature odrzucona ({hr:#x}) – zastępcza pusta (#{})", n + 1);
+                        crate::xlog_warn!(
+                            "D3D12.X: root signature odrzucona ({hr:#x}) – zastępcza pusta (#{})",
+                            n + 1
+                        );
                     }
                     hr = hr2;
                 }
@@ -998,7 +1618,10 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::RootSignature);
         if !blob.is_null() {
-            super::console_list::note_root_signature(*ppv as usize, std::slice::from_raw_parts(blob as *const u8, len));
+            super::console_list::note_root_signature(
+                *ppv as usize,
+                std::slice::from_raw_parts(blob as *const u8, len),
+            );
         }
     }
     hr
@@ -1008,14 +1631,25 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // presentation tracking
 // ---------------------------------------------------------------------------------------
 
-unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+unsafe extern "system" fn dev_create_rtv(
+    this: *mut c_void,
+    res: *mut c_void,
+    desc: *const c_void,
+    handle: usize,
+) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
 }
 
-unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+unsafe extern "system" fn cl_om_set_render_targets(
+    this: *mut c_void,
+    n: u32,
+    rtvs: *const usize,
+    single: i32,
+    dsv: *const usize,
+) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
@@ -1035,13 +1669,20 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     hr
 }
 
-unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
+unsafe extern "system" fn q_execute_command_lists(
+    this: *mut c_void,
+    n: u32,
+    lists: *const *mut c_void,
+) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void>;
     let lists = if n > 0 && !lists.is_null() {
-        mapped = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| super::console_list::pc_list(l).unwrap_or(l)).collect();
+        mapped = std::slice::from_raw_parts(lists, n as usize)
+            .iter()
+            .map(|&l| super::console_list::pc_list(l).unwrap_or(l))
+            .collect();
         mapped.as_ptr()
     } else {
         lists

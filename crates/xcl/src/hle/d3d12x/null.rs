@@ -216,7 +216,11 @@ fn device() -> *mut NullObj {
 // common slots
 // ---------------------------------------------------------------------------------------
 
-unsafe extern "system" fn QueryInterface(this: *mut NullObj, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn QueryInterface(
+    this: *mut NullObj,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if ppv.is_null() {
         return E_INVALIDARG;
     }
@@ -230,9 +234,17 @@ unsafe extern "system" fn AddRef(this: *mut NullObj) -> u32 {
 unsafe extern "system" fn Release(this: *mut NullObj) -> u32 {
     // Objects are intentionally leaked: a null device must never free memory a title
     // may still reference through a mis-guessed vtable slot.
-    (*this).refs.fetch_sub(1, Ordering::AcqRel).saturating_sub(1)
+    (*this)
+        .refs
+        .fetch_sub(1, Ordering::AcqRel)
+        .saturating_sub(1)
 }
-unsafe extern "system" fn Object_GetPrivateData(_t: *mut NullObj, _g: *const c_void, size: *mut u32, _d: *mut c_void) -> HRESULT {
+unsafe extern "system" fn Object_GetPrivateData(
+    _t: *mut NullObj,
+    _g: *const c_void,
+    size: *mut u32,
+    _d: *mut c_void,
+) -> HRESULT {
     if !size.is_null() {
         *size = 0;
     }
@@ -247,7 +259,11 @@ unsafe extern "system" fn Object_Ok2(_t: *mut NullObj, _a: usize, _b: usize) -> 
 unsafe extern "system" fn Object_Ok1(_t: *mut NullObj, _a: usize) -> HRESULT {
     S_OK
 }
-unsafe extern "system" fn DeviceChild_GetDevice(_t: *mut NullObj, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn DeviceChild_GetDevice(
+    _t: *mut NullObj,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if ppv.is_null() {
         return E_INVALIDARG;
     }
@@ -285,13 +301,28 @@ unsafe extern "system" fn Hidden_ZeroDesc40(_t: *mut NullObj, ret: *mut u8) -> *
 unsafe extern "system" fn Device_GetNodeCount(_t: *mut NullObj) -> u32 {
     1
 }
-unsafe extern "system" fn Device_CreateCommandQueue(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommandQueue(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::CommandQueue)
 }
-unsafe extern "system" fn Device_CreateCommandAllocator(_t: *mut NullObj, _ty: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommandAllocator(
+    _t: *mut NullObj,
+    _ty: u32,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::CommandAllocator)
 }
-unsafe extern "system" fn Device_CreatePipelineState4(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreatePipelineState4(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::PipelineState)
 }
 
@@ -355,7 +386,9 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
     while off + 8 <= size {
         let ty = *((base + off) as *const u32);
         let Some((psize, palign)) = subobject_payload(ty) else {
-            crate::xlog_debug!("[SHADER] strumień PSO: nieznany podobiekt typu {ty} – przerywam analizę");
+            crate::xlog_debug!(
+                "[SHADER] strumień PSO: nieznany podobiekt typu {ty} – przerywam analizę"
+            );
             break;
         };
         let poff = if palign == 8 { 8 } else { 4 };
@@ -377,29 +410,69 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
     }
 }
 
-unsafe extern "system" fn Device_CreateGraphicsPipelineState(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateGraphicsPipelineState(
+    _t: *mut NullObj,
+    d: *const u8,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     capture_graphics_desc(d);
     out_obj(ppv, Kind::PipelineState)
 }
-unsafe extern "system" fn Device_CreateComputePipelineState(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateComputePipelineState(
+    _t: *mut NullObj,
+    d: *const u8,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     capture_compute_desc(d);
     out_obj(ppv, Kind::PipelineState)
 }
-unsafe extern "system" fn Device_CreatePipelineStateStream(_t: *mut NullObj, d: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreatePipelineStateStream(
+    _t: *mut NullObj,
+    d: *const u8,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     capture_stream_desc(d);
     out_obj(ppv, Kind::PipelineState)
 }
-unsafe extern "system" fn Device_CreateCommandList(_t: *mut NullObj, _m: u32, _ty: u32, _a: *mut c_void, _p: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommandList(
+    _t: *mut NullObj,
+    _m: u32,
+    _ty: u32,
+    _a: *mut c_void,
+    _p: *mut c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::CommandList)
 }
-unsafe extern "system" fn Device_CreateCommandList1(_t: *mut NullObj, _m: u32, _ty: u32, _f: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommandList1(
+    _t: *mut NullObj,
+    _m: u32,
+    _ty: u32,
+    _f: u32,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::CommandList)
 }
-unsafe extern "system" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u32, _d: *mut c_void, _s: u32) -> HRESULT {
+unsafe extern "system" fn Device_CheckFeatureSupport(
+    _t: *mut NullObj,
+    feature: u32,
+    _d: *mut c_void,
+    _s: u32,
+) -> HRESULT {
     crate::xlog_debug!("D3D12.X null: CheckFeatureSupport({feature})");
     S_OK
 }
-unsafe extern "system" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateDescriptorHeap(
+    _t: *mut NullObj,
+    desc: *const u8,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if ppv.is_null() {
         return S_FALSE;
     }
@@ -414,10 +487,20 @@ unsafe extern "system" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *c
     *ppv = o as *mut c_void;
     S_OK
 }
-unsafe extern "system" fn Device_GetDescriptorHandleIncrementSize(_t: *mut NullObj, _ty: u32) -> u32 {
+unsafe extern "system" fn Device_GetDescriptorHandleIncrementSize(
+    _t: *mut NullObj,
+    _ty: u32,
+) -> u32 {
     32
 }
-unsafe extern "system" fn Device_CreateRootSignature(_t: *mut NullObj, _m: u32, b: *const c_void, l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateRootSignature(
+    _t: *mut NullObj,
+    _m: u32,
+    b: *const c_void,
+    l: usize,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     crate::gpu::shader::capture("rootsig", b as usize, l);
     out_obj(ppv, Kind::RootSignature)
 }
@@ -456,7 +539,13 @@ unsafe fn new_resource(desc: *const u8, ppv: *mut *mut c_void) -> HRESULT {
     S_OK
 }
 
-unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret: *mut u64, _mask: u32, n: u32, descs: *const u8) -> *mut u64 {
+unsafe extern "system" fn Device_GetResourceAllocationInfo(
+    _t: *mut NullObj,
+    ret: *mut u64,
+    _mask: u32,
+    n: u32,
+    descs: *const u8,
+) -> *mut u64 {
     let mut total = 0usize;
     for i in 0..n as usize {
         total += (approx_size(descs.add(i * 56)) + 0xFFFF) & !0xFFFF;
@@ -467,7 +556,12 @@ unsafe extern "system" fn Device_GetResourceAllocationInfo(_t: *mut NullObj, ret
     }
     ret
 }
-unsafe extern "system" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: *mut u8, _m: u32, ty: u32) -> *mut u8 {
+unsafe extern "system" fn Device_GetCustomHeapProperties(
+    _t: *mut NullObj,
+    ret: *mut u8,
+    _m: u32,
+    ty: u32,
+) -> *mut u8 {
     if !ret.is_null() {
         std::ptr::write_bytes(ret, 0, 20);
         *(ret as *mut u32) = 4; // CUSTOM
@@ -476,25 +570,77 @@ unsafe extern "system" fn Device_GetCustomHeapProperties(_t: *mut NullObj, ret: 
     }
     ret
 }
-unsafe extern "system" fn Device_CreateCommittedResource(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommittedResource(
+    _t: *mut NullObj,
+    _hp: *const c_void,
+    _hf: u32,
+    desc: *const u8,
+    _st: u32,
+    _cv: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "system" fn Device_CreateCommittedResource1(_t: *mut NullObj, _hp: *const c_void, _hf: u32, desc: *const u8, _st: u32, _cv: *const c_void, _ps: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommittedResource1(
+    _t: *mut NullObj,
+    _hp: *const c_void,
+    _hf: u32,
+    desc: *const u8,
+    _st: u32,
+    _cv: *const c_void,
+    _ps: *mut c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "system" fn Device_CreateHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateHeap(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::Heap)
 }
-unsafe extern "system" fn Device_CreateHeap1(_t: *mut NullObj, _d: *const c_void, _s: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateHeap1(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _s: *mut c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::Heap)
 }
-unsafe extern "system" fn Device_CreatePlacedResource(_t: *mut NullObj, _h: *mut c_void, _o: u64, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreatePlacedResource(
+    _t: *mut NullObj,
+    _h: *mut c_void,
+    _o: u64,
+    desc: *const u8,
+    _st: u32,
+    _cv: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "system" fn Device_CreateReservedResource(_t: *mut NullObj, desc: *const u8, _st: u32, _cv: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateReservedResource(
+    _t: *mut NullObj,
+    desc: *const u8,
+    _st: u32,
+    _cv: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     new_resource(desc, ppv)
 }
-unsafe extern "system" fn Device_CreateFence(_t: *mut NullObj, initial: u64, _f: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateFence(
+    _t: *mut NullObj,
+    initial: u64,
+    _f: u32,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if ppv.is_null() {
         return S_FALSE;
     }
@@ -515,9 +661,21 @@ unsafe extern "system" fn Device_GetCopyableFootprints(
     total: *mut u64,
 ) {
     let size = approx_size(desc) as u64;
-    let width = if desc.is_null() { 1 } else { (*(desc.add(16) as *const u64)).max(1) };
-    let height = if desc.is_null() { 1 } else { (*(desc.add(24) as *const u32)).max(1) };
-    let format = if desc.is_null() { 0 } else { *(desc.add(32) as *const u32) };
+    let width = if desc.is_null() {
+        1
+    } else {
+        (*(desc.add(16) as *const u64)).max(1)
+    };
+    let height = if desc.is_null() {
+        1
+    } else {
+        (*(desc.add(24) as *const u32)).max(1)
+    };
+    let format = if desc.is_null() {
+        0
+    } else {
+        *(desc.add(32) as *const u32)
+    };
     let row = ((width * 4 + 255) & !255) as u32;
     for i in 0..num as usize {
         if !layouts.is_null() {
@@ -540,10 +698,21 @@ unsafe extern "system" fn Device_GetCopyableFootprints(
         *total = size.max(row as u64 * height as u64);
     }
 }
-unsafe extern "system" fn Device_CreateQueryHeap(_t: *mut NullObj, _d: *const c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateQueryHeap(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::QueryHeap)
 }
-unsafe extern "system" fn Device_CreateCommandSignature(_t: *mut NullObj, _d: *const c_void, _rs: *mut c_void, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreateCommandSignature(
+    _t: *mut NullObj,
+    _d: *const c_void,
+    _rs: *mut c_void,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::CommandSignature)
 }
 unsafe extern "system" fn Device_GetAdapterLuid(_t: *mut NullObj, ret: *mut u64) -> *mut u64 {
@@ -552,10 +721,23 @@ unsafe extern "system" fn Device_GetAdapterLuid(_t: *mut NullObj, ret: *mut u64)
     }
     ret
 }
-unsafe extern "system" fn Device_CreatePipelineLibrary(_t: *mut NullObj, _b: *const c_void, _l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_CreatePipelineLibrary(
+    _t: *mut NullObj,
+    _b: *const c_void,
+    _l: usize,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     out_obj(ppv, Kind::PipelineLibrary)
 }
-unsafe extern "system" fn Device_SetEventOnMultipleFenceCompletion(_t: *mut NullObj, _f: *const c_void, _v: *const u64, _n: u32, _flags: u32, ev: *mut c_void) -> HRESULT {
+unsafe extern "system" fn Device_SetEventOnMultipleFenceCompletion(
+    _t: *mut NullObj,
+    _f: *const c_void,
+    _v: *const u64,
+    _n: u32,
+    _flags: u32,
+    ev: *mut c_void,
+) -> HRESULT {
     if !ev.is_null() {
         windows_sys::Win32::System::Threading::SetEvent(ev);
     }
@@ -566,7 +748,11 @@ unsafe extern "system" fn Device_SetEventOnMultipleFenceCompletion(_t: *mut Null
 // queue / fence / heap / resource / blob
 // ---------------------------------------------------------------------------------------
 
-unsafe extern "system" fn Queue_Signal(_t: *mut NullObj, fence: *mut NullObj, value: u64) -> HRESULT {
+unsafe extern "system" fn Queue_Signal(
+    _t: *mut NullObj,
+    fence: *mut NullObj,
+    value: u64,
+) -> HRESULT {
     if !fence.is_null() && (*fence).kind == Kind::Fence {
         (*fence).value.fetch_max(value, Ordering::AcqRel);
     }
@@ -579,7 +765,11 @@ unsafe extern "system" fn Queue_GetTimestampFrequency(_t: *mut NullObj, f: *mut 
     *f = 10_000_000;
     S_OK
 }
-unsafe extern "system" fn Queue_GetClockCalibration(_t: *mut NullObj, gpu: *mut u64, cpu: *mut u64) -> HRESULT {
+unsafe extern "system" fn Queue_GetClockCalibration(
+    _t: *mut NullObj,
+    gpu: *mut u64,
+    cpu: *mut u64,
+) -> HRESULT {
     let mut qpc = 0i64;
     windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut qpc);
     if !gpu.is_null() {
@@ -593,7 +783,11 @@ unsafe extern "system" fn Queue_GetClockCalibration(_t: *mut NullObj, gpu: *mut 
 unsafe extern "system" fn Fence_GetCompletedValue(this: *mut NullObj) -> u64 {
     (*this).value.load(Ordering::Acquire)
 }
-unsafe extern "system" fn Fence_SetEventOnCompletion(this: *mut NullObj, value: u64, ev: *mut c_void) -> HRESULT {
+unsafe extern "system" fn Fence_SetEventOnCompletion(
+    this: *mut NullObj,
+    value: u64,
+    ev: *mut c_void,
+) -> HRESULT {
     // the null GPU finishes everything instantly
     (*this).value.fetch_max(value, Ordering::AcqRel);
     if !ev.is_null() {
@@ -617,11 +811,23 @@ unsafe extern "system" fn Heap_GetHandleStart(this: *mut NullObj, ret: *mut u64)
     }
     ret
 }
-unsafe extern "system" fn Resource_Map(this: *mut NullObj, _sub: u32, _range: *const c_void, data: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn Resource_Map(
+    this: *mut NullObj,
+    _sub: u32,
+    _range: *const c_void,
+    data: *mut *mut c_void,
+) -> HRESULT {
     let mut g = (*this).mem.lock().unwrap();
     if g.0 == 0 {
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
-        g.0 = VirtualAlloc(std::ptr::null(), g.1.max(1), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
+        g.0 = VirtualAlloc(
+            std::ptr::null(),
+            g.1.max(1),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        ) as usize;
     }
     if !data.is_null() {
         *data = g.0 as *mut c_void;
@@ -641,7 +847,11 @@ unsafe extern "system" fn Resource_GetDesc(this: *mut NullObj, ret: *mut u8) -> 
 unsafe extern "system" fn Resource_GetGPUVirtualAddress(this: *mut NullObj) -> u64 {
     (*this).value.load(Ordering::Relaxed)
 }
-unsafe extern "system" fn Resource_GetHeapProperties(_t: *mut NullObj, props: *mut u8, flags: *mut u32) -> HRESULT {
+unsafe extern "system" fn Resource_GetHeapProperties(
+    _t: *mut NullObj,
+    props: *mut u8,
+    flags: *mut u32,
+) -> HRESULT {
     if !props.is_null() {
         std::ptr::write_bytes(props, 0, 20);
         *(props as *mut u32) = 1; // DEFAULT
@@ -688,46 +898,87 @@ unsafe fn create_device(ppv: *mut *mut c_void) -> HRESULT {
     S_OK
 }
 
-pub unsafe extern "system" fn D3D12CreateDevice(_adapter: *mut c_void, _fl: u32, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateDevice(
+    _adapter: *mut c_void,
+    _fl: u32,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     create_device(ppv)
 }
-pub unsafe extern "system" fn D3D12XboxCreateDevice(_adapter: *mut c_void, _params: *const c_void, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12XboxCreateDevice(
+    _adapter: *mut c_void,
+    _params: *const c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     create_device(ppv)
 }
-pub unsafe extern "system" fn D3D12GetDebugInterface(_riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12GetDebugInterface(
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
     }
     E_NOINTERFACE
 }
-pub unsafe extern "system" fn D3D12SerializeRootSignature(_d: *const c_void, _v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12SerializeRootSignature(
+    _d: *const c_void,
+    _v: u32,
+    blob: *mut *mut c_void,
+    err: *mut *mut c_void,
+) -> HRESULT {
     if !err.is_null() {
         *err = std::ptr::null_mut();
     }
     new_blob(16, blob)
 }
-pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(_d: *const c_void, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(
+    _d: *const c_void,
+    blob: *mut *mut c_void,
+    err: *mut *mut c_void,
+) -> HRESULT {
     if !err.is_null() {
         *err = std::ptr::null_mut();
     }
     new_blob(16, blob)
 }
-pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(_d: *const c_void, _l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateRootSignatureDeserializer(
+    _d: *const c_void,
+    _l: usize,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
     }
     E_NOTIMPL
 }
-pub unsafe extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(_d: *const c_void, _l: usize, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12CreateVersionedRootSignatureDeserializer(
+    _d: *const c_void,
+    _l: usize,
+    _r: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
     }
     E_NOTIMPL
 }
-pub unsafe extern "system" fn D3D12EnableExperimentalFeatures(_n: u32, _i: *const c_void, _c: *mut c_void, _s: *mut u32) -> HRESULT {
+pub unsafe extern "system" fn D3D12EnableExperimentalFeatures(
+    _n: u32,
+    _i: *const c_void,
+    _c: *mut c_void,
+    _s: *mut u32,
+) -> HRESULT {
     E_NOINTERFACE
 }
-pub unsafe extern "system" fn D3D12GetInterface(_clsid: *const c_void, _riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn D3D12GetInterface(
+    _clsid: *const c_void,
+    _riid: *const c_void,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
     if !ppv.is_null() {
         *ppv = std::ptr::null_mut();
     }
@@ -744,7 +995,12 @@ pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRES
 mod tests {
     use super::*;
 
-    type Fn4 = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT;
+    type Fn4 = unsafe extern "system" fn(
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> HRESULT;
 
     unsafe fn slot(obj: *mut c_void, i: usize) -> usize {
         *(*(obj as *const *const usize)).add(i)
@@ -754,37 +1010,79 @@ mod tests {
     fn device_queue_fence_resource_roundtrip() {
         unsafe {
             let mut dev = std::ptr::null_mut();
-            assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
+            assert_eq!(
+                D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev),
+                S_OK
+            );
             let create_queue: Fn4 = std::mem::transmute(slot(dev, 8));
             let mut q = std::ptr::null_mut();
-            assert_eq!(create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q), S_OK);
+            assert_eq!(
+                create_queue(dev, std::ptr::null(), std::ptr::null(), &mut q),
+                S_OK
+            );
             // fence: CreateFence(initial=5)
-            let create_fence: unsafe extern "system" fn(*mut c_void, u64, u32, *const c_void, *mut *mut c_void) -> HRESULT =
-                std::mem::transmute(slot(dev, 36));
+            let create_fence: unsafe extern "system" fn(
+                *mut c_void,
+                u64,
+                u32,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> HRESULT = std::mem::transmute(slot(dev, 36));
             let mut f = std::ptr::null_mut();
             assert_eq!(create_fence(dev, 5, 0, std::ptr::null(), &mut f), S_OK);
-            let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(slot(q, 14));
+            let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT =
+                std::mem::transmute(slot(q, 14));
             assert_eq!(signal(q, f, 9), S_OK);
-            let completed: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(slot(f, 8));
+            let completed: unsafe extern "system" fn(*mut c_void) -> u64 =
+                std::mem::transmute(slot(f, 8));
             assert_eq!(completed(f), 9);
             // buffer resource: Map gives writable memory
             let mut desc = [0u8; 56];
             desc[0] = 1; // BUFFER
             desc[16..24].copy_from_slice(&4096u64.to_le_bytes());
-            let create_res: unsafe extern "system" fn(*mut c_void, *const c_void, u32, *const u8, u32, *const c_void, *const c_void, *mut *mut c_void) -> HRESULT =
-                std::mem::transmute(slot(dev, 27));
+            let create_res: unsafe extern "system" fn(
+                *mut c_void,
+                *const c_void,
+                u32,
+                *const u8,
+                u32,
+                *const c_void,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> HRESULT = std::mem::transmute(slot(dev, 27));
             let mut r = std::ptr::null_mut();
-            assert_eq!(create_res(dev, std::ptr::null(), 0, desc.as_ptr(), 0, std::ptr::null(), std::ptr::null(), &mut r), S_OK);
-            let map: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(slot(r, 8));
+            assert_eq!(
+                create_res(
+                    dev,
+                    std::ptr::null(),
+                    0,
+                    desc.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut r
+                ),
+                S_OK
+            );
+            let map: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                *const c_void,
+                *mut *mut c_void,
+            ) -> HRESULT = std::mem::transmute(slot(r, 8));
             let mut p = std::ptr::null_mut();
             assert_eq!(map(r, 0, std::ptr::null(), &mut p), S_OK);
             std::ptr::write_bytes(p as *mut u8, 0xAB, 4096);
-            let gpu: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(slot(r, 11));
+            let gpu: unsafe extern "system" fn(*mut c_void) -> u64 =
+                std::mem::transmute(slot(r, 11));
             assert_ne!(gpu(r), 0);
             // unknown slot → logging stub returning 0
-            let unknown: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(dev, 200));
+            let unknown: unsafe extern "system" fn(*mut c_void) -> usize =
+                std::mem::transmute(slot(dev, 200));
             assert_eq!(unknown(dev), 0);
-            assert!(crate::stubs::all_stubs().iter().any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
+            assert!(crate::stubs::all_stubs()
+                .iter()
+                .any(|s| s.name == "ID3D12Device::#200" && s.calls.load(Ordering::Relaxed) > 0));
         }
     }
 }

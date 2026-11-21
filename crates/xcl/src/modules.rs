@@ -79,7 +79,12 @@ pub fn find_mapped_by_base(base: usize) -> Option<Arc<MappedModule>> {
 }
 
 pub fn find_mapped_by_addr(addr: usize) -> Option<Arc<MappedModule>> {
-    MAPPED.read().ok()?.iter().find(|m| m.contains(addr)).cloned()
+    MAPPED
+        .read()
+        .ok()?
+        .iter()
+        .find(|m| m.contains(addr))
+        .cloned()
 }
 
 pub fn set_main(m: Arc<MappedModule>) {
@@ -98,14 +103,23 @@ static HLE_HANDLES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
 /// Stable fake HMODULE for an HLE module: a committed page starting with "MZ".
 pub fn hle_handle(module_name: &str) -> usize {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+    };
     let key = crate::util::dll_key(module_name);
     let mut g = HLE_HANDLES.lock().unwrap();
     let map = g.get_or_insert_with(HashMap::new);
     if let Some(&h) = map.get(&key) {
         return h;
     }
-    let p = unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as *mut u8;
+    let p = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            0x1000,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    } as *mut u8;
     unsafe {
         *p = b'M';
         *p.add(1) = b'Z';
@@ -116,7 +130,10 @@ pub fn hle_handle(module_name: &str) -> usize {
 
 pub fn hle_name_by_handle(h: usize) -> Option<String> {
     let g = HLE_HANDLES.lock().ok()?;
-    g.as_ref()?.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone())
+    g.as_ref()?
+        .iter()
+        .find(|(_, &v)| v == h)
+        .map(|(k, _)| k.clone())
 }
 
 /// "game.exe+0x1234", "KERNELBASE.dll+0x5678" or "0x...".

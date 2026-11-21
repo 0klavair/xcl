@@ -138,7 +138,13 @@ pub const IO_GS_VERTICES: usize = 111;
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
     pub fn es_item_bytes(&self) -> u32 {
-        16 * (self.es_outputs.iter().map(|e| e.register).max().unwrap_or(0) + 1)
+        16 * (self
+            .es_outputs
+            .iter()
+            .map(|e| e.register)
+            .max()
+            .unwrap_or(0)
+            + 1)
     }
     /// LDS bytes for the ES vertices of a group; the GS output area follows (s2)
     pub fn es_ring_bytes(&self) -> u32 {
@@ -150,7 +156,12 @@ impl GsInterface {
     }
     /// float4 slots per pre-fetched input vertex
     pub fn input_registers(&self) -> u32 {
-        self.es_inputs.iter().filter(|e| e.system_value == 0).map(|e| e.register + 1).max().unwrap_or(0)
+        self.es_inputs
+            .iter()
+            .filter(|e| e.system_value == 0)
+            .map(|e| e.register + 1)
+            .max()
+            .unwrap_or(0)
     }
     /// The record the emulation writes per group (drawn by `mesh_passthrough`).
     pub fn record(&self) -> MsInterface {
@@ -180,7 +191,10 @@ pub struct CsInterface {
 impl CsInterface {
     /// From the FSSM stage descriptor at `desc` (COMPUTE_PGM_RSRC2 at +0x38, numthreads +0x3C).
     pub fn from_descriptor(fssm: &[u8], desc: usize) -> Option<CsInterface> {
-        let rd = |o: usize| fssm.get(desc + o..desc + o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let rd = |o: usize| {
+            fssm.get(desc + o..desc + o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
         let r = rd(0x38)?;
         let threads = [rd(0x3C)?, rd(0x40)?, rd(0x44)?];
         if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
@@ -212,14 +226,21 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
     use super::xbox;
     let pick = |blob: &[u8], hw: u8| -> Result<Vec<u8>, String> {
         let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
-        let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)).ok_or_else(|| format!("brak wariantu {}", xbox::hw_stage_name(hw)))?;
+        let f = sh
+            .fssm
+            .iter()
+            .find(|f| f.stages.first().is_some_and(|s| s.hw == hw))
+            .ok_or_else(|| format!("brak wariantu {}", xbox::hw_stage_name(hw)))?;
         let p = f.programs.first().ok_or("FSSM bez programu")?;
         Ok(f.data[p.offset..p.offset + p.len].to_vec())
     };
     let (es, gs) = (pick(es_blob, 2)?, pick(gs_blob, 3)?);
     let psv = super::dxbc::psv(gs_blob).ok_or("GS bez PSV0")?;
     if psv.gs_input_primitive != 3 || psv.gs_output_topology != 5 {
-        return Err(format!("GS: wejście {} / wyjście {} – obsługiwane trójkąty → triangle strip", psv.gs_input_primitive, psv.gs_output_topology));
+        return Err(format!(
+            "GS: wejście {} / wyjście {} – obsługiwane trójkąty → triangle strip",
+            psv.gs_input_primitive, psv.gs_output_topology
+        ));
     }
     let (es_inputs, es_outputs) = super::dxbc::signatures(es_blob);
     let g = GsInterface {
@@ -236,10 +257,16 @@ pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsIn
 
 /// Non-system elements in register order – the order of `exp param N` / `v_interp attrN`.
 pub fn ranked(sig: &[SigElement], with_clip: bool) -> Vec<&SigElement> {
-    let mut user: Vec<&SigElement> = sig.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
+    let mut user: Vec<&SigElement> = sig
+        .iter()
+        .filter(|e| e.system_value == 0 && !e.name.starts_with("SV_"))
+        .collect();
     user.sort_by_key(|e| e.register);
     if with_clip {
-        let mut clip: Vec<&SigElement> = sig.iter().filter(|e| matches!(e.system_value, 2 | 3)).collect();
+        let mut clip: Vec<&SigElement> = sig
+            .iter()
+            .filter(|e| matches!(e.system_value, 2 | 3))
+            .collect();
         clip.sort_by_key(|e| e.register);
         user.extend(clip);
     }
@@ -256,7 +283,12 @@ pub fn ps_input_vgpr(ena: u32, bit: u32) -> Option<u64> {
     if ena >> bit & 1 == 0 {
         return None;
     }
-    Some((0..bit).filter(|b| ena >> b & 1 == 1).map(|b| PS_INPUT_SIZES[b as usize]).sum())
+    Some(
+        (0..bit)
+            .filter(|b| ena >> b & 1 == 1)
+            .map(|b| PS_INPUT_SIZES[b as usize])
+            .sum(),
+    )
 }
 
 /// Interface of a console program from its container (None: not a VS/PS we can drive).
@@ -264,21 +296,49 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
     let (inputs, outputs) = super::dxbc::signatures(blob);
     let hw = f.stages.first()?.hw;
     match (sh.stage.as_str(), hw) {
-        ("VS", 4) => Some(Mode::Vertex(VsInterface { inputs, outputs, attr_base: 4 })),
+        ("VS", 4) => Some(Mode::Vertex(VsInterface {
+            inputs,
+            outputs,
+            attr_base: 4,
+        })),
         ("PS", 5) => {
-            let ena = f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
-            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena }))
+            let ena = f
+                .data
+                .get(0x248..0x24C)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
+            Some(Mode::Pixel(PsInterface {
+                inputs,
+                outputs,
+                input_ena: ena,
+            }))
         }
         // ES variant of a VS (before a GS) and the GS itself, each translatable on its own
-        ("VS", 2) => Some(Mode::Geometry(GsInterface { es_inputs: inputs, es_outputs: outputs, max_vertex_count: 1, ..Default::default() })),
+        ("VS", 2) => Some(Mode::Geometry(GsInterface {
+            es_inputs: inputs,
+            es_outputs: outputs,
+            max_vertex_count: 1,
+            ..Default::default()
+        })),
         ("GS", 3) => {
             let p = super::dxbc::psv(blob)?;
-            Some(Mode::Geometry(GsInterface { outputs, max_vertex_count: p.gs_max_vertex_count.max(1) as u32, gs_start: Some(0), ..Default::default() }))
+            Some(Mode::Geometry(GsInterface {
+                outputs,
+                max_vertex_count: p.gs_max_vertex_count.max(1) as u32,
+                gs_start: Some(0),
+                ..Default::default()
+            }))
         }
-        ("CS", 6) => Some(Mode::Compute(CsInterface::from_descriptor(&f.data, f.stages.first()?.offset)?)),
+        ("CS", 6) => Some(Mode::Compute(CsInterface::from_descriptor(
+            &f.data,
+            f.stages.first()?.offset,
+        )?)),
         ("MS", 7) => {
             let p = super::dxbc::psv(blob)?;
-            let threads = p.numthreads.map(|t| t[0] * t[1].max(1) * t[2].max(1)).filter(|&t| t > 0).unwrap_or(128);
+            let threads = p
+                .numthreads
+                .map(|t| t[0] * t[1].max(1) * t[2].max(1))
+                .filter(|&t| t > 0)
+                .unwrap_or(128);
             if p.ms_topology != 2 {
                 return None; // lines / points: not yet
             }
@@ -305,7 +365,11 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0 }
+        Options {
+            mode: Mode::Kernel,
+            wave64: true,
+            hw_wave: 0,
+        }
     }
 }
 
@@ -354,7 +418,9 @@ fn block_end(c: &Ctx, i: usize) -> u64 {
 }
 
 fn term(c: &Ctx, start: u64, end: u64) -> Term {
-    let Some(d) = c.insts.iter().rev().find(|d| d.pc >= start && d.pc < end) else { return Term::Next };
+    let Some(d) = c.insts.iter().rev().find(|d| d.pc >= start && d.pc < end) else {
+        return Term::Next;
+    };
     match (rdna2::branch_target(d), d.inst.name) {
         (Some(t), n) if n.starts_with("S_CBRANCH") => Term::Cond(t),
         (Some(t), "S_BRANCH") => Term::Jump(t),
@@ -388,7 +454,9 @@ fn else_end(c: &Ctx, then_lo: u64, t: u64, hi: u64) -> Option<u64> {
         return None;
     }
     match term(c, lb, t) {
-        Term::Jump(u) if u > t && u <= hi && (u == hi || c.leaders.binary_search(&u).is_ok()) => Some(u),
+        Term::Jump(u) if u > t && u <= hi && (u == hi || c.leaders.binary_search(&u).is_ok()) => {
+            Some(u)
+        }
         _ => None,
     }
 }
@@ -398,12 +466,19 @@ fn structurable_to(c: &Ctx, lo: u64, hi: u64, top: bool, exit: Option<u64>) -> b
     while i < c.leaders.len() && c.leaders[i] < hi {
         let start = c.leaders[i];
         let end = block_end(c, i);
-        if let Some(&(a, b)) = c.loops.iter().find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)) {
+        if let Some(&(a, b)) = c
+            .loops
+            .iter()
+            .find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi))
+        {
             // the latch is the last block of the loop: a branch back to its start
             let last = c.leaders.partition_point(|&l| l < b) - 1;
             let latch = c.leaders[last];
             if !matches!(term(c, latch, b), Term::Cond(t) if t == a) {
-                why(start, &format!("pętla {a:#x}..{b:#x}: koniec {:?}", term(c, latch, b)));
+                why(
+                    start,
+                    &format!("pętla {a:#x}..{b:#x}: koniec {:?}", term(c, latch, b)),
+                );
                 return false;
             }
             if !structurable_to(c, a, latch, false, None) {
@@ -414,10 +489,14 @@ fn structurable_to(c: &Ctx, lo: u64, hi: u64, top: bool, exit: Option<u64>) -> b
         }
         match term(c, start, end) {
             Term::Next => i += 1,
-            Term::Cond(t) if t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) => {
+            Term::Cond(t)
+                if t >= end && t <= hi && (t == hi || c.leaders.binary_search(&t).is_ok()) =>
+            {
                 // if / else: the skipped range ends with a jump over the else range
                 if let Some(u) = else_end(c, end, t, hi) {
-                    if !structurable_to(c, end, t, false, Some(u)) || !structurable_to(c, t, u, false, None) {
+                    if !structurable_to(c, end, t, false, Some(u))
+                        || !structurable_to(c, t, u, false, None)
+                    {
                         return false;
                     }
                     i = c.leaders.partition_point(|&l| l < u);
@@ -432,7 +511,10 @@ fn structurable_to(c: &Ctx, lo: u64, hi: u64, top: bool, exit: Option<u64>) -> b
             Term::End if top && end == u64::MAX => i += 1,
             Term::End if top && c.insts.iter().all(|d| d.pc < end) => i += 1,
             other => {
-                why(start, &format!("blok {start:#x}..{end:#x} w {lo:#x}..{hi:#x}: {other:?}"));
+                why(
+                    start,
+                    &format!("blok {start:#x}..{end:#x} w {lo:#x}..{hi:#x}: {other:?}"),
+                );
                 return false;
             }
         }
@@ -441,10 +523,22 @@ fn structurable_to(c: &Ctx, lo: u64, hi: u64, top: bool, exit: Option<u64>) -> b
 }
 
 /// The instructions of block [start, end) at `depth`; the flow of the last one.
-fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
+fn emit_block(
+    c: &Ctx,
+    em: &mut emit::Em,
+    body: &mut String,
+    start: u64,
+    end: u64,
+    depth: usize,
+    blocks: &mut usize,
+) -> emit::Flow {
     em.indent = depth;
     let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = c.insts.iter().filter(|d| d.pc >= start && d.pc < end).collect();
+    let block: Vec<&Decoded> = c
+        .insts
+        .iter()
+        .filter(|d| d.pc >= start && d.pc < end)
+        .collect();
     for (k, d) in block.iter().enumerate() {
         let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
         flow = em.inst(d, next);
@@ -458,19 +552,33 @@ fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u6
 }
 
 /// Emit a range `structurable` accepted.
-fn emit_structured(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize) {
+fn emit_structured(
+    c: &Ctx,
+    em: &mut emit::Em,
+    body: &mut String,
+    lo: u64,
+    hi: u64,
+    depth: usize,
+    blocks: &mut usize,
+) {
     let pad = "    ".repeat(depth);
     let mut i = c.leaders.partition_point(|&l| l < lo);
     while i < c.leaders.len() && c.leaders[i] < hi {
         let start = c.leaders[i];
         let end = block_end(c, i);
-        if let Some(&(a, b)) = c.loops.iter().find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)) {
+        if let Some(&(a, b)) = c
+            .loops
+            .iter()
+            .find(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi))
+        {
             let last = c.leaders.partition_point(|&l| l < b) - 1;
             let latch = c.leaders[last];
             body.push_str(&format!("{pad}[loop] for (;;) {{\n"));
             emit_structured(c, em, body, a, latch, depth + 1, blocks);
             match emit_block(c, em, body, latch, b, depth + 1, blocks) {
-                emit::Flow::Cond(cond, _) => body.push_str(&format!("{pad}    if (!({cond})) break;\n")),
+                emit::Flow::Cond(cond, _) => {
+                    body.push_str(&format!("{pad}    if (!({cond})) break;\n"))
+                }
                 _ => body.push_str(&format!("{pad}    break;\n")),
             }
             body.push_str(&format!("{pad}}}\n"));
@@ -520,17 +628,38 @@ fn structured_span(c: &Ctx, i: usize, hi: u64) -> Option<u64> {
         j += 1;
     }
     // entered only at start: no branch from outside lands strictly inside
-    let entered_inside = |x: u64| c.edges.iter().any(|&(src, dst)| dst > start && dst < x && (src < start || src >= x));
-    ends.iter().rev().take(64).copied().find(|&x| !entered_inside(x) && structurable_to(c, start, x, false, None))
+    let entered_inside = |x: u64| {
+        c.edges
+            .iter()
+            .any(|&(src, dst)| dst > start && dst < x && (src < start || src >= x))
+    };
+    ends.iter()
+        .rev()
+        .take(64)
+        .copied()
+        .find(|&x| !entered_inside(x) && structurable_to(c, start, x, false, None))
 }
 
 /// Emit the blocks starting in [lo, hi) at nesting `depth`; loop ranges become `while`.
-fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, depth: usize, blocks: &mut usize) {
+fn emit_range(
+    c: &Ctx,
+    em: &mut emit::Em,
+    body: &mut String,
+    lo: u64,
+    hi: u64,
+    depth: usize,
+    blocks: &mut usize,
+) {
     let pad = "    ".repeat(depth);
     let mut i = c.leaders.partition_point(|&l| l < lo);
     while i < c.leaders.len() && c.leaders[i] < hi {
         let start = c.leaders[i];
-        let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
+        let inner = c
+            .loops
+            .iter()
+            .filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi))
+            .max_by_key(|x| x.1)
+            .copied();
         if let Some((a, b)) = inner {
             body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks);
@@ -542,7 +671,11 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         if let Some(x) = structured_span(c, i, hi) {
             body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
             emit_structured(c, em, body, start, x, depth + 1, blocks);
-            let next = if x == u64::MAX || !c.starts.contains(&x) { "0xFFFFFFFFu".to_string() } else { format!("{x}u") };
+            let next = if x == u64::MAX || !c.starts.contains(&x) {
+                "0xFFFFFFFFu".to_string()
+            } else {
+                format!("{x}u")
+            };
             body.push_str(&format!("{pad}    pc = {next};\n{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < x);
             continue;
@@ -551,7 +684,11 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
         let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = c.insts.iter().filter(|d| d.pc >= start && d.pc < end).collect();
+        let block: Vec<&Decoded> = c
+            .insts
+            .iter()
+            .filter(|d| d.pc >= start && d.pc < end)
+            .collect();
         for (k, d) in block.iter().enumerate() {
             let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
             flow = em.inst(d, next);
@@ -560,7 +697,11 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
             }
         }
         body.push_str(&em.take());
-        let fallthrough = if end == u64::MAX || !c.starts.contains(&end) { "0xFFFFFFFFu".to_string() } else { format!("{end}u") };
+        let fallthrough = if end == u64::MAX || !c.starts.contains(&end) {
+            "0xFFFFFFFFu".to_string()
+        } else {
+            format!("{end}u")
+        };
         let tail = match flow {
             emit::Flow::Next => format!("pc = {fallthrough};"),
             emit::Flow::Jump(t) => format!("pc = {t}u;"),
@@ -580,7 +721,9 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut off = 0;
     while off + 4 <= code.len() {
-        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+            break;
+        };
         off += d.len;
         match d.inst.name {
             "V_READLANE_B32" | "V_WRITELANE_B32" => {
@@ -612,7 +755,9 @@ pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;
     let (mut w64, mut w32) = (0, 0);
     while off + 4 <= code.len() {
-        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else {
+            break;
+        };
         let n = d.inst.name;
         if n.ends_with("_SAVEEXEC_B64") || n.ends_with("_WREXEC_B64") || n.starts_with("V_CMPX") {
             w64 += n.ends_with("_B64") as i32;
@@ -638,7 +783,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
-        let d = rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: nie da się zdekodować ({e:?})"))?;
+        let d = rdna2::decode(&code[off..], off as u64)
+            .map_err(|e| format!("+{off:#x}: nie da się zdekodować ({e:?})"))?;
         off += d.len;
         insts.push(d);
     }
@@ -662,7 +808,10 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         if let Some(t) = rdna2::branch_target(d) {
             if !starts.contains(&t) {
-                return Err(format!("+{:#x}: skok do {t:#x}, który nie jest początkiem instrukcji", d.pc));
+                return Err(format!(
+                    "+{:#x}: skok do {t:#x}, który nie jest początkiem instrukcji",
+                    d.pc
+                ));
             }
             leaders.insert(t);
             leaders.insert(next);
@@ -730,9 +879,21 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         loops.sort();
         loops.dedup();
-        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges };
-        if gs_jump.is_none() && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX, true) {
+        let edges: Vec<(u64, u64)> = insts
+            .iter()
+            .filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t)))
+            .collect();
+        let ctx = Ctx {
+            insts: &insts,
+            starts: &starts,
+            leaders: &leaders,
+            loops: &loops,
+            edges: &edges,
+        };
+        if gs_jump.is_none()
+            && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none()
+            && structurable(&ctx, 0, u64::MAX, true)
+        {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut body, 0, u64::MAX, 1, &mut blocks);
@@ -742,5 +903,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let hlsl = em.finish(&body);
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks })
+    Ok(Translation {
+        hlsl,
+        unsupported: em.unsupported,
+        unsupported_why: em.unsupported_why,
+        ignored: em.ignored,
+        instructions: insts.len(),
+        blocks,
+    })
 }

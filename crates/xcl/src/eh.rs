@@ -10,7 +10,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    RtlAddFunctionTable, SetUnhandledExceptionFilter, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY,
+    RtlAddFunctionTable, SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+    IMAGE_RUNTIME_FUNCTION_ENTRY,
 };
 
 use crate::hooks;
@@ -19,7 +20,11 @@ use crate::modules;
 pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
     let count = size / std::mem::size_of::<IMAGE_RUNTIME_FUNCTION_ENTRY>() as u32;
     let ok = unsafe {
-        RtlAddFunctionTable((base + rva as usize) as *const IMAGE_RUNTIME_FUNCTION_ENTRY, count, base as u64)
+        RtlAddFunctionTable(
+            (base + rva as usize) as *const IMAGE_RUNTIME_FUNCTION_ENTRY,
+            count,
+            base as u64,
+        )
     };
     if !ok {
         crate::xlog_warn!("RtlAddFunctionTable({base:#x}) nie powiodło się");
@@ -30,7 +35,10 @@ pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
 static ORIG_PC_TO_FILE_HEADER: AtomicUsize = AtomicUsize::new(0);
 type PcToFileHeader = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> *mut c_void;
 
-unsafe extern "system" fn hk_rtl_pc_to_file_header(pc: *mut c_void, base_out: *mut *mut c_void) -> *mut c_void {
+unsafe extern "system" fn hk_rtl_pc_to_file_header(
+    pc: *mut c_void,
+    base_out: *mut *mut c_void,
+) -> *mut c_void {
     if let Some(b) = modules::image_base_for_addr(pc as usize) {
         if !base_out.is_null() {
             *base_out = b as *mut c_void;

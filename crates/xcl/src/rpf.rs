@@ -18,11 +18,18 @@ fn magic(b: &[u8]) -> String {
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
-    let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
+    let opt = |n: &str| {
+        args.iter()
+            .position(|a| a == n)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(30);
     let find = opt("--find");
     let extract = opt("--extract");
-    let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rpf_out"));
+    let out = opt("--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("rpf_out"));
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -37,10 +44,23 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let recs = pack::scan(&data, 0x40);
     if recs.is_empty() {
         // no inline records: list the (nested) RPF9 headers and say whether the TOC is readable
-        let heads: Vec<usize> = data.windows(4).enumerate().filter(|(i, w)| i % 0x800 == 0 && *w == pack::RPF9_MAGIC).map(|(i, _)| i).collect();
-        let toc = |h: usize| data.get(h + 0x40..h + 0x60).map(|b| b.to_vec()).unwrap_or_default();
+        let heads: Vec<usize> = data
+            .windows(4)
+            .enumerate()
+            .filter(|(i, w)| i % 0x800 == 0 && *w == pack::RPF9_MAGIC)
+            .map(|(i, _)| i)
+            .collect();
+        let toc = |h: usize| {
+            data.get(h + 0x40..h + 0x60)
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
+        };
         let same = heads.len() > 1 && heads.iter().all(|&h| toc(h) == toc(heads[0]));
-        println!("{}: {:.1} MB, brak rekordów z jawnymi nazwami", path.display(), data.len() as f64 / 1048576.0);
+        println!(
+            "{}: {:.1} MB, brak rekordów z jawnymi nazwami",
+            path.display(),
+            data.len() as f64 / 1048576.0
+        );
         println!("archiwa RPF9 (nagłówki co 2 KB): {}", heads.len());
         for &h in heads.iter().take(top) {
             let w = |o: usize| u32::from_le_bytes(data[h + o..h + o + 4].try_into().unwrap());
@@ -51,7 +71,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
         return 0;
     }
-    let (csum, usum): (usize, usize) = recs.iter().fold((0, 0), |a, r| (a.0 + r.csize, a.1 + r.usize));
+    let (csum, usum): (usize, usize) = recs
+        .iter()
+        .fold((0, 0), |a, r| (a.0 + r.csize, a.1 + r.usize));
     println!(
         "{}: {:.1} MB, {} rekordów, spakowane {:.1} MB → {:.1} MB",
         path.display(),
@@ -66,7 +88,11 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let mut shown = 0;
     let mut extracted = 0;
     for r in &recs {
-        let ext = r.name.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_else(|| "(bez rozszerzenia)".into());
+        let ext = r
+            .name
+            .rsplit_once('.')
+            .map(|x| x.1.to_ascii_lowercase())
+            .unwrap_or_else(|| "(bez rozszerzenia)".into());
         let e = by_ext.entry(ext).or_default();
         e.0 += 1;
         e.1 += r.usize;
@@ -75,10 +101,19 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         if !(hit && shown < top) && !want && by_magic.len() > 64 {
             continue;
         }
-        let Some(blob) = pack::inflate(&data, r) else { continue };
+        let Some(blob) = pack::inflate(&data, r) else {
+            continue;
+        };
         *by_magic.entry(magic(&blob)).or_default() += 1;
         if hit && shown < top {
-            println!("  {:#010x} {:>9} → {:>9} B  [{}]  {}", r.offset, r.csize, r.usize, magic(&blob), r.name);
+            println!(
+                "  {:#010x} {:>9} → {:>9} B  [{}]  {}",
+                r.offset,
+                r.csize,
+                r.usize,
+                magic(&blob),
+                r.name
+            );
             shown += 1;
         }
         if want {
@@ -95,7 +130,14 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     let mut m: Vec<_> = by_magic.into_iter().collect();
     m.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("sygnatury danych (z próbki): {}", m.iter().take(12).map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", "));
+    println!(
+        "sygnatury danych (z próbki): {}",
+        m.iter()
+            .take(12)
+            .map(|(k, n)| format!("{k} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     if extract.is_some() {
         println!("wypakowano {extracted} do {}", out.display());
     }

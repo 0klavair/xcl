@@ -208,7 +208,8 @@ pub struct Pe<'a> {
 }
 
 fn rd_u16(d: &[u8], off: usize) -> Option<u16> {
-    d.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    d.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
     d.get(off..off + 4)
@@ -248,7 +249,13 @@ impl<'a> Pe<'a> {
         if machine != IMAGE_FILE_MACHINE_AMD64 {
             return Err(PeError::NotX64(machine));
         }
-        let t = |o: usize| PeError::Truncated(if o < 112 { "optional header" } else { "data directories" });
+        let t = |o: usize| {
+            PeError::Truncated(if o < 112 {
+                "optional header"
+            } else {
+                "data directories"
+            })
+        };
         let entry_rva = rd_u32(data, opt + 16).ok_or(t(16))?;
         let image_base = rd_u64(data, opt + 24).ok_or(t(24))?;
         let section_alignment = rd_u32(data, opt + 32).ok_or(t(32))?;
@@ -270,7 +277,9 @@ impl<'a> Pe<'a> {
         let sec0 = opt + opt_size;
         for i in 0..nsec {
             let o = sec0 + i * 40;
-            let raw_name = data.get(o..o + 8).ok_or(PeError::Truncated("section table"))?;
+            let raw_name = data
+                .get(o..o + 8)
+                .ok_or(PeError::Truncated("section table"))?;
             let end = raw_name.iter().position(|&c| c == 0).unwrap_or(8);
             sections.push(Section {
                 name: String::from_utf8_lossy(&raw_name[..end]).into_owned(),
@@ -391,7 +400,10 @@ impl<'a> Pe<'a> {
                 let name = self.cstr_at(hn + 2).ok_or(PeError::BadRva(hn + 2))?;
                 ImportName::Name { hint, name }
             };
-            out.push(ImportEntry { iat_rva: iat_rva + i * 8, what });
+            out.push(ImportEntry {
+                iat_rva: iat_rva + i * 8,
+                what,
+            });
         }
         Ok(out)
     }
@@ -412,7 +424,12 @@ impl<'a> Pe<'a> {
             }
             let dll = self.cstr_at(name_rva).ok_or(PeError::BadRva(name_rva))?;
             let entries = self.thunks(int_rva, iat_rva)?;
-            out.push(ImportDll { dll, delay: false, entries, module_handle_rva: 0 });
+            out.push(ImportDll {
+                dll,
+                delay: false,
+                entries,
+                module_handle_rva: 0,
+            });
         }
         Ok(out)
     }
@@ -443,7 +460,12 @@ impl<'a> Pe<'a> {
             }
             let dll = self.cstr_at(name_rva).ok_or(PeError::BadRva(name_rva))?;
             let entries = self.thunks(int_rva, iat_rva)?;
-            out.push(ImportDll { dll, delay: true, entries, module_handle_rva: hmod_rva });
+            out.push(ImportDll {
+                dll,
+                delay: true,
+                entries,
+                module_handle_rva: hmod_rva,
+            });
         }
         Ok(out)
     }
@@ -456,8 +478,12 @@ impl<'a> Pe<'a> {
         }
         let mut pos = 0u32;
         while pos + 8 <= d.size {
-            let page = self.u32_at(d.rva + pos).ok_or(PeError::BadRva(d.rva + pos))?;
-            let block = self.u32_at(d.rva + pos + 4).ok_or(PeError::BadRva(d.rva + pos))?;
+            let page = self
+                .u32_at(d.rva + pos)
+                .ok_or(PeError::BadRva(d.rva + pos))?;
+            let block = self
+                .u32_at(d.rva + pos + 4)
+                .ok_or(PeError::BadRva(d.rva + pos))?;
             if block < 8 {
                 break;
             }
@@ -470,7 +496,10 @@ impl<'a> Pe<'a> {
                 if kind == IMAGE_REL_BASED_ABSOLUTE {
                     continue;
                 }
-                out.push(Reloc { rva: page + (e & 0x0FFF) as u32, kind });
+                out.push(Reloc {
+                    rva: page + (e & 0x0FFF) as u32,
+                    kind,
+                });
             }
             pos += block;
         }
@@ -529,7 +558,11 @@ impl<'a> Pe<'a> {
 
     /// Resolve an export to an RVA or a forwarder string ("DLL.Func" / "DLL.#12").
     pub fn export_target(&self, ex: &Exports, rva: u32) -> Option<ExportTarget> {
-        let fwd = if ex.is_forwarder_rva(rva) { self.cstr_at(rva) } else { None };
+        let fwd = if ex.is_forwarder_rva(rva) {
+            self.cstr_at(rva)
+        } else {
+            None
+        };
         ex.target(rva, fwd)
     }
 }
@@ -574,13 +607,22 @@ mod tests {
 
     #[test]
     fn rejects_non_pe() {
-        assert_eq!(Pe::parse(b"h", Layout::File).err(), Some(PeError::Truncated("DOS")));
-        assert_eq!(Pe::parse(b"hello", Layout::File).err(), Some(PeError::BadMagic("MZ")));
+        assert_eq!(
+            Pe::parse(b"h", Layout::File).err(),
+            Some(PeError::Truncated("DOS"))
+        );
+        assert_eq!(
+            Pe::parse(b"hello", Layout::File).err(),
+            Some(PeError::BadMagic("MZ"))
+        );
         let mut buf = vec![0u8; 256];
         buf[0] = b'M';
         buf[1] = b'Z';
         buf[0x3C] = 0x40;
-        assert_eq!(Pe::parse(&buf, Layout::File).err(), Some(PeError::BadMagic("PE")));
+        assert_eq!(
+            Pe::parse(&buf, Layout::File).err(),
+            Some(PeError::BadMagic("PE"))
+        );
     }
 
     #[test]
@@ -593,11 +635,20 @@ mod tests {
         assert!(ex.by_name.contains_key("CreateFileW"));
         assert!(ex.by_name.contains_key("GetProcAddress"));
         // kernel32 forwards plenty of functions to NTDLL / api sets
-        assert!(ex.by_name.values().any(|t| matches!(t, ExportTarget::Forwarder(_))));
+        assert!(ex
+            .by_name
+            .values()
+            .any(|t| matches!(t, ExportTarget::Forwarder(_))));
         let imps = pe.imports().unwrap();
-        assert!(imps.iter().any(|d| d.dll.to_ascii_lowercase().starts_with("api-ms-win-")
-            || d.dll.eq_ignore_ascii_case("ntdll.dll")));
-        assert!(pe.relocations().unwrap().iter().all(|r| r.kind == IMAGE_REL_BASED_DIR64));
+        assert!(imps
+            .iter()
+            .any(|d| d.dll.to_ascii_lowercase().starts_with("api-ms-win-")
+                || d.dll.eq_ignore_ascii_case("ntdll.dll")));
+        assert!(pe
+            .relocations()
+            .unwrap()
+            .iter()
+            .all(|r| r.kind == IMAGE_REL_BASED_DIR64));
     }
 
     #[test]
@@ -607,7 +658,10 @@ mod tests {
         let data = std::fs::read(me).unwrap();
         let pe = Pe::parse(&data, Layout::File).unwrap();
         assert!(!pe.is_dll());
-        let tls = pe.tls().unwrap().expect("rust binaries have a TLS directory");
+        let tls = pe
+            .tls()
+            .unwrap()
+            .expect("rust binaries have a TLS directory");
         assert!(tls.end_raw >= tls.start_raw);
         assert!(pe.va_to_rva(tls.address_of_index).is_some());
     }

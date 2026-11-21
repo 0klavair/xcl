@@ -450,7 +450,30 @@ nieznanych rekordów), wynik czytany `bvh::Bvh::trace` = brute force na 500 prom
     `dev_create_committed_resource_x`);
   - sterta deskryptorów **#9 / #10 (GetCPU/GPUDescriptorHandleForHeapStart) zwracają uchwyt w rax** (PC: ukryty wskaźnik).
 - Tworzenie kontekstu: 14 zasobów, 16 UAV, 10 SRV, Map/Unmap, GetCopyableFootprints – wszystko przez metody (bez inline).
-- Następny krok: `ffxDispatch` z teksturami wejściowymi (FfxApiResource) na liście konsolowej → rekordy tabel deskryptorów.
+- **`ffxDispatch` na liście konsolowej (`XCL_PROBE_FSR_DISPATCH=1`, wejścia 1280×720: kolor RGBA16F, głębia R32F, wektory
+  RG16F; wyjście 1920×1080 RGBA16F UAV) – 768 słów, wszystkie rozpoznane**: 20 dispatchy, 24 bariery, sterty, tabele.
+- **Tabele deskryptorów – format poznany:**
+  - rekord: nagłówek parametru + **1 słowo = 32-bitowy adres GPU pierwszego deskryptora** (root CBV: nagłówek + 2 słowa);
+    w spakowanej tablicy argumentów tabela zajmuje **4 B** (`Param::Table`);
+  - shader (kod RDNA2 z ACCC, niżej): `s_mov_b32 s10, s5; s_mov_b32 s11, 0; s_load_dwordx4 s[16:19], s[10:11], 0x240` –
+    **górna połowa adresu tabeli = 0**, deskryptor = **32 B na slot** (T# 8 dw, V# 4 dw w slocie 32 B; SRV×21 = 0x2A0);
+  - root CBV: shader sam składa V# (`s_mov_b32 s10, -1; s_mov_b32 s11, 0x31016fac` = DST_SEL xyzw + format 32);
+  - user SGPR (14, RSRC2): s4 = tabela 0 (UAV), s5 = tabela 1 (SRV), s[6:7], s[8:9]… = root CBV (ten sam spakowany układ
+    od s4; s[0:3] – nieznane), s14/s15 = TGID x/y.
+- **Sterty konsoli w XCL (`hle/d3d12x/console_heap.rs`, NOWE)** – sterta CBV/SRV/UAV tworzona przez kod konsoli
+  (#14) dostaje sloty 32 B w UMA (uchwyt CPU = uchwyt GPU = adres w UMA → młodsze 32 bity = offset w `mem`) + stertę PC
+  z 2 deskryptorami na slot (slot k → SRV 2k, UAV 2k+1). #15 zwraca 32, #18/#19 tworzą deskryptor PC i zapisują w slocie
+  T# w ABI XCL (`desc::xcl_image_for_view`: słowo 0 = 2k, format/rozmiar/typ/mipy jak w T#; UAV 2D dostaje też SRV pod 2k,
+  bo RDNA nie rozróżnia). Lista: #32 SetDescriptorHeaps, #26 ResourceBarrier (przejścia przekazane na PC), #15
+  CopyBufferRegion. Test sondy sprawdza, że tabele ze strumienia wskazują sloty z teksturami wejściowymi (formaty 71/22/29).
+  - Brakuje: **bufory w UMA** (V# dostaje adres tylko z UMA; dziś pusty V#, log „widok bufora … nie jest w UMA”),
+    CBV przez #17 (nie widziany), sterty samplerów, zwalnianie slotów przy Release sterty, CopyDescriptors.
+- **PSO FSR4 = ACCC (kontener „FSPX”)** – CreateComputePipelineState (NewBE) dostaje blob SFI0/ISG1/OSG1/PSV0/RTS0/HASH/ACCC
+  bez DXIL. FSPX: nagłówek 'FSPX', wersja 1, n wpisów, rozmiar; wpisy 16 B (typ, offset, rozmiar, 0): **0** (0x1C B:
+  numthreads u16×3 @+0x0C (256,1,1), RSRC1 @+0x14, RSRC2 @+0x18), **1** (0x14, skrót), **6 = kod RDNA2** (początek 0x24 B =
+  nagłówek ze skrótem), **7** (deklaracje zasobów: rekordy 32 B typ 0x41/0x42/0x43, offset w dwordach = slot·8).
+  Tłumacz jeszcze ich nie czyta → dispatche pominięte. Pomocnik: `raw_rdna2_listing` (`XCL_RAW=<kod>`).
+- Sloty listy jeszcze nieznane: #85 (wskaźnik struktury), #53 (struktura z polami +0x8C..0x94) – zaślepki.
 
 ### (archiwum) TLAS na GPU – blokada rozmiarem jednego shadera
 - Test `xbox_bvh_builder_builds_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_TLAS=1`): 2 BLAS + 16 instancji

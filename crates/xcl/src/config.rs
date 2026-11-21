@@ -96,7 +96,8 @@ impl Config {
     }
 
     pub fn is_series_s(&self) -> bool {
-        self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
+        self.device_type.eq_ignore_ascii_case("lockhart")
+            || self.device_type.eq_ignore_ascii_case("series s")
     }
 }
 

@@ -69,7 +69,11 @@ pub fn system_module(dll: &str) -> Option<usize> {
         }
     }
     let h = unsafe { LoadLibraryW(wide(dll).as_ptr()) } as usize;
-    SYS_CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, h);
+    SYS_CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, h);
     (h != 0).then_some(h)
 }
 
@@ -111,7 +115,10 @@ fn resolve_hle(m: &HleModule, key: &str, what: &ImportName) -> Option<(usize, So
     if let Some((other, a)) = registry().find_any(name) {
         return Some((a, Source::HleOther(other.name.to_string())));
     }
-    let n = ImportName::Name { hint: 0, name: name.to_string() };
+    let n = ImportName::Name {
+        hint: 0,
+        name: name.to_string(),
+    };
     for &c in m.fallback {
         let c = if c == crate::hle::SELF {
             if key == m.name {
@@ -142,7 +149,8 @@ pub fn find_game_dll(name: &str) -> Option<PathBuf> {
         }
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
-                if e.file_name().to_string_lossy().to_ascii_lowercase() == key && e.path().is_file() {
+                if e.file_name().to_string_lossy().to_ascii_lowercase() == key && e.path().is_file()
+                {
                     return Some(e.path());
                 }
             }
@@ -151,7 +159,11 @@ pub fn find_game_dll(name: &str) -> Option<PathBuf> {
     None
 }
 
-pub fn resolve_export_of_mapped(m: &modules::MappedModule, what: &ImportName, depth: u32) -> Option<usize> {
+pub fn resolve_export_of_mapped(
+    m: &modules::MappedModule,
+    what: &ImportName,
+    depth: u32,
+) -> Option<usize> {
     let t = match what {
         ImportName::Name { name, .. } => m.exports.by_name.get(name)?,
         ImportName::Ordinal(o) => m.exports.by_ordinal.get(&(*o as u32))?,
@@ -165,7 +177,10 @@ pub fn resolve_export_of_mapped(m: &modules::MappedModule, what: &ImportName, de
             let (dll, func) = f.split_once('.')?;
             let what = match func.strip_prefix('#') {
                 Some(n) => ImportName::Ordinal(n.parse().ok()?),
-                None => ImportName::Name { hint: 0, name: func.to_string() },
+                None => ImportName::Name {
+                    hint: 0,
+                    name: func.to_string(),
+                },
             };
             Some(resolve_inner(&dll_key(dll), &what, depth + 1).0)
         }
@@ -253,7 +268,9 @@ pub fn classify(dll: &str, what: &ImportName) -> Source {
                 Source::Stub
             }
         }
-        Some(Route::Hle(i)) => resolve_hle(&reg.modules[*i], &key, what).map(|x| x.1).unwrap_or(Source::Stub),
+        Some(Route::Hle(i)) => resolve_hle(&reg.modules[*i], &key, what)
+            .map(|x| x.1)
+            .unwrap_or(Source::Stub),
         None => {
             if find_game_dll(&key).is_some() {
                 return Source::GameDll(key);
@@ -304,7 +321,9 @@ pub fn load_library(name: &str) -> Option<usize> {
         .filter(|p| p.is_file())
         .or_else(|| find_game_dll(name));
     if let Some(path) = candidate {
-        let under_game = crate::vfs::get().map(|v| v.is_game_path(&path)).unwrap_or(false);
+        let under_game = crate::vfs::get()
+            .map(|v| v.is_game_path(&path))
+            .unwrap_or(false);
         if under_game || find_game_dll(&key).is_some() {
             match crate::loader::load_game_dll(&path) {
                 Ok(m) => return Some(m.base),
@@ -337,7 +356,9 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
     }
     // A real module: kernel-family modules prefer our overrides.
     let mut buf = [0u16; 260];
-    let n = unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(h as _, buf.as_mut_ptr(), 260) };
+    let n = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(h as _, buf.as_mut_ptr(), 260)
+    };
     if n > 0 {
         let full = String::from_utf16_lossy(&buf[..n as usize]);
         let key = dll_key(&full);

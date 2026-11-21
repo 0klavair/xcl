@@ -60,7 +60,9 @@ impl Encoding {
         self.fields.iter().find(|f| f.name == name)
     }
     pub fn field_width(&self, name: &str) -> u32 {
-        self.field(name).map(|f| f.ranges.iter().map(|r| r.1 as u32).sum()).unwrap_or(0)
+        self.field(name)
+            .map(|f| f.ranges.iter().map(|r| r.1 as u32).sum())
+            .unwrap_or(0)
     }
 }
 
@@ -107,19 +109,27 @@ pub fn all_instructions() -> impl Iterator<Item = &'static Inst> {
 fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
     T.get_or_init(|| {
-        let mut primary: Vec<usize> = (0..ENCODINGS.len()).filter(|&i| ENCODINGS[i].primary).collect();
+        let mut primary: Vec<usize> = (0..ENCODINGS.len())
+            .filter(|&i| ENCODINGS[i].primary)
+            .collect();
         primary.sort_by_key(|&i| ENCODINGS[i].order);
         let mut by_op = HashMap::new();
         let mut no_op = HashMap::new();
         for inst in all_instructions() {
             for (ei, e) in inst.encs.iter().enumerate() {
-                by_op.entry((e.encoding as usize, e.opcode)).or_insert((inst, ei));
+                by_op
+                    .entry((e.encoding as usize, e.opcode))
+                    .or_insert((inst, ei));
                 if ENCODINGS[e.encoding as usize].field("OP").is_none() {
                     no_op.entry(e.encoding as usize).or_insert((inst, ei));
                 }
             }
         }
-        Tables { primary, by_op, no_op }
+        Tables {
+            primary,
+            by_op,
+            no_op,
+        }
     })
 }
 
@@ -159,7 +169,13 @@ fn read_words(code: &[u8], n: usize) -> Vec<u32> {
 fn is_src_type(ty: &str) -> bool {
     matches!(
         ty,
-        "OPR_SRC" | "OPR_SRC_NOLDS" | "OPR_SRC_VGPR" | "OPR_SSRC" | "OPR_SSRC_NOLDS" | "OPR_SSRC_LANESEL" | "OPR_SIMM32"
+        "OPR_SRC"
+            | "OPR_SRC_NOLDS"
+            | "OPR_SRC_VGPR"
+            | "OPR_SSRC"
+            | "OPR_SSRC_NOLDS"
+            | "OPR_SSRC_LANESEL"
+            | "OPR_SIMM32"
     )
 }
 
@@ -193,7 +209,9 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
             break;
         }
     }
-    let Some((ei, inst, ie)) = found else { return Err(DecodeError::Unknown(head[0])) };
+    let Some((ei, inst, ie)) = found else {
+        return Err(DecodeError::Unknown(head[0]));
+    };
     let enc = &ENCODINGS[ei];
     let ienc = &inst.encs[ie];
     let base = enc.bits as usize / 8;
@@ -222,7 +240,9 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
         // VALU: the literal is fetched whenever a source field selects it, even one the
         // opcode does not read – console compilers hide the shader hash in v_nop literals
         if !has_literal && is_valu(enc) {
-            has_literal = ["SRC0", "SRC1", "SRC2"].iter().any(|f| field_value(enc, &base_words, f) == Some(255));
+            has_literal = ["SRC0", "SRC1", "SRC2"]
+                .iter()
+                .any(|f| field_value(enc, &base_words, f) == Some(255));
         }
     }
     if has_literal {
@@ -237,7 +257,16 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     }
     let words = read_words(code, len / 4);
     let literal = has_literal.then(|| words[base / 4]);
-    Ok(Decoded { pc, inst, ienc, enc, words, len, literal, variant })
+    Ok(Decoded {
+        pc,
+        inst,
+        ienc,
+        enc,
+        words,
+        len,
+        literal,
+        variant,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -257,12 +286,24 @@ pub fn scalar_operand(code: u64, size: u16, literal: Option<u32>) -> String {
     let wide = size > 32;
     match code {
         0..=105 => reg_range("s", code, size),
-        106 => if wide { "vcc".into() } else { "vcc_lo".into() },
+        106 => {
+            if wide {
+                "vcc".into()
+            } else {
+                "vcc_lo".into()
+            }
+        }
         107 => "vcc_hi".into(),
         108..=123 => reg_range("ttmp", code - 108, size),
         124 => "m0".into(),
         125 => "null".into(),
-        126 => if wide { "exec".into() } else { "exec_lo".into() },
+        126 => {
+            if wide {
+                "exec".into()
+            } else {
+                "exec_lo".into()
+            }
+        }
         127 => "exec_hi".into(),
         128 => "0".into(),
         129..=192 => format!("{}", code - 128),
@@ -320,7 +361,10 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
             }
         }
         "OPR_VGPR" | "OPR_VGPR_OR_LDS" => reg_range("v", v, o.size),
-        "OPR_SRC" | "OPR_SRC_NOLDS" | "OPR_SRC_VGPR" | "OPR_SRC_SIMPLE" | "OPR_ATTR" | "OPR_PARAM" if width >= 9 => {
+        "OPR_SRC" | "OPR_SRC_NOLDS" | "OPR_SRC_VGPR" | "OPR_SRC_SIMPLE" | "OPR_ATTR"
+        | "OPR_PARAM"
+            if width >= 9 =>
+        {
             if v >= 256 {
                 reg_range("v", v - 256, o.size)
             } else {
@@ -328,7 +372,8 @@ fn operand_text(d: &Decoded, o: &Operand) -> Option<String> {
             }
         }
         "OPR_SRC_SIMPLE" => reg_range("v", v, o.size),
-        "OPR_SIMM16" | "OPR_WAITCNT" | "OPR_HWREG" | "OPR_SENDMSG" | "OPR_CLAUSE" | "OPR_VERSION" | "OPR_WAITCNT_DEPCTR" | "OPR_TGT" => {
+        "OPR_SIMM16" | "OPR_WAITCNT" | "OPR_HWREG" | "OPR_SENDMSG" | "OPR_CLAUSE"
+        | "OPR_VERSION" | "OPR_WAITCNT_DEPCTR" | "OPR_TGT" => {
             format!("{v:#x}")
         }
         "OPR_LABEL" => {
@@ -357,8 +402,16 @@ pub fn register_scale(field: &str) -> u64 {
 
 /// Assemble one instruction (spec name such as "V_ADD_F32", encoding name such as
 /// "ENC_VOP2" or "VOP3_SDST_ENC"), setting the given fields; for tests and tools.
-pub fn encode(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32>) -> Result<Vec<u8>, String> {
-    let ei = ENCODINGS.iter().position(|e| e.name == enc).ok_or_else(|| format!("nieznane kodowanie {enc}"))?;
+pub fn encode(
+    name: &str,
+    enc: &str,
+    fields: &[(&str, u64)],
+    literal: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    let ei = ENCODINGS
+        .iter()
+        .position(|e| e.name == enc)
+        .ok_or_else(|| format!("nieznane kodowanie {enc}"))?;
     let e = &ENCODINGS[ei];
     let inst = all_instructions()
         .find(|i| i.name.eq_ignore_ascii_case(name))
@@ -428,13 +481,18 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+        if !["SREG", "SSRC", "SDST", "OPR_SRC"]
+            .iter()
+            .any(|k| o.ty.contains(k))
+        {
             continue;
         }
         if f == "SRC0" && d.variant != Variant::Plain {
             continue;
         }
-        let Some(v) = field_value(d.enc, &d.words, f) else { continue };
+        let Some(v) = field_value(d.enc, &d.words, f) else {
+            continue;
+        };
         let v = v * register_scale(f);
         if v > 127 || v == 125 {
             continue;
@@ -453,11 +511,16 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        let Some(mut v) = field_value(d.enc, &d.words, f) else { continue };
+        let Some(mut v) = field_value(d.enc, &d.words, f) else {
+            continue;
+        };
         let width = d.enc.field_width(f);
         let vgpr = if o.ty.starts_with("OPR_VGPR") && width <= 8 {
             true
-        } else if width >= 9 && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_VGPR")) && v >= 256 {
+        } else if width >= 9
+            && (o.ty.starts_with("OPR_SRC") || o.ty.starts_with("OPR_VGPR"))
+            && v >= 256
+        {
             v -= 256;
             true
         } else if f == "SRC0" && d.variant != Variant::Plain {
@@ -472,13 +535,17 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         let mut n = (o.size as u64).div_ceil(32).max(1);
         // MUBUF / MTBUF VADDR: only the index and / or offset VGPRs actually used
         if f == "VADDR" && matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF") {
-            n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
+            n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0)
+                + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
         }
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..v + n);
     }
     // read-modify-write accumulators
-    if matches!(d.inst.name, "V_FMAC_F32" | "V_MAC_F32" | "V_FMAC_LEGACY_F32") {
+    if matches!(
+        d.inst.name,
+        "V_FMAC_F32" | "V_MAC_F32" | "V_FMAC_LEGACY_F32"
+    ) {
         r.extend(w.iter().copied());
     }
     (r, w)
@@ -508,7 +575,12 @@ pub fn mnemonic(d: &Decoded) -> String {
 
 pub fn format(d: &Decoded) -> String {
     let mut s = mnemonic(d);
-    let ops: Vec<String> = d.ienc.operands.iter().filter_map(|o| operand_text(d, o)).collect();
+    let ops: Vec<String> = d
+        .ienc
+        .operands
+        .iter()
+        .filter_map(|o| operand_text(d, o))
+        .collect();
     if !ops.is_empty() {
         s.push(' ');
         s.push_str(&ops.join(", "));
@@ -516,7 +588,11 @@ pub fn format(d: &Decoded) -> String {
     if let Some(lit) = d.literal {
         let shown = d.inst.always_literal
             || d.ienc.operands.iter().any(|o| {
-                !o.implicit && o.field.is_some_and(|f| f == "LITERAL" || field_value(d.enc, &d.words, f) == Some(255) && is_src_type(o.ty))
+                !o.implicit
+                    && o.field.is_some_and(|f| {
+                        f == "LITERAL"
+                            || field_value(d.enc, &d.words, f) == Some(255) && is_src_type(o.ty)
+                    })
             });
         if !shown {
             let _ = write!(s, " ; lit {lit:#010x}");
@@ -528,13 +604,25 @@ pub fn format(d: &Decoded) -> String {
                 let _ = write!(s, ", {off:#x}");
             }
         }
-        "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" | "ENC_DS" => {
-            for (f, label) in [("OFFSET", "offset"), ("OFFSET0", "offset0"), ("OFFSET1", "offset1")] {
+        "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH"
+        | "ENC_DS" => {
+            for (f, label) in [
+                ("OFFSET", "offset"),
+                ("OFFSET0", "offset0"),
+                ("OFFSET1", "offset1"),
+            ] {
                 if let Some(v) = field_value(d.enc, &d.words, f).filter(|&v| v != 0) {
                     let _ = write!(s, " {label}:{v}");
                 }
             }
-            for (f, label) in [("OFFEN", "offen"), ("IDXEN", "idxen"), ("GLC", "glc"), ("SLC", "slc"), ("DLC", "dlc"), ("GDS", "gds")] {
+            for (f, label) in [
+                ("OFFEN", "offen"),
+                ("IDXEN", "idxen"),
+                ("GLC", "glc"),
+                ("SLC", "slc"),
+                ("DLC", "dlc"),
+                ("GDS", "gds"),
+            ] {
                 if field_value(d.enc, &d.words, f) == Some(1) {
                     let _ = write!(s, " {label}");
                 }
@@ -562,15 +650,28 @@ pub fn disassemble(code: &[u8], base_pc: u64, stop_at_end: bool) -> Vec<Line> {
         match decode(&code[off..], pc) {
             Ok(d) => {
                 let end = d.inst.flags & F_TERMINATOR != 0;
-                out.push(Line { pc, bytes: code[off..off + d.len].to_vec(), text: format(&d), ok: true, flags: d.inst.flags });
+                out.push(Line {
+                    pc,
+                    bytes: code[off..off + d.len].to_vec(),
+                    text: format(&d),
+                    ok: true,
+                    flags: d.inst.flags,
+                });
                 off += d.len;
                 if end && stop_at_end {
                     break;
                 }
             }
             Err(_) => {
-                let w = u32::from_le_bytes([code[off], code[off + 1], code[off + 2], code[off + 3]]);
-                out.push(Line { pc, bytes: code[off..off + 4].to_vec(), text: format!(".long {w:#010x}"), ok: false, flags: 0 });
+                let w =
+                    u32::from_le_bytes([code[off], code[off + 1], code[off + 2], code[off + 3]]);
+                out.push(Line {
+                    pc,
+                    bytes: code[off..off + 4].to_vec(),
+                    text: format!(".long {w:#010x}"),
+                    ok: false,
+                    flags: 0,
+                });
                 off += 4;
             }
         }
@@ -635,27 +736,71 @@ mod tests {
     #[test]
     fn scalar_register_fields_are_scaled() {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
-        assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
-        assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+        assert_eq!(
+            dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]),
+            "s_load_dwordx4 s[8:11], s[16:17], 0x920"
+        );
+        assert_eq!(
+            dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]),
+            "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40"
+        );
     }
 
     #[test]
     fn encoder_round_trips() {
-        let b = encode("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256 + 2), ("VSRC1", 3)], None).unwrap();
+        let b = encode(
+            "V_ADD_F32",
+            "ENC_VOP2",
+            &[("VDST", 1), ("SRC0", 256 + 2), ("VSRC1", 3)],
+            None,
+        )
+        .unwrap();
         assert_eq!(dis(&b), "v_add_f32 v1, v2, v3");
-        let b = encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255)], Some(0x1234_5678)).unwrap();
+        let b = encode(
+            "S_MOV_B32",
+            "ENC_SOP1",
+            &[("SDST", 0), ("SSRC0", 255)],
+            Some(0x1234_5678),
+        )
+        .unwrap();
         assert_eq!(dis(&b), "s_mov_b32 s0, 0x12345678");
-        let b = encode("V_FMA_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 256 + 4), ("SRC1", 244), ("SRC2", 243)], None).unwrap();
+        let b = encode(
+            "V_FMA_F32",
+            "ENC_VOP3",
+            &[("VDST", 0), ("SRC0", 256 + 4), ("SRC1", 244), ("SRC2", 243)],
+            None,
+        )
+        .unwrap();
         assert_eq!(dis(&b), "v_fma_f32 v0, v4, 2.0, -1.0");
-        let b = encode("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 1), ("SDST", 106), ("SRC0", 256 + 2), ("SRC1", 256 + 3)], None).unwrap();
+        let b = encode(
+            "V_ADD_CO_U32",
+            "VOP3_SDST_ENC",
+            &[
+                ("VDST", 1),
+                ("SDST", 106),
+                ("SRC0", 256 + 2),
+                ("SRC1", 256 + 3),
+            ],
+            None,
+        )
+        .unwrap();
         assert_eq!(decode(&b, 0).unwrap().inst.name, "V_ADD_CO_U32");
-        assert_eq!(dis(&encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()), "s_endpgm");
+        assert_eq!(
+            dis(&encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()),
+            "s_endpgm"
+        );
     }
 
     #[test]
     fn literal_in_unused_valu_field() {
         // v_nop (VOP3) with SRC2 = literal: retail console code carries the shader hash this way
-        let d = decode(&[0xdb, 0xb7, 0x80, 0xd5, 0xb9, 0x33, 0xff, 0x03, 0x46, 0x66, 0x47, 0x9d], 0).unwrap();
+        let d = decode(
+            &[
+                0xdb, 0xb7, 0x80, 0xd5, 0xb9, 0x33, 0xff, 0x03, 0x46, 0x66, 0x47, 0x9d,
+            ],
+            0,
+        )
+        .unwrap();
         assert_eq!(d.inst.name, "V_NOP");
         assert_eq!(d.len, 12);
         assert_eq!(format(&d), "v_nop ; lit 0x9d476646");
@@ -664,11 +809,20 @@ mod tests {
     #[test]
     fn sdwa_and_dpp_src0() {
         // v_mov_b32_sdwa v1, v2 (SDWA dword: src0 = v2)
-        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x06, 0x00]), "v_mov_b32_sdwa v1, v2");
+        assert_eq!(
+            dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x06, 0x00]),
+            "v_mov_b32_sdwa v1, v2"
+        );
         // same with S0 set: src0 = s2
-        assert_eq!(dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x86, 0x00]), "v_mov_b32_sdwa v1, s2");
+        assert_eq!(
+            dis(&[0xf9, 0x02, 0x02, 0x7e, 0x02, 0x06, 0x86, 0x00]),
+            "v_mov_b32_sdwa v1, s2"
+        );
         // v_mov_b32_dpp v1, v3
-        assert_eq!(dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x1b, 0x00, 0xff]), "v_mov_b32_dpp v1, v3");
+        assert_eq!(
+            dis(&[0xfa, 0x02, 0x02, 0x7e, 0x03, 0x1b, 0x00, 0xff]),
+            "v_mov_b32_dpp v1, v3"
+        );
     }
 
     #[test]
@@ -683,13 +837,19 @@ mod tests {
         assert_eq!(d.len, 8);
         assert_eq!(format(&d), "v_madmk_f32 v1, v2, 0x3f800000, v3");
         // spec instructions keep their opcodes
-        assert_eq!(decode(&[0x01, 0x05, 0x0a, 0x56], 0).unwrap().inst.name, "V_FMAC_F32");
+        assert_eq!(
+            decode(&[0x01, 0x05, 0x0a, 0x56], 0).unwrap().inst.name,
+            "V_FMAC_F32"
+        );
     }
 
     #[test]
     fn truncated_and_unknown() {
         assert_eq!(decode(&[0x01, 0x02], 0).err(), Some(DecodeError::Truncated));
-        assert_eq!(decode(&[0xff, 0x03, 0x80, 0xbe], 0).err(), Some(DecodeError::Truncated));
+        assert_eq!(
+            decode(&[0xff, 0x03, 0x80, 0xbe], 0).err(),
+            Some(DecodeError::Truncated)
+        );
     }
 
     /// Normalise an LLVM mnemonic to the AMD spec name (lower case, no encoding suffix).
@@ -717,19 +877,29 @@ mod tests {
             || m.starts_with("s_dcache_discard")
             || matches!(
                 m,
-                "v_mac_f32" | "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "s_dcache_wb" | "s_get_waveid_in_workgroup" | "s_wait_idle"
+                "v_mac_f32"
+                    | "v_mad_f32"
+                    | "v_madak_f32"
+                    | "v_madmk_f32"
+                    | "s_dcache_wb"
+                    | "s_get_waveid_in_workgroup"
+                    | "s_wait_idle"
             )
     }
 
     fn renamed_in_rdna2(llvm: &str, spec: &str) -> bool {
-        matches!((llvm, spec), ("v_mac_legacy_f32", "v_fmac_legacy_f32") | ("v_mad_legacy_f32", "v_fma_legacy_f32"))
+        matches!(
+            (llvm, spec),
+            ("v_mac_legacy_f32", "v_fmac_legacy_f32") | ("v_mad_legacy_f32", "v_fma_legacy_f32")
+        )
     }
 
     /// Decode every instruction in LLVM's gfx10 disassembler tests and compare the
     /// mnemonic and instruction length with LLVM's expectations.
     #[test]
     fn llvm_gfx10_corpus() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/llvm-amdgpu");
         let mut total = 0usize;
         let mut decoded = 0usize;
         let mut name_ok = 0usize;
@@ -742,16 +912,26 @@ mod tests {
                 continue;
             }
             for line in std::fs::read_to_string(&p).unwrap().lines() {
-                let Some(rest) = line.strip_prefix('#') else { continue };
-                let Some((_, rest)) = rest.split_once(':') else { continue };
-                let Some((asm, enc)) = rest.split_once("; encoding: [") else { continue };
-                let Some(enc) = enc.split(']').next() else { continue };
+                let Some(rest) = line.strip_prefix('#') else {
+                    continue;
+                };
+                let Some((_, rest)) = rest.split_once(':') else {
+                    continue;
+                };
+                let Some((asm, enc)) = rest.split_once("; encoding: [") else {
+                    continue;
+                };
+                let Some(enc) = enc.split(']').next() else {
+                    continue;
+                };
                 let bytes: Vec<u8> = enc
                     .split(',')
                     .filter_map(|b| u8::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok())
                     .collect();
                 let asm = asm.trim();
-                let Some(m) = asm.split_whitespace().next() else { continue };
+                let Some(m) = asm.split_whitespace().next() else {
+                    continue;
+                };
                 if bytes.len() < 4 {
                     continue;
                 }
@@ -769,7 +949,8 @@ mod tests {
                         if d.len == bytes.len() {
                             len_ok += 1;
                         } else {
-                            *bad.entry(format!("LEN {want}: {} != {}", d.len, bytes.len())).or_default() += 1;
+                            *bad.entry(format!("LEN {want}: {} != {}", d.len, bytes.len()))
+                                .or_default() += 1;
                         }
                     }
                     Err(_) => *failed_decode.entry(want).or_default() += 1,
@@ -785,7 +966,10 @@ mod tests {
         println!("top decode failures: {:?}", &fails[..fails.len().min(25)]);
         let unexpected: Vec<_> = fails.iter().filter(|(m, _)| !removed_in_rdna2(m)).collect();
         assert!(total > 10_000, "corpus too small: {total}");
-        assert!(unexpected.is_empty(), "instructions RDNA2 should know but failed to decode: {unexpected:?}");
+        assert!(
+            unexpected.is_empty(),
+            "instructions RDNA2 should know but failed to decode: {unexpected:?}"
+        );
         assert_eq!(len_ok, decoded, "instruction length mismatches: {worst:?}");
         assert_eq!(name_ok, decoded, "mnemonic mismatches: {worst:?}");
     }

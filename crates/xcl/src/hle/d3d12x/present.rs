@@ -48,7 +48,10 @@ fn now_ms() -> u64 {
 }
 
 pub fn counters() -> (u64, u64) {
-    (PRESENTS.load(Ordering::Relaxed), BOUNDARIES.load(Ordering::Relaxed))
+    (
+        PRESENTS.load(Ordering::Relaxed),
+        BOUNDARIES.load(Ordering::Relaxed),
+    )
 }
 
 fn enabled() -> bool {
@@ -56,12 +59,14 @@ fn enabled() -> bool {
 }
 
 unsafe fn add_ref(p: usize) {
-    let f: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(1));
+    let f: unsafe extern "system" fn(usize) -> u32 =
+        std::mem::transmute(*(*(p as *const *const usize)).add(1));
     f(p);
 }
 
 unsafe fn release(p: usize) {
-    let f: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(2));
+    let f: unsafe extern "system" fn(usize) -> u32 =
+        std::mem::transmute(*(*(p as *const *const usize)).add(2));
     f(p);
 }
 
@@ -74,7 +79,11 @@ pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     if !res.is_null() {
         add_ref(res as usize);
     }
-    let old = if res.is_null() { m.remove(&handle) } else { m.insert(handle, res as usize) };
+    let old = if res.is_null() {
+        m.remove(&handle)
+    } else {
+        m.insert(handle, res as usize)
+    };
     if let Some(o) = old {
         release(o);
     }
@@ -84,16 +93,28 @@ pub fn note_rt0(list: usize, handle: usize) {
     if !enabled() {
         return;
     }
-    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
+    LISTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(list, handle);
 }
 
 /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
 pub fn swap_format(f: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match f {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        | DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS => {
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        }
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        }
         _ => return None,
     })
 }
@@ -118,10 +139,17 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     let handle = {
         let g = LISTS.lock().unwrap();
         let Some(m) = g.as_ref() else { return };
-        lists.iter().rev().find_map(|l| m.get(&(*l as usize)).copied())
+        lists
+            .iter()
+            .rev()
+            .find_map(|l| m.get(&(*l as usize)).copied())
     };
     let Some(h) = handle else { return };
-    let res = RTVS.lock().unwrap().as_ref().and_then(|m| m.get(&h).copied());
+    let res = RTVS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&h).copied());
     let Some(res) = res else { return };
     if backbuffer_like(res).is_none() {
         return;
@@ -173,7 +201,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn window_thread() {
     unsafe {
-        let Ok(inst) = GetModuleHandleW(PCWSTR::null()) else { return };
+        let Ok(inst) = GetModuleHandleW(PCWSTR::null()) else {
+            return;
+        };
         let class = windows::core::w!("XCLGameWindow");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
@@ -184,8 +214,15 @@ fn window_thread() {
         };
         RegisterClassW(&wc);
         let cfg = crate::state::config();
-        let title = crate::state::boot().map(|b| b.title.clone()).unwrap_or_else(|| "XCL".into());
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
+        let title = crate::state::boot()
+            .map(|b| b.title.clone())
+            .unwrap_or_else(|| "XCL".into());
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: cfg.window_width as i32,
+            bottom: cfg.window_height as i32,
+        };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -206,7 +243,11 @@ fn window_thread() {
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("okno XCL utworzone ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!(
+            "okno XCL utworzone ({}x{})",
+            cfg.window_width,
+            cfg.window_height
+        );
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -218,7 +259,9 @@ fn window_thread() {
 fn ensure_window() -> Option<HWND> {
     static START: Once = Once::new();
     START.call_once(|| {
-        let _ = std::thread::Builder::new().name("xcl-window".into()).spawn(window_thread);
+        let _ = std::thread::Builder::new()
+            .name("xcl-window".into())
+            .spawn(window_thread);
     });
     let t0 = Instant::now();
     while HWND_RAW.load(Ordering::Acquire) == 0 {
@@ -252,7 +295,11 @@ unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
-unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+unsafe fn transition(
+    res: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -270,20 +317,45 @@ unsafe fn transition(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after:
 unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let dev_raw = super::real::device_raw();
     let dev = ID3D12Device::from_raw_borrowed(&dev_raw)?;
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).ok()?;
+    let alloc: ID3D12CommandAllocator = dev
+        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        .ok()?;
+    let list: ID3D12GraphicsCommandList = dev
+        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+        .ok()?;
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
-    Some(Presenter { queue, sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence, value: 0, event, last: Instant::now() - Duration::from_secs(1) })
+    Some(Presenter {
+        queue,
+        sc: None,
+        w: 0,
+        h: 0,
+        fmt: DXGI_FORMAT_UNKNOWN,
+        alloc,
+        list,
+        fence,
+        value: 0,
+        event,
+        last: Instant::now() - Duration::from_secs(1),
+    })
 }
 
-unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
+unsafe fn ensure_swapchain(
+    p: &mut Presenter,
+    hwnd: HWND,
+    w: u32,
+    h: u32,
+    fmt: DXGI_FORMAT,
+) -> bool {
     if let Some(sc) = &p.sc {
         if p.w == w && p.h == h && p.fmt == fmt {
             return true;
         }
-        if sc.ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0)).is_ok() {
+        if sc
+            .ResizeBuffers(2, w, h, fmt, DXGI_SWAP_CHAIN_FLAG(0))
+            .is_ok()
+        {
             p.w = w;
             p.h = h;
             p.fmt = fmt;
@@ -292,14 +364,21 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
         }
         return false;
     }
-    let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
+    let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+        return false;
+    };
     let qraw = p.queue as *mut c_void;
-    let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return false };
+    let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else {
+        return false;
+    };
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: w,
         Height: h,
         Format: fmt,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
@@ -314,7 +393,10 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
-            crate::xlog_info!("prezentacja: swap chain {w}x{h} {:?} – obraz gry pojawi się w oknie XCL", fmt);
+            crate::xlog_info!(
+                "prezentacja: swap chain {w}x{h} {:?} – obraz gry pojawi się w oknie XCL",
+                fmt
+            );
             p.sc.is_some()
         }
         Err(e) => {
@@ -335,8 +417,12 @@ unsafe fn present_now(min_interval: Duration) {
         }
     }
     let _reset = Reset;
-    let Some((queue, res)) = *CANDIDATE.lock().unwrap() else { return };
-    let Ok(mut guard) = PRESENTER.try_lock() else { return };
+    let Some((queue, res)) = *CANDIDATE.lock().unwrap() else {
+        return;
+    };
+    let Ok(mut guard) = PRESENTER.try_lock() else {
+        return;
+    };
     if guard.is_none() {
         *guard = new_presenter(queue);
     }
@@ -344,8 +430,12 @@ unsafe fn present_now(min_interval: Duration) {
     if p.last.elapsed() < min_interval {
         return;
     }
-    let Some(desc) = backbuffer_like(res) else { return };
-    let Some(fmt) = swap_format(desc.Format) else { return };
+    let Some(desc) = backbuffer_like(res) else {
+        return;
+    };
+    let Some(fmt) = swap_format(desc.Format) else {
+        return;
+    };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
@@ -360,22 +450,38 @@ unsafe fn present_now(min_interval: Duration) {
     }
     let Some(sc) = p.sc.clone() else { return };
     let rraw = res as *mut c_void;
-    let Some(src) = ID3D12Resource::from_raw_borrowed(&rraw) else { return };
-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
+    let Some(src) = ID3D12Resource::from_raw_borrowed(&rraw) else {
+        return;
+    };
+    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else {
+        return;
+    };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+    let b1 = [transition(
+        &bb,
+        D3D12_RESOURCE_STATE_PRESENT,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, src);
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+    let b2 = [transition(
+        &bb,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PRESENT,
+    )];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
         return;
     }
     let qraw = queue as *mut c_void;
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
-    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else {
+        return;
+    };
+    let Ok(cl) = p.list.cast::<ID3D12CommandList>() else {
+        return;
+    };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.value += 1;
     let _ = q.Signal(&p.fence, p.value);
@@ -383,7 +489,11 @@ unsafe fn present_now(min_interval: Duration) {
     p.last = Instant::now();
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        crate::xlog_info!("prezentacja: pierwsza klatka gry wyświetlona ({}x{})", desc.Width, desc.Height);
+        crate::xlog_info!(
+            "prezentacja: pierwsza klatka gry wyświetlona ({}x{})",
+            desc.Width,
+            desc.Height
+        );
     }
 }
 

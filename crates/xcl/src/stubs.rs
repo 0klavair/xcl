@@ -82,12 +82,19 @@ pub fn new_info(dll: &str, name: &str, ret: u64) -> &'static StubInfo {
 
 /// Allocate `size` bytes of executable memory for generated thunks.
 pub fn alloc_code(size: usize) -> *mut u8 {
-    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Memory::{
+        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    };
     let size = (size + 15) & !15;
     let mut a = ARENA.lock().unwrap();
     if a.0 == 0 || a.0 + size > a.1 {
         let p = unsafe {
-            VirtualAlloc(std::ptr::null(), ARENA_CHUNK, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null(),
+                ARENA_CHUNK,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
         } as usize;
         assert!(p != 0, "VirtualAlloc for stub arena failed");
         *a = (p, p + ARENA_CHUNK);
@@ -106,7 +113,11 @@ pub fn info_of_stub(addr: usize) -> Option<&'static StubInfo> {
     let g = map.lock().ok()?;
     let key = g.iter().find(|(_, &a)| a == addr).map(|(k, _)| k.clone())?;
     drop(g);
-    ALL.lock().ok()?.iter().copied().find(|s| format!("{}!{}", s.dll.to_ascii_lowercase(), s.name) == key)
+    ALL.lock()
+        .ok()?
+        .iter()
+        .copied()
+        .find(|s| format!("{}!{}", s.dll.to_ascii_lowercase(), s.name) == key)
 }
 
 /// Create (or reuse) a stub for `dll!name`. Returns the callable address.
@@ -119,7 +130,12 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
     let key = format!("{}!{}", dll.to_ascii_lowercase(), name);
     let map = BY_KEY.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(&addr) = map.lock().unwrap().get(&key) {
-        let info = ALL.lock().unwrap().iter().copied().find(|s| s.dll.eq_ignore_ascii_case(dll) && s.name == name);
+        let info = ALL
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|s| s.dll.eq_ignore_ascii_case(dll) && s.name == name);
         if let Some(i) = info {
             return (addr, i);
         }
@@ -211,7 +227,9 @@ impl StubDb {
                 .map(|(dll, m)| {
                     (
                         dll.to_ascii_lowercase(),
-                        m.into_iter().filter_map(|(o, n)| Some((o.parse().ok()?, n))).collect(),
+                        m.into_iter()
+                            .filter_map(|(o, n)| Some((o.parse().ok()?, n)))
+                            .collect(),
                     )
                 })
                 .collect(),
@@ -231,7 +249,10 @@ impl StubDb {
     }
 
     pub fn ordinal_name(&self, dll: &str, ordinal: u16) -> Option<&str> {
-        self.ordinals.get(&dll.to_ascii_lowercase())?.get(&ordinal).map(String::as_str)
+        self.ordinals
+            .get(&dll.to_ascii_lowercase())?
+            .get(&ordinal)
+            .map(String::as_str)
     }
 }
 
@@ -250,10 +271,14 @@ mod tests {
     #[test]
     fn stub_returns_configured_value_and_counts_calls() {
         let addr = make_stub("unit.dll", "Answer", 42);
-        let f: extern "system" fn(usize, usize, usize, usize, usize) -> u64 = unsafe { std::mem::transmute(addr) };
+        let f: extern "system" fn(usize, usize, usize, usize, usize) -> u64 =
+            unsafe { std::mem::transmute(addr) };
         assert_eq!(f(1, 2, 3, 4, 5), 42);
         assert_eq!(f(0, 0, 0, 0, 0), 42);
-        let info = all_stubs().into_iter().find(|s| s.name == "Answer").unwrap();
+        let info = all_stubs()
+            .into_iter()
+            .find(|s| s.name == "Answer")
+            .unwrap();
         assert_eq!(info.calls.load(Ordering::Relaxed), 2);
         assert_ne!(info.first_caller.load(Ordering::Relaxed), 0);
         // same key → same thunk
@@ -266,7 +291,10 @@ mod tests {
         ov.insert("kernelx.dll!Foo".to_string(), "7".to_string());
         let db = StubDb::parse(BUILTIN_DB, &ov);
         assert_eq!(db.return_for("kernelx.dll", "Foo"), 7);
-        assert_eq!(db.return_for("xgameruntime.dll", "XSomethingUnknown"), 0x8000_4001);
+        assert_eq!(
+            db.return_for("xgameruntime.dll", "XSomethingUnknown"),
+            0x8000_4001
+        );
         assert_eq!(db.return_for("kernelx.dll", "SomethingUnknown"), 0);
         assert_eq!(db.ordinal_name("d3d12_x.dll", 7), Some("D3D12CreateDevice"));
     }

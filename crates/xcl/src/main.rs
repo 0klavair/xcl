@@ -15,7 +15,8 @@ unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mu
 
 #[used]
 #[link_section = ".CRT$XLY"]
-static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
+static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) =
+    xcl_tls_callback;
 
 const HELP: &str = "\
 XCL – warstwa zgodności Xbox Series X|S → Windows
@@ -60,7 +61,9 @@ fn main() {
             xcl::inspect::run(&PathBuf::from(&args[1]), json)
         }
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
-        Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("shaders") if args.len() >= 2 => {
+            xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..])
+        }
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));

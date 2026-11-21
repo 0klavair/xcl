@@ -34,7 +34,13 @@ fn f(x: f32) -> u32 {
 /// D3D12_SHADER_BYTECODE) and the backend device. None: no sample pack / DXC / GPU.
 fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device)> {
     static PACK: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
+    let data = PACK
+        .get_or_init(|| {
+            std::env::var("XCL_SAMPLE_RPF")
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+        })
+        .as_ref();
     let Some(data) = data else {
         println!("XCL_SAMPLE_RPF nie ustawione – pomijam");
         return None;
@@ -47,9 +53,15 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device)> {
     let blobs: Vec<Vec<u8>> = names
         .iter()
         .map(|n| {
-            let r = recs.iter().find(|r| r.name == *n).unwrap_or_else(|| panic!("brak rekordu {n}"));
+            let r = recs
+                .iter()
+                .find(|r| r.name == *n)
+                .unwrap_or_else(|| panic!("brak rekordu {n}"));
             let b = pack::inflate(data, r).unwrap();
-            assert!(xcl::gpu::xbox::is_xbox(&b), "{n}: oczekiwany kontener konsoli");
+            assert!(
+                xcl::gpu::xbox::is_xbox(&b),
+                "{n}: oczekiwany kontener konsoli"
+            );
             b
         })
         .collect();
@@ -59,18 +71,35 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device)> {
     }
     println!("urządzenie backendu: {}", real::stats().adapter);
     let raw = real::device_raw();
-    Some((blobs, unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone()))
+    Some((
+        blobs,
+        unsafe { ID3D12Device::from_raw_borrowed(&raw) }
+            .unwrap()
+            .clone(),
+    ))
 }
 
 /// CreateGraphicsPipelineState through the backend hook with the title's own (empty)
 /// root signature and input layout; asserts the pipeline came from translated shaders.
-fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, DXGI_FORMAT, u32)]) -> ID3D12PipelineState {
+fn pso_through_hook(
+    dev: &ID3D12Device,
+    vs: &[u8],
+    ps: &[u8],
+    layout: &[(&CStr, DXGI_FORMAT, u32)],
+) -> ID3D12PipelineState {
     let game_rs: ID3D12RootSignature = unsafe {
-        let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            ..Default::default()
+        };
         let mut ser = None;
         D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
         let ser = ser.unwrap();
-        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+        dev.CreateRootSignature(
+            0,
+            std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()),
+        )
+        .unwrap()
     };
     let elems: Vec<D3D12_INPUT_ELEMENT_DESC> = layout
         .iter()
@@ -84,13 +113,25 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
         .collect();
     let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
-        VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
-        PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+        VS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: vs.as_ptr() as _,
+            BytecodeLength: vs.len(),
+        },
+        PS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: ps.as_ptr() as _,
+            BytecodeLength: ps.len(),
+        },
         SampleMask: u32::MAX,
-        InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
+        InputLayout: D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: elems.as_ptr(),
+            NumElements: elems.len() as u32,
+        },
         PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         NumRenderTargets: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         ..Default::default()
     };
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
@@ -99,11 +140,20 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
     desc.RasterizerState.DepthClipEnable = true.into();
     desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
     let before = real::stats();
-    let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState przez hak backendu");
+    let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }
+        .expect("CreateGraphicsPipelineState przez hak backendu");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
     let after = real::stats();
-    assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO nie powstał z przetłumaczonych shaderów: {:?}", after.translation_errors);
-    assert_eq!(after.fallback_pipelines, before.fallback_pipelines, "użyto zastępczych shaderów");
+    assert_eq!(
+        after.translated_pipelines,
+        before.translated_pipelines + 1,
+        "PSO nie powstał z przetłumaczonych shaderów: {:?}",
+        after.translation_errors
+    );
+    assert_eq!(
+        after.fallback_pipelines, before.fallback_pipelines,
+        "użyto zastępczych shaderów"
+    );
     pso
 }
 
@@ -113,8 +163,21 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
 #[test]
 fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((blobs, dev)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
-    let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)]);
+    let Some((blobs, dev)) = setup(&[
+        "VS_Rage_TransformPosCpv_f020b20e_Wrapped",
+        "PS_Rage_Untextured_14f8529b_Wrapped",
+    ]) else {
+        return;
+    };
+    let pso = pso_through_hook(
+        &dev,
+        &blobs[0],
+        &blobs[1],
+        &[
+            (c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0),
+            (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12),
+        ],
+    );
     let rs = real::abi_root_signature().expect("root signature ABI XCL");
 
     // explicit inputs: user SGPR s[8:9] → descriptor table at 0x100 with two V#s
@@ -125,8 +188,13 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let vsharp = |base: u32| [base, 0, 0x1000, 0];
     mem[0x100 / 4..0x100 / 4 + 4].copy_from_slice(&vsharp(0x1000)); // world (VS reads 0x00..0x3F)
     mem[0x120 / 4..0x120 / 4 + 4].copy_from_slice(&vsharp(0x2000)); // view-projection (0x160..0x19F)
-    // world rows = coefficients of x, y, z, then translation: (0.5·x + 0.25, 0.5·y, z)
-    let world: [[f32; 4]; 4] = [[0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.25, 0.0, 0.0, 0.0]];
+                                                                    // world rows = coefficients of x, y, z, then translation: (0.5·x + 0.25, 0.5·y, z)
+    let world: [[f32; 4]; 4] = [
+        [0.5, 0.0, 0.0, 0.0],
+        [0.0, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.25, 0.0, 0.0, 0.0],
+    ];
     for (r, row) in world.iter().enumerate() {
         for (c, v) in row.iter().enumerate() {
             mem[0x1000 / 4 + 4 * r + c] = f(*v);
@@ -141,21 +209,33 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     for (i, v) in vp.iter().enumerate() {
         mem[(0x2000 + 0x160) / 4 + i] = f(*v);
     }
-    let corners = [([-1.0f32, -1.0, 0.5], [1.0f32, 0.0, 0.0, 1.0]), ([-1.0, 1.0, 0.5], [0.0, 1.0, 0.0, 1.0]), ([1.0, -1.0, 0.5], [0.0, 0.0, 1.0, 0.5])];
+    let corners = [
+        ([-1.0f32, -1.0, 0.5], [1.0f32, 0.0, 0.0, 1.0]),
+        ([-1.0, 1.0, 0.5], [0.0, 1.0, 0.0, 1.0]),
+        ([1.0, -1.0, 0.5], [0.0, 0.0, 1.0, 0.5]),
+    ];
     let mut vertices = Vec::new();
     for (p, c) in &corners {
         vertices.extend_from_slice(p);
         vertices.extend_from_slice(c);
     }
-    let px = runner::draw_on(&dev, &pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("rysowanie");
+    let px =
+        runner::draw_on(&dev, &pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("rysowanie");
 
     // expected: the same transform on the CPU → pixel-space triangle → interpolated colour
     let to_px = |p: [f32; 3]| {
         let (wx, wy) = (0.5 * p[0] + 0.25, 0.5 * p[1]);
         let (cx, cy) = (wx, -wy);
-        ((cx + 1.0) * 0.5 * SIZE as f32, (1.0 - cy) * 0.5 * SIZE as f32)
+        (
+            (cx + 1.0) * 0.5 * SIZE as f32,
+            (1.0 - cy) * 0.5 * SIZE as f32,
+        )
     };
-    let (a, b, c) = (to_px(corners[0].0), to_px(corners[1].0), to_px(corners[2].0));
+    let (a, b, c) = (
+        to_px(corners[0].0),
+        to_px(corners[1].0),
+        to_px(corners[2].0),
+    );
     let area = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
     let (mut inside, mut outside) = (0, 0);
     for y in 0..SIZE as usize {
@@ -167,9 +247,14 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
             let got = px[y * SIZE as usize + x];
             let m = l1.min(l2).min(l3);
             if m > 0.02 {
-                let want: Vec<f32> = (0..4).map(|k| l1 * corners[0].1[k] + l2 * corners[1].1[k] + l3 * corners[2].1[k]).collect();
+                let want: Vec<f32> = (0..4)
+                    .map(|k| l1 * corners[0].1[k] + l2 * corners[1].1[k] + l3 * corners[2].1[k])
+                    .collect();
                 let ok = (0..4).all(|k| (got[k] - want[k]).abs() < 0.01);
-                assert!(ok, "piksel ({x},{y}) wewnątrz: {got:?}, oczekiwane {want:?}");
+                assert!(
+                    ok,
+                    "piksel ({x},{y}) wewnątrz: {got:?}, oczekiwane {want:?}"
+                );
                 inside += 1;
             } else if m < -0.02 {
                 assert_eq!(got, CLEAR, "piksel ({x},{y}) poza trójkątem");
@@ -177,13 +262,23 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
             }
         }
     }
-    println!("sprawdzone piksele: {inside} wewnątrz, {outside} na zewnątrz; trójkąt {a:?} {b:?} {c:?}");
-    assert!(inside > 400 && outside > 2500, "za mało sprawdzonych pikseli: {inside} / {outside}");
+    println!(
+        "sprawdzone piksele: {inside} wewnątrz, {outside} na zewnątrz; trójkąt {a:?} {b:?} {c:?}"
+    );
+    assert!(
+        inside > 400 && outside > 2500,
+        "za mało sprawdzonych pikseli: {inside} / {outside}"
+    );
 }
 
 /// Texel (x, y) of the two test textures, RGBA8.
 fn texel_a(x: usize, y: usize) -> [u8; 4] {
-    [(x * 4) as u8, (y * 4) as u8, if (x / 8 + y / 8) % 2 == 0 { 255 } else { 0 }, 255]
+    [
+        (x * 4) as u8,
+        (y * 4) as u8,
+        if (x / 8 + y / 8) % 2 == 0 { 255 } else { 0 },
+        255,
+    ]
 }
 
 fn texel_b(x: usize, y: usize) -> [u8; 4] {
@@ -213,12 +308,21 @@ fn console_tsharp(address: u64, dst_sel: [u32; 4]) -> [u32; 8] {
 #[test]
 fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((blobs, dev)) = setup(&["VS_Rage_TransformPosCpvTex_1702efec_Wrapped", "PS_Rage_Textured_1702efec_Wrapped"]) else { return };
+    let Some((blobs, dev)) = setup(&[
+        "VS_Rage_TransformPosCpvTex_1702efec_Wrapped",
+        "PS_Rage_Textured_1702efec_Wrapped",
+    ]) else {
+        return;
+    };
     let pso = pso_through_hook(
         &dev,
         &blobs[0],
         &blobs[1],
-        &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12), (c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 28)],
+        &[
+            (c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0),
+            (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12),
+            (c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 28),
+        ],
     );
     let rs = real::abi_root_signature().expect("root signature ABI XCL");
 
@@ -236,7 +340,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
     bytes(&mut mem, addr_b, texel_b);
     let t_a = console_tsharp(addr_a, [4, 5, 6, 7]); // identity
     let t_b = console_tsharp(addr_b, [6, 5, 4, 7]); // r ← z, b ← x
-    // the static sampler the PS builds in code: s[0:3] = 0x400, 0xC00000, 0x18F00000, 0
+                                                    // the static sampler the PS builds in code: s[0:3] = 0x400, 0xC00000, 0x18F00000, 0
     let s_code = [0x400u32, 0xC0_0000, 0x18F0_0000, 0];
 
     // our decoder: T# → D3D12 resource + SRV (texel data read from the T#'s address), S# → sampler
@@ -245,33 +349,79 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         let img = desc::image(&t).expect("T#");
         assert_eq!(img.swizzle_mode, 0, "test używa liniowych tekstur");
         let (res, srv) = desc::image_d3d12(&img).expect("format DXGI");
-        assert_eq!((res.Width, res.Height, res.Format), (SIZE as u64, SIZE, DXGI_FORMAT_R8G8B8A8_UNORM));
+        assert_eq!(
+            (res.Width, res.Height, res.Format),
+            (SIZE as u64, SIZE, DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
         let at = img.address as usize;
-        let data: Vec<u8> = mem[at / 4..at / 4 + (SIZE * SIZE) as usize].iter().flat_map(|w| w.to_le_bytes()).collect();
-        textures.push(runner::ViewTexture { res, srv, data, row_bytes: SIZE as usize * 4 });
+        let data: Vec<u8> = mem[at / 4..at / 4 + (SIZE * SIZE) as usize]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        textures.push(runner::ViewTexture {
+            res,
+            srv,
+            data,
+            row_bytes: SIZE as usize * 4,
+        });
     }
     let sampler = desc::sampler_d3d12(&s_code, false);
-    assert_eq!((sampler.Filter, sampler.AddressU, sampler.MaxAnisotropy), (D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 4));
+    assert_eq!(
+        (sampler.Filter, sampler.AddressU, sampler.MaxAnisotropy),
+        (D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_WRAP, 4)
+    );
 
     // descriptor tables in the XCL shader ABI form: +0x00 world V#, +0x20 T#, +0x40 view-projection V#
     let vsharp = |base: u32| [base, 0, 0x1000, 0];
     for (table, t, heap_index) in [(0x100usize, t_a, 0u32), (0x200, t_b, 2)] {
         mem[table / 4..table / 4 + 4].copy_from_slice(&vsharp(0x1000));
-        mem[(table + 0x20) / 4..(table + 0x20) / 4 + 8].copy_from_slice(&desc::xcl_image_words(&t, heap_index));
+        mem[(table + 0x20) / 4..(table + 0x20) / 4 + 8]
+            .copy_from_slice(&desc::xcl_image_words(&t, heap_index));
         mem[(table + 0x40) / 4..(table + 0x40) / 4 + 4].copy_from_slice(&vsharp(0x2000));
     }
-    assert_eq!(desc::xcl_sampler_words(&s_code, 0), s_code, "S# z kodu wskazuje sampler 0");
+    assert_eq!(
+        desc::xcl_sampler_words(&s_code, 0),
+        s_code,
+        "S# z kodu wskazuje sampler 0"
+    );
     // identity world and view-projection
-    for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0].iter().enumerate() {
+    for (i, v) in [
+        1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ]
+    .iter()
+    .enumerate()
+    {
         mem[0x1000 / 4 + i] = f(*v);
     }
-    for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0].iter().enumerate() {
+    for (i, v) in [
+        1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ]
+    .iter()
+    .enumerate()
+    {
         mem[(0x2000 + 0x160) / 4 + i] = f(*v);
     }
     // full-screen quad, white, uv = screen position → every pixel centre hits a texel centre
     let mut vertices = Vec::new();
-    for (x, y) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        vertices.extend_from_slice(&[x, y, 0.5, 1.0, 1.0, 1.0, 1.0, (x + 1.0) * 0.5, (1.0 - y) * 0.5]);
+    for (x, y) in [
+        (-1.0f32, -1.0f32),
+        (-1.0, 1.0),
+        (1.0, -1.0),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (1.0, 1.0),
+    ] {
+        vertices.extend_from_slice(&[
+            x,
+            y,
+            0.5,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            (x + 1.0) * 0.5,
+            (1.0 - y) * 0.5,
+        ]);
     }
     let half = SIZE as i32 / 2;
     let user_data = |table: u32| {
@@ -280,10 +430,29 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         io
     };
     let draws = [
-        runner::Draw { sgprs: user_data(0x100), scissor: [0, 0, half, SIZE as i32] },
-        runner::Draw { sgprs: user_data(0x200), scissor: [half, 0, SIZE as i32, SIZE as i32] },
+        runner::Draw {
+            sgprs: user_data(0x100),
+            scissor: [0, 0, half, SIZE as i32],
+        },
+        runner::Draw {
+            sgprs: user_data(0x200),
+            scissor: [half, 0, SIZE as i32, SIZE as i32],
+        },
     ];
-    let px = runner::draw_on_multi(&dev, &pso, &rs, &vertices, 36, &draws, &mem, &textures, &[sampler], SIZE, CLEAR).expect("rysowanie");
+    let px = runner::draw_on_multi(
+        &dev,
+        &pso,
+        &rs,
+        &vertices,
+        36,
+        &draws,
+        &mem,
+        &textures,
+        &[sampler],
+        SIZE,
+        CLEAR,
+    )
+    .expect("rysowanie");
 
     let unorm = |t: [u8; 4]| t.map(|c| c as f32 / 255.0);
     let (mut checked, mut changed) = (0, 0);
@@ -292,8 +461,15 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
             let got = px[y * SIZE as usize + x];
             let a = unorm(texel_a(x, y));
             let b = unorm(texel_b(x, y));
-            let want = if x < half as usize { a } else { [b[2], b[1], b[0], b[3]] };
-            assert!((0..4).all(|k| (got[k] - want[k]).abs() < 0.005), "piksel ({x},{y}): {got:?}, oczekiwane {want:?}");
+            let want = if x < half as usize {
+                a
+            } else {
+                [b[2], b[1], b[0], b[3]]
+            };
+            assert!(
+                (0..4).all(|k| (got[k] - want[k]).abs() < 0.005),
+                "piksel ({x},{y}): {got:?}, oczekiwane {want:?}"
+            );
             checked += 1;
             // right half: the second draw saw the other descriptor, not texture A
             if x >= half as usize && (0..4).any(|k| (got[k] - a[k]).abs() > 0.05) {
@@ -303,7 +479,10 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
     }
     let right = (SIZE * SIZE / 2) as usize;
     println!("sprawdzone piksele: {checked}; po zmianie deskryptora różnych od tekstury A: {changed} / {right}");
-    assert!(changed > right * 9 / 10, "zmiana deskryptora między draw callami nie zmieniła wyniku: {changed} / {right}");
+    assert!(
+        changed > right * 9 / 10,
+        "zmiana deskryptora między draw callami nie zmieniła wyniku: {changed} / {right}"
+    );
 }
 
 /// Retail legacy GS: `VS_VoxelizeGeneric` (ES variant) + `GS_VoxelizeGeneric` translated as
@@ -315,37 +494,73 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
 /// coordinates (w = 1, z in [0, 1]), and pixels covered.
 #[test]
 fn retail_es_gs_voxelize_geometry_mode() {
-    let Some((blobs, _dev)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    let Some((blobs, _dev)) = setup(&[
+        "VS_VoxelizeGeneric_6be01b34_Wrapped",
+        "GS_VoxelizeGeneric_6be01b34_Wrapped",
+    ]) else {
+        return;
+    };
     use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
     let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("para ES + GS");
     assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
-    let t = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    let t = recomp::translate(
+        &code,
+        &recomp::Options {
+            mode: recomp::Mode::Geometry(g.clone()),
+            wave64: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let rec = g.record();
     let ms = dxc::compile(&recomp::mesh_passthrough(&rec), "main", "ms_6_6", &[]).unwrap();
-    let ps = dxc::compile("float4 main(float4 p : SV_Position) : SV_Target0 { return float4(1, 0, 0, 1); }", "main", "ps_6_6", &[]).unwrap();
+    let ps = dxc::compile(
+        "float4 main(float4 p : SV_Position) : SV_Target0 { return float4(1, 0, 0, 1); }",
+        "main",
+        "ps_6_6",
+        &[],
+    )
+    .unwrap();
 
     // user data: s[8:9] → X (GS output base, ·256) at +0xB8; s16 → GS table (V# at +0x920 →
     // scale at +0x40); s17 → ES table (V# at +0x60 → world 4×3); s19 = 0 (scale 1)
-    let (p_tab, gs_tab, es_tab, world, scale, vin) = (0x100u32, 0x200u32, 0x1200u32, 0x2000u32, 0x2100u32, 0x3000u32);
+    let (p_tab, gs_tab, es_tab, world, scale, vin) = (
+        0x100u32, 0x200u32, 0x1200u32, 0x2000u32, 0x2100u32, 0x3000u32,
+    );
     let mut mem = vec![0u32; 0x4000 / 4];
     let vsharp = |base: u32| [base, 0, 0x1000, 0];
     mem[(p_tab + 0xB8) as usize / 4] = 0;
-    mem[(gs_tab + 0x920) as usize / 4..(gs_tab + 0x920) as usize / 4 + 4].copy_from_slice(&vsharp(scale));
-    mem[(es_tab + 0x60) as usize / 4..(es_tab + 0x60) as usize / 4 + 4].copy_from_slice(&vsharp(world));
-    for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0].iter().enumerate() {
+    mem[(gs_tab + 0x920) as usize / 4..(gs_tab + 0x920) as usize / 4 + 4]
+        .copy_from_slice(&vsharp(scale));
+    mem[(es_tab + 0x60) as usize / 4..(es_tab + 0x60) as usize / 4 + 4]
+        .copy_from_slice(&vsharp(world));
+    for (i, v) in [
+        1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    ]
+    .iter()
+    .enumerate()
+    {
         mem[world as usize / 4 + i] = v.to_bits();
     }
     for (i, v) in [1.0f32, 1.0, 1.0, 0.0].iter().enumerate() {
         mem[(scale + 0x40) as usize / 4 + i] = v.to_bits();
     }
     // two triangles: in the plane z = 0.2 (normal z) and x = 0.3 (normal x)
-    let tris = [[[-0.5f32, -0.5, 0.2], [0.5, -0.5, 0.2], [-0.5, 0.5, 0.2]], [[0.3, -0.4, -0.4], [0.3, 0.4, -0.4], [0.3, -0.4, 0.4]]];
+    let tris = [
+        [[-0.5f32, -0.5, 0.2], [0.5, -0.5, 0.2], [-0.5, 0.5, 0.2]],
+        [[0.3, -0.4, -0.4], [0.3, 0.4, -0.4], [0.3, -0.4, 0.4]],
+    ];
     for (t, tri) in tris.iter().enumerate() {
         for (i, p) in tri.iter().enumerate() {
             let at = vin as usize / 4 + (t * 3 + i) * 4;
-            mem[at..at + 4].copy_from_slice(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 1.0f32.to_bits()]);
+            mem[at..at + 4].copy_from_slice(&[
+                p[0].to_bits(),
+                p[1].to_bits(),
+                p[2].to_bits(),
+                1.0f32.to_bits(),
+            ]);
         }
     }
     let mut io = vec![0u32; 128];
@@ -354,32 +569,67 @@ fn retail_es_gs_voxelize_geometry_mode() {
     io[17] = es_tab;
     io[IO_GS_PRIMS] = 2;
     io[IO_GS_VERTICES] = vin;
-    let (px, r) = runner::mesh_draw(&cs, &ms, &ps, 1, rec.record_dwords(), &io, &mem, 64, [0.0; 4]).expect("rysowanie");
+    let (px, r) = runner::mesh_draw(
+        &cs,
+        &ms,
+        &ps,
+        1,
+        rec.record_dwords(),
+        &io,
+        &mem,
+        64,
+        [0.0; 4],
+    )
+    .expect("rysowanie");
 
     let vd = rec.vert_dwords();
     let fl = |i: usize| f32::from_bits(r[i]);
-    assert_eq!((r[0], r[1]), (6, 2), "3 wierzchołki i 1 trójkąt na trójkąt wejściowy");
+    assert_eq!(
+        (r[0], r[1]),
+        (6, 2),
+        "3 wierzchołki i 1 trójkąt na trójkąt wejściowy"
+    );
     let tri_at = MESH_HEADER + rec.max_vertices as usize * vd;
     let mut axes = Vec::new();
     for (t, tri) in tris.iter().enumerate() {
         let base = 3 * t;
-        assert_eq!(r[tri_at + t], (base | (base + 1) << 10 | (base + 2) << 20) as u32, "trójkąt {t}: indeksy");
+        assert_eq!(
+            r[tri_at + t],
+            (base | (base + 1) << 10 | (base + 2) << 20) as u32,
+            "trójkąt {t}: indeksy"
+        );
         // true normal and the two coordinates that are not the dominant axis
-        let (e1, e2) = ([0, 1, 2].map(|k| tri[1][k] - tri[0][k]), [0, 1, 2].map(|k| tri[2][k] - tri[0][k]));
-        let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let (e1, e2) = (
+            [0, 1, 2].map(|k| tri[1][k] - tri[0][k]),
+            [0, 1, 2].map(|k| tri[2][k] - tri[0][k]),
+        );
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        let dom = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs())).unwrap();
+        let dom = (0..3)
+            .max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs()))
+            .unwrap();
         let others: Vec<usize> = (0..3).filter(|&k| k != dom).collect();
         let mut found = false;
         for i in 0..3 {
             let v = MESH_HEADER + (base + i) * vd;
             let pos = [fl(v), fl(v + 1), fl(v + 2), fl(v + 3)];
-            let (axis, tc1, tc3) = (r[v + 4], [fl(v + 8), fl(v + 9), fl(v + 10), fl(v + 11)], [fl(v + 12), fl(v + 13), fl(v + 14)]);
+            let (axis, tc1, tc3) = (
+                r[v + 4],
+                [fl(v + 8), fl(v + 9), fl(v + 10), fl(v + 11)],
+                [fl(v + 12), fl(v + 13), fl(v + 14)],
+            );
             println!("trójkąt {t} wierzchołek {i}: pos {pos:?} oś {axis} TEXCOORD1 {tc1:?} TEXCOORD3 {tc3:?}");
             assert_eq!(tc1, [-1.0, -1.0, 1.0, 1.0], "TEXCOORD1");
             let dot = (tc3[0] * n[0] + tc3[1] * n[1] + tc3[2] * n[2]) / len;
             let unit = (tc3[0] * tc3[0] + tc3[1] * tc3[1] + tc3[2] * tc3[2]).sqrt();
-            assert!((unit - 1.0).abs() < 1e-3 && (dot.abs() - 1.0).abs() < 1e-3, "TEXCOORD3 = jednostkowa normalna: {tc3:?} vs {n:?}");
+            assert!(
+                (unit - 1.0).abs() < 1e-3 && (dot.abs() - 1.0).abs() < 1e-3,
+                "TEXCOORD3 = jednostkowa normalna: {tc3:?} vs {n:?}"
+            );
             assert_eq!(pos[3], 1.0, "w");
             assert!((0.0..=1.0).contains(&pos[2]), "z w [0, 1]: {pos:?}");
             if i == 0 {
@@ -391,9 +641,15 @@ fn retail_es_gs_voxelize_geometry_mode() {
             let p = tri[i];
             let ok = [(others[0], others[1]), (others[1], others[0])]
                 .iter()
-                .any(|&(a, b)| (pos[0].abs() - p[a].abs()).abs() < 1e-5 && (pos[1].abs() - p[b].abs()).abs() < 1e-5);
+                .any(|&(a, b)| {
+                    (pos[0].abs() - p[a].abs()).abs() < 1e-5
+                        && (pos[1].abs() - p[b].abs()).abs() < 1e-5
+                });
             found |= ok;
-            assert!(ok, "pozycja = rzut na płaszczyznę osi dominującej: {pos:?} z {p:?} (oś {dom})");
+            assert!(
+                ok,
+                "pozycja = rzut na płaszczyznę osi dominującej: {pos:?} z {p:?} (oś {dom})"
+            );
             // exactly, as the code selects: z-dominant → (x, y), x-dominant → (z, y); depth = 0.5·d + 0.5
             let want = match dom {
                 2 => [p[0], p[1], 0.5 * p[2] + 0.5, 1.0],
@@ -406,5 +662,8 @@ fn retail_es_gs_voxelize_geometry_mode() {
     assert_eq!(axes, vec![4, 0], "oś dominująca: z → 4, x → 0");
     let covered = px.iter().filter(|p| p[0] == 1.0).count();
     println!("pokryte piksele: {covered}");
-    assert!(covered > 300, "pass-through narysował wyjście GS: {covered}");
+    assert!(
+        covered > 300,
+        "pass-through narysował wyjście GS: {covered}"
+    );
 }

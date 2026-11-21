@@ -24,7 +24,8 @@ impl SigElement {
 }
 
 fn rd32(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    b.get(o..o + 4)
+        .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
 }
 
 fn cstr(b: &[u8], o: usize) -> String {
@@ -68,8 +69,12 @@ pub fn signature(blob: &[u8], fourcc: &str) -> Option<Vec<SigElement>> {
 
 /// Input and output signature of a shader (whichever version the container has).
 pub fn signatures(blob: &[u8]) -> (Vec<SigElement>, Vec<SigElement>) {
-    let i = signature(blob, "ISG1").or_else(|| signature(blob, "ISGN")).unwrap_or_default();
-    let o = signature(blob, "OSG1").or_else(|| signature(blob, "OSGN")).unwrap_or_default();
+    let i = signature(blob, "ISG1")
+        .or_else(|| signature(blob, "ISGN"))
+        .unwrap_or_default();
+    let o = signature(blob, "OSG1")
+        .or_else(|| signature(blob, "OSGN"))
+        .unwrap_or_default();
     (i, o)
 }
 
@@ -101,7 +106,11 @@ pub fn psv(blob: &[u8]) -> Option<Psv> {
     let size = rd32(d, 0)? as usize;
     let r = d.get(4..4 + size)?;
     let u16at = |o: usize| r.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-    let mut v = Psv { min_wave: rd32(r, 16)?, max_wave: rd32(r, 20)?, ..Default::default() };
+    let mut v = Psv {
+        min_wave: rd32(r, 16)?,
+        max_wave: rd32(r, 20)?,
+        ..Default::default()
+    };
     if size >= 36 {
         v.kind = Some(r[24]);
     }
@@ -134,7 +143,10 @@ mod tests {
         d.extend_from_slice(&2u32.to_le_bytes());
         d.extend_from_slice(&8u32.to_le_bytes());
         let base = 8 + 2 * 32;
-        for (i, (name_off, sv, ct, reg, mask)) in [(0u32, 0u32, 3u32, 0u32, 7u8), (9, 6, 1, 1, 1)].iter().enumerate() {
+        for (i, (name_off, sv, ct, reg, mask)) in [(0u32, 0u32, 3u32, 0u32, 7u8), (9, 6, 1, 1, 1)]
+            .iter()
+            .enumerate()
+        {
             d.extend_from_slice(&0u32.to_le_bytes()); // stream
             d.extend_from_slice(&(base + name_off).to_le_bytes());
             d.extend_from_slice(&(i as u32 * 0).to_le_bytes());
@@ -166,7 +178,15 @@ mod tests {
         part.extend_from_slice(&0u32.to_le_bytes()); // resources
         let p = psv(&crate::gpu::xbox::tests::container(&[(b"PSV0", &part)])).unwrap();
         assert_eq!(p.kind, Some(13));
-        assert_eq!((p.ms_max_vertices, p.ms_max_primitives, p.ms_topology, p.ms_groupshared), (128, 126, 2, 1024));
+        assert_eq!(
+            (
+                p.ms_max_vertices,
+                p.ms_max_primitives,
+                p.ms_topology,
+                p.ms_groupshared
+            ),
+            (128, 126, 2, 1024)
+        );
         assert_eq!(p.numthreads, Some([128, 1, 1]));
     }
 
@@ -174,8 +194,19 @@ mod tests {
     fn parses_v1_signature() {
         let s = signature(&isg1(), "ISG1").unwrap();
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].semantic().as_str(), s[0].register, s[0].mask, s[0].component_type), ("POSITION0", 0, 7, 3));
-        assert_eq!((s[1].name.as_str(), s[1].system_value, s[1].register), ("SV_VertexID", 6, 1));
+        assert_eq!(
+            (
+                s[0].semantic().as_str(),
+                s[0].register,
+                s[0].mask,
+                s[0].component_type
+            ),
+            ("POSITION0", 0, 7, 3)
+        );
+        assert_eq!(
+            (s[1].name.as_str(), s[1].system_value, s[1].register),
+            ("SV_VertexID", 6, 1)
+        );
         assert_eq!(signatures(&isg1()).0, s);
     }
 }

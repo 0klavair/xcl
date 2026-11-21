@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+};
 
 /// allocation granularity (as VirtualAlloc)
 pub const GRAIN: usize = 0x1_0000;
@@ -43,7 +45,11 @@ impl Uma {
             if !p.is_null() {
                 let mut inner = Inner::default();
                 inner.free.insert(0, size);
-                return Some(Uma { base: p as usize, size, inner: Mutex::new(inner) });
+                return Some(Uma {
+                    base: p as usize,
+                    size,
+                    inner: Mutex::new(inner),
+                });
             }
         }
         None
@@ -91,7 +97,9 @@ impl Uma {
         }
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
-        let Some(orig) = g.used.remove(&off) else { return false };
+        let Some(orig) = g.used.remove(&off) else {
+            return false;
+        };
         let (mut start, mut len) = (off, orig);
         // merge with the free neighbours
         if let Some((&o, &l)) = g.free.range(..off).next_back() {
