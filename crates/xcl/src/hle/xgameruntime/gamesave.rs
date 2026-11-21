@@ -501,7 +501,7 @@ mod tests {
             assert_eq!(
                 XGameSaveInitializeProvider(
                     std::ptr::null_mut(),
-                    b"olympus-read-name-validation\0".as_ptr(),
+                    b"xcl-read-name-validation\0".as_ptr(),
                     false,
                     &mut provider,
                 ),

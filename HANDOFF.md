@@ -530,6 +530,11 @@ Nothing open.
 - **#6** T# validation (mip range, cube faces, array depth), 1D height ignored, UMA span and subresource-count checks,
   physical-page mapping inside one allocation. Its own linear layout was not taken (not addrlib's): linear stays
   `tiling::Layout` mode 0.
+- **Second round (#6 rebuilt, #9–#11, #13):** D3D12 texture limits and UTF-16 `MicrosoftGame.config`; DXC toolchain id
+  (dxcompiler / dxil size + mtime) in the DXIL cache key – the cache rebuilds once – and fresh DXIL validated; GameSave
+  read results survive a too-small-buffer retry; a null process task queue means disabled (`E_NO_TASK_QUEUE`); `xcl rpf`
+  probes archives over 1 GB in 4 MB chunks (`--probe` / `--full`). Open: #12 (feature availability should be false
+  only for XStore / XAppCapture).
 - **#7** only the persistent-local-storage accounting (used bytes measured). Its task-queue / XAsync handle registries
   (2.8 k lines against forged handles) were not taken.
 

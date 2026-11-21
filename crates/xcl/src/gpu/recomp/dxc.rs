@@ -522,7 +522,7 @@ mod cache_tests {
 
     #[test]
     fn rejects_invalid_fresh_dxil_without_poisoning_the_cache() {
-        let dir = std::env::temp_dir().join(format!("olympus-dxil-fresh-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-fresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let key = cache_key("fresh validation", "main", "cs_6_6");
         let file = dir.join(format!("{key:016x}.dxil"));
@@ -616,7 +616,7 @@ mod cache_tests {
 
     #[test]
     fn path_aliases_share_the_same_cache_flight() {
-        let root = std::env::temp_dir().join(format!("olympus-dxil-alias-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-dxil-alias-{}", std::process::id()));
         let dir = root.join("cache");
         let child = dir.join("child");
         let alias = child.join("..");
