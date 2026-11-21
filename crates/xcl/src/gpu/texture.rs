@@ -34,43 +34,9 @@ pub struct Placement {
     /// first byte (the T# address rounded down to a block; the rest is the base swizzle)
     pub start: u64,
     pub bytes: usize,
-    pub chain: Option<Chain>,
-    linear: Option<LinearChain>,
-    /// array slices (cube faces), or the storage layers of a tiled 3D texture.
+    pub chain: Chain,
+    /// array slices (cube faces), or the storage layers of a 3D texture.
     pub slices: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LinearLevel { offset: usize, width: usize, height: usize, depth: usize, pitch_bytes: usize }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LinearChain { elem_bytes: usize, slice_bytes: usize, levels: Vec<LinearLevel> }
-
-fn align_256(n: usize) -> Option<usize> { n.checked_add(255).map(|x| x & !255) }
-
-fn linear_element(format: u32) -> Option<(usize, u32)> {
-    tiling::element(format)
-        .map(|(log2, side)| (1usize << log2, side))
-        .or_else(|| (72..=74).contains(&format).then_some((12, 1)))
-}
-
-fn linear_chain(t: &Image) -> Result<LinearChain, String> {
-    let (elem_bytes, side) = linear_element(t.format).ok_or_else(|| format!("format {} without a linear element layout", t.format))?;
-    let mut offset = 0usize;
-    let mut levels = Vec::with_capacity((t.max_mip + 1) as usize);
-    for mip in 0..=t.max_mip {
-        let width = (t.width >> mip).max(1).div_ceil(side) as usize;
-        let height = (t.height >> mip).max(1).div_ceil(side) as usize;
-        let depth = if t.ty == ImageType::D3 { (t.depth >> mip).max(1) as usize } else { 1 };
-        let row_bytes = width.checked_mul(elem_bytes).ok_or("linear texture row size overflow")?;
-        let pitch_bytes = align_256(row_bytes).ok_or("linear texture row pitch overflow")?;
-        offset = align_256(offset).ok_or("linear texture mip offset overflow")?;
-        levels.push(LinearLevel { offset, width, height, depth, pitch_bytes });
-        let plane_bytes = pitch_bytes.checked_mul(height).ok_or("linear texture plane size overflow")?;
-        offset = offset.checked_add(plane_bytes.checked_mul(depth).ok_or("linear texture level size overflow")?).ok_or("linear texture chain size overflow")?;
-    }
-    let slice_bytes = align_256(offset).ok_or("linear texture slice size overflow")?;
-    Ok(LinearChain { elem_bytes, slice_bytes, levels })
 }
 
 pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
@@ -88,15 +54,7 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
         // The T# height field is ignored for 1D resources, just as image_d3d12 ignores it.
         surface.height = 1;
     }
-    if t.swizzle_mode == 0 {
-        let slices = match t.ty {
-            ImageType::D1Array | ImageType::D2Array | ImageType::Cube => t.depth.max(1) as usize,
-            _ => 1,
-        };
-        let linear = linear_chain(&surface)?;
-        let bytes = linear.slice_bytes.checked_mul(slices).ok_or("linear texture size overflow")?;
-        return Ok(Placement { start: t.address, bytes, chain: None, linear: Some(linear), slices });
-    }
+    // linear (SW_MODE 0) included: addrlib's 256-byte rows, levels from the smallest
     let chain = tiling::image_chain(&surface, cfg).ok_or_else(|| format!("SW_MODE {} / format {} without a tiling pattern", t.swizzle_mode, t.format))?;
     let slices = match t.ty {
         ImageType::D1Array | ImageType::D2Array | ImageType::Cube => t.depth.max(1) as usize,
@@ -105,7 +63,7 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
     };
     let start = t.address & !(chain.layout.block_bytes as u64 - 1);
     let bytes = chain.slice_bytes.checked_mul(slices).ok_or("tiled texture size overflow")?;
-    Ok(Placement { start, bytes, chain: Some(chain), linear: None, slices })
+    Ok(Placement { start, bytes, chain, slices })
 }
 
 /// The subresources of `t` in D3D12 order (mip + slice × mips) from `mem`, its bytes from
@@ -115,45 +73,26 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
     if mem.len() < p.bytes {
         return Err(format!("{} B of memory, but the texture takes {} B", mem.len(), p.bytes));
     }
-    if let Some(chain) = &p.chain {
-        let e = 1usize << chain.layout.elem_log2;
-        if matches!(t.ty, ImageType::D3) {
-            return Ok(chain
-                .levels
-                .iter()
-                .enumerate()
-                .map(|(i, l)| Subresource {
-                    rows: l.height,
-                    row_bytes: l.width * e,
-                    depth: l.depth,
-                    data: chain.detile_volume(mem, i),
-                })
-                .collect());
-        }
-        let mut out = Vec::with_capacity(p.slices * chain.levels.len());
-        for s in 0..p.slices {
-            let slice = &mem[s * chain.slice_bytes..(s + 1) * chain.slice_bytes];
-            for (i, l) in chain.levels.iter().enumerate() {
-                out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * e, data: chain.detile_level(slice, i) });
-            }
-        }
-        return Ok(out);
+    let chain = &p.chain;
+    let e = 1usize << chain.layout.elem_log2;
+    if matches!(t.ty, ImageType::D3) {
+        return Ok(chain
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Subresource {
+                rows: l.height,
+                row_bytes: l.width * e,
+                depth: l.depth,
+                data: chain.detile_volume(mem, i),
+            })
+            .collect());
     }
-    let linear = p.linear.as_ref().ok_or("texture placement without a layout")?;
-    let mut out = Vec::with_capacity(p.slices * linear.levels.len());
+    let mut out = Vec::with_capacity(p.slices * chain.levels.len());
     for s in 0..p.slices {
-        let slice = &mem[s * linear.slice_bytes..(s + 1) * linear.slice_bytes];
-        for l in &linear.levels {
-            let row_bytes = l.width * linear.elem_bytes;
-            let mut data = Vec::with_capacity(row_bytes * l.height * l.depth);
-            let plane_bytes = l.pitch_bytes * l.height;
-            for z in 0..l.depth {
-                for y in 0..l.height {
-                    let start = l.offset + z * plane_bytes + y * l.pitch_bytes;
-                    data.extend_from_slice(&slice[start..start + row_bytes]);
-                }
-            }
-            out.push(Subresource { depth: l.depth, rows: l.height, row_bytes, data });
+        let slice = &mem[s * chain.slice_bytes..(s + 1) * chain.slice_bytes];
+        for (i, l) in chain.levels.iter().enumerate() {
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * e, data: chain.detile_level(slice, i) });
         }
     }
     Ok(out)
@@ -421,25 +360,7 @@ mod tests {
                 })
                 .collect()
         };
-        if let Some(linear) = &p.linear {
-            for s in 0..p.slices {
-                for l in &linear.levels {
-                    let row_bytes = l.width * linear.elem_bytes;
-                    let data = random(row_bytes * l.height * l.depth);
-                    let plane_bytes = l.pitch_bytes * l.height;
-                    for z in 0..l.depth {
-                        for y in 0..l.height {
-                            let src = (z * l.height + y) * row_bytes;
-                            let dst = s * linear.slice_bytes + l.offset + z * plane_bytes + y * l.pitch_bytes;
-                            mem[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
-                        }
-                    }
-                    subs.push(Subresource { rows: l.height, row_bytes, depth: l.depth, data });
-                }
-            }
-            return (subs, mem);
-        }
-        let chain = p.chain.as_ref().unwrap();
+        let chain = &p.chain;
         let e = 1usize << chain.layout.elem_log2;
         if matches!(t.ty, ImageType::D3) {
             for (i, l) in chain.levels.iter().enumerate() {
@@ -472,82 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn linear_mipped_array_uses_256_byte_rows_levels_and_slices() {
-        let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
-        let t = image(rgba8, ImageType::D2Array, 65, 3, 2, 3, 0, 0x20_0000);
-        let p = placement(&t, CONSOLE_PIPES).unwrap();
-        let linear = p.linear.as_ref().unwrap();
-        assert!(p.chain.is_none());
-        assert_eq!(linear.levels, vec![
-            LinearLevel { offset: 0, width: 65, height: 3, depth: 1, pitch_bytes: 512 },
-            LinearLevel { offset: 1536, width: 32, height: 1, depth: 1, pitch_bytes: 256 },
-            LinearLevel { offset: 1792, width: 16, height: 1, depth: 1, pitch_bytes: 256 },
-        ]);
-        assert_eq!((linear.slice_bytes, p.bytes), (2048, 4096));
-        let mut mem = vec![0xEE; p.bytes];
-        let mut want = Vec::new();
-        for slice in 0..p.slices {
-            for (mip, level) in linear.levels.iter().enumerate() {
-                let row_bytes = level.width * linear.elem_bytes;
-                let mut data = Vec::new();
-                for y in 0..level.height {
-                    let value = (slice * 32 + mip * 8 + y) as u8;
-                    let start = slice * linear.slice_bytes + level.offset + y * level.pitch_bytes;
-                    mem[start..start + row_bytes].fill(value);
-                    data.extend(std::iter::repeat(value).take(row_bytes));
-                }
-                want.push(Subresource { depth: 1, rows: level.height, row_bytes, data });
-            }
-        }
-        assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
-        assert!(subresources(&t, &mem[..mem.len() - 1], CONSOLE_PIPES).is_err());
-    }
-
-    #[test]
-    fn linear_block_compressed_dimensions_are_in_blocks() {
-        let bc7 = desc::gfx10_format(DXGI_FORMAT_BC7_UNORM).unwrap();
-        let t = image(bc7, ImageType::D2, 7, 5, 1, 3, 0, 0x30_0000);
-        let p = placement(&t, CONSOLE_PIPES).unwrap();
-        let linear = p.linear.as_ref().unwrap();
-        assert_eq!(linear.elem_bytes, 16);
-        assert_eq!(linear.levels.iter().map(|l| (l.width, l.height, l.depth, l.pitch_bytes)).collect::<Vec<_>>(), vec![(2, 2, 1, 256), (1, 1, 1, 256), (1, 1, 1, 256)]);
-        assert_eq!(linear.slice_bytes, 1024);
-    }
-
-    #[test]
-    fn linear_96_bit_texture_extracts_and_uploads_twelve_byte_elements() {
-        let rgb32 = desc::gfx10_format(DXGI_FORMAT_R32G32B32_FLOAT).unwrap();
-        let t = image(rgb32, ImageType::D2, 21, 2, 1, 2, 0, 0x34_0000);
-        let p = placement(&t, CONSOLE_PIPES).unwrap();
-        let linear = p.linear.as_ref().unwrap();
-        assert_eq!(linear.elem_bytes, 12);
-        assert_eq!(linear.levels, vec![
-            LinearLevel { offset: 0, width: 21, height: 2, depth: 1, pitch_bytes: 256 },
-            LinearLevel { offset: 512, width: 10, height: 1, depth: 1, pitch_bytes: 256 },
-        ]);
-        assert_eq!(p.bytes, 768);
-        let mut mem = vec![0xEE; p.bytes];
-        let mut want = Vec::new();
-        for (mip, level) in linear.levels.iter().enumerate() {
-            let row_bytes = level.width * 12;
-            let mut data = Vec::new();
-            for y in 0..level.height {
-                let value = (mip * 16 + y) as u8;
-                let start = level.offset + y * level.pitch_bytes;
-                mem[start..start + row_bytes].fill(value);
-                data.extend(std::iter::repeat(value).take(row_bytes));
-            }
-            want.push(Subresource { depth: 1, rows: level.height, row_bytes, data });
-        }
-        assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
-        let Some((dev, queue)) = device() else { return };
-        unsafe {
-            let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
-            assert_eq!(read_back(&dev, &queue, &res, &want), want);
-        }
-    }
-
-    #[test]
     fn one_dimensional_arrays_ignore_tsharp_height_for_linear_and_tiled_layouts() {
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
         let gpu = device();
@@ -556,25 +401,7 @@ mod tests {
             let mut normalized = t;
             normalized.height = 1;
             assert_eq!(placement(&t, CONSOLE_PIPES).unwrap().bytes, placement(&normalized, CONSOLE_PIPES).unwrap().bytes);
-            let (want, mem) = if mode == 1 {
-                console_texture(&t)
-            } else {
-                let p = placement(&t, CONSOLE_PIPES).unwrap();
-                let linear = p.linear.as_ref().unwrap();
-                assert!(linear.levels.iter().all(|l| l.height == 1));
-                let mut mem = vec![0xEE; p.bytes];
-                let mut want = Vec::new();
-                for slice in 0..p.slices {
-                    for (mip, level) in linear.levels.iter().enumerate() {
-                        let row_bytes = level.width * linear.elem_bytes;
-                        let value = (slice * 16 + mip) as u8;
-                        let start = slice * linear.slice_bytes + level.offset;
-                        mem[start..start + row_bytes].fill(value);
-                        want.push(Subresource { depth: 1, rows: 1, row_bytes, data: vec![value; row_bytes] });
-                    }
-                }
-                (want, mem)
-            };
+            let (want, mem) = console_texture(&t);
             assert!(want.iter().all(|s| s.rows == 1));
             assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
             if let Some((dev, queue)) = &gpu {
@@ -593,27 +420,8 @@ mod tests {
         for mode in [0, 1] {
             let t = image(rgba8, ImageType::D2, 17, 3, 9, 2, mode, 0x37_0000);
             assert_eq!(desc::image_d3d12(&t).unwrap().0.DepthOrArraySize, 1);
-            let (want, mem) = if mode == 1 {
-                console_texture(&t)
-            } else {
-                let p = placement(&t, CONSOLE_PIPES).unwrap();
-                assert_eq!(p.slices, 1);
-                let linear = p.linear.as_ref().unwrap();
-                let mut mem = vec![0xEE; p.bytes];
-                let mut want = Vec::new();
-                for (mip, level) in linear.levels.iter().enumerate() {
-                    let row_bytes = level.width * linear.elem_bytes;
-                    let mut data = Vec::new();
-                    for y in 0..level.height {
-                        let value = (mip * 8 + y) as u8;
-                        let start = level.offset + y * level.pitch_bytes;
-                        mem[start..start + row_bytes].fill(value);
-                        data.extend(std::iter::repeat(value).take(row_bytes));
-                    }
-                    want.push(Subresource { depth: 1, rows: level.height, row_bytes, data });
-                }
-                (want, mem)
-            };
+            assert_eq!(placement(&t, CONSOLE_PIPES).unwrap().slices, 1);
+            let (want, mem) = console_texture(&t);
             assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
             if let Some((dev, queue)) = &gpu {
                 unsafe {
@@ -659,42 +467,6 @@ mod tests {
         let t = image(rgba8, ImageType::D2Array, 1, 1, u16::MAX as u32 + 1, 1, 1, 0x37_d000);
         assert!(placement(&t, CONSOLE_PIPES).err().unwrap().contains("invalid"));
         assert!(desc::image_d3d12(&t).is_none());
-    }
-
-    #[test]
-    fn linear_3d_mips_extract_and_upload_every_depth_plane() {
-        let r8 = desc::gfx10_format(DXGI_FORMAT_R8_UNORM).unwrap();
-        let t = image(r8, ImageType::D3, 5, 3, 4, 3, 0, 0x38_0000);
-        let p = placement(&t, CONSOLE_PIPES).unwrap();
-        let linear = p.linear.as_ref().unwrap();
-        assert_eq!(linear.levels, vec![
-            LinearLevel { offset: 0, width: 5, height: 3, depth: 4, pitch_bytes: 256 },
-            LinearLevel { offset: 3072, width: 2, height: 1, depth: 2, pitch_bytes: 256 },
-            LinearLevel { offset: 3584, width: 1, height: 1, depth: 1, pitch_bytes: 256 },
-        ]);
-        assert_eq!(p.bytes, 3840);
-        let mut mem = vec![0xEE; p.bytes];
-        let mut want = Vec::new();
-        for (mip, level) in linear.levels.iter().enumerate() {
-            let row_bytes = level.width * linear.elem_bytes;
-            let plane_bytes = level.pitch_bytes * level.height;
-            let mut data = Vec::new();
-            for z in 0..level.depth {
-                for y in 0..level.height {
-                    let value = (mip * 40 + z * 8 + y) as u8;
-                    let start = level.offset + z * plane_bytes + y * level.pitch_bytes;
-                    mem[start..start + row_bytes].fill(value);
-                    data.extend(std::iter::repeat(value).take(row_bytes));
-                }
-            }
-            want.push(Subresource { depth: level.depth, rows: level.height, row_bytes, data });
-        }
-        assert_eq!(subresources(&t, &mem, CONSOLE_PIPES).unwrap(), want);
-        let Some((dev, queue)) = device() else { return };
-        unsafe {
-            let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
-            assert_eq!(read_back(&dev, &queue, &res, &want), want);
-        }
     }
 
     fn device() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
@@ -881,7 +653,7 @@ mod tests {
                 let Some(err) = mip_error(&subs[k - 1], &subs[k], ch, cb) else { continue };
                 bad = bad.max(err);
                 // control: a tail level read from the tail block's corner
-                let chain = p.chain.as_ref().unwrap();
+                let chain = &p.chain;
                 let l = chain.levels[k];
                 if l.origin != (0, 0) && l.width >= 2 && l.height >= 2 {
                     let mut wrong = chain.clone();
