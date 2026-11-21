@@ -22,6 +22,7 @@ pub const MODE_IMMEDIATE: u32 = 3;
 pub const PORT_WORK: u32 = 0;
 pub const PORT_COMPLETION: u32 = 1;
 pub const E_ABORT_QUEUE_TERMINATED: HRESULT = 0x8004_0001u32 as i32; // E_ABORT-like
+pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01ABu32 as i32;
 
 pub type XTaskQueueCallback = unsafe extern "system" fn(*mut c_void, bool);
 pub type XTaskQueueTerminatedCallback = unsafe extern "system" fn(*mut c_void);
@@ -275,20 +276,39 @@ pub fn new_handle(q: Arc<Queue>) -> *mut QueueHandle {
 
 pub unsafe fn queue_from(h: *mut c_void) -> Option<Arc<Queue>> {
     if h.is_null() {
-        return Some(process_queue());
+        return process_queue();
     }
     let qh = &*(h as *const QueueHandle);
     (qh.magic == MAGIC).then(|| qh.queue.clone())
 }
 
-static PROCESS_QUEUE: Mutex<Option<Arc<Queue>>> = Mutex::new(None);
+struct ProcessQueueState {
+    initialized: bool,
+    queue: Option<Arc<Queue>>,
+}
 
-pub fn process_queue() -> Arc<Queue> {
-    PROCESS_QUEUE
-        .lock()
-        .unwrap()
-        .get_or_insert_with(|| Queue::new(MODE_THREAD_POOL, MODE_THREAD_POOL))
-        .clone()
+impl ProcessQueueState {
+    fn current(&mut self) -> Option<Arc<Queue>> {
+        if !self.initialized {
+            self.initialized = true;
+            self.queue = Some(Queue::new(MODE_THREAD_POOL, MODE_THREAD_POOL));
+        }
+        self.queue.clone()
+    }
+
+    fn set(&mut self, queue: Option<Arc<Queue>>) {
+        self.initialized = true;
+        self.queue = queue;
+    }
+}
+
+static PROCESS_QUEUE: Mutex<ProcessQueueState> = Mutex::new(ProcessQueueState {
+    initialized: false,
+    queue: None,
+});
+
+pub fn process_queue() -> Option<Arc<Queue>> {
+    PROCESS_QUEUE.lock().unwrap().current()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -397,13 +417,24 @@ pub unsafe extern "system" fn XTaskQueueGetCurrentProcessTaskQueue(out: *mut *mu
     if out.is_null() {
         return false;
     }
-    *out = new_handle(process_queue()) as *mut c_void;
-    true
+    match process_queue() {
+        Some(queue) => {
+            *out = new_handle(queue) as *mut c_void;
+            true
+        }
+        None => {
+            *out = std::ptr::null_mut();
+            false
+        }
+    }
 }
 
 pub unsafe extern "system" fn XTaskQueueSetCurrentProcessTaskQueue(h: *mut c_void) {
-    let q = if h.is_null() { None } else { queue_from(h) };
-    *PROCESS_QUEUE.lock().unwrap() = q;
+    if h.is_null() {
+        PROCESS_QUEUE.lock().unwrap().set(None);
+    } else if let Some(queue) = queue_from(h) {
+        PROCESS_QUEUE.lock().unwrap().set(Some(queue));
+    }
 }
 
 #[repr(C)]
@@ -481,6 +512,24 @@ mod tests {
         if canceled {
             CANCELED.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn process_queue_state_distinguishes_default_disabled_and_replacement() {
+        let mut state = ProcessQueueState { initialized: false, queue: None };
+        let default = state.current().expect("default process queue was not materialized");
+        assert_eq!(default.ports[PORT_WORK as usize].mode, MODE_THREAD_POOL);
+        assert_eq!(default.ports[PORT_COMPLETION as usize].mode, MODE_THREAD_POOL);
+
+        state.set(None);
+        assert!(state.current().is_none(), "disabled process queue was silently recreated");
+
+        let replacement = Queue::new(MODE_MANUAL, MODE_IMMEDIATE);
+        state.set(Some(replacement.clone()));
+        let current = state.current().expect("replacement process queue was lost");
+        assert!(Arc::ptr_eq(&current, &replacement));
+        drop(replacement);
+        assert!(state.current().is_some(), "process queue did not retain its own reference");
     }
 
     #[test]
