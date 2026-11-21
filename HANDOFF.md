@@ -250,7 +250,8 @@ NOTE:
   (300 triangles, 2000 rays) and `gpu_built_bvh_nodes_match_the_cpu_node_test` (64 lanes, nodes from the builder through
   the translated `image_bvh_intersect_ray` = CPU result). Missing: instance nodes (TLAS – the console driver's layout, traversed
   by the shader code, to be read from `CS_RTShadowTrace*`), box16 in the builder, hooking into `BuildRaytracingAccelerationStructure`.
-- **Opus postponed until the exe** (user's decision: "we'll see once we have the exe"). See the Audio section.
+- **Opus: decoded** (session 5, PR #3) – see "Opus decoding" in the Audio section; what the exe still has to show is how
+  the title hands Opus to the system (XAudio2 0x704F voices with AWC-framed buffers, or a console API).
 - Tests: 111 unit (7 ignored helpers) + title e2e + 3 in `gpu_pso_e2e` – PASSED (full `cargo test --workspace`).
 
 ### Console DLLs from the game pack (session 5, without the exe)
@@ -516,6 +517,24 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
 
 ## In progress (unfinished)
 Nothing open.
+
+## Opus decoding (session 5, 2026-11-21, PR #3)
+- `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
+  loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
+  parser (all 32 TOC configurations, codes 0–3), RFC 7845 `OpusHead` (pre-skip, output gain; multistream 3–8 channels
+  split over several MFTs), framing: Ogg, `[u16 LE length][packet]…` in blocks (nBlockAlign, or the AWC 2048 B when the
+  format has none), a raw packet.
+- `hle/xaudio2.rs`: `WAVE_FORMAT_OPUS` (0x704F) / EXTENSIBLE with the Opus subtype → a PCM16 voice; SubmitSourceBuffer
+  decodes the buffer, the PCM lives until `OnBufferEnd` (the voice's callback is wrapped; contexts mapped back in the
+  callbacks and `GetState`), `FlushSourceBuffers` / end of stream reset the decoder, regions clamped to the decoded
+  length; without the decoder: silence of the same length. `report.json → audio`: `opus_voices`,
+  `opus_buffers_decoded`, `opus_decode_errors`.
+- **Checked on the game's audio** (`XCL_SAMPLE_AWC` = an AWC with one Opus stream, test `decodes_a_game_sound`,
+  `XCL_OPUS_WAV` writes a WAV): a 1.6 s effect and a 56.6 s sound from a bank decode completely (whole 20 ms frames,
+  < 3 frames past the AWC's sample count – its encoder delay / end), 56 s in 0.2 s. The test packets in the repository
+  are libopus-encoded tones, no game data.
+- Open (needs the exe): whether the title uses 0x704F voices with AWC-framed buffers at all, the voice format's
+  nBlockAlign / extra bytes; streaming AWCs (512 KB blocks with a 2048 B header) are not unpacked by XCL – the title does that.
 
 ## Audio – conclusions from `audio.rpf` (the real game)
 - AWC containers ("ADAT", version 1): u64 chunk table (type = byte 7, size = bits 28–55, offset = bits 0–27, offset from the
@@ -830,7 +849,8 @@ Little is left to do without the exe – the rest needs an actual run of the gam
    (geometry from GPU buffers in UMA; Rehydrate = prebuilt BVHs from `*_bvh4.rpf` – format to be checked).
 3. Textures: binding `gpu::texture` to the title's API (textures in its memory, re-upload after a write), the console's
    pipe/packer configuration for the _X modes (`texture::CONSOLE_PIPES`), MSAA.
-4. Audio: Opus (the MFT above) for XAudio2 0x704F voices, or the console API – depending on what the exe shows; XMA2 low priority.
+4. Audio: Opus is decoded (0x704F voices); with the exe check how the title feeds it (voice format, buffer framing, or a
+   console API); XMA2 low priority (the game has none).
 5. Smaller: 749 wave64 programs at risk in a 32-wide wave (only if they show up), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.

@@ -31,6 +31,9 @@ use windows::Win32::System::Com::IClassFactory;
 /// CLSID of Windows' built-in Microsoft Opus Audio Decoder MFT (`MSOpusDecoder.dll`).
 const CLSID_MS_OPUS_DECODER: GUID = GUID::from_u128(0x63e17c10_2d43_4c42_8fe3_8d8b63e46a6a);
 
+/// The game's AWC containers hold Opus as `[u16 LE len][packet]…` in blocks of this size.
+pub const AWC_BLOCK: usize = 2048;
+
 /// Opus maximum packet duration (RFC 6716 §3.2.5): 120 ms = 5760 samples at 48 kHz.
 pub const MAX_PACKET_SAMPLES_48K: u32 = 5760;
 
@@ -601,8 +604,9 @@ pub fn extract_packets<'a>(data: &'a [u8], block_align: u16, multistream: bool) 
             return pkts;
         }
     }
-    // Multiple fixed-size blocks (e.g. N * 2048 B AWC blocks)
-    let ba = block_align as usize;
+    // Multiple fixed-size blocks (e.g. N * 2048 B AWC blocks); a format without a usable
+    // nBlockAlign gets the AWC block size
+    let ba = if block_align >= 64 { block_align as usize } else { AWC_BLOCK };
     if ba >= 64 && data.len() >= ba && data.len() % ba == 0 {
         let mut all = Vec::new();
         let mut ok = true;
@@ -1267,6 +1271,71 @@ pub(crate) mod tests {
             assert_eq!(h.output_gain, -256);
             assert_eq!(h.mapping_family, if ch <= 2 { 0 } else { 1 });
         }
+    }
+
+    /// A sound of the game (`XCL_SAMPLE_AWC`: an AWC with one Opus stream, its data chunk as
+    /// the console stores it): every packet decodes, the length matches the AWC's sample count,
+    /// it is not silence. With `XCL_OPUS_WAV` the result is written there to listen to.
+    #[test]
+    fn decodes_a_game_sound() {
+        let Ok(path) = std::env::var("XCL_SAMPLE_AWC") else {
+            println!("XCL_SAMPLE_AWC not set – skipping");
+            return;
+        };
+        if !is_available() {
+            println!("MSOpusDecoder.dll not available – skipping");
+            return;
+        }
+        let awc = std::fs::read(path).unwrap();
+        let (data, samples, channels) = awc_stream(&awc);
+        let mut d = Decoder::new(channels, 48_000, &[]).unwrap();
+        // block_align 1: the AWC block size is assumed
+        let pcm = d.decode_buffer(data, 1).unwrap();
+        let frames = pcm.len() / channels as usize;
+        println!("{} B of Opus → {frames} samples per channel (the AWC says {samples})", data.len());
+        // whole 20 ms frames: up to three frames past the AWC's count (its encoder delay / end)
+        assert!(frames >= samples && frames - samples < 3 * 960, "{frames} samples for {samples}");
+        let rms = (pcm.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / pcm.len() as f64).sqrt();
+        assert!(rms > 100.0, "silence (rms {rms})");
+        if let Ok(out) = std::env::var("XCL_OPUS_WAV") {
+            let mut w = Vec::new();
+            let bytes = (pcm.len() * 2) as u32;
+            w.extend_from_slice(b"RIFF");
+            w.extend_from_slice(&(36 + bytes).to_le_bytes());
+            w.extend_from_slice(b"WAVEfmt ");
+            for v in [16u32, 1 | (channels as u32) << 16, 48_000, 96_000 * channels as u32, (2 * channels as u32) | 16 << 16] {
+                w.extend_from_slice(&v.to_le_bytes());
+            }
+            w.extend_from_slice(b"data");
+            w.extend_from_slice(&bytes.to_le_bytes());
+            pcm.iter().for_each(|s| w.extend_from_slice(&s.to_le_bytes()));
+            std::fs::write(&out, w).unwrap();
+            println!("written to {out} (rms {rms:.0})");
+        }
+    }
+
+    /// (data chunk, samples, channels) of a single-stream AWC: header "ADAT", version, flags,
+    /// streams, data offset; chunk table of u64 (type byte 7, size bits 28-55, offset 0-27).
+    fn awc_stream(b: &[u8]) -> (&[u8], usize, u16) {
+        assert_eq!(&b[..4], b"ADAT");
+        let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let (flags, streams) = (u16_at(6), u32_at(8) as usize);
+        assert_eq!(streams, 1, "a single-stream AWC");
+        let mut o = 16 + if flags & 1 != 0 { 2 * streams } else { 0 };
+        let count = (u32_at(o) >> 29) as usize;
+        o += 4;
+        let chunk = |ty: u64| {
+            (0..count)
+                .map(|c| u64::from_le_bytes(b[o + 8 * c..o + 8 * c + 8].try_into().unwrap()))
+                .find(|v| v >> 56 == ty)
+                .map(|v| ((v & 0xFFF_FFFF) as usize, ((v >> 28) & 0xFFF_FFFF) as usize))
+                .unwrap()
+        };
+        let (doff, dsz) = chunk(0x55);
+        let (foff, _) = chunk(0x76);
+        assert_eq!(b[foff + 28], 0x0B, "Opus");
+        (&b[doff..doff + dsz], u32_at(foff) as usize, b[foff + 29].max(1) as u16)
     }
 
     #[test]
