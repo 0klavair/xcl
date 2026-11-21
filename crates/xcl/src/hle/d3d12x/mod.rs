@@ -27,7 +27,16 @@ use std::sync::OnceLock;
 
 use crate::util::{HRESULT, S_OK};
 
+/// data export: titles pass `&IID_ID3D12Device` to D3D12XboxCreateDevice / QueryInterface
+static IID_ID3D12_DEVICE: windows::core::GUID = windows::core::GUID::from_u128(0x189819f1_1db6_4b57_be54_1821339b85f7);
+
 pub fn exports() -> Vec<(&'static str, usize)> {
+    let mut v = exports_fns();
+    v.push(("IID_ID3D12Device", &IID_ID3D12_DEVICE as *const _ as usize));
+    v
+}
+
+fn exports_fns() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
         D3D12CreateDevice,
         D3D12XboxCreateDevice,

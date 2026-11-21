@@ -71,6 +71,11 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
     .map_err(|e| e.clone())
 }
 
+/// The PC compiler's DxcCreateInstance (for titles that use the console's `dxcompiler_xs.dll`).
+pub fn create_instance() -> Option<usize> {
+    load().ok().map(|&(_, f)| f)
+}
+
 fn create_fn() -> Result<CreateInstance, String> {
     let &(_, f) = load()?;
     Ok(unsafe { std::mem::transmute::<usize, CreateInstance>(f) })

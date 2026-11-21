@@ -26,6 +26,15 @@ struct SystemOsVersionInfo {
     revision: u16,
 }
 
+// Fortnite imports these from xmem.dll (XCL finds console functions by name)
+#[link(name = "xmem", kind = "raw-dylib")]
+extern "system" {
+    fn XMemGetWorkingSetStatistics(flags: u32, stats: *mut u64) -> i32;
+    fn XMemAllocatePhysicalPages(attrs: u64, count: *mut usize, pages: *mut u64) -> i32;
+    fn XMemMapPhysicalPages(va: *mut c_void, count: usize, pages: *mut u64) -> *mut c_void;
+    fn XMemFreePhysicalPages(count: usize, pages: *mut u64) -> i32;
+}
+
 #[link(name = "kernelx", kind = "raw-dylib")]
 extern "system" {
     fn XMemAlloc(size: usize, attrs: u64) -> *mut c_void;
@@ -222,6 +231,19 @@ fn main() {
         *(g as *mut u32) = 7;
         *(p as *mut u32) = 7;
         ensure!(VirtualFree(g, 0, 0x8000) != 0 && VirtualFree(p, 0, 0x8000) != 0, "VirtualFree");
+        Ok(())
+    });
+
+    check("xmem: working-set statistics, physical pages mapped and freed", || unsafe {
+        let mut ws = [u64::MAX; 15];
+        ensure!(XMemGetWorkingSetStatistics(0x1000_0001, ws.as_mut_ptr()) != 0, "XMemGetWorkingSetStatistics");
+        ensure!(ws[0] >= 8 << 30 && ws[1] > 0 && ws[1] <= ws[0] && ws[2..].iter().all(|&x| x == 0), "limit / used {:#x} / {:#x}", ws[0], ws[1]);
+        let (mut n, mut pages) = (4usize, [0u64; 4]);
+        ensure!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) != 0 && n == 4, "XMemAllocatePhysicalPages");
+        let p = XMemMapPhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()) as *mut u32;
+        ensure!(!p.is_null() && p as usize >> 32 >= 4, "XMemMapPhysicalPages: {p:?}");
+        *p.add(0x1_0000) = 7; // second page
+        ensure!(XMemFreePhysicalPages(4, pages.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
         Ok(())
     });
 

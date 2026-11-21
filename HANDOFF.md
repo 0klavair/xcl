@@ -587,12 +587,30 @@ Console GPU addresses in unified memory are the title's own: memory operations g
 - Not modelled (logged, no-op): Wait32 / 64BitValueX #71 / #72, GDS #76 / #77, KickoffX #93 (TomBox splits the list
   and submits the first part), depth bias X #94 (needs pipelines with dynamic depth bias), hints (HiStencil, MSAA,
   compression, limits, prefetch).
-- **Nested occlusion queries** (#28 / #29 / #30; the console allows them, the PC one active per list): one begun while
-  another is active is not sent to the PC – the outer one counts on (exact: the inner range lies in it), the inner one
-  resolves as visible (0x10000 samples, binary 1; written over the resolved data, MARKER_OUT). TomBox ends the outer
-  one early instead – its count can then be 0 and the object culled. List Reset (#10) forgets the active queries.
+- **Nested occlusion queries** (#28 / #29 / #30; the console allows them, the PC one active per list): when one begins
+  while another is active, the outer one ends there on the PC and resolves as visible (0x10000 samples, binary 1;
+  written over the resolved data, MARKER_OUT); the inner one is a real query – Fortnite nests its per-object queries in
+  a dummy outer one. List Reset (#10) forgets the active queries.
 - The test title writes / fills / copies its own graphics memory through #60–#89, takes a GPU timestamp, draws
-  through DrawIndexedX and #47 with indices in its memory, and nests occlusion queries (outer = 2 × a single draw's).
+  through DrawIndexedX and #47 with indices in its memory, and nests occlusion queries (inner = a single draw's).
+
+## Fortnite's console imports (session 5, 2026-11-21; from TomBox's library map, Fortnite XSX 2.0.1461.7919)
+The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetDXGIDeviceManagerX`; xmem `XMemAlloc`,
+`XMemFree`, `XMemAllocDefault`, `XMemFreeDefault`, `XMemVirtualAlloc`, `XMemGetWorkingSetStatistics`,
+`XMemTransferMemory`, `XMemAllocatePhysicalPages`, `XMemMapPhysicalPages`, `XMemFreePhysicalPages`; xg_xs
+`XGCreateTextureComputer`; d3d12_xs `D3D12XboxCreateDevice`, `D3D12CreateDevice`, `IID_ID3D12Device` (data),
+`D3D12SerializeRootSignature`, `D3D12SerializeVersionedRootSignature`, `D3D12XboxSetProcessDebugFlags`; XCRDAPI
+`DStorageGetFactory`; dxcompiler_xs `DxcCreateInstance`; AcpHal `AcpHalCreate`, `ApuAlloc`, `ApuFree`, `ApuCreateHeap`,
+`ApuHeapGetState`, `AcpHalAllocateShapeContexts`.
+- Now in XCL: `XMemGetWorkingSetStatistics` (0x78 bytes, +0 title limit, +8 used – Fortnite sizes its pools from them;
+  it returned FALSE), `XMemTransferMemory` (TRUE), `XMem{Allocate,Map,Free}PhysicalPages` on the title physical pages
+  (64 KiB, contiguous; a chosen address / scattered pages are still refused – Fortnite's texture streaming maps pages
+  into reserved address space, so that is next), `IID_ID3D12Device` as data, `dxcompiler_xs.dll` = the PC DXC.
+- Missing (each a project): `XGCreateTextureComputer` (the console texture layout computer – TomBox reimplements
+  `xg_xs`), `DStorageGetFactory` (console DirectStorage – Fortnite's IO), AcpHal / SHAPE / xapu / XMA (the hardware audio
+  path Fortnite plays through).
+- Nested occlusion queries: Fortnite nests its per-object queries in a dummy outer one, so the inner ones are now the
+  real queries and the outer one ends early and resolves as visible (it was the other way round).
 
 ## Device as IDXGIDevice, XMemVirtualAlloc (session 5, 2026-11-21)
 - The console D3D12 device is also an IDXGIDevice / 1 / 2: Microsoft's public GDK samples (ATG DeviceResources) take the

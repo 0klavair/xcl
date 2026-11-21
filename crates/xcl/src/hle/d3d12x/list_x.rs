@@ -8,9 +8,9 @@
 //! Write32BitValueBottomOfShaderX #90. A title call of any other extension (waits on memory,
 //! GDS, KickoffX, depth bias, hints…) is logged and does nothing (`real::class_for`).
 //!
-//! Occlusion queries may nest on the console; the PC allows one active per list. One begun
-//! while another is active is not sent to the PC: the outer one counts on (its result is
-//! exact – the inner range lies in it), the inner one resolves as visible.
+//! Occlusion queries may nest on the console; the PC allows one active per list. When one
+//! begins while another is active, the outer one ends there on the PC and resolves as visible;
+//! the inner one is a real query (Fortnite nests its per-object queries in a dummy outer one).
 //!
 //! Console GPU addresses in unified memory are the title's own addresses; memory operations
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
@@ -380,34 +380,32 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
 /// a query: (heap, index)
 type Query = (usize, u32);
 
-/// One list's occlusion queries: the active one and those begun while it was (not sent to
-/// the PC).
+/// One list's occlusion queries: the one active on the PC and the outer ones it ended early.
 #[derive(Default)]
 struct Occlusion {
     active: Option<Query>,
-    inner: Vec<Query>,
+    ended_early: Vec<Query>,
 }
 
 impl Occlusion {
-    /// Whether the PC begins `q`.
-    fn begin(&mut self, q: Query) -> bool {
-        if self.active.is_none() {
-            self.active = Some(q);
-            return true;
+    /// Begin `q` on the PC; Some(outer): end that one on the PC first.
+    fn begin(&mut self, q: Query) -> Option<Query> {
+        let outer = self.active.replace(q);
+        if let Some(o) = outer {
+            self.ended_early.push(o);
         }
-        self.inner.push(q);
-        false
+        outer
     }
 
-    /// Whether the PC ends `q` (not: an inner one).
+    /// Whether the PC ends `q` (not: an outer one already ended – it resolves as visible).
     fn end(&mut self, q: Query) -> bool {
         if self.active == Some(q) {
             self.active = None;
             return true;
         }
-        match self.inner.iter().position(|e| *e == q) {
+        match self.ended_early.iter().position(|e| *e == q) {
             Some(i) => {
-                self.inner.swap_remove(i);
+                self.ended_early.swap_remove(i);
                 false
             }
             None => true,
@@ -416,9 +414,9 @@ impl Occlusion {
 }
 
 static OCCLUSION: Mutex<Option<HashMap<usize, Occlusion>>> = Mutex::new(None);
-/// inner queries since ended, and the result they resolve to
+/// outer queries ended early, and the result they resolve to
 static VISIBLE: Mutex<Option<HashMap<Query, u64>>> = Mutex::new(None);
-/// what an inner OCCLUSION query reports (BINARY_OCCLUSION: 1)
+/// what such an OCCLUSION query reports (BINARY_OCCLUSION: 1)
 const VISIBLE_SAMPLES: u64 = 0x1_0000;
 
 fn is_occlusion(ty: D3D12_QUERY_TYPE) -> bool {
@@ -439,12 +437,12 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
 pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
     static N: AtomicU64 = AtomicU64::new(0);
     if is_occlusion(ty) {
-        let forward = OCCLUSION.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().begin((heap, index));
-        if !forward {
+        let outer = OCCLUSION.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().begin((heap, index));
+        if let Some((h, i)) = outer {
             if once(&N, 1) {
-                crate::xlog_info!("D3D12.X: nested occlusion query – the outer one counts on, the inner one reports visible");
+                crate::xlog_info!("D3D12.X: nested occlusion query – the outer one ends there and reports visible, the inner one counts");
             }
-            return;
+            pc::<QueryFn>(this, PC_END_QUERY)(this, h, ty, i);
         }
         if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
             m.remove(&(heap, index));
@@ -467,7 +465,7 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 }
 
 /// command list #30 ResolveQueryData(heap, type, first, count, destination, offset) (PC #54):
-/// inner occlusion queries are written over the resolved data (after it, in COPY_DEST as
+/// outer occlusion queries ended early are written over the resolved data (after it, in COPY_DEST as
 /// ResolveQueryData wants the destination)
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
@@ -497,16 +495,20 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 #[cfg(test)]
 mod tests {
     #[test]
-    fn nested_occlusion_queries_leave_the_outer_one_on_the_pc() {
+    fn nested_occlusion_queries_end_the_outer_one_early() {
         let mut o = super::Occlusion::default();
-        assert!(o.begin((1, 0)));
-        assert!(!o.begin((1, 1)), "inner: not begun on the PC");
-        assert!(!o.end((1, 1)), "inner: not ended on the PC");
-        assert!(o.end((1, 0)));
-        // overlapping, not nested: A, B, end A, C, end B, end C
-        assert!(o.begin((1, 2)) && !o.begin((1, 3)) && o.end((1, 2)));
-        assert!(o.begin((1, 4)) && !o.end((1, 3)) && o.end((1, 4)));
-        assert!(o.active.is_none() && o.inner.is_empty());
+        assert_eq!(o.begin((1, 0)), None);
+        assert_eq!(o.begin((1, 1)), Some((1, 0)), "the outer one ends on the PC");
+        assert!(o.end((1, 1)), "inner: a real query");
+        // more per-object queries inside the same outer one
+        assert_eq!(o.begin((1, 2)), None);
+        assert!(o.end((1, 2)));
+        assert!(!o.end((1, 0)), "outer: already ended");
+        // overlapping, not nested: A, B, end A, end B
+        assert_eq!(o.begin((1, 3)), None);
+        assert_eq!(o.begin((1, 4)), Some((1, 3)));
+        assert!(!o.end((1, 3)) && o.end((1, 4)));
+        assert!(o.active.is_none() && o.ended_early.is_empty());
         assert!(o.end((1, 9)), "a query not begun here: the PC's call");
     }
 

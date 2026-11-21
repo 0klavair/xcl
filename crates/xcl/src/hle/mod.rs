@@ -12,6 +12,7 @@ use crate::util::glob_match;
 
 pub mod d3d12_layout;
 pub mod d3d12x;
+pub mod dxcompiler;
 pub mod kernelx;
 pub mod opus;
 pub mod xaudio2;
@@ -71,6 +72,7 @@ pub const KERNELX: &str = "kernelx.dll";
 pub const XGAMERUNTIME: &str = "xgameruntime.dll";
 pub const D3D12X: &str = "d3d12_xs.dll";
 pub const XAUDIO2: &str = "xaudio2_9.dll";
+pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
 
 fn build(config: &Config) -> Registry {
     let modules = vec![
@@ -78,6 +80,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
+        HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -112,6 +115,10 @@ fn build(config: &Config) -> Registry {
     let a = idx(XAUDIO2);
     for p in ["xaudio2_9.dll", "xaudio2_9redist.dll"] {
         routes.push((p.into(), Route::Hle(a)));
+    }
+    let c = idx(DXCOMPILER);
+    for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
+        routes.push((p.into(), Route::Hle(c)));
     }
     Registry { modules, routes }
 }

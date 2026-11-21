@@ -678,7 +678,7 @@ pub fn render_triangle() -> Result<(), String> {
         results.Map(0, None, Some(&mut r)).map_err(e)?;
         let counts = std::slice::from_raw_parts(r as *const u64, 3).to_vec();
         results.Unmap(0, None);
-        ensure!(counts[2] > 0 && counts[0] == 2 * counts[2] && counts[1] > 0, "occlusion queries (outer, inner, single) = {counts:?}: expected 2 × single and a visible inner one");
+        ensure!(counts[2] > 0 && counts[1] == counts[2] && counts[0] > 0, "occlusion queries (outer, inner, single) = {counts:?}: expected the inner one = single and a visible outer one");
         ensure!(top_right == [0, 255, 0, 255], "top-right quadrant {top_right:?} (expected green: DrawIndexedX)");
         ensure!(bottom_left == [0, 255, 0, 255], "bottom-left quadrant {bottom_left:?} (expected green: the title's index buffer, bound again)");
         ensure!(center == [0, 255, 0, 255], "centre pixel {center:?} (expected green triangle)");

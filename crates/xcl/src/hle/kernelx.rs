@@ -43,6 +43,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemSetAllocationHooks,
         XMemVirtualQuery,
         XMemVirtualAlloc,
+        XMemAllocatePhysicalPages,
+        XMemMapPhysicalPages,
+        XMemFreePhysicalPages,
+        XMemTransferMemory,
         XMemGetWorkingSetStatistics,
         TitleMemoryStatus,
         JobTitleMemoryStatus,
@@ -267,8 +271,25 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
 /// `BOOL XMemGetWorkingSetStatistics(UINT32 allocator, void* stats)` (as FSR's upscaler calls
 /// it: allocator 0x20000001, 128-byte buffer, reads +8 only on success). No statistics:
 /// FALSE, which the caller reports as 0 bytes.
-pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_allocator: u32, _stats: *mut c_void) -> BOOL {
-    0
+/// `BOOL XMemGetWorkingSetStatistics(DWORD flags, XMEM_WORKING_SET_STATISTICS* stats)`
+/// (0x78 bytes): +0 the title's memory limit, +8 what it uses – engines size their pools and
+/// texture streaming from these (Fortnite: flags 0x10000001). The rest is left zero.
+pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_flags: u32, stats: *mut u8) -> BOOL {
+    if stats.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let limit = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
+    std::ptr::write_bytes(stats, 0, 0x78);
+    (stats as *mut u64).write_unaligned(limit);
+    (stats.add(8) as *mut u64).write_unaligned(process_private_bytes().min(limit));
+    1
+}
+
+/// `BOOL XMemTransferMemory(direction, size)`: moving budget between the title and the tools
+/// pools – there is one budget here
+pub unsafe extern "system" fn XMemTransferMemory(_direction: u32, _size: usize) -> BOOL {
+    1
 }
 
 /// The title's debug output (console builds print a lot there) goes to XCL's log as well.
@@ -444,6 +465,22 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     }
     fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
     std::ptr::null_mut()
+}
+
+/// `BOOL XMemAllocatePhysicalPages(XALLOC_ATTRIBUTES, SIZE_T* count, ULONG64* pages)`: the
+/// title physical pages above (64 KiB)
+pub unsafe extern "system" fn XMemAllocatePhysicalPages(_attrs: u64, num: *mut usize, arr: *mut u64) -> BOOL {
+    AllocateTitlePhysicalPages(std::mem::zeroed(), 0, num, arr as *mut usize)
+}
+
+/// `void* XMemMapPhysicalPages(void* address, SIZE_T count, ULONG64* pages)`
+pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, arr: *mut u64) -> *mut c_void {
+    MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
+}
+
+/// `BOOL XMemFreePhysicalPages(SIZE_T count, ULONG64* pages)`
+pub unsafe extern "system" fn XMemFreePhysicalPages(n: usize, arr: *mut u64) -> BOOL {
+    FreeTitlePhysicalPages(std::mem::zeroed(), n, arr as *mut usize)
 }
 
 // ---------------------------------------------------------------------------------------
