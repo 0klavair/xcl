@@ -541,6 +541,27 @@ Slots and semantics as observed on Fortnite (UE RHI call sites); XCL's own evide
 - Next with the exe: the console-only command-list methods Fortnite calls (report.json lists them), title heaps /
   placed resources at title addresses, occlusion queries (the console allows nesting them, PC does not).
 
+## The console device's own methods (session 5, 2026-11-21, `d3d12x/device_x.rs`)
+Slots as observed on Fortnite. From #44 on the console device's vtable holds its extensions, so a title call there
+must not run the PC method at that index (#44 is PC CreatePipelineLibrary, #48 OpenExistingHeapFromAddress…):
+- **#44 CreatePlacedResourceX**(address, desc, state, clear, riid, out): a buffer at a 64 KiB boundary in unified
+  memory is placed in that window's heap – it *is* the title's memory (GPU VA = the address; Release leaves the title's
+  allocation alone). Textures and other buffers get memory of their own (logged): the console tiling of texels the title
+  writes there is not translated yet.
+- **#48 CreateCommandQueueX** / #8, #9, **#73 CreateCommandListX**(params `{ type @0; node mask @8 }`, …) / #12: the
+  console DMA type 0x10 is the PC copy type, the DMA list IID is created as a graphics list, console priorities → PC.
+- **#60 / #62** graphics / compute PSO X (PC desc + extension count / pointer, extensions not modelled), **#86**
+  CreatePipelineState (streams); **#61 CreateSamplerX** (0x6C-byte desc → anisotropic PC sampler); **#38**
+  GetCopyableFootprints retried with the PC desc when the console desc is rejected; **#41** command signatures (DispatchX
+  105 → Dispatch, root signature only for root arguments); descriptor heap type 4 = CBV / SRV / UAV.
+- **#52** SetDebugFlagsX → S_OK, **#56 / #66** SerializePipelineStateX → E_ACCESSDENIED (as the release runtime),
+  **#57 / #67** DeserializePipelineStateX → E_NOTIMPL (console pipeline caches hold console shaders; not decoded yet),
+  **#74 / #75** page pools (index registry). Every other device slot from #44: a logged stub answering S_OK.
+- The test title copies a buffer placed at its own `XMemAlloc` graphics memory through a DMA queue / allocator / list
+  created through #48 / #9 / #73 and checks the remaining slots.
+- Not yet: CreateDerivedPipelineStateX #55 (patches over a base PSO's desc), deserializing console pipeline caches,
+  placed textures at title addresses (detiling).
+
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
   sqrt / rsq / class, v_swaprel, pknorm f16…) with tests. Fixed on the GPU (RX 9070), where its GPU tests had not run:
@@ -556,8 +577,9 @@ Slots and semantics as observed on Fortnite (UE RHI call sites); XCL's own evide
 - **Second round (#6 rebuilt, #9–#11, #13):** D3D12 texture limits and UTF-16 `MicrosoftGame.config`; DXC toolchain id
   (dxcompiler / dxil size + mtime) in the DXIL cache key – the cache rebuilds once – and fresh DXIL validated; GameSave
   read results survive a too-small-buffer retry; a null process task queue means disabled (`E_NO_TASK_QUEUE`); `xcl rpf`
-  probes archives over 1 GB in 4 MB chunks (`--probe` / `--full`). Open: #12 (feature availability should be false
-  only for XStore / XAppCapture).
+  probes archives over 1 GB in 4 MB chunks (`--probe` / `--full`). **#12** every documented runtime feature
+  available except XStore and XAppCapture; **#14** geometry (ES + GS) as two wave32 halves on adapters without wave64,
+  rejecting cross-half operations (no change on wave64 adapters: the sampled shaders translate identically).
 - **#7** only the persistent-local-storage accounting (used bytes measured). Its task-queue / XAsync handle registries
   (2.8 k lines against forged handles) were not taken.
 

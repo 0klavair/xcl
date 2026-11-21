@@ -323,6 +323,97 @@ pub fn present_x_frame() -> Result<(), String> {
     }
 }
 
+/// The console device's own methods as a title calls them: a buffer placed at the title's
+/// graphics memory (#44 CreatePlacedResourceX) is copied by a DMA queue (#48
+/// CreateCommandQueueX), allocator (#9) and list (#73 CreateCommandListX, the DMA list's IID)
+/// into a readback buffer; page pools (#74 / #75), SetDebugFlagsX (#52),
+/// SerializePipelineStateX (#56) and an extension XCL does not model (#47).
+pub fn console_device_methods() -> Result<(), String> {
+    const DMA: u32 = 0x10;
+    const IID_DMA_LIST: windows::core::GUID = windows::core::GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
+    type Create = unsafe extern "system" fn(*mut c_void, *const u32, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type PlacedX = unsafe extern "system" fn(*mut c_void, u64, *const D3D12_RESOURCE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type ListX = unsafe extern "system" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    unsafe {
+        let dev = device()?;
+        let d = dev.as_raw();
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let n = 0x1_0000usize;
+        let graphics = 1u64 << 29;
+        let mem = crate::XMemAlloc(n, graphics) as *mut u32;
+        ensure!(!mem.is_null() && mem as usize % n == 0, "graphics memory {mem:?}");
+        for i in 0..n / 4 {
+            *mem.add(i) = 0xC0DE_0000 | i as u32;
+        }
+        let buffer = |width: usize| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: width as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let placed: PlacedX = std::mem::transmute(slot(d, 44));
+        let mut raw = std::ptr::null_mut();
+        let hr = placed(d, mem as u64, &buffer(n), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), &ID3D12Resource::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreatePlacedResourceX hr={hr:#x}");
+        let src = ID3D12Resource::from_raw(raw);
+        ensure!(src.GetGPUVirtualAddress() == mem as u64, "placed buffer at {:#x}, not the title's {mem:?}", src.GetGPUVirtualAddress());
+        let mut dst: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buffer(n),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut dst,
+        )
+        .map_err(e)?;
+        let dst = dst.ok_or("no readback buffer")?;
+
+        let queue_x: Create = std::mem::transmute(slot(d, 48));
+        let mut raw = std::ptr::null_mut();
+        let hr = queue_x(d, [DMA, 0, 0, 0].as_ptr(), &ID3D12CommandQueue::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateCommandQueueX (DMA) hr={hr:#x}");
+        let queue = ID3D12CommandQueue::from_raw(raw);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(DMA as i32)).map_err(e)?;
+        let list_x: ListX = std::mem::transmute(slot(d, 73));
+        let mut raw = std::ptr::null_mut();
+        let hr = list_x(d, [DMA, 0, 1, 0].as_ptr(), alloc.as_raw(), std::ptr::null_mut(), &IID_DMA_LIST, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateCommandListX (DMA) hr={hr:#x}");
+        let list = ID3D12GraphicsCommandList::from_raw(raw);
+        list.CopyBufferRegion(&dst, 0, &src, 0, n as u64);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        dst.Map(0, None, Some(&mut p)).map_err(e)?;
+        let copied = std::slice::from_raw_parts(p as *const u32, n / 4).iter().enumerate().all(|(i, &v)| v == 0xC0DE_0000 | i as u32);
+        dst.Unmap(0, None);
+        ensure!(copied, "the DMA copy did not read the title's memory");
+        drop(src);
+        ensure!(*mem.add(7) == 0xC0DE_0007, "the title's memory went with the placed buffer");
+        crate::XMemFree(mem as *mut c_void, graphics);
+
+        let register: unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32) -> HRESULT = std::mem::transmute(slot(d, 74));
+        let unregister: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(slot(d, 75));
+        let mut pool = u32::MAX;
+        ensure!(register(d, 0x2_0000_0000, 16, &mut pool) == 0 && pool != u32::MAX, "RegisterPagePoolX");
+        ensure!(unregister(d, pool as u64) == 0 && unregister(d, pool as u64) < 0, "UnregisterPagePoolX");
+        let debug_flags: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(slot(d, 52));
+        ensure!(debug_flags(d, 1) == 0, "SetDebugFlagsX");
+        let serialize: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(slot(d, 56));
+        ensure!(serialize(d, std::ptr::null_mut()) == 0x8007_0005u32 as i32, "SerializePipelineStateX");
+        // #47 is PC CreatePipelineState: with no arguments it would fail or crash
+        let unmodelled: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(slot(d, 47));
+        ensure!(unmodelled(d, 0, 0, 0) == 0, "console extension #47");
+        Ok(())
+    }
+}
+
 pub fn render_triangle() -> Result<(), String> {
     unsafe {
         let dev = device()?;
