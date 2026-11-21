@@ -19,8 +19,8 @@ measurements and next steps:
 - **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
   movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
   console upscaler sets up and records its work, the GDK HTTP library initialises.
-- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 908 of 912
-  textures of the game's texture archive byte for byte.
+- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
+  textures of the game's texture archive byte for byte, its volume textures included.
 - **150 automated tests**, including GPU tests that compare translated shaders against expected
   results instruction by instruction.
 
@@ -53,7 +53,7 @@ measurements and next steps:
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | 🟡 | device, resources, heaps and pipelines are in place | draw submission and present need the game exe |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes), mip chains with mip tail, arrays and cubes → PC textures | 908 / 912 retail textures exact; GPU upload bit exact |
+| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL creates its context and records its dispatches | end-to-end with the real DLL |
 
@@ -69,9 +69,9 @@ measurements and next steps:
 | Needs a game executable | Not done yet | Not planned |
 |---|---|---|
 | D3D12.X draw records and `PresentX` / frame pacing | Opus / XMA2 audio decoding | Xbox Live, Store licensing (offline by design) |
-| root arguments → shader registers for graphics | hull / domain / amplification shaders (none in the sample game) | decrypting XVC packages or any DRM |
-| texture creation in title memory (binding the detiler) | linear / 3D / MSAA tiled textures | console SDK headers / binaries in the repository |
-| Bink GPU decoding, rehydrating prebuilt BVHs | performance work (GPU buffers live in system memory) | |
+| root arguments → shader registers for graphics | performance work (GPU buffers live in system memory) | decrypting XVC packages or any DRM |
+| texture creation in title memory (binding the detiler), MSAA tiled textures | hull / domain / amplification shaders (none in the sample game) | console SDK headers / binaries in the repository |
+| Bink GPU decoding, rehydrating prebuilt BVHs | | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
 classes asked for, shader statistics, audio formats, crash) – the to-do list for the next step.

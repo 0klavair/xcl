@@ -4,10 +4,10 @@
 //! directly. A PC texture has an opaque layout, so every mip level of every slice is detiled
 //! (`tiling::Chain`) into a D3D12 subresource and copied in.
 //!
-//! What is not here yet: linear (SW_MODE 0) and 3D (thick) textures, MSAA, the console's pipe
-//! configuration for the _X modes (`CONSOLE_PIPES`), and the binding to the console API that
-//! creates textures in title memory (and tells when the title rewrote one) – that comes with
-//! the game executable.
+//! 2D textures, arrays and cubes, 3D textures (thick and thin modes) and linear ones. What is
+//! not here yet: MSAA, the console's pipe configuration for the _X modes (`CONSOLE_PIPES`),
+//! and the binding to the console API that creates textures in title memory (and tells when
+//! the title rewrote one) – that comes with the game executable.
 
 use super::desc::{self, Image, ImageType};
 use super::tiling::{self, Chain, PipeConfig};
@@ -18,11 +18,13 @@ use windows::Win32::Graphics::Direct3D12::*;
 /// archives use do not need it.
 pub const CONSOLE_PIPES: PipeConfig = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
 
-/// Linear data of one subresource: `rows` rows of `row_bytes` (elements: pixels or 4×4 blocks).
+/// Linear data of one subresource: `depth` slices (3D, else 1) of `rows` rows of `row_bytes`
+/// (elements: pixels or 4×4 blocks).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Subresource {
     pub rows: usize,
     pub row_bytes: usize,
+    pub depth: usize,
     pub data: Vec<u8>,
 }
 
@@ -32,19 +34,18 @@ pub struct Placement {
     pub start: u64,
     pub bytes: usize,
     pub chain: Chain,
+    /// array slices (cube faces), or the slices of a 3D texture (`Chain::layers`)
     pub slices: usize,
 }
 
 pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
-    if matches!(t.ty, ImageType::D3 | ImageType::D2Msaa | ImageType::D2MsaaArray) {
-        return Err(format!("texture {:?} – not yet (only 1D/2D, arrays, cube)", t.ty));
+    if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
+        return Err(format!("texture {:?} – not yet (MSAA)", t.ty));
     }
-    if t.swizzle_mode == 0 {
-        return Err("linear texture (SW_MODE 0) – not yet".into());
-    }
-    let chain = tiling::image_chain(t, cfg).ok_or_else(|| format!("SW_MODE {} / format {} without a tiling pattern", t.swizzle_mode, t.format))?;
+    let chain = tiling::image_chain(t, cfg).ok_or_else(|| format!("SW_MODE {} / format {} / {:?} without a tiling pattern", t.swizzle_mode, t.format, t.ty))?;
     let slices = match t.ty {
         ImageType::D1Array | ImageType::D2Array | ImageType::Cube => t.depth.max(1) as usize,
+        ImageType::D3 => chain.layers(),
         _ => 1,
     };
     let start = t.address & !(chain.layout.block_bytes as u64 - 1);
@@ -59,11 +60,15 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
         return Err(format!("{} B of memory, but the texture takes {} B", mem.len(), p.bytes));
     }
     let e = 1usize << p.chain.layout.elem_log2;
+    if matches!(t.ty, ImageType::D3) {
+        // one subresource per level, all its depth slices
+        return Ok(p.chain.levels.iter().enumerate().map(|(i, l)| Subresource { rows: l.height, row_bytes: l.width * e, depth: l.depth, data: p.chain.detile_volume(mem, i) }).collect());
+    }
     let mut out = Vec::with_capacity(p.slices * p.chain.levels.len());
     for s in 0..p.slices {
         let slice = &mem[s * p.chain.slice_bytes..(s + 1) * p.chain.slice_bytes];
         for (i, l) in p.chain.levels.iter().enumerate() {
-            out.push(Subresource { rows: l.height, row_bytes: l.width * e, data: p.chain.detile_level(slice, i) });
+            out.push(Subresource { rows: l.height, row_bytes: l.width * e, depth: 1, data: p.chain.detile_level(slice, i) });
         }
     }
     Ok(out)
@@ -116,8 +121,13 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     for ((s, fp), &nrows) in subs.iter().zip(&fps).zip(&rows) {
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
-        for y in 0..(nrows as usize).min(s.rows) {
-            std::ptr::copy_nonoverlapping(s.data[y * s.row_bytes..].as_ptr(), (p as *mut u8).add(fp.Offset as usize + y * pitch), row);
+        // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
+        let slice_pitch = pitch * nrows as usize;
+        for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
+            for y in 0..(nrows as usize).min(s.rows) {
+                let at = fp.Offset as usize + z * slice_pitch + y * pitch;
+                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), (p as *mut u8).add(at), row);
+            }
         }
     }
     up.Unmap(0, None);
@@ -220,19 +230,30 @@ mod tests {
         let mut mem = vec![0u8; p.bytes];
         let mut subs = Vec::new();
         let mut n = 0x1234_5678u32;
+        let mut random = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    n ^= n << 13;
+                    n ^= n >> 17;
+                    n ^= n << 5;
+                    n as u8
+                })
+                .collect()
+        };
+        if matches!(t.ty, ImageType::D3) {
+            for (i, l) in p.chain.levels.iter().enumerate() {
+                let data = random(l.width * l.height * l.depth * e);
+                p.chain.tile_volume(&mut mem, i, &data);
+                subs.push(Subresource { rows: l.height, row_bytes: l.width * e, depth: l.depth, data });
+            }
+            return (subs, mem);
+        }
         for s in 0..p.slices {
             let slice = &mut mem[s * p.chain.slice_bytes..(s + 1) * p.chain.slice_bytes];
             for (i, l) in p.chain.levels.iter().enumerate() {
-                let data: Vec<u8> = (0..l.width * l.height * e)
-                    .map(|_| {
-                        n ^= n << 13;
-                        n ^= n >> 17;
-                        n ^= n << 5;
-                        n as u8
-                    })
-                    .collect();
+                let data = random(l.width * l.height * e);
                 p.chain.tile_level(slice, i, &data);
-                subs.push(Subresource { rows: l.height, row_bytes: l.width * e, data });
+                subs.push(Subresource { rows: l.height, row_bytes: l.width * e, depth: 1, data });
             }
         }
         (subs, mem)
@@ -264,8 +285,9 @@ mod tests {
         let rd = res.GetDesc();
         let n = subs.len();
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+        let mut nrows = vec![0u32; n];
         let mut total = 0u64;
-        dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), None, None, Some(&mut total));
+        dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(nrows.as_mut_ptr()), None, Some(&mut total));
         let mut rb: Option<ID3D12Resource> = None;
         let bd = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
@@ -286,13 +308,16 @@ mod tests {
         rb.Map(0, None, Some(&mut p)).unwrap();
         let out = subs
             .iter()
-            .zip(&fps)
-            .map(|(s, fp)| {
-                let mut data = Vec::with_capacity(s.rows * s.row_bytes);
-                for y in 0..s.rows {
-                    data.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), s.row_bytes));
+            .zip(fps.iter().zip(&nrows))
+            .map(|(s, (fp, &nr))| {
+                let pitch = fp.Footprint.RowPitch as usize;
+                let mut data = Vec::with_capacity(s.depth * s.rows * s.row_bytes);
+                for z in 0..s.depth {
+                    for y in 0..s.rows {
+                        data.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + (z * nr as usize + y) * pitch), s.row_bytes));
+                    }
                 }
-                Subresource { rows: s.rows, row_bytes: s.row_bytes, data }
+                Subresource { rows: s.rows, row_bytes: s.row_bytes, depth: s.depth, data }
             })
             .collect();
         rb.Unmap(0, None);
@@ -300,7 +325,8 @@ mod tests {
     }
 
     /// Tiled console memory → PC texture → read back = the linear data it was tiled from, for
-    /// every mip and slice: an RGBA8 array with 4 KB tiles, a BC7 cube with 64 KB tiles.
+    /// every mip and slice: an RGBA8 array with 4 KB tiles, a BC7 cube with 64 KB tiles, 3D
+    /// textures (thick 4 KB / 64 KB, BC1 thick, linear) and a linear 2D texture.
     #[test]
     fn gpu_console_textures_upload_every_mip_and_slice() {
         let Some((dev, queue)) = device() else {
@@ -309,13 +335,23 @@ mod tests {
         };
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
         let bc7 = desc::gfx10_format(DXGI_FORMAT_BC7_UNORM).unwrap();
-        for t in [image(rgba8, ImageType::D2Array, 200, 72, 3, 8, 5, 0x40_0000), image(bc7, ImageType::Cube, 256, 256, 6, 9, 10, 0x80_0000)] {
+        let bc1 = desc::gfx10_format(DXGI_FORMAT_BC1_UNORM).unwrap();
+        let rgba16f = desc::gfx10_format(DXGI_FORMAT_R16G16B16A16_FLOAT).unwrap();
+        for t in [
+            image(rgba8, ImageType::D2Array, 200, 72, 3, 8, 5, 0x40_0000),
+            image(bc7, ImageType::Cube, 256, 256, 6, 9, 10, 0x80_0000),
+            image(rgba8, ImageType::D3, 40, 24, 20, 6, 5, 0x100_0000),
+            image(rgba16f, ImageType::D3, 64, 64, 64, 7, 9, 0x200_0000),
+            image(bc1, ImageType::D3, 64, 32, 8, 4, 5, 0x300_0000),
+            image(rgba8, ImageType::D3, 33, 17, 5, 3, 0, 0x400_0000),
+            image(rgba8, ImageType::D2, 100, 30, 1, 7, 0, 0x500_0000),
+        ] {
             let (want, mem) = console_texture(&t);
             unsafe {
                 let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
                 let got = read_back(&dev, &queue, &res, &want);
                 for (k, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert!(g == w, "format {} subresource {k} ({} rows × {} B) differs", t.format, w.rows, w.row_bytes);
+                    assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
             }
         }
@@ -364,6 +400,7 @@ mod tests {
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
         let (mut checked, mut close, mut worst) = (0, 0, Vec::new());
         let (mut tail_levels, mut tail_err, mut wrong_err) = (0, 0.0f64, 0.0f64);
+        let mut volumes = Vec::new();
         for t in &a.textures {
             let Some((e, side, _)) = ttpf_element(t.dxgi) else { continue };
             let gfx10 = match (e, side) {
@@ -374,12 +411,28 @@ mod tests {
                 (3, 4) => 169,
                 _ => 171,
             };
-            let ty = if t.slices > 1 { ImageType::D2Array } else { ImageType::D2 };
+            let ty = match t.dim {
+                3 => ImageType::D3,
+                2 => ImageType::Cube,
+                _ if t.slices > 1 => ImageType::D2Array,
+                _ => ImageType::D2,
+            };
             let img = image(gfx10, ty, t.w, t.h, t.slices, t.mips, t.mode, 0);
             let p = placement(&img, CONSOLE_PIPES).unwrap();
             sized += 1;
             if p.bytes == t.end - t.start || p.bytes.div_ceil(4096) * 4096 == t.end - t.start {
                 fit += 1;
+            }
+            // volumes of 16-bit float texels (colour-grading LUTs): neighbours along x and z
+            // differ little read as thick blocks, a lot read as 2D slices
+            if t.dim == 3 && matches!(t.dxgi, 10 | 54) {
+                if let Some(mem) = a.read(t.start, t.end) {
+                    let thick = subresources(&img, &mem, CONSOLE_PIPES).unwrap().remove(0);
+                    let flat = image(gfx10, ImageType::D2Array, t.w, t.h, t.slices, t.mips, t.mode, 0);
+                    let as_2d: Vec<u8> = subresources(&flat, &mem, CONSOLE_PIPES).unwrap().into_iter().flat_map(|s| s.data).collect();
+                    let (w, h, d, e) = (t.w as usize, t.h as usize, t.slices as usize, 1usize << e);
+                    volumes.push((t.index, roughness(&thick.data, w, h, d, e), roughness(&as_2d, w, h, d, e)));
+                }
             }
             // unorm channels: R8 / A8, RGBA8 / BGRA8, RGBA16
             let (ch, cb) = match t.dxgi {
@@ -405,7 +458,7 @@ mod tests {
                 if l.origin != (0, 0) && l.width >= 2 && l.height >= 2 {
                     let mut wrong = p.chain.clone();
                     wrong.levels[k].origin = (0, 0);
-                    let ws = Subresource { rows: l.height, row_bytes: subs[k].row_bytes, data: wrong.detile_level(&mem, k) };
+                    let ws = Subresource { rows: l.height, row_bytes: subs[k].row_bytes, depth: 1, data: wrong.detile_level(&mem, k) };
                     tail_levels += 1;
                     tail_err += err;
                     wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
@@ -422,9 +475,33 @@ mod tests {
         println!("TTPF: the mip chain model size matches for {fit} of {sized} textures");
         println!("TTPF: textures with mips (R8/RGBA8/RGBA16): {close} of {checked} – every mip close to the previous one downscaled (< 8/255), {unreadable} in unreadable blocks; outliers: {worst:?}");
         println!("TTPF: {tail_levels} levels in the mip tail – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
+        println!("TTPF: volumes (index, neighbour difference as thick blocks, as 2D slices): {volumes:?}");
         assert!(fit * 100 >= sized * 99, "mip chain model: {fit} / {sized}");
         assert!(checked >= 5 && close * 100 >= checked * 90, "mips: {close} / {checked}");
         assert!(tail_levels >= 5 && wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
+        assert!(!volumes.is_empty() && volumes.iter().all(|v| v.2 > 3.0 * v.1), "volumes: {volumes:?}");
+    }
+
+    /// Mean |difference| between x and z neighbours of the first channel (half floats, `e`-byte
+    /// texels) of a `w` × `h` × `d` volume, relative to the mean |value|.
+    fn roughness(v: &[u8], w: usize, h: usize, d: usize, e: usize) -> f64 {
+        let half = |b: u16| -> f64 {
+            let (s, x, m) = ((b >> 15) as i32, ((b >> 10) & 31) as i32, (b & 1023) as f64);
+            let v = if x == 0 { m / 1024.0 * 2f64.powi(-14) } else { (1.0 + m / 1024.0) * 2f64.powi(x - 15) };
+            if s == 1 { -v } else { v }
+        };
+        let at = |x: usize, y: usize, z: usize| half(u16::from_le_bytes([v[((z * h + y) * w + x) * e], v[((z * h + y) * w + x) * e + 1]]));
+        let (mut diff, mut mag) = (0.0, 0.0);
+        for z in 0..d - 1 {
+            for y in 0..h {
+                for x in 0..w - 1 {
+                    let c = at(x, y, z);
+                    diff += (at(x + 1, y, z) - c).abs() + (at(x, y, z + 1) - c).abs();
+                    mag += c.abs();
+                }
+            }
+        }
+        diff / mag.max(1e-9)
     }
 
     /// (element log2, pixels per side, uncompressed) of the DXGI formats the archive uses
@@ -448,6 +525,8 @@ mod tests {
         mode: u32,
         mips: u32,
         slices: u32,
+        /// dword 1 bits 21-23: 1 2D, 2 cube, 3 volume (slices = depth), 5 2D array
+        dim: u32,
         start: usize,
         end: usize,
     }
@@ -492,6 +571,7 @@ mod tests {
                         mode: if (b >> 24) & 3 == 0 { 10 } else { 5 },
                         mips: (a >> 28).max(1),
                         slices: ((b >> 10) & 0x7ff) + 1,
+                        dim: (b >> 21) & 7,
                         start: (c & 0x1f_ffff) as usize * 4096 + 0x800,
                         end: total,
                     }

@@ -637,6 +637,24 @@ Nothing open.
   PC queues, XStore rejected, an unhandled slot in the report), `libhttpclient_initialises_through_the_xgameruntime_thunks`
   (real DLL: HCInitialize → S_OK). Without the system xgameruntime.dll: the XCL classes work, the rest is "missing".
 
+## 3D and linear textures (session 5, 2026-11-21)
+- **3D thick modes** (4KB_S, 64KB_S / S_T, 4KB_S_X, 64KB_S_X, 64KB_D_X on a 3D resource; addrlib Gfx10Lib::
+  GetSwizzlePatternInfo, `PATTERNS_3D` from `gfx10SwizzlePattern.h` S3 / S3_X / S3_T / D3_X): a block tiles x, y and z
+  (`Layout::new_3d`, `block_d`, `oz`); block = addrlib Block1K_3d grown by log2(block) − 10 split over w, h, d
+  (ComputeThickBlockDimension: 4 KB with 2 B texels = 8×16×16). The thin 3D modes (64KB_Z_X / R_X) and linear are 2D
+  per depth slice. Mip chain (`Chain::new_3d`, ComputeSurfaceInfoMacroTiled / AddrFromCoordMacroTiled): per layer of
+  `block_d` z-slices the whole chain (tail block, then the levels from the smallest), layers `slice_bytes` apart; the tail
+  holds levels ≤ the block with h (4 KB) / w (64 KB) halved, at most GetMaxNumMipsInTail (thick: log2 − (log2 − 8) / 3)
+  levels, origins in Block256_3d units. `detile_volume` / `tile_volume`; `texture::subresources` gives one subresource
+  per level with its depth slices, `upload` copies them (slices NumRows × RowPitch apart).
+- **Linear** (SW_MODE 0): rows padded to 256 bytes, levels from the smallest (HwlComputeSurfaceInfoLinear) – a "block" of
+  256 B × 1 row in the same `Layout` / `Chain`.
+- **Retail check (TTPF):** the texture header's dword 1 bits 21–23 are the dimension (1 2D, 2 cube, 3 volume, 5 array);
+  the 3 volumes (4 KB tiles, R16F 256×32×8 and RGBA16F 32×64×32 / 32³ LUTs) are thick: the 256×32×8 one takes 256 KB
+  (2D slices: 128 KB) – the model now fits 909 of 912 textures – and x / z neighbours differ 5–17× less than read as 2D
+  slices. GPU test: thick 4 KB / 64 KB, BC1 3D, linear 3D and 2D upload bit for bit.
+- Not covered: MSAA (only render targets, needs the console's pipe configuration and the exe).
+
 ## Tiled textures from console memory (session 5, 2026-11-21)
 - **GFX10 mip chain** (`tiling::Chain`, `tiling::image_chain(&desc::Image, cfg)`; addrlib
   Gfx10Lib::ComputeSurfaceInfoMacroTiled/MicroTiled): per slice, first the mip tail block (levels ≤ half the block width,
@@ -654,7 +672,7 @@ Nothing open.
 - GPU test `gpu_console_textures_upload_every_mip_and_slice`: tiled memory → PC texture → readback = the data, bit for
   bit, every mip and slice (RGBA8 4 KB array, BC7 64 KB cube).
 - **To do with the exe:** binding to the API through which the title creates textures in its memory (CreatePlacedResourceX / heap
-  at an address), and the moment of re-upload (CPU write / GPU copy); linear textures, 3D (thick), MSAA.
+  at an address), and the moment of re-upload (CPU write / GPU copy); MSAA.
 
 ## Static samplers (session 5, 2026-11-21)
 - **Gap:** the translator always took the PC sampler index from S# word 3 [11:0], but an S# built from constants in the code (the console's
@@ -799,7 +817,7 @@ Little is left to do without the exe – the rest needs an actual run of the gam
    and Compute dispatches; `XboxBvhBuilder` (or `BuildRaytracingAccelerationStructure`) → `gpu::bvh::build/build_top`
    (geometry from GPU buffers in UMA; Rehydrate = prebuilt BVHs from `*_bvh4.rpf` – format to be checked).
 3. Textures: binding `gpu::texture` to the title's API (textures in its memory, re-upload after a write), the console's
-   pipe/packer configuration for the _X modes (`texture::CONSOLE_PIPES`), linear / 3D textures.
+   pipe/packer configuration for the _X modes (`texture::CONSOLE_PIPES`), MSAA.
 4. Audio: Opus (the MFT above) for XAudio2 0x704F voices, or the console API – depending on what the exe shows; XMA2 low priority.
 5. Smaller: 749 wave64 programs at risk in a 32-wide wave (only if they show up), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
