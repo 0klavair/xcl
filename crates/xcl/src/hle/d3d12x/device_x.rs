@@ -424,6 +424,22 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
     ret
 }
 
+/// Resources the title placed at an address an earlier one was placed at: on the console they
+/// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
+fn note_alias(va: usize, x: &[u8; 0x38]) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<usize, String>>> = std::sync::Mutex::new(None);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+    let what = format!("dimension {} {}x{} format {} flags {:#x}", u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30));
+    let mut g = SEEN.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if let Some(prev) = m.insert(va, what.clone()) {
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_info!("D3D12.X: CreatePlacedResourceX at {va:#x} ({what}) – aliases an earlier resource there ({prev})");
+        }
+    }
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -436,8 +452,17 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = pc_resource_desc(&x);
     let buffer = u32::from_le_bytes(d[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    note_alias(va as usize, &x);
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
+            return hr;
+        }
+    }
+    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`)
+    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    if !buffer && super::vram::gpu_owned(flags) {
+        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
             return hr;
         }
     }

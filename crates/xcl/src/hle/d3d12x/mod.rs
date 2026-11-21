@@ -24,6 +24,7 @@ pub mod pso_async;
 pub mod real;
 pub mod title_list;
 pub mod title_textures;
+pub mod vram;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

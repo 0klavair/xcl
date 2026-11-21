@@ -439,7 +439,7 @@ unsafe fn present_now(min_interval: Duration) {
 /// (`frame_<n>.bmp`, a quarter of each side) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 60
+    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 20
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`

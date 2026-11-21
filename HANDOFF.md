@@ -1104,6 +1104,18 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   reach memory only through those windows – the pool does not fit (and 12+ GB committed is near this PC's commit
   limit). Options: a much larger UMA (commit cost), or a GPU page table in translated shaders (title memory stays where
   it is, per-chunk heaps) – the general one, larger work. Until then Map of such a buffer fails and the title stops.
+- **Aliasing of placed textures** (`vram`): the title places resources at addresses that already hold one – 16 in
+  its first seconds (render targets 3840x2160 / 1920x1080, UAV textures, other formats at the same address; logged by
+  `note_alias`). GPU-owned textures (render target / depth / UAV flags) now go to *arenas*: default heaps standing for
+  ranges of title addresses (from the 32 MiB below, at least 128 MiB), placed at their address's offset, so resources
+  at one address share memory. ~16 arenas in XDefiant's first 25 s. Other textures stay committed and mirrored.
+- **XDefiant now**: frames 20 and 140 dumped (`XCL_FRAME_DUMP`) – the presented 3840x2160 R10G10B10A2 buffer is
+  entirely black; at ~25 s four engine threads read a null command-context member (+0x1358 of the object with vtable
+  +0x34dd7e0) at `+0x6859a1` – not out of video memory (the same with smaller arenas); cause open. Next: find which
+  pass first writes non-black (dump intermediate render targets / log clear colours), check the final composite.
+- **Notes from another implementer** (user-provided): XDefiant also calls XGCreateTextureComputerFromDescriptor, then
+  libHttpClient / XCurl (XUserGetTokenAndSignature*, XNetworking) and retries wss://rta.xboxlive.com/connect every
+  10–25 s; a 3D 120x68x64 RGBA16F resource / view returning E_INVALIDARG is not null-checked by the title.
 - **Decided (user): a GPU page table in translated shaders.** Measured with `tests/heap_probe.rs` (GPU copies only):
   - a heap over a file mapping (`OpenExistingHeapFromFileMapping`) works for **SEC_COMMIT** sections – the GPU reads
     what the CPU wrote and the CPU sees GPU writes; **SEC_RESERVE** sections are refused (E_INVALIDARG) even when
