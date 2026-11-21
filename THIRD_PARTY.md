@@ -16,7 +16,7 @@ carry a note in their header about its origin and the date of changes (GPL-2.0 �
 | docs.xbox.com | documentation | signatures, enums, structs written independently | reference |
 | Rust crates (`Cargo.lock`) | MIT / BSD-2 / Zlib / Unlicense (or with an MIT alternative) | build dependencies | statically linked |
 | DXC (`dxcompiler.dll`, `dxil.dll`) from the Windows SDK | NCSA (dxcompiler) / Microsoft (dxil) | HLSL → DXIL compilation at runtime | loaded from the user's SDK, **not** distributed with XCL |
-| Windows system libraries (d3d12, dxgi, xaudio2_9, ole32 …) | system | target APIs | GPL-2.0 "system library" exception |
+| Windows system libraries (d3d12, dxgi, xaudio2_9, mfplat, MSOpusDecoder, ole32 …) | system | target APIs | GPL-2.0 "system library" exception |
 
 When adding dependencies: compatible with GPL-2.0-only are MIT, BSD, Zlib, ISC, Unlicense, LGPL-2.1(+),
 GPL-2.0(+), MPL-2.0 (via its Secondary License clause). Incompatible: Apache-2.0 without an alternative,

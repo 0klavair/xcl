@@ -1,21 +1,26 @@
 //! xaudio2_9.dll – console XAudio2 on top of the Windows XAudio2 2.9.
 //!
-//! The console API is the Windows 2.9 API plus XMA2 source voices (decoded by audio
-//! hardware on the console) and a few console-only flags. `XAudio2Create` /
-//! `XAudio2CreateWithVersionInfo` create the genuine Windows engine with console-only
-//! flags dropped and patch its vtables **in place** (the Windows classes have internal
-//! virtual methods after the public ones, so a vtable copy of the public part is not
-//! safe):
+//! The console API is the Windows 2.9 API plus compressed source voices (XMA2, Opus) and a
+//! few console-only flags. `XAudio2Create` / `XAudio2CreateWithVersionInfo` create the
+//! genuine Windows engine with console-only flags dropped and patch its vtables **in place**
+//! (the Windows classes have internal virtual methods after the public ones, so a vtable
+//! copy of the public part is not safe):
 //!
-//! * IXAudio2 slot 5 `CreateSourceVoice` – XMA/XMA2 formats become a PCM16 voice with
-//!   the same channel count and sample rate; other formats pass through, and a compressed
-//!   format Windows rejects (e.g. Opus, 0x704F) also gets a silent PCM16 voice,
+//! * IXAudio2 slot 5 `CreateSourceVoice` – Opus formats (`WAVE_FORMAT_OPUS` 0x704F or
+//!   `WAVE_FORMAT_EXTENSIBLE` with `MFAudioFormat_Opus`) become PCM16 voices backed by a
+//!   real RFC 6716 / RFC 7845 decoder (`hle::opus`, using Windows' `MSOpusDecoder.dll`);
+//!   XMA/XMA2 and any other format Windows rejects become silent PCM16 voices of matching
+//!   length,
 //! * IXAudio2 slot 7 `CreateMasteringVoice` – console device ids are ignored (default
 //!   device); on failure retried with default channels/rate and the game-effects category,
-//! * IXAudio2SourceVoice slot 21 `SubmitSourceBuffer` – on such voices the buffer becomes
-//!   silence of the same length, so callbacks (OnBufferEnd, OnStreamEnd, loops) keep the
-//!   title's timing,
-//! * IXAudio2SourceVoice slot 18 `DestroyVoice` – forget the silent voice.
+//! * IXAudio2SourceVoice slot 21 `SubmitSourceBuffer` – Opus voices decode the submitted
+//!   packets to PCM16 and keep each decoded buffer alive until `OnBufferEnd` (or voice
+//!   destruction); silent voices submit silence of matching length, preserving callbacks,
+//! * IXAudio2SourceVoice slot 22 `FlushSourceBuffers` – flushes the Opus decoder state,
+//! * IXAudio2SourceVoice slot 25 `GetState` – maps internal buffer tokens back to the
+//!   title's original `pBufferContext`,
+//! * IXAudio2SourceVoice slot 18 `DestroyVoice` – tears down the voice, then releases any
+//!   remaining decoded buffers and callback wrapper.
 //!
 //! Next step: a real XMA2 decoder (FFmpeg libavcodec, LGPL-2.1+).
 //! Exports we do not implement (X3DAudio*, CreateFX, CreateAudioReverb…) fall back to the
@@ -25,18 +30,25 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hle::opus;
 use crate::util::{E_FAIL, E_POINTER, HRESULT, S_OK};
 
 pub const WAVE_FORMAT_PCM: u16 = 1;
+pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 pub const WAVE_FORMAT_XMA: u16 = 0x165;
 pub const WAVE_FORMAT_XMA2: u16 = 0x166;
-pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+pub const WAVE_FORMAT_OPUS: u16 = 0x704F;
 pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// `MFAudioFormat_Opus` / `KSDATAFORMAT_SUBTYPE_OPUS`: `{0000704F-0000-0010-8000-00AA00389B71}`.
+pub const SUBFORMAT_OPUS: [u8; 16] = [
+    0x4F, 0x70, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+];
 
 /// XAudio2Create flags Windows accepts: STOP_ENGINE_WHEN_IDLE, 1024_QUANTUM, NO_VIRTUAL_AUDIO_CLIENT.
 pub const ENGINE_FLAGS: u32 = 0x2000 | 0x8000 | 0x1_0000;
@@ -47,12 +59,15 @@ pub const MASTERING_FLAGS: u32 = 0x1_0000;
 const XAUDIO2_DEFAULT_PROCESSOR: u32 = 1;
 const NTDDI_WIN10_RS5: u32 = 0x0A00_0006;
 const AUDIO_CATEGORY_GAME_EFFECTS: u32 = 6;
+const XAUDIO2_END_OF_STREAM: u32 = 0x40;
 const CO_E_NOTINITIALIZED: HRESULT = 0x8004_01F0u32 as i32;
 
 const ENGINE_CREATE_SOURCE_VOICE: usize = 5;
 const ENGINE_CREATE_MASTERING_VOICE: usize = 7;
 const VOICE_DESTROY: usize = 18;
 const VOICE_SUBMIT_SOURCE_BUFFER: usize = 21;
+const VOICE_FLUSH_SOURCE_BUFFERS: usize = 22;
+const VOICE_GET_STATE: usize = 25;
 
 /// Size of the shared silence buffer (zero pages are only backed once read).
 const SILENCE_BYTES: usize = 32 << 20;
@@ -67,6 +82,15 @@ pub struct WaveFormatEx {
     pub block_align: u16,
     pub bits: u16,
     pub cb_size: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct WaveFormatExtensible {
+    pub wfx: WaveFormatEx,
+    pub samples: u16,
+    pub channel_mask: u32,
+    pub sub_format: [u8; 16],
 }
 
 /// XMA2WAVEFORMATEX (xma2defs.h, packed).
@@ -102,17 +126,39 @@ pub struct XAudio2Buffer {
     pub context: *mut c_void,
 }
 
+/// XAUDIO2_VOICE_STATE (packed).
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct XAudio2VoiceState {
+    pub current_buffer_context: *mut c_void,
+    pub buffers_queued: u32,
+    pub samples_played: u64,
+}
+
 const _: () = assert!(std::mem::size_of::<WaveFormatEx>() == 18);
+const _: () = assert!(std::mem::size_of::<WaveFormatExtensible>() == 40);
 const _: () = assert!(std::mem::size_of::<Xma2WaveFormatEx>() == 52);
 const _: () = assert!(std::mem::size_of::<XAudio2Buffer>() == 44);
+const _: () = assert!(std::mem::size_of::<XAudio2VoiceState>() == 20);
 
 type CreateWithVersionFn = unsafe extern "system" fn(*mut *mut c_void, u32, u32, u32) -> HRESULT;
 type CreateFn = unsafe extern "system" fn(*mut *mut c_void, u32, u32) -> HRESULT;
-type CreateSourceVoiceFn =
-    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *const WaveFormatEx, u32, f32, *mut c_void, *const c_void, *const c_void) -> HRESULT;
-type CreateMasteringVoiceFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32, u32, u32, *const u16, *const c_void, u32) -> HRESULT;
+type CreateSourceVoiceFn = unsafe extern "system" fn(
+    *mut c_void,
+    *mut *mut c_void,
+    *const WaveFormatEx,
+    u32,
+    f32,
+    *mut c_void,
+    *const c_void,
+    *const c_void,
+) -> HRESULT;
+type CreateMasteringVoiceFn =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32, u32, u32, *const u16, *const c_void, u32) -> HRESULT;
 type DestroyVoiceFn = unsafe extern "system" fn(*mut c_void);
 type SubmitSourceBufferFn = unsafe extern "system" fn(*mut c_void, *const XAudio2Buffer, *const c_void) -> HRESULT;
+type FlushSourceBuffersFn = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+type GetStateFn = unsafe extern "system" fn(*mut c_void, *mut XAudio2VoiceState, u32);
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![XAudio2Create, XAudio2CreateWithVersionInfo]
@@ -132,7 +178,13 @@ pub struct AudioStats {
     pub source_voices: u64,
     /// XMA/XMA2 voices replaced by PCM16 voices (no decoder yet → silence)
     pub xma_voices: u64,
-    /// other formats the Windows engine rejected, replaced the same way (tags, e.g. "0x704f")
+    /// Opus voices decoded to PCM16 via MSOpusDecoder
+    pub opus_voices: u64,
+    /// Opus buffers decoded to PCM16
+    pub opus_buffers_decoded: u64,
+    /// Opus buffers that failed decoding (fell back to silence)
+    pub opus_decode_errors: u64,
+    /// other formats the Windows engine rejected, replaced the same way (tags, e.g. "0x161")
     pub unsupported_formats: Vec<String>,
     pub silent_voices: u64,
     pub buffers_silenced: u64,
@@ -148,6 +200,9 @@ static MASTERING_RETRIES: AtomicU64 = AtomicU64::new(0);
 static MASTERING_ERRORS: AtomicU64 = AtomicU64::new(0);
 static SOURCE_VOICES: AtomicU64 = AtomicU64::new(0);
 static XMA_VOICES: AtomicU64 = AtomicU64::new(0);
+static OPUS_VOICES_CREATED: AtomicU64 = AtomicU64::new(0);
+static OPUS_BUFFERS_DECODED: AtomicU64 = AtomicU64::new(0);
+static OPUS_DECODE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static SILENT_VOICES: AtomicU64 = AtomicU64::new(0);
 static SILENCED: AtomicU64 = AtomicU64::new(0);
 static UNSUPPORTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -163,6 +218,9 @@ pub fn stats() -> AudioStats {
         mastering_errors: MASTERING_ERRORS.load(Ordering::Relaxed),
         source_voices: SOURCE_VOICES.load(Ordering::Relaxed),
         xma_voices: XMA_VOICES.load(Ordering::Relaxed),
+        opus_voices: OPUS_VOICES_CREATED.load(Ordering::Relaxed),
+        opus_buffers_decoded: OPUS_BUFFERS_DECODED.load(Ordering::Relaxed),
+        opus_decode_errors: OPUS_DECODE_ERRORS.load(Ordering::Relaxed),
         unsupported_formats: UNSUPPORTED.lock().map(|d| d.clone()).unwrap_or_default(),
         silent_voices: SILENT_VOICES.load(Ordering::Relaxed),
         buffers_silenced: SILENCED.load(Ordering::Relaxed),
@@ -196,9 +254,21 @@ pub struct XmaInfo {
     pub rate: u32,
     /// WAVEFORMATEX.nAvgBytesPerSec of the original format
     pub avg_bytes: u32,
+    pub block_align: u16,
     pub samples_encoded: u32,
     pub bytes_per_block: u32,
     pub block_count: u16,
+    pub is_opus: bool,
+}
+
+/// Parsed fields of an Opus `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpusFormat<'a> {
+    pub channels: u16,
+    pub rate: u32,
+    pub block_align: u16,
+    pub avg_bytes: u32,
+    pub extra: &'a [u8],
 }
 
 pub fn is_xma(tag: u16) -> bool {
@@ -208,6 +278,38 @@ pub fn is_xma(tag: u16) -> bool {
 /// Formats the Windows engine decodes itself – never replaced.
 pub fn is_plain_pcm(tag: u16) -> bool {
     matches!(tag, WAVE_FORMAT_PCM | WAVE_FORMAT_IEEE_FLOAT | WAVE_FORMAT_EXTENSIBLE)
+}
+
+/// Recognize an Opus format (`WAVE_FORMAT_OPUS` 0x704F or `WAVE_FORMAT_EXTENSIBLE` with
+/// `MFAudioFormat_Opus`) and return its header fields + codec-private extra bytes.
+///
+/// # Safety
+/// `fmt` must point to a `WAVEFORMATEX` followed by `cbSize` readable bytes.
+pub unsafe fn opus_format<'a>(fmt: *const WaveFormatEx) -> Option<OpusFormat<'a>> {
+    let w = fmt.read_unaligned();
+    let channels = w.channels.clamp(1, 8);
+    let rate = if w.rate == 0 { 48_000 } else { w.rate };
+    if w.tag == WAVE_FORMAT_OPUS {
+        let extra = if w.cb_size > 0 {
+            std::slice::from_raw_parts((fmt as *const u8).add(std::mem::size_of::<WaveFormatEx>()), w.cb_size as usize)
+        } else {
+            &[]
+        };
+        return Some(OpusFormat { channels, rate, block_align: w.block_align, avg_bytes: w.avg_bytes, extra });
+    }
+    if w.tag == WAVE_FORMAT_EXTENSIBLE && w.cb_size >= 22 {
+        let ext = (fmt as *const WaveFormatExtensible).read_unaligned();
+        if ext.sub_format == SUBFORMAT_OPUS {
+            let extra_len = (w.cb_size - 22) as usize;
+            let extra = if extra_len > 0 {
+                std::slice::from_raw_parts((fmt as *const u8).add(std::mem::size_of::<WaveFormatExtensible>()), extra_len)
+            } else {
+                &[]
+            };
+            return Some(OpusFormat { channels, rate, block_align: w.block_align, avg_bytes: w.avg_bytes, extra });
+        }
+    }
+    None
 }
 
 /// Voice info from a format (XMA2WAVEFORMATEX fields only when cbSize says they are there).
@@ -220,6 +322,8 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
         channels: w.channels.clamp(1, 8),
         rate: if w.rate == 0 { 48_000 } else { w.rate },
         avg_bytes: w.avg_bytes,
+        block_align: w.block_align,
+        is_opus: opus_format(fmt).is_some(),
         ..Default::default()
     };
     if w.tag == WAVE_FORMAT_XMA2 && w.cb_size as usize >= std::mem::size_of::<Xma2WaveFormatEx>() - 18 {
@@ -231,10 +335,52 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     i
 }
 
+/// PCM16 format with the channel count and sample rate of a voice.
+pub fn pcm16_for_rate(channels: u16, rate: u32) -> WaveFormatEx {
+    let ch = channels.clamp(1, 8);
+    let block = ch * 2;
+    WaveFormatEx {
+        tag: WAVE_FORMAT_PCM,
+        channels: ch,
+        rate,
+        avg_bytes: rate * block as u32,
+        block_align: block,
+        bits: 16,
+        cb_size: 0,
+    }
+}
+
 /// PCM16 format with the channel count and sample rate of an XMA voice.
 pub fn pcm16_for(i: &XmaInfo) -> WaveFormatEx {
-    let block = i.channels * 2;
-    WaveFormatEx { tag: WAVE_FORMAT_PCM, channels: i.channels, rate: i.rate, avg_bytes: i.rate * block as u32, block_align: block, bits: 16, cb_size: 0 }
+    pcm16_for_rate(i.channels, i.rate)
+}
+
+/// Clamp play/loop sample regions to `total_frames` so XAudio2 never rejects a decoded
+/// buffer with `XAUDIO2_E_INVALID_CALL`.
+pub fn clamp_regions(b: &mut XAudio2Buffer, total_frames: u32) {
+    if total_frames == 0 {
+        b.play_begin = 0;
+        b.play_length = 0;
+        b.loop_begin = 0;
+        b.loop_length = 0;
+        b.loop_count = 0;
+        return;
+    }
+    if b.play_begin >= total_frames {
+        b.play_begin = 0;
+        b.play_length = 0;
+    } else if b.play_length > 0 && b.play_begin.saturating_add(b.play_length) > total_frames {
+        b.play_length = total_frames - b.play_begin;
+    }
+    if b.loop_count > 0 {
+        if b.loop_begin >= total_frames {
+            b.loop_begin = 0;
+            b.loop_length = 0;
+            b.loop_count = 0;
+        } else if b.loop_length > 0 && b.loop_begin.saturating_add(b.loop_length) > total_frames {
+            b.loop_length = total_frames - b.loop_begin;
+        }
+    }
 }
 
 /// Frames (samples per channel) a compressed buffer of `audio_bytes` decodes to: XMA2 in
@@ -252,13 +398,23 @@ pub fn estimate_frames(i: &XmaInfo, audio_bytes: u32) -> u64 {
     f.max(128)
 }
 
-/// The PCM16 silence buffer that stands in for an XMA buffer: same play/loop region and
-/// flags/context; length from PlayBegin+PlayLength (or the estimate), clamped to
-/// `max_bytes` (then the whole – shorter – buffer is played).
+/// The PCM16 silence buffer that stands in for an XMA (or fallback) buffer: same play/loop
+/// region and flags/context; length from PlayBegin+PlayLength (or RFC 6716 Opus packet
+/// durations / XMA2 estimate), clamped to `max_bytes`.
 pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_bytes: usize) -> XAudio2Buffer {
+    let opus_est = if i.is_opus && !b.audio_data.is_null() && b.audio_bytes > 0 {
+        let data = unsafe { std::slice::from_raw_parts(b.audio_data, b.audio_bytes as usize) };
+        opus::estimate_buffer_frames(data, i.block_align, i.rate, i.channels > 2)
+    } else {
+        None
+    };
     let mut nb = *b;
     let (pb, pl, lb, ll) = (b.play_begin as u64, b.play_length as u64, b.loop_begin as u64, b.loop_length as u64);
-    let mut frames = if pl > 0 { pb + pl } else { estimate_frames(i, b.audio_bytes).max(pb + 1) };
+    let mut frames = if pl > 0 {
+        pb + pl
+    } else {
+        opus_est.unwrap_or_else(|| estimate_frames(i, b.audio_bytes)).max(pb + 1)
+    };
     if b.loop_count > 0 {
         frames = frames.max(lb + ll);
     }
@@ -277,13 +433,162 @@ pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_byt
 }
 
 // ---------------------------------------------------------------------------------------
+// Opus voice state & IXAudio2VoiceCallback wrapper (decoded PCM buffer lifetime manager)
+// ---------------------------------------------------------------------------------------
+
+/// Owned decoded PCM16 buffer kept alive at a stable heap address until `OnBufferEnd`
+/// or `DestroyVoice`.
+struct DecodedBuffer {
+    orig_context: usize,
+    _pcm: Box<[u8]>,
+}
+
+struct OpusVoiceState {
+    decoder: Mutex<opus::Decoder>,
+    block_align: u16,
+    channels: u16,
+    rate: u32,
+    avg_bytes: u32,
+    title_cb: usize,
+    /// Maps stable token (`&*DecodedBuffer as usize`) → owned `DecodedBuffer`.
+    live_buffers: Mutex<HashMap<usize, Box<DecodedBuffer>>>,
+}
+
+struct OpusVoiceHandle {
+    state: Arc<OpusVoiceState>,
+    cb_ptr: usize,
+}
+
+// IXAudio2VoiceCallback vtable (7 methods, no IUnknown).
+#[repr(C)]
+struct VoiceCallbackVtbl {
+    pass_start: unsafe extern "system" fn(*mut c_void, u32),
+    pass_end: unsafe extern "system" fn(*mut c_void),
+    stream_end: unsafe extern "system" fn(*mut c_void),
+    buffer_start: unsafe extern "system" fn(*mut c_void, *mut c_void),
+    buffer_end: unsafe extern "system" fn(*mut c_void, *mut c_void),
+    loop_end: unsafe extern "system" fn(*mut c_void, *mut c_void),
+    voice_error: unsafe extern "system" fn(*mut c_void, *mut c_void, HRESULT),
+}
+
+#[repr(C)]
+struct OpusCallback {
+    vtbl: &'static VoiceCallbackVtbl,
+    state: Arc<OpusVoiceState>,
+}
+
+unsafe fn title_cb_vtbl(cb: usize) -> Option<(*mut c_void, *const VoiceCallbackVtbl)> {
+    if cb == 0 {
+        return None;
+    }
+    let obj = cb as *mut c_void;
+    let vtbl = *(obj as *const *const VoiceCallbackVtbl);
+    if vtbl.is_null() {
+        return None;
+    }
+    Some((obj, vtbl))
+}
+
+unsafe extern "system" fn opus_cb_pass_start(this: *mut c_void, bytes: u32) {
+    let cb = &*(this as *const OpusCallback);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).pass_start)(obj, bytes);
+    }
+}
+
+unsafe extern "system" fn opus_cb_pass_end(this: *mut c_void) {
+    let cb = &*(this as *const OpusCallback);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).pass_end)(obj);
+    }
+}
+
+unsafe extern "system" fn opus_cb_stream_end(this: *mut c_void) {
+    let cb = &*(this as *const OpusCallback);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).stream_end)(obj);
+    }
+}
+
+unsafe extern "system" fn opus_cb_buffer_start(this: *mut c_void, ctx: *mut c_void) {
+    let cb = &*(this as *const OpusCallback);
+    let orig = cb
+        .state
+        .live_buffers
+        .lock()
+        .unwrap()
+        .get(&(ctx as usize))
+        .map(|b| b.orig_context as *mut c_void)
+        .unwrap_or(ctx);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).buffer_start)(obj, orig);
+    }
+}
+
+unsafe extern "system" fn opus_cb_buffer_end(this: *mut c_void, ctx: *mut c_void) {
+    let cb = &*(this as *const OpusCallback);
+    // Remove and drop the decoded PCM buffer before invoking the title's callback so
+    // the lock is released and no double-free or deadlock can occur.
+    let removed = cb.state.live_buffers.lock().unwrap().remove(&(ctx as usize));
+    let orig = removed.as_ref().map(|b| b.orig_context as *mut c_void).unwrap_or(ctx);
+    drop(removed);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).buffer_end)(obj, orig);
+    }
+}
+
+unsafe extern "system" fn opus_cb_loop_end(this: *mut c_void, ctx: *mut c_void) {
+    let cb = &*(this as *const OpusCallback);
+    let orig = cb
+        .state
+        .live_buffers
+        .lock()
+        .unwrap()
+        .get(&(ctx as usize))
+        .map(|b| b.orig_context as *mut c_void)
+        .unwrap_or(ctx);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).loop_end)(obj, orig);
+    }
+}
+
+unsafe extern "system" fn opus_cb_voice_error(this: *mut c_void, ctx: *mut c_void, hr: HRESULT) {
+    let cb = &*(this as *const OpusCallback);
+    let orig = cb
+        .state
+        .live_buffers
+        .lock()
+        .unwrap()
+        .get(&(ctx as usize))
+        .map(|b| b.orig_context as *mut c_void)
+        .unwrap_or(ctx);
+    if let Some((obj, vt)) = title_cb_vtbl(cb.state.title_cb) {
+        ((*vt).voice_error)(obj, orig, hr);
+    }
+}
+
+static OPUS_CALLBACK_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
+    pass_start: opus_cb_pass_start,
+    pass_end: opus_cb_pass_end,
+    stream_end: opus_cb_stream_end,
+    buffer_start: opus_cb_buffer_start,
+    buffer_end: opus_cb_buffer_end,
+    loop_end: opus_cb_loop_end,
+    voice_error: opus_cb_voice_error,
+};
+
+// ---------------------------------------------------------------------------------------
 // the system engine and in-place vtable patches
 // ---------------------------------------------------------------------------------------
 
 /// Originals of patched slots: (vtable address, slot) → function.
 static ORIGINALS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
-/// Live XMA voices (voice pointer → info).
+/// Live silent voices (voice pointer → info).
 static XMA: Mutex<Option<HashMap<usize, XmaInfo>>> = Mutex::new(None);
+/// Live decoded Opus voices (voice pointer → handle).
+static OPUS_VOICES: Mutex<Option<HashMap<usize, OpusVoiceHandle>>> = Mutex::new(None);
+/// Count of live Opus voices (fast path for non-Opus voices).
+static OPUS_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn vtable(obj: *mut c_void) -> *mut usize {
     *(obj as *const *mut usize)
@@ -390,13 +695,62 @@ unsafe extern "system" fn create_source_voice(
         return orig(this, pp, fmt, flags, max_ratio, cb, sends, chain);
     }
     let tag = (*fmt).tag;
-    let mut silent = is_xma(tag).then(|| xma_info(fmt));
+
+    // 1. Opus voice (WAVE_FORMAT_OPUS 0x704F or WAVE_FORMAT_EXTENSIBLE with MFAudioFormat_Opus)
+    if let Some(of) = opus_format(fmt) {
+        match opus::Decoder::new(of.channels, of.rate, of.extra) {
+            Ok(dec) => {
+                let pcm_ch = dec.channels();
+                let pcm_rate = dec.output_rate();
+                let pcm = pcm16_for_rate(pcm_ch, pcm_rate);
+                let state = Arc::new(OpusVoiceState {
+                    decoder: Mutex::new(dec),
+                    block_align: of.block_align,
+                    channels: pcm_ch,
+                    rate: pcm_rate,
+                    avg_bytes: of.avg_bytes,
+                    title_cb: cb as usize,
+                    live_buffers: Mutex::new(HashMap::new()),
+                });
+                let wrapped_cb = Box::into_raw(Box::new(OpusCallback {
+                    vtbl: &OPUS_CALLBACK_VTBL,
+                    state: Arc::clone(&state),
+                }));
+                let hr = orig(this, pp, &pcm, flags, max_ratio, wrapped_cb as *mut c_void, sends, chain);
+                if hr < 0 || (*pp).is_null() {
+                    drop(Box::from_raw(wrapped_cb));
+                    SOURCE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    crate::xlog_warn!("XAudio2: CreateSourceVoice(Opus→PCM16) failed ({:#x})", hr as u32);
+                    return hr;
+                }
+                let voice = *pp;
+                patch_source_voice(voice);
+                OPUS_VOICES
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .insert(voice as usize, OpusVoiceHandle { state, cb_ptr: wrapped_cb as usize });
+                OPUS_LIVE_COUNT.fetch_add(1, Ordering::Release);
+                SOURCE_VOICES.fetch_add(1, Ordering::Relaxed);
+                if OPUS_VOICES_CREATED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    crate::xlog_info!("XAudio2: Opus voice ({pcm_ch} ch., {pcm_rate} Hz) → real PCM16 decoding via MSOpusDecoder");
+                }
+                return hr;
+            }
+            Err(e) => {
+                crate::xlog_warn!("XAudio2: Opus decoder unavailable ({e}) – falling back to silence");
+            }
+        }
+    }
+
+    // 2. XMA/XMA2 or other formats (including Opus fallback if MSOpusDecoder is missing)
+    let mut silent = (is_xma(tag) || opus_format(fmt).is_some()).then(|| xma_info(fmt));
     let mut hr = match &silent {
         Some(i) => orig(this, pp, &pcm16_for(i), flags, max_ratio, cb, sends, chain),
         None => orig(this, pp, fmt, flags, max_ratio, cb, sends, chain),
     };
     if hr < 0 && silent.is_none() && !is_plain_pcm(tag) {
-        // a compressed format the Windows engine does not know (console-only, e.g. Opus)
+        // a compressed format the Windows engine does not know
         let i = xma_info(fmt);
         let h2 = orig(this, pp, &pcm16_for(&i), flags, max_ratio, cb, sends, chain);
         if h2 >= 0 {
@@ -421,8 +775,7 @@ unsafe extern "system" fn create_source_voice(
         return hr;
     }
     let voice = *pp;
-    patch(voice, VOICE_SUBMIT_SOURCE_BUFFER, submit_source_buffer as usize);
-    patch(voice, VOICE_DESTROY, destroy_voice as usize);
+    patch_source_voice(voice);
     SOURCE_VOICES.fetch_add(1, Ordering::Relaxed);
     if let Some(i) = silent {
         XMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(voice as usize, i);
@@ -437,6 +790,13 @@ unsafe extern "system" fn create_source_voice(
         }
     }
     hr
+}
+
+unsafe fn patch_source_voice(voice: *mut c_void) {
+    patch(voice, VOICE_SUBMIT_SOURCE_BUFFER, submit_source_buffer as usize);
+    patch(voice, VOICE_FLUSH_SOURCE_BUFFERS, flush_source_buffers as usize);
+    patch(voice, VOICE_GET_STATE, get_state as usize);
+    patch(voice, VOICE_DESTROY, destroy_voice as usize);
 }
 
 unsafe extern "system" fn create_mastering_voice(
@@ -489,9 +849,92 @@ fn silence() -> *const u8 {
     *P.get_or_init(|| unsafe { VirtualAlloc(std::ptr::null(), SILENCE_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) as usize }) as *const u8
 }
 
+unsafe fn submit_opus_buffer(
+    this: *mut c_void,
+    orig: SubmitSourceBufferFn,
+    state: &OpusVoiceState,
+    orig_buf: XAudio2Buffer,
+) -> HRESULT {
+    let data = if !orig_buf.audio_data.is_null() && orig_buf.audio_bytes > 0 {
+        std::slice::from_raw_parts(orig_buf.audio_data, orig_buf.audio_bytes as usize)
+    } else {
+        &[]
+    };
+
+    let decoded_pcm = {
+        let mut dec = state.decoder.lock().unwrap();
+        let res = dec.decode_buffer(data, state.block_align);
+        if (orig_buf.flags & XAUDIO2_END_OF_STREAM) != 0 {
+            dec.flush();
+        }
+        res
+    };
+
+    let mut nb = orig_buf;
+    let pcm_bytes: Box<[u8]> = match decoded_pcm {
+        Ok(samples) if !samples.is_empty() => {
+            let total_frames = (samples.len() / state.channels.max(1) as usize) as u32;
+            clamp_regions(&mut nb, total_frames);
+            let mut bytes = Vec::with_capacity(samples.len() * 2);
+            for s in samples {
+                bytes.extend_from_slice(&s.to_le_bytes());
+            }
+            OPUS_BUFFERS_DECODED.fetch_add(1, Ordering::Relaxed);
+            bytes.into_boxed_slice()
+        }
+        res => {
+            if let Err(e) = res {
+                if OPUS_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    crate::xlog_warn!("XAudio2: Opus decode error ({e}) – substituting silence");
+                }
+            } else {
+                OPUS_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            let info = XmaInfo {
+                channels: state.channels,
+                rate: state.rate,
+                avg_bytes: state.avg_bytes,
+                block_align: state.block_align,
+                is_opus: true,
+                ..Default::default()
+            };
+            let sb = silent_buffer(&info, &orig_buf, std::ptr::null(), SILENCE_BYTES);
+            nb = sb;
+            SILENCED.fetch_add(1, Ordering::Relaxed);
+            vec![0u8; sb.audio_bytes as usize].into_boxed_slice()
+        }
+    };
+
+    let pcm_ptr = pcm_bytes.as_ptr();
+    let pcm_len = pcm_bytes.len() as u32;
+    let boxed = Box::new(DecodedBuffer { orig_context: orig_buf.context as usize, _pcm: pcm_bytes });
+    let token = &*boxed as *const DecodedBuffer as usize;
+    state.live_buffers.lock().unwrap().insert(token, boxed);
+
+    nb.audio_data = pcm_ptr;
+    nb.audio_bytes = pcm_len;
+    nb.context = token as *mut c_void;
+
+    let hr = orig(this, &nb, std::ptr::null());
+    if hr < 0 {
+        state.live_buffers.lock().unwrap().remove(&token);
+    }
+    hr
+}
+
 unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XAudio2Buffer, wma: *const c_void) -> HRESULT {
     let Some(orig) = original(this, VOICE_SUBMIT_SOURCE_BUFFER) else { return E_FAIL };
     let orig: SubmitSourceBufferFn = std::mem::transmute(orig);
+    if !buf.is_null() && OPUS_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let state = OPUS_VOICES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+        if let Some(state) = state {
+            return submit_opus_buffer(this, orig, &state, buf.read_unaligned());
+        }
+    }
     let info = XMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
     match info {
         Some(i) if !buf.is_null() => {
@@ -507,13 +950,65 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
     }
 }
 
+unsafe extern "system" fn flush_source_buffers(this: *mut c_void) -> HRESULT {
+    let Some(orig) = original(this, VOICE_FLUSH_SOURCE_BUFFERS) else { return E_FAIL };
+    let orig: FlushSourceBuffersFn = std::mem::transmute(orig);
+    let hr = orig(this);
+    if hr >= 0 && OPUS_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let state = OPUS_VOICES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+        if let Some(state) = state {
+            state.decoder.lock().unwrap().flush();
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn get_state(this: *mut c_void, state_out: *mut XAudio2VoiceState, flags: u32) {
+    let Some(orig) = original(this, VOICE_GET_STATE) else { return };
+    let orig: GetStateFn = std::mem::transmute(orig);
+    orig(this, state_out, flags);
+    if !state_out.is_null() && OPUS_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let voice_state = OPUS_VOICES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&(this as usize)).map(|h| Arc::clone(&h.state)));
+        if let Some(voice_state) = voice_state {
+            let cur = (*state_out).current_buffer_context as usize;
+            if cur != 0 {
+                if let Some(buf) = voice_state.live_buffers.lock().unwrap().get(&cur) {
+                    (*state_out).current_buffer_context = buf.orig_context as *mut c_void;
+                }
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn destroy_voice(this: *mut c_void) {
     let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
-    orig(this)
+    let opus_handle = if OPUS_LIVE_COUNT.load(Ordering::Acquire) != 0 {
+        OPUS_VOICES.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)))
+    } else {
+        None
+    };
+    if opus_handle.is_some() {
+        OPUS_LIVE_COUNT.fetch_sub(1, Ordering::Release);
+    }
+    // Destroy the Windows voice first so its audio thread stops using the callback and any
+    // queued PCM buffers before we free them.
+    orig(this);
+    if let Some(h) = opus_handle {
+        h.state.live_buffers.lock().unwrap().clear();
+        drop(Box::from_raw(h.cb_ptr as *mut OpusCallback));
+    }
 }
 
 #[cfg(test)]
@@ -548,7 +1043,19 @@ mod tests {
     fn xma2_format_to_pcm16() {
         let f = xma2(2, 44_100, 441_000, 0x8000, 4);
         let i = unsafe { xma_info(&f as *const Xma2WaveFormatEx as *const WaveFormatEx) };
-        assert_eq!(i, XmaInfo { channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
+        assert_eq!(
+            i,
+            XmaInfo {
+                channels: 2,
+                rate: 44_100,
+                avg_bytes: 0,
+                block_align: 1,
+                samples_encoded: 441_000,
+                bytes_per_block: 0x8000,
+                block_count: 4,
+                is_opus: false,
+            }
+        );
         let p = pcm16_for(&i);
         assert_eq!((p.tag, p.channels, p.rate, p.block_align, p.bits, p.avg_bytes), (1, 2, 44_100, 4, 16, 176_400));
         // plain XMA (or a short cbSize): no XMA2 fields are read
@@ -559,8 +1066,38 @@ mod tests {
     }
 
     #[test]
+    fn opus_format_detection_and_region_clamping() {
+        // Plain WAVE_FORMAT_OPUS (0x704F) with OpusHead extra data
+        let head = opus::build_opus_head(2, 48_000, 312, 0);
+        let mut raw = Vec::with_capacity(18 + head.len());
+        let wfx = WaveFormatEx { tag: WAVE_FORMAT_OPUS, channels: 2, rate: 48_000, avg_bytes: 16_000, block_align: 2048, bits: 0, cb_size: head.len() as u16 };
+        raw.extend_from_slice(unsafe { std::slice::from_raw_parts(&wfx as *const _ as *const u8, 18) });
+        raw.extend_from_slice(&head);
+        let of = unsafe { opus_format(raw.as_ptr() as *const WaveFormatEx) }.unwrap();
+        assert_eq!((of.channels, of.rate, of.block_align, of.extra), (2, 48_000, 2048, head.as_slice()));
+
+        // WAVE_FORMAT_EXTENSIBLE with MFAudioFormat_Opus subformat
+        let ext = WaveFormatExtensible {
+            wfx: WaveFormatEx { tag: WAVE_FORMAT_EXTENSIBLE, channels: 6, rate: 48_000, avg_bytes: 0, block_align: 0, bits: 0, cb_size: 22 },
+            samples: 0,
+            channel_mask: 0x3F,
+            sub_format: SUBFORMAT_OPUS,
+        };
+        let of2 = unsafe { opus_format(&ext as *const _ as *const WaveFormatEx) }.unwrap();
+        assert_eq!((of2.channels, of2.rate, of2.extra.len()), (6, 48_000, 0));
+
+        // Region clamping
+        let mut b = buffer(100, 200, 5000, 100, 4000, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }), (200, 760, 100, 860));
+        let mut b2 = buffer(100, 1000, 100, 1000, 100, 1);
+        clamp_regions(&mut b2, 960);
+        assert_eq!(({ b2.play_begin }, { b2.play_length }, { b2.loop_count }), (0, 0, 0));
+    }
+
+    #[test]
     fn silence_has_the_length_of_the_xma_buffer() {
-        let i = XmaInfo { channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
+        let i = XmaInfo { channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2, ..Default::default() };
         let z = 0x5000 as *const u8;
         // explicit play region: PlayBegin + PlayLength frames
         let b = silent_buffer(&i, &buffer(4096, 128, 4800, 0, 0, 0), z, 1 << 20);
@@ -605,6 +1142,157 @@ mod tests {
             release(eng2);
             release(eng);
             assert!(stats().dropped_flags.iter().any(|f| f == "XAudio2Create:0x1"));
+        }
+    }
+
+    #[test]
+    fn opus_source_voice_decodes_and_manages_lifetime() {
+        if !opus::is_available() {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        }
+        use std::sync::atomic::AtomicUsize;
+
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        static STARTED: AtomicUsize = AtomicUsize::new(0);
+        static STREAM_END: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn on_pass_start(_: *mut c_void, _: u32) {}
+        unsafe extern "system" fn on_nothing(_: *mut c_void) {}
+        unsafe extern "system" fn on_stream_end(_: *mut c_void) {
+            STREAM_END.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_buf_start(_: *mut c_void, ctx: *mut c_void) {
+            STARTED.fetch_add(ctx as usize, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_buf_end(_: *mut c_void, ctx: *mut c_void) {
+            ENDED.fetch_add(ctx as usize, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn on_loop(_: *mut c_void, _: *mut c_void) {}
+        unsafe extern "system" fn on_err(_: *mut c_void, _: *mut c_void, _: HRESULT) {}
+
+        static TEST_VTBL: VoiceCallbackVtbl = VoiceCallbackVtbl {
+            pass_start: on_pass_start,
+            pass_end: on_nothing,
+            stream_end: on_stream_end,
+            buffer_start: on_buf_start,
+            buffer_end: on_buf_end,
+            loop_end: on_loop,
+            voice_error: on_err,
+        };
+        #[repr(C)]
+        struct TestCb {
+            vtbl: &'static VoiceCallbackVtbl,
+        }
+        static TEST_CB: TestCb = TestCb { vtbl: &TEST_VTBL };
+
+        unsafe {
+            let mut eng: *mut c_void = std::ptr::null_mut();
+            assert_eq!(XAudio2Create(&mut eng, 0, 1), S_OK);
+            let vt_eng = vtable(eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            let mut master: *mut c_void = std::ptr::null_mut();
+            if create_master(eng, &mut master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+                release(eng);
+                eprintln!("skipping: no audio device");
+                return;
+            }
+
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let opus_wfx = WaveFormatEx { tag: WAVE_FORMAT_OPUS, channels: 1, rate: 48_000, avg_bytes: 4000, block_align: 2048, bits: 0, cb_size: 0 };
+            let mut voice: *mut c_void = std::ptr::null_mut();
+            let hr = create_src(eng, &mut voice, &opus_wfx, 0, 2.0, &TEST_CB as *const _ as *mut c_void, std::ptr::null(), std::ptr::null());
+            assert_eq!(hr, S_OK, "CreateSourceVoice(Opus) → {:#x}", hr as u32);
+            assert!(!voice.is_null());
+
+            // Pack 2 packets into a 2048 B AWC block + 1 raw packet
+            let mut block = vec![0u8; 2048];
+            let mut pos = 0;
+            for &pkt in &opus::tests::MONO_HYBRID_20MS[..2] {
+                block[pos..pos + 2].copy_from_slice(&(pkt.len() as u16).to_le_bytes());
+                block[pos + 2..pos + 2 + pkt.len()].copy_from_slice(pkt);
+                pos += 2 + pkt.len();
+            }
+
+            let vt_v = vtable(voice);
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let get_st: GetStateFn = std::mem::transmute(vt_v.add(VOICE_GET_STATE).read());
+            let start: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(19).read());
+            let flush: FlushSourceBuffersFn = std::mem::transmute(vt_v.add(VOICE_FLUSH_SOURCE_BUFFERS).read());
+            let destroy: DestroyVoiceFn = std::mem::transmute(vt_v.add(VOICE_DESTROY).read());
+
+            const CTX1: usize = 0x1001;
+            const CTX2: usize = 0x2002;
+            let b1 = XAudio2Buffer {
+                flags: 0,
+                audio_bytes: block.len() as u32,
+                audio_data: block.as_ptr(),
+                play_begin: 0,
+                play_length: 0,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: CTX1 as *mut c_void,
+            };
+            let raw = opus::tests::MONO_HYBRID_20MS[2];
+            let b2 = XAudio2Buffer {
+                flags: XAUDIO2_END_OF_STREAM,
+                audio_bytes: raw.len() as u32,
+                audio_data: raw.as_ptr(),
+                play_begin: 0,
+                play_length: 0,
+                loop_begin: 0,
+                loop_length: 0,
+                loop_count: 0,
+                context: CTX2 as *mut c_void,
+            };
+
+            let before_decoded = stats().opus_buffers_decoded;
+            assert_eq!(submit(voice, &b1, std::ptr::null()), S_OK);
+            assert_eq!(submit(voice, &b2, std::ptr::null()), S_OK);
+            assert_eq!(stats().opus_buffers_decoded, before_decoded + 2);
+
+            // GetState must return the title's original CTX1, not our internal token!
+            let mut st = XAudio2VoiceState { current_buffer_context: std::ptr::null_mut(), buffers_queued: 0, samples_played: 0 };
+            get_st(voice, &mut st, 0);
+            assert_eq!({ st.buffers_queued }, 2);
+            assert_eq!({ st.current_buffer_context } as usize, CTX1);
+
+            // Mute voice so the test runs silently on developer machines, then play to completion
+            let set_vol: unsafe extern "system" fn(*mut c_void, f32, u32) -> HRESULT = std::mem::transmute(vt_v.add(12).read());
+            let _ = set_vol(voice, 0.0, 0);
+            assert_eq!(start(voice, 0, 0), S_OK);
+
+            let t0 = std::time::Instant::now();
+            while (ENDED.load(Ordering::SeqCst) != CTX1 + CTX2 || STREAM_END.load(Ordering::SeqCst) == 0)
+                && t0.elapsed() < std::time::Duration::from_secs(3)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(STARTED.load(Ordering::SeqCst), CTX1 + CTX2);
+            assert_eq!(ENDED.load(Ordering::SeqCst), CTX1 + CTX2);
+            assert!(STREAM_END.load(Ordering::SeqCst) >= 1);
+
+            // All decoded buffers must have been freed on OnBufferEnd!
+            let remaining = OPUS_VOICES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&(voice as usize)).map(|h| h.state.live_buffers.lock().unwrap().len()))
+                .unwrap_or(999);
+            assert_eq!(remaining, 0, "decoded PCM buffers leaked after OnBufferEnd");
+
+            // Test FlushSourceBuffers while stopped + DestroyVoice cleanup
+            let stop: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = std::mem::transmute(vt_v.add(20).read());
+            let _ = stop(voice, 0, 0);
+            assert_eq!(submit(voice, &b2, std::ptr::null()), S_OK);
+            assert_eq!(flush(voice), S_OK);
+
+            destroy(voice);
+            destroy(master);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
+            release(eng);
         }
     }
 }

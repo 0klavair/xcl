@@ -13,6 +13,7 @@ use crate::util::glob_match;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod kernelx;
+pub mod opus;
 pub mod xaudio2;
 pub mod xgameruntime;
 

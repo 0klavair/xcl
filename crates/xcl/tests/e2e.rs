@@ -160,8 +160,11 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(a["dropped_flags"].as_array().unwrap().iter().any(|f| f == "XAudio2Create:0x41"), "audio: {a}");
     if a["mastering_voices"] == 1 {
         assert_eq!(a["xma_voices"], 1, "audio: {a}");
+        assert_eq!(a["opus_voices"], 1, "audio: {a}");
+        assert_eq!(a["opus_buffers_decoded"], 1, "audio: {a}");
+        assert_eq!(a["opus_decode_errors"], 0, "audio: {a}");
         assert_eq!(a["silent_voices"], 1, "audio: {a}");
-        assert_eq!(a["source_voices"], 2, "audio: {a}");
+        assert_eq!(a["source_voices"], 3, "audio: {a}");
         assert_eq!(a["buffers_silenced"], 1, "audio: {a}");
         assert_eq!(a["source_voice_errors"], 0, "audio: {a}");
     } else {
