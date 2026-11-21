@@ -12,6 +12,10 @@
 "d3d12_x.dll" = "E_NOTIMPL"
 "xg_xs.dll" = "E_NOTIMPL"
 "acphal.dll" = "E_NOTIMPL"
+# console DirectStorage (DStorageGetFactory) and the Xbox One texture layout library: a fake S_OK
+# would leave the title's output pointer as it was
+"xcrdapi.dll" = "E_NOTIMPL"
+"xg_x.dll" = "E_NOTIMPL"
 "gameinput.dll" = "E_NOTIMPL"
 
 [functions]
