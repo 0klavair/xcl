@@ -469,9 +469,12 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 /// * descriptor heap #9 / #10: the heap start handles come back in rax on the console.
 /// * resource #11 GetGPUVirtualAddress: console buffers live in unified memory; their console
 ///   address (= CPU address, low 32 bits = offset in `mem`) is what console code gets.
-/// * device #14 / #15 / #18 / #19 (CreateDescriptorHeap, GetDescriptorHandleIncrementSize,
-///   CreateShaderResourceView, CreateUnorderedAccessView): CBV/SRV/UAV heaps of console code
-///   get 32-byte slots in unified memory (`console_heap`).
+/// * device #14 / #15 / #17 / #18 / #19 / #22 / #23 / #24 (CreateDescriptorHeap,
+///   GetDescriptorHandleIncrementSize, CreateConstantBufferView, CreateShaderResourceView,
+///   CreateUnorderedAccessView, CreateSampler, CopyDescriptors, CopyDescriptorsSimple):
+///   CBV/SRV/UAV and sampler heaps of console code get 32 / 16-byte slots in unified memory
+///   (`console_heap`). #14–#19 seen from console code with the PC layout; #17 and #22–#24
+///   assumed to follow it (each checks its arguments and otherwise goes to the PC method).
 /// * device #12 `CreateCommandList` (only with console lists on): console code gets a
 ///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
@@ -480,8 +483,12 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
             let mut v = vec![
                 (14, dev_create_descriptor_heap_x as usize),
                 (15, dev_increment_size_x as usize),
+                (17, dev_create_cbv_x as usize),
                 (18, dev_create_srv_x as usize),
                 (19, dev_create_uav_x as usize),
+                (22, dev_create_sampler_x as usize),
+                (23, dev_copy_descriptors_x as usize),
+                (24, dev_copy_descriptors_simple_x as usize),
                 (62, dev_create_compute_pso_x as usize),
                 (76, dev_create_committed_resource_x as usize),
             ];
@@ -521,10 +528,12 @@ unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
 
 unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let d = if desc.is_null() { [u32::MAX; 4] } else { *desc };
-    if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 {
+    let sampler = d[0] == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32;
+    if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
-    let pc = [d[0], d[1].saturating_mul(2), d[2], d[3]];
+    // views: an SRV / UAV pair per console slot; samplers: one per slot
+    let pc = [d[0], if sampler { d[1] } else { d[1].saturating_mul(2) }, d[2], d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
     if hr >= 0 {
         let raw = *ppv;
@@ -532,8 +541,8 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
         let gpu = if d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
-        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc) {
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
+        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler) {
             crate::xlog_warn!("sterta deskryptorów konsoli: brak miejsca w UMA na {} slotów", d[1]);
         }
     }
@@ -543,6 +552,9 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
 unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u32 {
     if ty == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 {
         return super::console_heap::SLOT;
+    }
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 {
+        return super::console_heap::SAMPLER_SLOT;
     }
     let f: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
     f(this, ty)
@@ -695,6 +707,112 @@ fn note_buffer_view() {
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("widok bufora w stercie konsoli: bufor nie jest w UMA – shader dostanie pusty V# (num_records 0)");
     }
+}
+
+/// #17 CreateConstantBufferView: a raw V# of the buffer's console address (unified memory;
+/// anything else gets an empty V#). No PC CBV: translated shaders read buffers through `mem`.
+unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
+    let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
+        let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
+        return f(this, desc, cpu);
+    };
+    let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
+    let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+    if !in_uma {
+        note_buffer_view();
+    }
+    let (va, size) = if in_uma { (va, size) } else { (0, 0) };
+    super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));
+}
+
+/// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
+/// [11:0] = sampler heap index; the state lives in the PC sampler).
+unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, desc: *const D3D12_SAMPLER_DESC, cpu: u64) {
+    let f: unsafe extern "system" fn(*mut c_void, *const D3D12_SAMPLER_DESC, u64) = std::mem::transmute(orig_fn(this, 22));
+    let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
+    f(this, desc, slot.pc_srv);
+    super::console_heap::write(&slot, &[0, 0, 0, slot.index & 0xFFF]);
+}
+
+/// Copy `n` console slots from `src` to `dst` (both in console heaps of one kind): the PC
+/// descriptors (2 per view slot) and the slots. False: not two console ranges.
+unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) -> bool {
+    use super::console_heap::{copy_words, slot, SAMPLER_SLOT, SLOT};
+    let (Some(d0), Some(s0)) = (slot(dst), slot(src)) else { return false };
+    if d0.sampler != s0.sampler {
+        return false;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
+    f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
+    let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
+    for k in 0..n as u64 {
+        if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
+            copy_words(&s, &d);
+        }
+    }
+    true
+}
+
+static MIXED_COPIES: AtomicU64 = AtomicU64::new(0);
+
+fn note_mixed_copy() {
+    if MIXED_COPIES.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_warn!("CopyDescriptors (konsola): zakres spoza stert konsoli XCL – kopiowanie tylko na PC");
+    }
+}
+
+/// #24 CopyDescriptorsSimple(n, dst, src, type)
+unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
+    if copy_console_slots(this, n, dst, src, ty) {
+        return;
+    }
+    if super::console_heap::slot(dst).is_some() || super::console_heap::slot(src).is_some() {
+        note_mixed_copy();
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
+    f(this, n, dst, src, ty);
+}
+
+/// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dsts: *const u64, dsizes: *const u32, ns: u32, srcs: *const u64, ssizes: *const u32, ty: u32) {
+    use super::console_heap::{slot, SAMPLER_SLOT, SLOT};
+    let console = !dsts.is_null() && !srcs.is_null() && nd > 0 && slot(*dsts).is_some();
+    if !console {
+        if !srcs.is_null() && ns > 0 && slot(*srcs).is_some() {
+            note_mixed_copy();
+            return;
+        }
+        type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
+        let f: F = std::mem::transmute(orig_fn(this, 23));
+        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+    }
+    // every descriptor as (dst, src) handle, ranges walked in step
+    let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
+    let expand = |starts: *const u64, sizes: *const u32, n: u32| -> Vec<u64> {
+        (0..n as usize).flat_map(|r| {
+            let (h, len) = (*starts.add(r), if sizes.is_null() { 1 } else { *sizes.add(r) });
+            (0..len as u64).map(move |k| h + k * step)
+        })
+        .collect()
+    };
+    let (d, s) = (expand(dsts, dsizes, nd), expand(srcs, ssizes, ns));
+    for (a, b) in d.iter().zip(s.iter()) {
+        if !copy_console_slots(this, 1, *a, *b, ty) {
+            note_mixed_copy();
+        }
+    }
+}
+
+/// descriptor heap Release (every caller): a console heap's slots go with it
+unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::console_heap::unregister(this as usize);
+    }
+    n
 }
 
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
@@ -888,6 +1006,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
         Kind::Resource => v.push(("Release", res_release as usize)),
+        Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         _ => {}
     }
     v

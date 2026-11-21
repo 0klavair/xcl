@@ -33,6 +33,8 @@ pub(super) struct Em {
     ps_done: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
+    /// scratch_* used: declare the per-lane private memory
+    uses_scratch: bool,
     /// highest VGPR the program references (v_movrel* ranges)
     pub max_vgpr: u64,
 }
@@ -42,7 +44,7 @@ const NOOPS: &[&str] = &[
     "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
     "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_round_mode", "s_setreg_imm32_b32", "s_setreg_b32", "s_sendmsg", "s_sendmsghalt",
-    "s_set_gpr_idx_off", "s_version",
+    "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
 
 fn sname(code: u64) -> Option<String> {
@@ -233,6 +235,7 @@ impl Em {
             ps_modes: BTreeMap::new(),
             ps_done: false,
             uses_lds: false,
+            uses_scratch: false,
             max_vgpr: 0,
         }
     }
@@ -509,7 +512,7 @@ impl Em {
             "ENC_DS" => self.ds(d, &name),
             "ENC_VINTRP" => self.interp(d, &name),
             "ENC_MIMG" => self.mimg(d, &name),
-            "ENC_FLAT" | "ENC_FLAT_GLBL" => self.flat(d, &name),
+            "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" => self.flat(d, &name),
             e if e.starts_with("ENC_VOP") || e.starts_with("VOP") => self.valu(d, &name),
             _ => Err("kodowanie"),
         };
@@ -896,6 +899,13 @@ impl Em {
     // ---------------------------------------------------------------- memory (flat model)
 
     fn smem(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if name == "s_memtime" || name == "s_memrealtime" {
+            // no clock in this model: a constant time (profiling deltas come out 0)
+            let sdata = Self::field(d, "SDATA");
+            let (lo, hi) = (self.sreg(sdata), self.sreg(sdata + 1));
+            self.line(&format!("{lo} = 0u; {hi} = 0u;"));
+            return Ok(());
+        }
         let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
             "dword" => 1,
             "dwordx2" => 2,
@@ -953,6 +963,9 @@ impl Em {
             "buffer_store_short" => Some((2, false, true)),
             _ => None,
         };
+        if let Some((n, signed, store, half)) = d16_small(name.trim_start_matches("buffer_")) {
+            return self.mubuf_d16(d, n, signed, store, half);
+        }
         let (kind, count) = match small {
             Some(_) => (BufKind::Load, 1),
             None => buffer_op(name).ok_or("MUBUF")?,
@@ -1291,12 +1304,10 @@ impl Em {
         let sampling = base.starts_with("sample") || base.starts_with("gather4");
         let rest = base.trim_start_matches("sample").trim_start_matches("gather4");
         let mods: Vec<&str> = if sampling { rest.split('_').filter(|x| !x.is_empty()).collect() } else { Vec::new() };
-        if mods.contains(&"cd") {
-            return Err("MIMG cd");
-        }
+        // `cd` (coarse derivatives) samples like `d`: the gradients are the instruction's own
         let (has_cl, has_o) = (mods.contains(&"cl"), mods.contains(&"o"));
         let (has_b, has_c, has_d, has_l, has_lz) =
-            (mods.contains(&"b"), mods.contains(&"c"), mods.contains(&"d"), mods.contains(&"l"), mods.contains(&"lz"));
+            (mods.contains(&"b"), mods.contains(&"c"), mods.contains(&"d") || mods.contains(&"cd"), mods.contains(&"l"), mods.contains(&"lz"));
         let grad_n = if has_d { [1u64, 2, 3, 2, 1, 2, 2, 2][dim as usize] } else { 0 };
         // address components: (16-bit?, starts a dword?)
         let h = if a16 { 16 } else { 32 };
@@ -1623,6 +1634,17 @@ impl Em {
                     uav("int"),
                     uav("float")
                 ));
+            }
+            _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
+                // the operations without an int view: on the uint texel (CAS loops where needed)
+                let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+                self.line(&format!("RWTexture{rty}<uint> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
+                self.line(&format!("uint {t}_old = 0u;"));
+                let body = rmw32(&base[7..], &At::Ref(format!("{t}_U[{icoord}]")), &v, &cmp, &format!("{t}_old"), &t).ok_or("image_atomic")?;
+                self.line(&format!("if ({act}) {{ {body} }}"));
+                if f("GLC") == 1 {
+                    self.line(&format!("if ({act}) {v} = {t}_old;"));
+                }
             }
             _ if base.starts_with("atomic_") => {
                 let op = match &base[7..] {
@@ -2210,7 +2232,10 @@ impl Em {
             return self.interp(d, name);
         }
         let (outs, ins) = Self::ops(d);
-        let f16 = name.contains("f16") || name.contains("_i16") || name.contains("_u16") || name.contains("_b16");
+        // 32-bit operations whose names mention 16-bit halves
+        const WIDE16: &[&str] =
+            &["v_cvt_pknorm_i16_f32", "v_cvt_pknorm_u16_f32", "v_cvt_pk_u16_u32", "v_cvt_pk_i16_i32", "v_mad_u32_u16", "v_mad_i32_i16", "v_sad_u16", "v_sat_pk_u8_i16"];
+        let f16 = (name.contains("f16") || name.contains("_i16") || name.contains("_u16") || name.contains("_b16")) && !WIDE16.contains(&name);
         let cmp = name.starts_with("v_cmp");
         // inline constants are f16 patterns only where the source itself is 16-bit
         let src_f16 = matches!(name, "v_cvt_f32_f16" | "v_pack_b32_f16") || (cmp && name.ends_with("_f16"));
@@ -2220,6 +2245,17 @@ impl Em {
         }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
+        }
+        if name == "v_swap_b32" && d.variant == Variant::Plain {
+            let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+            let s0 = f("SRC0");
+            if s0 < 256 {
+                return Err("v_swap_b32: SRC0 nie jest VGPR");
+            }
+            let (x, y) = (self.vreg(f("VDST")), self.vreg(s0 - 256));
+            let (t, act) = (self.t(), self.act());
+            self.line(&format!("uint {t} = {x}; {x} = select({act}, {y}, {x}); {y} = select({act}, {t}, {y});"));
+            return Ok(());
         }
         if d.enc.name == "ENC_VOP3P" && !mix {
             return Err("VOP3P");
@@ -2404,6 +2440,33 @@ impl Em {
             "v_max3_i32" => format!("(uint)max(max((int){a}, (int){b}), (int){c})"),
             "v_med3_i32" => format!("(uint)med3i((int){a}, (int){b}, (int){c})"),
             "v_sad_u32" => format!("(max({a}, {b}) - min({a}, {b})) + {c}"),
+            "v_sad_u8" => format!("sad_u8({a}, {b}) + {c}"),
+            "v_sad_hi_u8" => format!("(sad_u8({a}, {b}) << 16) + {c}"),
+            "v_sad_u16" => format!("absd16({a}, {b}, 0u) + absd16({a}, {b}, 16u) + {c}"),
+            "v_msad_u8" => format!("msad_u8({a}, {b}) + {c}"),
+            "v_lerp_u8" => format!("lerp_u8({a}, {b}, {c})"),
+            "v_add_nc_i32" if m.clamp => format!("sat_i32((int64_t)(int){a} + (int64_t)(int){b})"),
+            "v_sub_nc_i32" if m.clamp => format!("sat_i32((int64_t)(int){a} - (int64_t)(int){b})"),
+            "v_add_nc_i32" => format!("{a} + {b}"),
+            "v_sub_nc_i32" => format!("{a} - {b}"),
+            "v_mad_u32_u16" => format!("(({a} >> {}u) & 0xFFFFu) * (({b} >> {}u) & 0xFFFFu) + {c}", 16 * (m.opsel & 1), 8 * (m.opsel & 2)),
+            "v_mad_i32_i16" => format!(
+                "(uint)((((int)(({a} >> {}u) << 16)) >> 16) * (((int)(({b} >> {}u) << 16)) >> 16) + (int){c})",
+                16 * (m.opsel & 1),
+                8 * (m.opsel & 2)
+            ),
+            "v_cvt_pk_u16_u32" => format!("min({a}, 0xFFFFu) | (min({b}, 0xFFFFu) << 16)"),
+            "v_cvt_pk_i16_i32" => format!("((uint)clamp((int){a}, -32768, 32767) & 0xFFFFu) | (((uint)clamp((int){b}, -32768, 32767) & 0xFFFFu) << 16)"),
+            "v_cvt_pknorm_i16_f32" => format!(
+                "((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) | (((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) << 16)",
+                fs(0),
+                fs(1)
+            ),
+            "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
+            "v_mul_hi_i32_i24" => format!("(uint)(((int64_t)i24({a}) * (int64_t)i24({b})) >> 32)"),
+            "v_sat_pk_u8_i16" => format!("(uint)clamp(((int)({a} << 16)) >> 16, 0, 255) | ((uint)clamp((int){a} >> 16, 0, 255) << 8)"),
+            "v_div_fmas_f32" => fr(format!("mad({}, {}, {})", fs(0), fs(1), fs(2))),
+            "v_div_fixup_f32" => fr(format!("div_fixup({}, {}, {})", fs(0), fs(1), fs(2))),
             "v_cvt_pk_u8_f32" => format!(
                 "({c} & ~(0xFFu << (8u * ({b} & 3u)))) | (((uint)clamp(round({}), 0.0f, 255.0f)) << (8u * ({b} & 3u)))",
                 fs(0)
@@ -2454,6 +2517,15 @@ impl Em {
                     let v = self.vreg(*n);
                     self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
                 }
+                return Ok(());
+            }
+            "v_div_scale_f32" => {
+                // no pre-scaling (the quotient sequence still gives a/b; only extreme ranges lose
+                // precision): src0 unchanged, VCC 0 = no post-scale in v_div_fmas
+                let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
+                self.write_mask(&sdst, "false");
+                let r = format!("asuint({})", fs(0));
+                self.vwrite(d, &dst, &r);
                 return Ok(());
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" => {
@@ -2601,17 +2673,54 @@ impl Em {
     fn buffer_atomic(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let op = name.trim_start_matches("buffer_atomic_");
-        let func = match op {
-            "add" => "InterlockedAdd",
-            "smin" | "umin" => "InterlockedMin",
-            "smax" | "umax" => "InterlockedMax",
-            "and" => "InterlockedAnd",
-            "or" => "InterlockedOr",
-            "xor" => "InterlockedXor",
-            "swap" => "InterlockedExchange",
-            "cmpswap" => "InterlockedCompareExchange",
-            _ => return Err("buffer_atomic"),
-        };
+        let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
+        let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
+        let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
+        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
+        let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
+        let t = self.t();
+        let x2 = op.ends_with("_x2");
+        let op = op.trim_end_matches("_x2");
+        let bytes = if x2 { 8 } else { 4 };
+        self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
+        self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
+        self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
+        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+        let act = self.act();
+        if x2 {
+            return self.atomic64(op, &format!("{t}_a"), vdata, vdata + 2, f("GLC") == 1, vdata, &format!("and({act}, {t}_ok)"));
+        }
+        let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
+        let body = rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmp, &format!("{t}_old"), &t).ok_or("buffer_atomic")?;
+        self.line(&format!("uint {t}_old = 0u;"));
+        self.line(&format!("if (and({act}, {t}_ok)) {{ {body} }}"));
+        if f("GLC") == 1 {
+            self.line(&format!("{v} = select({act}, select({t}_ok, {t}_old, 0u), {v});"));
+        }
+        Ok(())
+    }
+
+    /// A 64-bit atomic (`_x2`) at byte address `a` of the flat memory; data in VGPRs
+    /// `data`, `data + 1` (compare value of cmpswap at `cmp`); the old value to `dst` (GLC).
+    #[allow(clippy::too_many_arguments)]
+    fn atomic64(&mut self, op: &str, a: &str, data: u64, cmp: u64, glc: bool, dst: u64, active: &str) -> Result<(), &'static str> {
+        let t = self.t();
+        let (lo, hi) = (self.vreg(data), self.vreg(data + 1));
+        let (clo, chi) = (self.vreg(cmp), self.vreg(cmp + 1));
+        self.line(&format!("uint64_t {t}_v = (uint64_t){lo} | ((uint64_t){hi} << 32); uint64_t {t}_cmp = (uint64_t){clo} | ((uint64_t){chi} << 32); uint64_t {t}_old = 0;"));
+        let body = rmw64(op, a, &format!("{t}_v"), &format!("{t}_cmp"), &format!("{t}_old"), &t).ok_or("atomic 64")?;
+        self.line(&format!("if ({active}) {{ {body} }}"));
+        if glc {
+            let (r0, r1) = (self.vreg(dst), self.vreg(dst + 1));
+            self.line(&format!("if ({active}) {{ {r0} = (uint){t}_old; {r1} = (uint)({t}_old >> 32); }}"));
+        }
+        Ok(())
+    }
+
+    /// buffer_* d16 sub-dword loads / stores (half of the VGPR, the other half kept).
+    fn mubuf_d16(&mut self, d: &Decoded, n: u32, signed: bool, store: bool, half: u32) -> Result<(), &'static str> {
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
@@ -2621,24 +2730,15 @@ impl Em {
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~3u;"));
-        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + 4u <= {d2}, {index} < {d2});"));
-        let v = self.vreg(vdata);
+        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
+        let ok = format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})");
         let act = self.act();
-        let signed = op == "smin" || op == "smax";
-        let ty = if signed { "int" } else { "uint" };
-        self.line(&format!("{ty} {t}_old = 0;"));
-        let call = if op == "cmpswap" {
-            let cmp = self.vreg(vdata + 1);
-            format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
-        } else if signed {
-            format!("mem.{func}({t}_a, (int){v}, {t}_old);")
+        let v = self.vreg(vdata);
+        if store {
+            self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
         } else {
-            format!("mem.{func}({t}_a, {v}, {t}_old);")
-        };
-        self.line(&format!("if (and({act}, {t}_ok)) {{ {call} }}"));
-        if f("GLC") == 1 {
-            self.line(&format!("{v} = select({act}, select({t}_ok, (uint){t}_old, 0u), {v});"));
+            let raw = format!("select({ok}, ld_raw({t}_a).x, 0u)");
+            self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
         }
         Ok(())
     }
@@ -2646,9 +2746,32 @@ impl Em {
     /// FLAT / global: the flat memory model (address = low 32 bits).
     fn flat(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
-        let op = name.trim_start_matches("global_").trim_start_matches("flat_");
+        let op = name.trim_start_matches("global_").trim_start_matches("flat_").trim_start_matches("scratch_");
+        let scratch = d.enc.name == "ENC_FLAT_SCRATCH";
         if let Some(a) = op.strip_prefix("atomic_") {
             return self.flat_atomic(d, a);
+        }
+        if scratch {
+            return self.scratch(d, op);
+        }
+        if let Some((n, signed, store, half)) = flat_small(op) {
+            let global = d.enc.name == "ENC_FLAT_GLBL";
+            let addr = self.vreg(f("ADDR"));
+            let saddr = f("SADDR");
+            let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
+            let raw = f("OFFSET") as u32;
+            let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
+            let t = self.t();
+            self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+            let act = self.act();
+            if store {
+                let v = self.vreg(f("DATA"));
+                self.line(&format!("if ({act}) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
+            } else {
+                let v = self.vreg(f("VDST"));
+                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &format!("ld_raw({t}_a).x"), n, signed, half)));
+            }
+            return Ok(());
         }
         let (store, count) = match op {
             "load_dword" => (false, 1),
@@ -2689,6 +2812,51 @@ impl Em {
         Ok(())
     }
 
+    /// scratch_*: per-lane private memory (`xcl_scratch`); address = SADDR or VADDR + offset.
+    fn scratch(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+        self.uses_scratch = true;
+        let saddr = f("SADDR");
+        let base = if saddr != 0x7D && saddr != 0x7F { self.sreg(saddr) } else { self.vreg(f("ADDR")) };
+        let raw = f("OFFSET") as u32;
+        let off = (((raw << 20) as i32) >> 20) as u32;
+        let t = self.t();
+        self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
+        let act = self.act();
+        if let Some((n, signed, store, half)) = flat_small(op) {
+            if store {
+                let v = self.vreg(f("DATA"));
+                self.line(&format!("if ({act}) scr_st({t}_a, {}, {n}u);", d16_data(&v, half)));
+            } else {
+                let v = self.vreg(f("VDST"));
+                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &format!("scr_ld({t}_a)"), n, signed, half)));
+            }
+            return Ok(());
+        }
+        let (store, count) = match op {
+            "load_dword" => (false, 1),
+            "load_dwordx2" => (false, 2),
+            "load_dwordx3" => (false, 3),
+            "load_dwordx4" => (false, 4),
+            "store_dword" => (true, 1),
+            "store_dwordx2" => (true, 2),
+            "store_dwordx3" => (true, 3),
+            "store_dwordx4" => (true, 4),
+            _ => return Err("SCRATCH"),
+        };
+        let mut st = Vec::new();
+        for i in 0..count {
+            let slot = format!("xcl_scratch[(({t}_a + {}u) >> 2) & 1023u]", 4 * i);
+            if store {
+                st.push(format!("{slot} = {};", self.vreg(f("DATA") + i)));
+            } else {
+                st.push(format!("{} = {slot};", self.vreg(f("VDST") + i)));
+            }
+        }
+        self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
+        Ok(())
+    }
+
     /// FLAT / global atomics on the flat memory (dword ops; float min / max by a CAS loop).
     fn flat_atomic(&mut self, d: &Decoded, op: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
@@ -2699,11 +2867,19 @@ impl Em {
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
-        self.line(&format!("uint {t}_a = ({base} + {}) & ~3u;", hex(off)));
-        let v = self.vreg(f("DATA"));
+        let x2 = op.ends_with("_x2");
+        let op = op.trim_end_matches("_x2");
+        self.line(&format!("uint {t}_a = ({base} + {}) & ~{}u;", hex(off), if x2 { 7 } else { 3 }));
         let act = self.act();
+        if x2 {
+            let data = f("DATA");
+            return self.atomic64(op, &format!("{t}_a"), data, data + 2, f("GLC") == 1, f("VDST"), &act);
+        }
+        let v = self.vreg(f("DATA"));
         self.line(&format!("uint {t}_old = 0u;"));
+        let cmpv = self.vreg(f("DATA") + 1);
         let body = match op {
+            "inc" | "dec" | "csub" | "fcmpswap" => rmw32(op, &At::Mem(format!("{t}_a")), &v, &cmpv, &format!("{t}_old"), &t).ok_or("FLAT atomic")?,
             "add" => format!("mem.InterlockedAdd({t}_a, {v}, {t}_old);"),
             "sub" => format!("mem.InterlockedAdd({t}_a, 0u - {v}, {t}_old);"),
             "and" => format!("mem.InterlockedAnd({t}_a, {v}, {t}_old);"),
@@ -2809,6 +2985,22 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 _ => return None,
             })
         };
+        // d16 8 / 16-bit LDS accesses (half of the VGPR)
+        if let Some((bits, signed, write, half)) = ds_d16(name) {
+            let at = format!("{a} + {off16}u");
+            let slot = lds(at.clone());
+            let sh = format!("((({at}) & 3u) * 8u)");
+            let mask = (1u64 << bits) - 1;
+            if write {
+                let v = d16_data(&self.vreg(f("DATA0")), half);
+                self.line(&format!("if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"));
+            } else {
+                let v = self.vreg(f("VDST"));
+                let raw = format!("({slot} >> {sh})");
+                self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, bits / 8, signed, half)));
+            }
+            return Ok(());
+        }
         // 8 / 16-bit LDS accesses: atomic and / or keep the rest of the dword intact
         let small = match name {
             "ds_write_b8" => Some((8u32, false, true)),
@@ -2871,24 +3063,24 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             Some(r) => (r.to_string(), false),
             None => return Err("DS"),
         };
-        let func = match op.as_str() {
-            "add_u32" => "InterlockedAdd",
-            "min_u32" | "min_i32" => "InterlockedMin",
-            "max_u32" | "max_i32" => "InterlockedMax",
-            "and_b32" => "InterlockedAnd",
-            "or_b32" => "InterlockedOr",
-            "xor_b32" => "InterlockedXor",
-            "wrxchg_b32" => "InterlockedExchange",
-            "sub_u32" => "InterlockedAdd",
-            _ => return Err("DS"),
-        };
-        if op.ends_with("_i32") {
-            return Err("DS min/max i32");
+        // two exchanges (ds_wrxchg2(st64)_rtn_b32): old values to VDST, VDST + 1
+        if op == "wrxchg2_b32" || op == "wrxchg2st64_b32" {
+            let stride = if op == "wrxchg2_b32" { 4 } else { 256 };
+            let (s0, s1) = (lds(format!("{a} + {}u", o0 * stride)), lds(format!("{a} + {}u", o1 * stride)));
+            let (v0, v1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
+            self.line(&format!("uint {t}_o0 = 0u, {t}_o1 = 0u; if ({act}) {{ InterlockedExchange({s0}, {v0}, {t}_o0); InterlockedExchange({s1}, {v1}, {t}_o1); }}"));
+            if rtn {
+                let (r0, r1) = (self.vreg(f("VDST")), self.vreg(f("VDST") + 1));
+                self.line(&format!("if ({act}) {{ {r0} = {t}_o0; {r1} = {t}_o1; }}"));
+            }
+            return Ok(());
         }
-        let v = self.vreg(f("DATA0"));
-        let val = if op == "sub_u32" { format!("(0u - {v})") } else { v };
+        // operands: cmpst = (compare DATA0, new DATA1), mskor = (mask DATA0, or DATA1)
+        let (d0, d1) = (self.vreg(f("DATA0")), self.vreg(f("DATA1")));
+        let (v, v2) = if op.starts_with("cmpst_") { (d1, d0) } else { (d0, d1) };
         let slot = lds(format!("{a} + {off16}u"));
-        self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {func}({slot}, {val}, {t}_o); }}"));
+        let body = rmw32(&op, &At::Ref(slot), &v, &v2, &format!("{t}_o"), &t).ok_or("DS")?;
+        self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {body} }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
             self.line(&format!("if ({act}) {r} = {t}_o;"));
@@ -2914,6 +3106,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
+        if self.uses_scratch {
+            h.push_str(PRELUDE_SCRATCH);
+        }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
         let load_sgprs = |h: &mut String| {
@@ -3375,6 +3570,173 @@ fn cmp_op(rest: &str) -> Option<(&'static str, bool)> {
     ))
 }
 
+/// Where a 32-bit atomic works: a byte address in `mem`, or an lvalue (LDS slot, texel).
+enum At {
+    Mem(String),
+    Ref(String),
+}
+
+/// A 32-bit atomic read-modify-write: HLSL statements leaving the old value in `old` (a
+/// declared uint). `v` = data, `v2` = second operand (cmpswap: the compare value; DS mskor:
+/// the or value). Operations without an HLSL intrinsic run as a bounded compare-exchange
+/// loop. Operation names as in buffer / flat / image (`umin`) and DS (`min_u32`).
+fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<String> {
+    let direct = |f: &str, val: &str| match at {
+        At::Mem(a) => format!("mem.{f}({a}, {val}, {old});"),
+        At::Ref(r) => format!("{f}({r}, {val}, {old});"),
+    };
+    let cas = |new: String| {
+        let (load, cx) = match at {
+            At::Mem(a) => (format!("mem.Load({a})"), format!("mem.InterlockedCompareExchange({a}, {t}_c, {t}_n, {t}_p);")),
+            At::Ref(r) => (r.clone(), format!("InterlockedCompareExchange({r}, {t}_c, {t}_n, {t}_p);")),
+        };
+        format!(
+            "uint {t}_c = {load}; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint {t}_n = {new}; uint {t}_p = 0u; {cx} if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+        )
+    };
+    let c = format!("{t}_c");
+    let signed = |f: &str, pick: &str| match at {
+        At::Mem(a) => format!("int {t}_s = 0; mem.{f}({a}, (int){v}, {t}_s); {old} = (uint){t}_s;"),
+        At::Ref(_) => cas(format!("(uint){pick}((int){c}, (int){v})")),
+    };
+    Some(match op {
+        "add" | "add_u32" => direct("InterlockedAdd", v),
+        "sub" | "sub_u32" => direct("InterlockedAdd", &format!("(0u - {v})")),
+        "and" | "and_b32" => direct("InterlockedAnd", v),
+        "or" | "or_b32" => direct("InterlockedOr", v),
+        "xor" | "xor_b32" => direct("InterlockedXor", v),
+        "swap" | "wrxchg_b32" => direct("InterlockedExchange", v),
+        "umin" | "min_u32" => direct("InterlockedMin", v),
+        "umax" | "max_u32" => direct("InterlockedMax", v),
+        // float compare-swap compares bits (differs only for -0 / NaN)
+        "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => match at {
+            At::Mem(a) => format!("mem.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
+            At::Ref(r) => format!("InterlockedCompareExchange({r}, {v2}, {v}, {old});"),
+        },
+        "smin" | "min_i32" => signed("InterlockedMin", "min"),
+        "smax" | "max_i32" => signed("InterlockedMax", "max"),
+        // float min / max in memory as one integer atomic: non-negative floats order like
+        // signed ints, negative ones like unsigned ints in reverse (no CAS loop – a program
+        // with 168 such loops was too much for the driver's compiler)
+        "fmin" | "fmax" | "min_f32" | "max_f32" => {
+            let min = op == "fmin" || op == "min_f32";
+            match at {
+                At::Mem(a) => {
+                    let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
+                    format!("if (asfloat({v}) >= 0.0f) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
+                }
+                At::Ref(_) => cas(format!("asuint({}(asfloat({c}), asfloat({v})))", if min { "min" } else { "max" })),
+            }
+        }
+        "rsub" | "rsub_u32" => cas(format!("{v} - {c}")),
+        "inc" | "inc_u32" => cas(format!("select({c} >= {v}, 0u, {c} + 1u)")),
+        "dec" | "dec_u32" => cas(format!("select(or({c} == 0u, {c} > {v}), {v}, {c} - 1u)")),
+        "csub" => cas(format!("select({c} >= {v}, {c} - {v}, 0u)")),
+        "add_f32" => cas(format!("asuint(asfloat({c}) + asfloat({v}))")),
+        "mskor_b32" => cas(format!("({c} & ~{v}) | {v2}")),
+        _ => return None,
+    })
+}
+
+/// A 64-bit atomic at byte address `a` of the flat memory (SM 6.6 InterlockedXxx64);
+/// `v`, `cmp`, `old` are uint64_t variables.
+fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<String> {
+    let f = match op {
+        "add" | "sub" => "InterlockedAdd64",
+        "and" => "InterlockedAnd64",
+        "or" => "InterlockedOr64",
+        "xor" => "InterlockedXor64",
+        "swap" => "InterlockedExchange64",
+        "umin" => "InterlockedMin64",
+        "umax" => "InterlockedMax64",
+        "smin" | "smax" => {
+            let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
+            return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
+        }
+        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        _ => return None,
+    };
+    let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
+    Some(format!("mem.{f}({a}, {val}, {old});"))
+}
+
+/// Sub-dword d16 forms: (bytes, sign-extend, store, half: 0 low / 1 high) by the name after
+/// the `buffer_` / `flat_` / `global_` prefix.
+fn d16_small(op: &str) -> Option<(u32, bool, bool, u32)> {
+    Some(match op {
+        "load_ubyte_d16" => (1, false, false, 0),
+        "load_ubyte_d16_hi" => (1, false, false, 1),
+        "load_sbyte_d16" => (1, true, false, 0),
+        "load_sbyte_d16_hi" => (1, true, false, 1),
+        "load_short_d16" => (2, false, false, 0),
+        "load_short_d16_hi" => (2, false, false, 1),
+        "store_byte_d16_hi" => (1, false, true, 1),
+        "store_short_d16_hi" => (2, false, true, 1),
+        _ => return None,
+    })
+}
+
+/// FLAT / global sub-dword forms (plain and d16): (bytes, sign-extend, store, half: 0 low,
+/// 1 high, 2 = the whole VGPR).
+fn flat_small(op: &str) -> Option<(u32, bool, bool, u32)> {
+    Some(match op {
+        "load_ubyte" => (1, false, false, 2),
+        "load_sbyte" => (1, true, false, 2),
+        "load_ushort" => (2, false, false, 2),
+        "load_sshort" => (2, true, false, 2),
+        "store_byte" => (1, false, true, 2),
+        "store_short" => (2, false, true, 2),
+        _ => return d16_small(op),
+    })
+}
+
+/// DS d16 forms: (bits, sign-extend, write, half).
+fn ds_d16(name: &str) -> Option<(u32, bool, bool, u32)> {
+    Some(match name {
+        "ds_read_u8_d16" => (8, false, false, 0),
+        "ds_read_u8_d16_hi" => (8, false, false, 1),
+        "ds_read_i8_d16" => (8, true, false, 0),
+        "ds_read_i8_d16_hi" => (8, true, false, 1),
+        "ds_read_u16_d16" => (16, false, false, 0),
+        "ds_read_u16_d16_hi" => (16, false, false, 1),
+        "ds_write_b8_d16_hi" => (8, false, true, 1),
+        "ds_write_b16_d16_hi" => (16, false, true, 1),
+        _ => return None,
+    })
+}
+
+/// The data a d16 store takes from VGPR `v` (half 1: the high 16 bits).
+fn d16_data(v: &str, half: u32) -> String {
+    if half == 1 {
+        format!("({v} >> 16)")
+    } else {
+        v.to_string()
+    }
+}
+
+/// VGPR `v` after loading `n` bytes (`raw`, low bits) as half 0 / 1 (the other half kept)
+/// or as the whole register (half 2).
+fn d16_merge(v: &str, raw: &str, n: u32, signed: bool, half: u32) -> String {
+    let bits = 8 * n;
+    let val = if signed { format!("(uint)(((int)(({raw}) << {}u)) >> {}u)", 32 - bits, 32 - bits) } else { format!("(({raw}) & {}u)", (1u64 << bits) - 1) };
+    match half {
+        0 => format!("({v} & 0xFFFF0000u) | ({val} & 0xFFFFu)"),
+        1 => format!("({v} & 0xFFFFu) | ({val} << 16)"),
+        _ => val,
+    }
+}
+
+/// Per-lane private memory of scratch_* (static = thread-private in HLSL; 4 KB per lane).
+const PRELUDE_SCRATCH: &str = r#"
+static uint xcl_scratch[1024];
+uint scr_ld(uint a) { uint b = (a >> 2) & 1023u; uint s = (a & 3u) * 8u; uint lo = xcl_scratch[b]; uint hi = xcl_scratch[(b + 1u) & 1023u]; return select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u))); }
+void scr_st(uint a, uint v, uint n) {
+    uint b = (a >> 2) & 1023u; uint s = (a & 3u) * 8u; uint m = select(n >= 4u, 0xFFFFFFFFu, (1u << ((8u * n) & 31u)) - 1u);
+    xcl_scratch[b] = (xcl_scratch[b] & ~(m << s)) | ((v & m) << s);
+    if (s != 0u && s + 8u * n > 32u) { uint b2 = (b + 1u) & 1023u; xcl_scratch[b2] = (xcl_scratch[b2] & ~(m >> (32u - s))) | ((v & m) >> (32u - s)); }
+}
+"#;
+
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
@@ -3539,6 +3901,14 @@ uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
 float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
+uint absd8(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFu; uint y = (b >> k) & 0xFFu; return max(x, y) - min(x, y); }
+uint absd16(uint a, uint b, uint k) { uint x = (a >> k) & 0xFFFFu; uint y = (b >> k) & 0xFFFFu; return max(x, y) - min(x, y); }
+uint sad_u8(uint a, uint b) { return absd8(a, b, 0u) + absd8(a, b, 8u) + absd8(a, b, 16u) + absd8(a, b, 24u); }
+uint msad_u8(uint a, uint b) { return select((b & 0xFFu) != 0u, absd8(a, b, 0u), 0u) + select(((b >> 8) & 0xFFu) != 0u, absd8(a, b, 8u), 0u) + select(((b >> 16) & 0xFFu) != 0u, absd8(a, b, 16u), 0u) + select((b >> 24) != 0u, absd8(a, b, 24u), 0u); }
+uint lerp8(uint a, uint b, uint c, uint k) { return ((((a >> k) & 0xFFu) + ((b >> k) & 0xFFu) + ((c >> k) & 1u)) >> 1) << k; }
+uint lerp_u8(uint a, uint b, uint c) { return lerp8(a, b, c, 0u) | lerp8(a, b, c, 8u) | lerp8(a, b, c, 16u) | lerp8(a, b, c, 24u); }
+uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, select(r < -(int64_t)0x80000000u, 0x80000000u, (uint)r)); }
+float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }

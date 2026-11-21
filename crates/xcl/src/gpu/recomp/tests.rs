@@ -558,6 +558,8 @@ fn gpu_images_sample_load_store_atomic() {
     // tex1: R32_UINT UAV, T# in s[32:39] (SRSRC = 8); tex2: 1x1 R32_UINT UAV in s[40:47] (10)
     code.extend(mimg("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 37), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
     code.extend(mimg("IMAGE_ATOMIC_UMAX", &[("VDATA", 7), ("VADDR", 35), ("SRSRC", 10), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
+    // tex3: 1x1 R32_UINT UAV in s[48:55] (12): image_atomic_inc (no HLSL intrinsic: CAS loop)
+    code.extend(mimg("IMAGE_ATOMIC_INC", &[("VDATA", 39), ("VADDR", 35), ("SRSRC", 12), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)]));
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
     let mut st = KernelState::default();
@@ -566,6 +568,7 @@ fn gpu_images_sample_load_store_atomic() {
     st.sgpr[28..32].copy_from_slice(&[0, 0, 0, 1]);
     st.sgpr[32..40].copy_from_slice(&tsharp(2, 20, 9));
     st.sgpr[40..48].copy_from_slice(&tsharp(4, 20, 9));
+    st.sgpr[48..56].copy_from_slice(&tsharp(6, 20, 9));
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let (x, y) = ((l % 4) as u32, (l / 4 % 4) as u32);
         r[0] = f((x as f32 + 0.5) / 4.0);
@@ -584,6 +587,7 @@ fn gpu_images_sample_load_store_atomic() {
         r[36] = 0;
         r[37] = x; // lanes 16.. land outside the 4x4 texture: their stores are dropped
         r[38] = l as u32 / 4;
+        r[39] = 100;
     }
     // tex0: 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1)
     let mut t0 = Vec::new();
@@ -597,6 +601,7 @@ fn gpu_images_sample_load_store_atomic() {
     let tex = vec![
         TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false },
         TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 4, height: 4, depth: 1, texel_bytes: 4, data: vec![0xEE; 64], uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
         TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 1, height: 1, depth: 1, texel_bytes: 4, data: vec![0; 4], uav: true },
     ];
     let samp = vec![
@@ -619,6 +624,7 @@ fn gpu_images_sample_load_store_atomic() {
         assert_eq!(t1[i], 10 * i as u32, "image_store texel {i}");
     }
     assert_eq!(u32::from_le_bytes(r.textures[1][..4].try_into().unwrap()), 63, "image_atomic_umax");
+    assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
 #[test]
@@ -1937,6 +1943,135 @@ fn gpu_global_atomics_and_sub_dword_access() {
     }
 }
 
+/// The instructions added for code outside the retail pack: global inc / dec / csub /
+/// 64-bit add, LDS signed min / max, cmpst, mskor, float add (CAS loops), global sub-dword
+/// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
+#[test]
+fn gpu_more_atomics_sub_dword_scratch_valu() {
+    if !gpu_ready() {
+        return;
+    }
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let glbl = |n: &'static str, f: &[(&str, u64)]| enc(n, "ENC_FLAT_GLBL", f);
+    let ds = |n: &'static str, f: &[(&str, u64)]| enc(n, "ENC_DS", f);
+    let vop3 = |n: &'static str, f: &[(&str, u64)]| enc(n, "ENC_VOP3", f);
+    let mut code = Vec::new();
+    // global atomics at 0x600 + offset (s[2:3] + v30 = 0)
+    code.extend(glbl("GLOBAL_ATOMIC_INC", &[("ADDR", 30), ("DATA", 21), ("SADDR", 2), ("OFFSET", 0)]));
+    code.extend(glbl("GLOBAL_ATOMIC_DEC", &[("ADDR", 30), ("DATA", 21), ("SADDR", 2), ("OFFSET", 4)]));
+    code.extend(glbl("GLOBAL_ATOMIC_CSUB", &[("ADDR", 30), ("DATA", 35), ("SADDR", 2), ("OFFSET", 8)]));
+    code.extend(glbl("GLOBAL_ATOMIC_ADD_X2", &[("ADDR", 30), ("DATA", 38), ("SADDR", 2), ("OFFSET", 16)]));
+    // LDS: initial values, then the atomics, then read back
+    for (a, v) in [(7, 8), (17, 9), (18, 10), (19, 12), (20, 15)] {
+        code.extend(ds("DS_WRITE_B32", &[("ADDR", a), ("DATA0", v)]));
+    }
+    code.extend(enc("S_BARRIER", "ENC_SOPP", &[]));
+    code.extend(ds("DS_MAX_I32", &[("ADDR", 7), ("DATA0", 33)]));
+    code.extend(ds("DS_MIN_I32", &[("ADDR", 17), ("DATA0", 33)]));
+    code.extend(ds("DS_CMPST_RTN_B32", &[("VDST", 53), ("ADDR", 18), ("DATA0", 10), ("DATA1", 11)]));
+    code.extend(ds("DS_MSKOR_B32", &[("ADDR", 19), ("DATA0", 13), ("DATA1", 14)]));
+    code.extend(ds("DS_ADD_F32", &[("ADDR", 20), ("DATA0", 16)]));
+    code.extend(enc("S_BARRIER", "ENC_SOPP", &[]));
+    for (k, a) in [7u64, 17, 18, 19, 20].iter().enumerate() {
+        code.extend(ds("DS_READ_B32", &[("VDST", 54 + k as u64), ("ADDR", *a)]));
+    }
+    // global bytes at 0x780 + lane, shorts at 0x700 + 2 · lane (s[2:3] + v + 0x100 / 0x180)
+    code.extend(glbl("GLOBAL_STORE_BYTE", &[("ADDR", 3), ("DATA", 36), ("SADDR", 2), ("OFFSET", 0x100)]));
+    code.extend(glbl("GLOBAL_LOAD_UBYTE", &[("VDST", 59), ("ADDR", 3), ("SADDR", 2), ("OFFSET", 0x100)]));
+    code.extend(glbl("GLOBAL_LOAD_SBYTE", &[("VDST", 60), ("ADDR", 3), ("SADDR", 2), ("OFFSET", 0x100)]));
+    code.extend(glbl("GLOBAL_LOAD_UBYTE_D16_HI", &[("VDST", 61), ("ADDR", 3), ("SADDR", 2), ("OFFSET", 0x100)]));
+    code.extend(glbl("GLOBAL_STORE_SHORT_D16_HI", &[("ADDR", 2), ("DATA", 62), ("SADDR", 2), ("OFFSET", 0x100)]));
+    code.extend(glbl("GLOBAL_LOAD_USHORT", &[("VDST", 63), ("ADDR", 2), ("SADDR", 2), ("OFFSET", 0x100)]));
+    // scratch (per lane): a dword at 2 · lane + 16, a byte at 2 · lane + 40
+    code.extend(enc("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 11), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 36), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    code.extend(enc("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 64), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 16)]));
+    code.extend(enc("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 65), ("ADDR", 2), ("SADDR", 0x7F), ("OFFSET", 40)]));
+    // VALU
+    let vv = |n: u64| V + n;
+    code.extend(vop3("V_SAD_U8", &[("VDST", 66), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(24))]));
+    code.extend(vop3("V_MSAD_U8", &[("VDST", 67), ("SRC0", vv(22)), ("SRC1", vv(25)), ("SRC2", vv(24))]));
+    code.extend(vop3("V_LERP_U8", &[("VDST", 68), ("SRC0", vv(22)), ("SRC1", vv(23)), ("SRC2", vv(26))]));
+    code.extend(vop3("V_DIV_FIXUP_F32", &[("VDST", 69), ("SRC0", vv(37)), ("SRC1", vv(28)), ("SRC2", vv(27))]));
+    code.extend(vop3("V_DIV_FIXUP_F32", &[("VDST", 70), ("SRC0", vv(37)), ("SRC1", 128), ("SRC2", vv(27))]));
+    code.extend(vop3("V_DIV_FMAS_F32", &[("VDST", 71), ("SRC0", vv(28)), ("SRC1", vv(27)), ("SRC2", vv(28))]));
+    code.extend(enc("V_DIV_SCALE_F32", "VOP3_SDST_ENC", &[("VDST", 72), ("SDST", 106), ("SRC0", vv(27)), ("SRC1", vv(28)), ("SRC2", vv(27))]));
+    code.extend(vop3("V_ADD_NC_I32", &[("VDST", 73), ("SRC0", vv(29)), ("SRC1", vv(35)), ("CLAMP", 1)]));
+    code.extend(vop3("V_CVT_PK_U16_U32", &[("VDST", 74), ("SRC0", vv(76)), ("SRC1", vv(24))]));
+    code.extend(vop3("V_MAD_U32_U16", &[("VDST", 75), ("SRC0", vv(77)), ("SRC1", vv(78)), ("SRC2", vv(35))]));
+    code.extend(vop3("V_CVT_PKNORM_U16_F32", &[("VDST", 79), ("SRC0", 242), ("SRC1", 240)]));
+    code.extend(enc("V_SWAP_B32", "ENC_VOP1", &[("VDST", 80), ("SRC0", vv(81))]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x600;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l32 = l as u32;
+        r[2] = 2 * l32;
+        r[3] = 0x80 + l32;
+        for (k, a) in [(7, 512u32), (17, 516), (18, 520), (19, 524), (20, 528)] {
+            r[k] = a;
+        }
+        r[8] = (-100i32) as u32;
+        r[9] = 100;
+        r[10] = 7;
+        r[11] = l32 + 1;
+        r[12] = 0xFF00;
+        r[13] = 0xF0F0;
+        r[14] = 0x0101;
+        r[15] = 0;
+        r[16] = f(0.5);
+        r[21] = 10;
+        r[22] = 0x1020_3040;
+        r[23] = 0x4030_2010;
+        r[24] = 5;
+        r[25] = 0x0030_2010;
+        r[26] = 0x0101_0101;
+        r[27] = f(7.0);
+        r[28] = f(2.0);
+        r[29] = 0x7FFF_FFFF;
+        r[30] = 0;
+        r[33] = (l as i32 - 30) as u32;
+        r[35] = 1;
+        r[36] = 0x90 + l32;
+        r[37] = f(3.5);
+        r[38] = 1;
+        r[39] = 0;
+        r[61] = 0x1234;
+        r[62] = 0xBEEF_1111;
+        r[76] = 70000;
+        r[77] = 0x1_0003;
+        r[78] = 0x2_0004;
+        r[80] = 1;
+        r[81] = 2;
+    }
+    let mut mem = vec![0u32; 1024];
+    mem[0x604 / 4] = 5;
+    mem[0x608 / 4] = 50;
+    mem[0x610 / 4] = 0xFFFF_FFF0;
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    assert_eq!(r.mem[0x600 / 4], 64 % 11, "global_atomic_inc wraps at 10");
+    assert_eq!(r.mem[0x604 / 4], 7, "global_atomic_dec wraps to 10 below 0");
+    assert_eq!(r.mem[0x608 / 4], 0, "global_atomic_csub clamps at 0");
+    assert_eq!((r.mem[0x610 / 4], r.mem[0x614 / 4]), (0x30, 1), "global_atomic_add_x2 carries into the high dword");
+    assert_eq!(r.vgpr.iter().filter(|v| v[53] == 7).count(), 1, "ds_cmpst: one lane finds the compare value");
+    for l in 0..64usize {
+        let v = &r.vgpr[l];
+        let b = 0x90 + l as u32;
+        assert_eq!((v[54] as i32, v[55] as i32), (33, -30), "lane {l}: ds_max_i32 / ds_min_i32");
+        assert!((1..=64).contains(&v[56]), "lane {l}: ds_cmpst stored a lane's value");
+        assert_eq!((v[57], f32::from_bits(v[58])), (0x0F01, 32.0), "lane {l}: ds_mskor_b32 / ds_add_f32");
+        assert_eq!((v[59], v[60], v[61]), (b, b | 0xFFFF_FF00, 0x1234 | b << 16), "lane {l}: global ubyte / sbyte / ubyte_d16_hi");
+        assert_eq!(v[63], 0xBEEF, "lane {l}: global_store_short_d16_hi + load_ushort");
+        assert_eq!((v[64], v[65]), (l as u32 + 1, b), "lane {l}: scratch dword / byte");
+        assert_eq!((v[66], v[67], v[68]), (133, 85, 0x2828_2828), "lane {l}: v_sad_u8 / v_msad_u8 / v_lerp_u8");
+        assert_eq!((f32::from_bits(v[69]), f32::from_bits(v[70]), f32::from_bits(v[71])), (3.5, f32::INFINITY, 16.0), "lane {l}: div_fixup / fixup(x/0) / div_fmas");
+        assert_eq!((f32::from_bits(v[72]), v[73]), (7.0, 0x7FFF_FFFF), "lane {l}: v_div_scale_f32 / v_add_nc_i32 clamp");
+        assert_eq!((v[74], v[75], v[79]), (0x0005_FFFF, 13, 0x8000_FFFF), "lane {l}: cvt_pk_u16_u32 / mad_u32_u16 / cvt_pknorm_u16_f32");
+        assert_eq!((v[80], v[81]), (2, 1), "lane {l}: v_swap_b32");
+    }
+    assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");
+}
+
 /// `XCL_BLOB=<console CS container>`: HLSL size and shape of its translation.
 #[test]
 #[ignore]
@@ -2249,7 +2384,13 @@ fn isa_coverage() {
         let Some(ie) = inst.encs.iter().find(|e| ENCODINGS[e.encoding as usize].primary) else { continue };
         let enc = ENCODINGS[ie.encoding as usize].name;
         let lit = inst.always_literal.then_some(0);
-        let Ok(mut code) = encode(inst.name, enc, &[], lit) else { continue };
+        // operands that must not be 0: MIMG channel mask, VOP3 SDST (VCC)
+        let fields: &[(&str, u64)] = match enc {
+            "ENC_MIMG" => &[("DMASK", 1)],
+            "VOP3_SDST_ENC" => &[("SDST", 106)],
+            _ => &[],
+        };
+        let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
         let ok = std::panic::catch_unwind(|| {
             try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F }))
@@ -2268,6 +2409,7 @@ fn isa_coverage() {
     println!("instrukcje RDNA2 (spec + konsola): {all}, tłumaczone: {ok} ({:.1}%)", 100.0 * ok as f64 / all.max(1) as f64);
     for (enc, (ok, all, missing)) in &per_enc {
         let m: Vec<String> = missing.iter().map(|n| n.to_lowercase()).collect();
-        println!("  {enc:<12} {ok:>4} / {all:<4} brak: {}", if m.len() > 14 { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
+        let full = std::env::var_os("XCL_ISA_FULL").is_some();
+        println!("  {enc:<12} {ok:>4} / {all:<4} brak: {}", if m.len() > 14 && !full { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
     }
 }

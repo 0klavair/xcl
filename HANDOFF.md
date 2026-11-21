@@ -536,6 +536,35 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## Instrukcje spoza paczki, sterty konsoli, struktura (sesja 5, 2026-11-21)
+- **Pokrycie ISA** (`isa_coverage`, każda instrukcja dekodera osobno; MIMG z DMASK=1, VOP3_SDST z VCC – wcześniej
+  fałszywe braki): **975 / 1157 (84,3%)**, było 766. Dodane (test GPU `gpu_more_atomics_sub_dword_scratch_valu` +
+  `image_atomic_inc` w `gpu_images_sample_load_store_atomic`):
+  - wspólny generator atomików 32-bit (`emit::rmw32`, `At::Mem` / `At::Ref`) dla buffer / flat / global / DS / obrazów:
+    inc, dec, rsub, csub, mskor, cmpst / fcmpswap (porównanie bitowe), add_f32, min/max ze znakiem na LDS i obrazach –
+    ograniczona pętla CAS (4096); fmin/fmax w `mem` dalej bez pętli (sztuczka ze znakiem); **64-bit `_x2`**
+    (`rmw64`: InterlockedXxx64 SM 6.6) – add/sub/and/or/xor/swap/min/max/cmpswap; `ds_wrxchg2(st64)_rtn_b32`;
+  - flat/global/scratch bajt/półsłowo + **d16 / d16_hi** (też buffer_*_d16, ds_read_*_d16, ds_write_*_d16_hi);
+  - **scratch_*** – prywatna pamięć wątku `static uint xcl_scratch[1024]` (4 KB/wątek);
+  - `v_sad_u8/hi_u8/u16`, `v_msad_u8`, `v_lerp_u8`, `v_div_scale/fmas/fixup_f32` (bez skalowania: VCC=0, fixup =
+    przypadki specjalne IEEE), `v_add/sub_nc_i32` z clamp, `v_mad_u32_u16/i32_i16`, `v_cvt_pk_u16_u32/i16_i32`,
+    `v_cvt_pknorm_*_f32`, `v_mul_hi_i32_i24`, `v_sat_pk_u8_i16`, `v_swap_b32`; `s_memtime/s_memrealtime` (= 0);
+    `buffer_gl0/gl1_inv`, `ds_nop` (bez efektu); `image_sample_cd*` jak `_d`.
+  - Dalej brak: f64 (sqrt/rsq/frexp/…), 64-bit LDS, GWS / append / consume, debug/trap, `s_setpc/s_call`, obrazy
+    `pck` / `by2` / `msaa_load` / `store_mip`, formaty d16 (`buffer/tbuffer_*_format_d16_*`), `v_cvt_*_f16` norm.
+- **Sterty deskryptorów konsoli – dokończone** (`console_heap.rs`; test `slots_copy_and_release`):
+  - **sterty samplerów**: sloty S# 16 B w UMA, slot k → sampler PC k, S# słowo 3 [11:0] = k (`#22 CreateSampler`);
+  - **`#17 CreateConstantBufferView`** → surowy V# z adresem konsoli (UMA; inaczej pusty V#);
+  - **`#24 CopyDescriptorsSimple` / `#23 CopyDescriptors`** – kopia deskryptorów PC (2 na slot widoków) + slotów z
+    przenumerowaniem indeksu (T# słowo 0, S# słowo 3; V# bez zmian); zakresy mieszane konsola/PC → log, tylko PC;
+  - **Release sterty** zwalnia jej sloty (`heap_release`). Increment konsoli: widoki 32, samplery 16.
+  - #17 / #22–#24 przyjęte za układem PC (jak #14–#19 widziane z kodu konsoli) – do potwierdzenia z exe.
+- **Struktura**: pętle z bezwarunkowym skokiem wstecz (wyjście przez flagi + break), **`continue`** (skok wstecz do
+  głowy najbliższej pętli), **wejście do środka pętli** skokiem z wcześniejszego kodu (cel przechodzi do poziomu ciała
+  jako oczekujący: kod przed nim od 2. iteracji), zakres równy pętli (np. ciało if) = ta pętla. Cała paczka: programów
+  z blokami `pc` **2274 → 2046 (8,5%)**. Zostaje: skok wstecz bez cyklu (kompilator współdzieli kod między ścieżkami –
+  wymagałby powielenia), `continue` do zewnętrznej pętli, pętle z wieloma krawędziami wstecz.
+
 ## Pipeline'y MS (NGG) i GS w tworzeniu PSO (sesja 5, 2026-11-21)
 - 9 282 MS + 195 GS z `shaders.rpf` (~40% paczki) dostawały dotąd shadery zastępcze (`real.rs` obsługiwał tylko VS+PS
   i CS). Teraz:
