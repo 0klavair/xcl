@@ -31,11 +31,7 @@ impl Default for KernelState {
         let mut sgpr = vec![0u32; KERNEL_SGPRS];
         sgpr[126] = u32::MAX; // EXEC: all 64 lanes
         sgpr[127] = u32::MAX;
-        KernelState {
-            sgpr,
-            vgpr: vec![vec![0u32; KERNEL_VGPRS]; KERNEL_LANES],
-            scc: 0,
-        }
+        KernelState { sgpr, vgpr: vec![vec![0u32; KERNEL_VGPRS]; KERNEL_LANES], scc: 0 }
     }
 }
 
@@ -78,57 +74,28 @@ fn e(x: windows::core::Error) -> String {
 fn init() -> Result<Gpu, String> {
     unsafe {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(e)?;
-        let adapter: IDXGIAdapter1 = factory
-            .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
-            .map_err(e)?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE).map_err(e)?;
         let desc = adapter.GetDesc1().map_err(e)?;
-        let name = String::from_utf16_lossy(&desc.Description)
-            .trim_end_matches('\0')
-            .to_string();
+        let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_string();
         let mut dev: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(e)?;
         let dev = dev.ok_or("brak urządzenia")?;
-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-        };
-        dev.CheckFeatureSupport(
-            D3D12_FEATURE_SHADER_MODEL,
-            &mut sm as *mut _ as _,
-            std::mem::size_of_val(&sm) as u32,
-        )
-        .map_err(|x| format!("SM 6.6: {x}"))?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+        dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
+            .map_err(|x| format!("SM 6.6: {x}"))?;
         if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
             return Err(format!("{name}: brak SM 6.6"));
         }
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        dev.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS1,
-            &mut o1 as *mut _ as _,
-            std::mem::size_of_val(&o1) as u32,
-        )
-        .map_err(e)?;
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut o1 as *mut _ as _, std::mem::size_of_val(&o1) as u32).map_err(e)?;
         if !o1.WaveOps.as_bool() || o1.WaveLaneCountMax < 64 || !o1.Int64ShaderOps.as_bool() {
-            return Err(format!(
-                "{name}: brak wave64/operacji falowych/int64 ({}..{})",
-                o1.WaveLaneCountMin, o1.WaveLaneCountMax
-            ));
+            return Err(format!("{name}: brak wave64/operacji falowych/int64 ({}..{})", o1.WaveLaneCountMin, o1.WaveLaneCountMax));
         }
-        let queue: ID3D12CommandQueue = dev
-            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })
-            .map_err(e)?;
+        let queue: ID3D12CommandQueue =
+            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu {
-            dev,
-            queue,
-            rs,
-            fence,
-            value: 0,
-            adapter: name,
-        })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name })
     }
 }
 
@@ -175,12 +142,7 @@ struct Bound {
 
 /// Create the descriptor heaps (always, so the directly indexed root signature is valid),
 /// the test textures and samplers; record the uploads into `list`.
-unsafe fn bind_resources(
-    dev: &ID3D12Device,
-    list: &ID3D12GraphicsCommandList,
-    textures: &[TestTexture],
-    samplers: &[TestSampler],
-) -> Result<Bound, String> {
+unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[TestTexture], samplers: &[TestSampler]) -> Result<Bound, String> {
     let n = (2 * textures.len()).max(2) as u32;
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -200,9 +162,7 @@ unsafe fn bind_resources(
         .map_err(e)?;
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let sinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
-    let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
-        ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step,
-    };
+    let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step };
     for (j, sm) in samplers.iter().enumerate() {
         let mut sd = D3D12_SAMPLER_DESC {
             Filter: sm.filter,
@@ -235,45 +195,19 @@ unsafe fn bind_resources(
             DepthOrArraySize: depth_or_array as u16,
             MipLevels: 1,
             Format: t.format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Flags: if t.uav {
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-            } else {
-                D3D12_RESOURCE_FLAG_NONE
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
             ..Default::default()
         };
         let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
-        dev.GetCopyableFootprints(
-            &rd,
-            0,
-            subs,
-            total,
-            Some(fps.as_mut_ptr()),
-            None,
-            None,
-            Some(&mut size),
-        );
+        dev.GetCopyableFootprints(&rd, 0, subs, total, Some(fps.as_mut_ptr()), None, None, Some(&mut size));
         total = (total + size + 511) & !511;
         plans.push(fps);
         descs.push(rd);
     }
-    let upload = if total > 0 {
-        Some(buffer(
-            dev,
-            total,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?)
-    } else {
-        None
-    };
+    let upload = if total > 0 { Some(buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?) } else { None };
     let mut out = Vec::new();
     if let Some(up) = &upload {
         let mut p = std::ptr::null_mut();
@@ -282,21 +216,12 @@ unsafe fn bind_resources(
             let row = (t.width * t.texel_bytes) as usize;
             let slices = t.depth as usize;
             for z in 0..slices {
-                let fp = if t.dim == TexDim::D3 {
-                    &fps[0]
-                } else {
-                    &fps[z]
-                };
+                let fp = if t.dim == TexDim::D3 { &fps[0] } else { &fps[z] };
                 let slice_pitch = fp.Footprint.RowPitch as usize * t.height as usize;
-                let zoff = if t.dim == TexDim::D3 {
-                    z * slice_pitch
-                } else {
-                    0
-                };
+                let zoff = if t.dim == TexDim::D3 { z * slice_pitch } else { 0 };
                 for y in 0..t.height as usize {
                     let src = &t.data[(z * t.height as usize + y) * row..][..row];
-                    let dst = (p as *mut u8)
-                        .add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize);
+                    let dst = (p as *mut u8).add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize);
                     std::ptr::copy_nonoverlapping(src.as_ptr(), dst, row);
                 }
             }
@@ -305,181 +230,84 @@ unsafe fn bind_resources(
     }
     for (i, ((t, rd), fps)) in textures.iter().zip(&descs).zip(&plans).enumerate() {
         let mut r: Option<ID3D12Resource> = None;
-        dev.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
-            D3D12_HEAP_FLAG_NONE,
-            rd,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-            &mut r,
-        )
-        .map_err(e)?;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
+            .map_err(e)?;
         let r = r.ok_or("tekstura")?;
         for (k, fp) in fps.iter().enumerate() {
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: transmute_copy(&r),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: k as u32,
-                },
-            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
             let src = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: transmute_copy(upload.as_ref().unwrap()),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *fp,
-                },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
-        let after = if t.uav {
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-        } else {
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-        };
+        let after = if t.uav { D3D12_RESOURCE_STATE_UNORDERED_ACCESS } else { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE };
         list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, after)]);
-        let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: t.format,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            ..Default::default()
-        };
-        let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: t.format,
-            ..Default::default()
-        };
+        let mut sv = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: t.format, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+        let mut uv = D3D12_UNORDERED_ACCESS_VIEW_DESC { Format: t.format, ..Default::default() };
         match t.dim {
             TexDim::D2 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                };
+                sv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
             }
             TexDim::D2Array => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
-                    MipLevels: 1,
-                    ArraySize: t.depth,
-                    ..Default::default()
-                };
+                sv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: t.depth, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
-                    ArraySize: t.depth,
-                    ..Default::default()
-                };
+                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }
             TexDim::D3 => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-                sv.Anonymous.Texture3D = D3D12_TEX3D_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                };
+                sv.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-                uv.Anonymous.Texture3D = D3D12_TEX3D_UAV {
-                    WSize: t.depth,
-                    ..Default::default()
-                };
+                uv.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: t.depth, ..Default::default() };
             }
             TexDim::Cube => {
                 sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                sv.Anonymous.TextureCube = D3D12_TEXCUBE_SRV {
-                    MipLevels: 1,
-                    ..Default::default()
-                };
+                sv.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
-                    ArraySize: 6,
-                    ..Default::default()
-                };
+                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 6, ..Default::default() };
             }
         }
         if !t.uav {
             dev.CreateShaderResourceView(&r, Some(&sv), at(&heap, 2 * i, inc));
         }
         if t.uav {
-            dev.CreateUnorderedAccessView(
-                &r,
-                None::<&ID3D12Resource>,
-                Some(&uv),
-                at(&heap, 2 * i + 1, inc),
-            );
+            dev.CreateUnorderedAccessView(&r, None::<&ID3D12Resource>, Some(&uv), at(&heap, 2 * i + 1, inc));
         }
         let mut readable = 0u64;
         let subs = fps.len() as u32;
         let mut rfps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
-        dev.GetCopyableFootprints(
-            rd,
-            0,
-            subs,
-            0,
-            Some(rfps.as_mut_ptr()),
-            None,
-            None,
-            Some(&mut readable),
-        );
+        dev.GetCopyableFootprints(rd, 0, subs, 0, Some(rfps.as_mut_ptr()), None, None, Some(&mut readable));
         out.push((r, rfps, readable));
     }
     list.SetDescriptorHeaps(&[Some(heap.clone()), Some(sheap.clone())]);
-    Ok(Bound {
-        _heaps: [heap, sheap],
-        textures: out,
-        _upload: upload,
-    })
+    Ok(Bound { _heaps: [heap, sheap], textures: out, _upload: upload })
 }
 
-fn buffer(
-    dev: &ID3D12Device,
-    size: u64,
-    heap: D3D12_HEAP_TYPE,
-    state: D3D12_RESOURCE_STATES,
-    uav: bool,
-) -> Result<ID3D12Resource, String> {
+fn buffer(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES, uav: bool) -> Result<ID3D12Resource, String> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(256),
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: if uav {
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-        } else {
-            D3D12_RESOURCE_FLAG_NONE
-        },
+        Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
         ..Default::default()
     };
     let mut r: Option<ID3D12Resource> = None;
     unsafe {
-        dev.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: heap,
-                ..Default::default()
-            },
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            state,
-            None,
-            &mut r,
-        )
-        .map_err(e)?;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
+            .map_err(e)?;
     }
     r.ok_or_else(|| "bufor".into())
 }
 
-fn transition(
-    r: &ID3D12Resource,
-    before: D3D12_RESOURCE_STATES,
-    after: D3D12_RESOURCE_STATES,
-) -> D3D12_RESOURCE_BARRIER {
+fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -498,9 +326,7 @@ fn transition(
 pub fn adapter() -> Result<String, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);
-    gpu.as_ref()
-        .map(|x| x.adapter.clone())
-        .map_err(|x| x.clone())
+    gpu.as_ref().map(|x| x.adapter.clone()).map_err(|x| x.clone())
 }
 
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
@@ -509,13 +335,7 @@ pub fn run(dxil: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult
 }
 
 /// `run` with test textures (SRV at heap index 2·i, UAV at 2·i + 1) and samplers.
-pub fn run_with(
-    dxil: &[u8],
-    state: &KernelState,
-    mem: &[u32],
-    textures: &[TestTexture],
-    samplers: &[TestSampler],
-) -> Result<KernelResult, String> {
+pub fn run_with(dxil: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let mut io: Vec<u32> = state.sgpr.clone();
@@ -532,51 +352,18 @@ pub fn run_with(
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: dxil.as_ptr() as _,
-                    BytecodeLength: dxil.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
             .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let io_bytes = (io.len() * 4) as u64;
         let res_bytes = (KERNEL_RES_DWORDS * 4) as u64;
         let mem_bytes = (mem_len * 4) as u64;
-        let upload = buffer(
-            dev,
-            io_bytes + mem_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
-        let io_buf = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let mem_buf = buffer(
-            dev,
-            mem_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let res_buf = buffer(
-            dev,
-            res_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let readback = buffer(
-            dev,
-            res_bytes + mem_bytes,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            false,
-        )?;
+        let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let readback = buffer(dev, res_bytes + mem_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
         std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
@@ -585,30 +372,14 @@ pub fn run_with(
         std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(io.len()), m.len());
         upload.Unmap(0, None);
 
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
-            .map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
         list.ResourceBarrier(&[
-            transition(
-                &io_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let bound = bind_resources(dev, &list, textures, samplers)?;
         list.SetComputeRootSignature(&gpu.rs);
@@ -617,16 +388,8 @@ pub fn run_with(
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ),
+            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         ]);
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
         list.CopyBufferRegion(&readback, res_bytes, &mem_buf, 0, mem_bytes);
@@ -637,58 +400,30 @@ pub fn run_with(
                 continue;
             }
             let (r, fps, size) = &bound.textures[i];
-            let rb = buffer(
-                dev,
-                *size,
-                D3D12_HEAP_TYPE_READBACK,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                false,
-            )?;
-            list.ResourceBarrier(&[transition(
-                r,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            let rb = buffer(dev, *size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+            list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             for (k, fp) in fps.iter().enumerate() {
-                let dst = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: transmute_copy(&rb),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: *fp,
-                    },
-                };
-                let src = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: transmute_copy(r),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: k as u32,
-                    },
-                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
                 list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             }
             tex_back.push((i, rb));
         }
         list.Close().map_err(e)?;
-        gpu.queue
-            .ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev =
-            windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!(
-                "GPU nie skończył w 10 s (usunięte urządzenie: {:?})",
-                dev.GetDeviceRemovedReason()
-            ));
+            return Err(format!("GPU nie skończył w 10 s (usunięte urządzenie: {:?})", dev.GetDeviceRemovedReason()));
         }
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
         let raw = std::slice::from_raw_parts(p as *const u32, KERNEL_RES_DWORDS).to_vec();
-        let mem_out =
-            std::slice::from_raw_parts((p as *const u32).add(KERNEL_RES_DWORDS), mem_len).to_vec();
+        let mem_out = std::slice::from_raw_parts((p as *const u32).add(KERNEL_RES_DWORDS), mem_len).to_vec();
         readback.Unmap(0, None);
         let mut tex_out = Vec::new();
         for (i, rb) in &tex_back {
@@ -699,22 +434,10 @@ pub fn run_with(
             let row = (t.width * t.texel_bytes) as usize;
             let mut v = Vec::new();
             for z in 0..t.depth as usize {
-                let fp = if t.dim == TexDim::D3 {
-                    &fps[0]
-                } else {
-                    &fps[z]
-                };
-                let zoff = if t.dim == TexDim::D3 {
-                    z * fp.Footprint.RowPitch as usize * t.height as usize
-                } else {
-                    0
-                };
+                let fp = if t.dim == TexDim::D3 { &fps[0] } else { &fps[z] };
+                let zoff = if t.dim == TexDim::D3 { z * fp.Footprint.RowPitch as usize * t.height as usize } else { 0 };
                 for y in 0..t.height as usize {
-                    let s = std::slice::from_raw_parts(
-                        (q as *const u8)
-                            .add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize),
-                        row,
-                    );
+                    let s = std::slice::from_raw_parts((q as *const u8).add(fp.Offset as usize + zoff + y * fp.Footprint.RowPitch as usize), row);
                     v.extend_from_slice(s);
                 }
             }
@@ -725,57 +448,34 @@ pub fn run_with(
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
         readback.Unmap(0, None);
         let vgpr = (0..KERNEL_LANES)
-            .map(|l| {
-                raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec()
-            })
+            .map(|l| raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec())
             .collect();
         drop(bound);
-        Ok(KernelResult {
-            sgpr: raw[..KERNEL_SGPRS].to_vec(),
-            vgpr,
-            scc: raw[KERNEL_SCC_SLOT],
-            raw,
-            mem: mem_out,
-            textures: tex_out,
-        })
+        Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: mem_out, textures: tex_out })
     }
 }
 
 /// Run a whole console program: its code region is also placed in `mem` at address 0,
 /// so constants addressed through s_getpc_b64 are found; `extra` follows the code
 /// (dword-aligned, at the returned offset).
-pub fn run_program(
-    code: &[u8],
-    state: &KernelState,
-    extra: &[u32],
-) -> Result<(KernelResult, usize), String> {
-    let mut mem: Vec<u32> = code
-        .chunks(4)
-        .map(|c| {
-            let mut b = [0u8; 4];
-            b[..c.len()].copy_from_slice(c);
-            u32::from_le_bytes(b)
-        })
-        .collect();
+pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(KernelResult, usize), String> {
+    let mut mem: Vec<u32> = code.chunks(4).map(|c| {
+        let mut b = [0u8; 4];
+        b[..c.len()].copy_from_slice(c);
+        u32::from_le_bytes(b)
+    }).collect();
     let at = mem.len() * 4;
     mem.extend_from_slice(extra);
     Ok((run_code(code, state, &mem)?, at))
 }
 
 /// Translate + compile + run RDNA2 code as a kernel, with test textures and samplers.
-pub fn run_code_with(
-    code: &[u8],
-    state: &KernelState,
-    mem: &[u32],
-    textures: &[TestTexture],
-    samplers: &[TestSampler],
-) -> Result<KernelResult, String> {
+pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
     let t = super::translate(code, &super::Options::default())?;
     if !t.complete() {
         return Err(format!("nieobsługiwane instrukcje: {:?}", t.unsupported));
     }
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[])
-        .map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
     run_with(&dxil, state, mem, textures, samplers)
 }
 
@@ -786,8 +486,7 @@ pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelR
     if !t.complete() {
         return Err(format!("nieobsługiwane instrukcje: {:?}", t.unsupported));
     }
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[])
-        .map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
     run(&dxil, state, mem)
 }
 
@@ -818,10 +517,7 @@ pub fn draw(
     unsafe {
         let dev = &gpu.dev;
         let rs = root_signature(dev, true)?;
-        let names: Vec<std::ffi::CString> = layout
-            .iter()
-            .map(|l| std::ffi::CString::new(l.semantic).unwrap())
-            .collect();
+        let names: Vec<std::ffi::CString> = layout.iter().map(|l| std::ffi::CString::new(l.semantic).unwrap()).collect();
         let elems: Vec<D3D12_INPUT_ELEMENT_DESC> = layout
             .iter()
             .zip(&names)
@@ -837,25 +533,13 @@ pub fn draw(
             .collect();
         let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: transmute_copy(&rs),
-            VS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: vs.as_ptr() as _,
-                BytecodeLength: vs.len(),
-            },
-            PS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: ps.as_ptr() as _,
-                BytecodeLength: ps.len(),
-            },
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
             SampleMask: u32::MAX,
-            InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                pInputElementDescs: elems.as_ptr(),
-                NumElements: elems.len() as u32,
-            },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: elems.len() as u32 },
             PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
             NumRenderTargets: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         };
         pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
@@ -863,9 +547,7 @@ pub fn draw(
         pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         pd.RasterizerState.DepthClipEnable = true.into();
         pd.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        let pso: ID3D12PipelineState = dev
-            .CreateGraphicsPipelineState(&pd)
-            .map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
+        let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pd).map_err(|x| format!("CreateGraphicsPipelineState: {x}"))?;
         draw_on(dev, &pso, &rs, vertices, stride, sgprs, mem, size, clear)
     }
 }
@@ -886,23 +568,8 @@ pub fn draw_on(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    let draw = Draw {
-        sgprs: sgprs.to_vec(),
-        scissor: [0, 0, size as i32, size as i32],
-    };
-    draw_on_multi(
-        dev,
-        pso,
-        rs,
-        vertices,
-        stride,
-        &[draw],
-        mem,
-        &[],
-        &[],
-        size,
-        clear,
-    )
+    let draw = Draw { sgprs: sgprs.to_vec(), scissor: [0, 0, size as i32, size as i32] };
+    draw_on_multi(dev, pso, rs, vertices, stride, &[draw], mem, &[], &[], size, clear)
 }
 
 /// A texture in D3D12 terms (e.g. decoded from a console T# by `gpu::desc`): SRV at
@@ -922,12 +589,7 @@ pub struct Draw {
 }
 
 /// Heaps with `textures` (SRV at 2·i) and `samplers` (at j), bound on `list`.
-unsafe fn bind_views(
-    dev: &ID3D12Device,
-    list: &ID3D12GraphicsCommandList,
-    textures: &[ViewTexture],
-    samplers: &[D3D12_SAMPLER_DESC],
-) -> Result<Vec<windows::core::IUnknown>, String> {
+unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textures: &[ViewTexture], samplers: &[D3D12_SAMPLER_DESC]) -> Result<Vec<windows::core::IUnknown>, String> {
     let heap: ID3D12DescriptorHeap = dev
         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -946,81 +608,32 @@ unsafe fn bind_views(
         .map_err(e)?;
     let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
     let sinc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
-    let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
-        ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step,
-    };
+    let at = |h: &ID3D12DescriptorHeap, k: usize, step: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: h.GetCPUDescriptorHandleForHeapStart().ptr + k * step };
     for (j, sd) in samplers.iter().enumerate() {
         dev.CreateSampler(sd, at(&sheap, j, sinc));
     }
-    let mut keep: Vec<windows::core::IUnknown> =
-        vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
+    let mut keep: Vec<windows::core::IUnknown> = vec![heap.cast().map_err(e)?, sheap.cast().map_err(e)?];
     for (i, t) in textures.iter().enumerate() {
         let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let (mut rows, mut total) = (0u32, 0u64);
-        dev.GetCopyableFootprints(
-            &t.res,
-            0,
-            1,
-            0,
-            Some(&mut fp),
-            Some(&mut rows),
-            None,
-            Some(&mut total),
-        );
-        let up = buffer(
-            dev,
-            total,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
+        dev.GetCopyableFootprints(&t.res, 0, 1, 0, Some(&mut fp), Some(&mut rows), None, Some(&mut total));
+        let up = buffer(dev, total, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         up.Map(0, None, Some(&mut p)).map_err(e)?;
         for y in 0..rows as usize {
             if let Some(src) = t.data.get(y * t.row_bytes..(y + 1) * t.row_bytes) {
-                std::ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize),
-                    t.row_bytes,
-                );
+                std::ptr::copy_nonoverlapping(src.as_ptr(), (p as *mut u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), t.row_bytes);
             }
         }
         up.Unmap(0, None);
         let mut r: Option<ID3D12Resource> = None;
-        dev.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
-            D3D12_HEAP_FLAG_NONE,
-            &t.res,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-            &mut r,
-        )
-        .map_err(|x| format!("tekstura {i}: {x}"))?;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &t.res, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
+            .map_err(|x| format!("tekstura {i}: {x}"))?;
         let r = r.ok_or("tekstura")?;
-        let dst = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&r),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        let src = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&up),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: fp,
-            },
-        };
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        list.ResourceBarrier(&[transition(
-            &r,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        )]);
+        list.ResourceBarrier(&[transition(&r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
         dev.CreateShaderResourceView(&r, Some(&t.srv), at(&heap, 2 * i, inc));
         keep.push(r.cast().map_err(e)?);
         keep.push(up.cast().map_err(e)?);
@@ -1047,12 +660,8 @@ pub fn draw_on_multi(
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
     unsafe {
-        let queue: ID3D12CommandQueue = dev
-            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })
-            .map_err(e)?;
+        let queue: ID3D12CommandQueue =
+            dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
 
         let tex = D3D12_RESOURCE_DESC {
@@ -1062,23 +671,14 @@ pub fn draw_on_multi(
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
-        let cv = D3D12_CLEAR_VALUE {
-            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear },
-        };
+        let cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R32G32B32A32_FLOAT, Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear } };
         let mut rt: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             D3D12_HEAP_FLAG_NONE,
             &tex,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1088,11 +688,7 @@ pub fn draw_on_multi(
         .map_err(e)?;
         let rt = rt.ok_or("render target")?;
         let heap: ID3D12DescriptorHeap = dev
-            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 1,
-                ..Default::default()
-            })
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
             .map_err(e)?;
         let rtv = heap.GetCPUDescriptorHandleForHeapStart();
         dev.CreateRenderTargetView(&rt, None, rtv);
@@ -1109,175 +705,72 @@ pub fn draw_on_multi(
         let io_bytes = (io.len() * 4) as u64;
         let mem_len = mem.len().max(64);
         let mem_bytes = (mem_len * 4) as u64;
-        let upload = buffer(
-            dev,
-            vb_bytes + io_bytes + mem_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
+        let upload = buffer(dev, vb_bytes + io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
-        std::ptr::copy_nonoverlapping(
-            vertices.as_ptr() as *const u32,
-            p as *mut u32,
-            vertices.len(),
-        );
+        std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u32, p as *mut u32, vertices.len());
         std::ptr::copy_nonoverlapping(io.as_ptr(), (p as *mut u32).add(vertices.len()), io.len());
         let mut m = mem.to_vec();
         m.resize(mem_len, 0);
-        std::ptr::copy_nonoverlapping(
-            m.as_ptr(),
-            (p as *mut u32).add(vertices.len() + io.len()),
-            m.len(),
-        );
+        std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(vertices.len() + io.len()), m.len());
         upload.Unmap(0, None);
-        let io_buf = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let mem_buf = buffer(
-            dev,
-            mem_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let res_buf = buffer(
-            dev,
-            256,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
 
         let mut layout_fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
-        dev.GetCopyableFootprints(
-            &tex,
-            0,
-            1,
-            0,
-            Some(&mut layout_fp),
-            None,
-            None,
-            Some(&mut total),
-        );
-        let readback = buffer(
-            dev,
-            total,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            false,
-        )?;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut layout_fp), None, None, Some(&mut total));
+        let readback = buffer(dev, total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)
-            .map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, vb_bytes, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, vb_bytes + io_bytes, mem_bytes);
         list.ResourceBarrier(&[
-            transition(
-                &io_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.ClearRenderTargetView(rtv, &clear, None);
-        list.RSSetViewports(&[D3D12_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: size as f32,
-            Height: size as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        }]);
-        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: size as i32,
-            bottom: size as i32,
-        }]);
-        let _bound = if textures.is_empty() && samplers.is_empty() {
-            bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())?
-        } else {
-            bind_views(dev, &list, textures, samplers)?
-        };
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
+        let _bound = if textures.is_empty() && samplers.is_empty() { bind_resources(dev, &list, &[], &[]).map(|_| Vec::new())? } else { bind_views(dev, &list, textures, samplers)? };
         list.SetGraphicsRootSignature(rs);
         list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        let vbv = D3D12_VERTEX_BUFFER_VIEW {
-            BufferLocation: upload.GetGPUVirtualAddress(),
-            SizeInBytes: vb_bytes as u32,
-            StrideInBytes: stride,
-        };
+        let vbv = D3D12_VERTEX_BUFFER_VIEW { BufferLocation: upload.GetGPUVirtualAddress(), SizeInBytes: vb_bytes as u32, StrideInBytes: stride };
         list.IASetVertexBuffers(0, Some(&[vbv]));
         for (k, d) in draws.iter().enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(
-                0,
-                io_buf.GetGPUVirtualAddress() + (k * KERNEL_SGPRS * 4) as u64,
-            );
+            list.SetGraphicsRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress() + (k * KERNEL_SGPRS * 4) as u64);
             let [left, top, right, bottom] = d.scissor;
-            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-                left,
-                top,
-                right,
-                bottom,
-            }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left, top, right, bottom }]);
             list.DrawInstanced((vertices.len() as u32 * 4) / stride, 1, 0, 0);
         }
-        list.ResourceBarrier(&[transition(
-            &rt,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
+        list.ResourceBarrier(&[transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             pResource: transmute_copy(&readback),
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: layout_fp,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout_fp },
         };
         let src = D3D12_TEXTURE_COPY_LOCATION {
             pResource: transmute_copy(&rt),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         queue.Signal(&fence, 1).map_err(e)?;
-        let ev =
-            windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
         fence.SetEventOnCompletion(1, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if fence.GetCompletedValue() < 1 {
-            return Err(format!(
-                "GPU nie skończył w 10 s ({:?})",
-                dev.GetDeviceRemovedReason()
-            ));
+            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -1298,11 +791,7 @@ fn uav_barrier(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: unsafe { transmute_copy(r) },
-            }),
-        },
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: unsafe { transmute_copy(r) } }) },
     }
 }
 
@@ -1349,79 +838,31 @@ pub fn mesh_draw(
         let cpso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: cs.as_ptr() as _,
-                    BytecodeLength: cs.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as _, BytecodeLength: cs.len() },
                 ..Default::default()
             })
             .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let mut blend = D3D12_BLEND_DESC::default();
         blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
-        let rast = D3D12_RASTERIZER_DESC {
-            FillMode: D3D12_FILL_MODE_SOLID,
-            CullMode: D3D12_CULL_MODE_NONE,
-            DepthClipEnable: true.into(),
-            ..Default::default()
-        };
-        let mut rtv_formats = D3D12_RT_FORMAT_ARRAY {
-            NumRenderTargets: 1,
-            ..Default::default()
-        };
+        let rast = D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, DepthClipEnable: true.into(), ..Default::default() };
+        let mut rtv_formats = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
         rtv_formats.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         let mut stream = MeshStream {
-            rs: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
-                v: gpu.rs.as_raw(),
-            },
-            ms: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
-                v: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: ms.as_ptr() as _,
-                    BytecodeLength: ms.len(),
-                },
-            },
-            ps: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
-                v: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: ps.as_ptr() as _,
-                    BytecodeLength: ps.len(),
-                },
-            },
-            blend: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
-                v: blend,
-            },
-            mask: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-                v: u32::MAX,
-            },
-            rast: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
-                v: rast,
-            },
-            depth: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
-                v: D3D12_DEPTH_STENCIL_DESC::default(),
-            },
-            rtv: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
-                v: rtv_formats,
-            },
-            samples: Sub {
-                ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
-                v: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-            },
+            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: gpu.rs.as_raw() },
+            ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ms.as_ptr() as _, BytecodeLength: ms.len() } },
+            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() } },
+            blend: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, v: blend },
+            mask: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, v: u32::MAX },
+            rast: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, v: rast },
+            depth: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, v: D3D12_DEPTH_STENCIL_DESC::default() },
+            rtv: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rtv_formats },
+            samples: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, v: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 } },
         };
         let dev2: ID3D12Device2 = dev.cast().map_err(e)?;
         let mpso: ID3D12PipelineState = dev2
             .CreatePipelineState(&D3D12_PIPELINE_STATE_STREAM_DESC {
                 SizeInBytes: std::mem::size_of::<MeshStream>(),
-                pPipelineStateSubobjectStream: &mut stream as *mut MeshStream
-                    as *mut std::ffi::c_void,
+                pPipelineStateSubobjectStream: &mut stream as *mut MeshStream as *mut std::ffi::c_void,
             })
             .map_err(|x| format!("CreatePipelineState (mesh): {x}"))?;
 
@@ -1432,23 +873,14 @@ pub fn mesh_draw(
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             ..Default::default()
         };
-        let cv = D3D12_CLEAR_VALUE {
-            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-            Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear },
-        };
+        let cv = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R32G32B32A32_FLOAT, Anonymous: D3D12_CLEAR_VALUE_0 { Color: clear } };
         let mut rt: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             D3D12_HEAP_FLAG_NONE,
             &tex,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1458,11 +890,7 @@ pub fn mesh_draw(
         .map_err(e)?;
         let rt = rt.ok_or("render target")?;
         let heap: ID3D12DescriptorHeap = dev
-            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: 1,
-                ..Default::default()
-            })
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
             .map_err(e)?;
         let rtv = heap.GetCPUDescriptorHandleForHeapStart();
         dev.CreateRenderTargetView(&rt, None, rtv);
@@ -1474,13 +902,7 @@ pub fn mesh_draw(
         let mem_bytes = (mem_len * 4) as u64;
         let res_len = record_dwords * groups as usize;
         let res_bytes = (res_len * 4) as u64;
-        let upload = buffer(
-            dev,
-            io_bytes + mem_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
+        let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
         std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
@@ -1488,62 +910,22 @@ pub fn mesh_draw(
         m.resize(mem_len, 0);
         std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(io.len()), m.len());
         upload.Unmap(0, None);
-        let io_buf = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let mem_buf = buffer(
-            dev,
-            mem_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let res_buf = buffer(
-            dev,
-            res_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
         dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
-        let readback = buffer(
-            dev,
-            total + res_bytes,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            false,
-        )?;
+        let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso)
-            .map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &cpso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
         list.ResourceBarrier(&[
-            transition(
-                &io_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         // pass 1: the console program as a compute shader
         let _bound = bind_resources(dev, &list, &[], &[])?;
@@ -1561,65 +943,28 @@ pub fn mesh_draw(
         list.SetGraphicsRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.OMSetRenderTargets(1, Some(&rtv), false, None);
         list.ClearRenderTargetView(rtv, &clear, None);
-        list.RSSetViewports(&[D3D12_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: size as f32,
-            Height: size as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        }]);
-        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: size as i32,
-            bottom: size as i32,
-        }]);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
         let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
         list6.DispatchMesh(groups, 1, 1);
         list.ResourceBarrier(&[
-            transition(
-                &rt,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ),
+            transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         ]);
-        let dst = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&readback),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: fp,
-            },
-        };
-        let src = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: transmute_copy(&rt),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
         list.Close().map_err(e)?;
-        gpu.queue
-            .ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev =
-            windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!(
-                "GPU nie skończył w 10 s ({:?})",
-                dev.GetDeviceRemovedReason()
-            ));
+            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
@@ -1631,9 +976,7 @@ pub fn mesh_draw(
                 px.push([*c, *c.add(1), *c.add(2), *c.add(3)]);
             }
         }
-        let recs =
-            std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len)
-                .to_vec();
+        let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
         readback.Unmap(0, None);
         Ok((px, recs))
     }
@@ -1648,17 +991,11 @@ struct Arena {
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
+
 /// `run` with a unified memory region as `mem` (u2): the GPU works on the process memory
 /// itself, no copies.
-pub fn run_in_arena(
-    dxil: &[u8],
-    state: &KernelState,
-    arena: &crate::gpu::uma::Uma,
-) -> Result<KernelResult, String> {
-    let arena = Arena {
-        base: arena.base() as *mut u8,
-        size: arena.size(),
-    };
+pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::Uma) -> Result<KernelResult, String> {
+    let arena = Arena { base: arena.base() as *mut u8, size: arena.size() };
     let r = run_in_region(dxil, state, &arena);
     std::mem::forget(arena); // owned by the Uma
     r
@@ -1678,102 +1015,45 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     unsafe {
         let dev = &gpu.dev;
         let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
-        let heap: ID3D12Heap = dev3
-            .OpenExistingHeapFromAddress(arena.base as *const std::ffi::c_void)
-            .map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
+        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(arena.base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: arena.size as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
             ..Default::default()
         };
         let mut mem_buf: Option<ID3D12Resource> = None;
-        dev.CreatePlacedResource(
-            &heap,
-            0,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            None,
-            &mut mem_buf,
-        )
-        .map_err(|x| format!("CreatePlacedResource: {x}"))?;
+        dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
         let mem_buf = mem_buf.ok_or("arena")?;
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: dxil.as_ptr() as _,
-                    BytecodeLength: dxil.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
             .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let io_bytes = (io.len() * 4) as u64;
         let res_bytes = (KERNEL_RES_DWORDS * 4) as u64;
-        let upload = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
-        let io_buf = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let res_buf = buffer(
-            dev,
-            res_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let readback = buffer(
-            dev,
-            res_bytes,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            false,
-        )?;
+        let upload = buffer(dev, io_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let readback = buffer(dev, res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
         std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
         upload.Unmap(0, None);
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
-            .map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.ResourceBarrier(&[
-            transition(
-                &io_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
@@ -1781,51 +1061,27 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COMMON,
-            ),
+            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
         ]);
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
         list.Close().map_err(e)?;
-        gpu.queue
-            .ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev =
-            windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!(
-                "GPU nie skończył w 10 s ({:?})",
-                dev.GetDeviceRemovedReason()
-            ));
+            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let raw = std::slice::from_raw_parts(q as *const u32, KERNEL_RES_DWORDS).to_vec();
         readback.Unmap(0, None);
-        let vgpr = (0..KERNEL_LANES)
-            .map(|l| {
-                raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec()
-            })
-            .collect();
-        Ok(KernelResult {
-            sgpr: raw[..KERNEL_SGPRS].to_vec(),
-            vgpr,
-            scc: raw[KERNEL_SCC_SLOT],
-            raw,
-            mem: Vec::new(),
-            textures: Vec::new(),
-        })
+        let vgpr = (0..KERNEL_LANES).map(|l| raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec()).collect();
+        Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: Vec::new(), textures: Vec::new() })
     }
 }
 
@@ -1836,29 +1092,14 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
     let mut r: Option<ID3D12Resource> = None;
     unsafe {
         gpu.dev
-            .CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut r,
-            )
+            .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
             .map_err(|x| format!("CreateCommittedResource: {x}"))
     }
 }
 
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
-pub fn dispatch(
-    dxil: &[u8],
-    groups: [u32; 3],
-    sgprs: &[u32],
-    mem: &[u32],
-) -> Result<Vec<u32>, String> {
+pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let mut io = sgprs.to_vec();
@@ -1869,21 +1110,12 @@ pub fn dispatch(
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: dxil.as_ptr() as _,
-                    BytecodeLength: dxil.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
             .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let (io_bytes, mem_bytes) = ((io.len() * 4) as u64, (mem_len * 4) as u64);
-        let upload = buffer(
-            dev,
-            io_bytes + mem_bytes,
-            D3D12_HEAP_TYPE_UPLOAD,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            false,
-        )?;
+        let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
         upload.Map(0, None, Some(&mut p)).map_err(e)?;
         std::ptr::copy_nonoverlapping(io.as_ptr(), p as *mut u32, io.len());
@@ -1891,58 +1123,18 @@ pub fn dispatch(
         m.resize(mem_len, 0);
         std::ptr::copy_nonoverlapping(m.as_ptr(), (p as *mut u32).add(io.len()), m.len());
         upload.Unmap(0, None);
-        let io_buf = buffer(
-            dev,
-            io_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let mem_buf = buffer(
-            dev,
-            mem_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let res_buf = buffer(
-            dev,
-            256,
-            D3D12_HEAP_TYPE_DEFAULT,
-            D3D12_RESOURCE_STATE_COMMON,
-            true,
-        )?;
-        let readback = buffer(
-            dev,
-            mem_bytes,
-            D3D12_HEAP_TYPE_READBACK,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            false,
-        )?;
-        let alloc: ID3D12CommandAllocator = dev
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
-            .map_err(e)?;
+        let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let res_buf = buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let readback = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
         list.ResourceBarrier(&[
-            transition(
-                &io_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &mem_buf,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
-            transition(
-                &res_buf,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ),
+            transition(&io_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&mem_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let _bound = bind_resources(dev, &list, &[], &[])?;
         list.SetComputeRootSignature(&gpu.rs);
@@ -1950,27 +1142,18 @@ pub fn dispatch(
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
         list.Dispatch(groups[0], groups[1], groups[2]);
-        list.ResourceBarrier(&[transition(
-            &mem_buf,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COPY_SOURCE,
-        )]);
+        list.ResourceBarrier(&[transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyBufferRegion(&readback, 0, &mem_buf, 0, mem_bytes);
         list.Close().map_err(e)?;
-        gpu.queue
-            .ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
         gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev =
-            windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
+        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
         gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!(
-                "GPU nie skończył w 10 s ({:?})",
-                dev.GetDeviceRemovedReason()
-            ));
+            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;

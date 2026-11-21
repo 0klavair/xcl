@@ -9,10 +9,7 @@ use crate::config::Boot;
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
 pub fn host_main(boot_path: &Path) -> i32 {
-    let boot: Boot = match std::fs::read_to_string(boot_path)
-        .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-    {
+    let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("xcl host: nie można odczytać {}: {e}", boot_path.display());
@@ -24,16 +21,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         crate::log::Level::parse(&boot.config.log_level),
         boot.config.log_to_stderr,
     );
-    crate::xlog_info!(
-        "XCL {} – host dla '{}'",
-        env!("CARGO_PKG_VERSION"),
-        boot.title
-    );
-    crate::xlog_info!(
-        "gra: {} (folder tylko do odczytu: {})",
-        boot.exe_path.display(),
-        boot.game_root.display()
-    );
+    crate::xlog_info!("XCL {} – host dla '{}'", env!("CARGO_PKG_VERSION"), boot.title);
+    crate::xlog_info!("gra: {} (folder tylko do odczytu: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("dane XCL: {}", boot.data_dir.display());
 
     crate::state::set_boot(boot.clone());
@@ -48,17 +37,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::resolver::set_search_dirs(dirs);
 
-    let mounts: Vec<(String, String)> = boot
-        .config
-        .mounts
-        .iter()
-        .map(|(k, v)| (k.clone(), boot.expand(v)))
-        .collect();
-    crate::vfs::init(crate::vfs::Vfs::new(
-        &boot.game_root,
-        &boot.data_dir,
-        mounts,
-    ));
+    let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
+    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {

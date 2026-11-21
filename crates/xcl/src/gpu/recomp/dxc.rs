@@ -11,34 +11,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
-use windows::Win32::Graphics::Direct3D::Dxc::{
-    CLSID_DxcCompiler, DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, DXC_CP_UTF8,
-};
+use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler, DXC_CP_UTF8};
 
-type CreateInstance =
-    unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
 fn candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = std::env::var_os("XCL_DXC_DIR") {
         v.push(PathBuf::from(d));
     }
-    if let Some(d) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-    {
+    if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         v.push(d);
     }
-    for root in [
-        r"C:\Program Files (x86)\Windows Kits\10\bin",
-        r"C:\Program Files\Windows Kits\10\bin",
-    ] {
+    for root in [r"C:\Program Files (x86)\Windows Kits\10\bin", r"C:\Program Files\Windows Kits\10\bin"] {
         if let Ok(rd) = std::fs::read_dir(root) {
-            let mut vers: Vec<PathBuf> = rd
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir())
-                .collect();
+            let mut vers: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
             vers.sort();
             for ver in vers.into_iter().rev() {
                 v.push(ver.join("x64"));
@@ -112,10 +99,7 @@ fn compiler() -> Result<IDxcCompiler3, String> {
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
-    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"]
-        .iter()
-        .map(|a| crate::util::wide(a))
-        .collect();
+    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
     // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
     // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
@@ -126,37 +110,23 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
-    let buf = DxcBuffer {
-        Ptr: src.as_ptr() as *const c_void,
-        Size: src.len(),
-        Encoding: DXC_CP_UTF8.0,
-    };
+    let buf = DxcBuffer { Ptr: src.as_ptr() as *const c_void, Size: src.len(), Encoding: DXC_CP_UTF8.0 };
     unsafe {
-        let r: IDxcResult = c
-            .Compile(&buf, Some(&ptrs), None)
-            .map_err(|e| format!("Compile: {e}"))?;
+        let r: IDxcResult = c.Compile(&buf, Some(&ptrs), None).map_err(|e| format!("Compile: {e}"))?;
         let status = r.GetStatus().map_err(|e| format!("{e}"))?;
         if status.is_err() {
             let msg = r
                 .GetErrorBuffer()
                 .ok()
                 .map(|b| {
-                    let s = std::slice::from_raw_parts(
-                        b.GetBufferPointer() as *const u8,
-                        b.GetBufferSize(),
-                    );
-                    String::from_utf8_lossy(s)
-                        .trim_end_matches('\0')
-                        .to_string()
+                    let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+                    String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
                 })
                 .unwrap_or_default();
             return Err(format!("dxc: {msg}"));
         }
         let blob: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(
-            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
-                .to_vec(),
-        )
+        Ok(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
     }
 }
 
@@ -177,20 +147,13 @@ pub fn cache_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XCL_DXIL_CACHE") {
         return PathBuf::from(d);
     }
-    let base = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+    let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
     base.join("xcl").join("dxil")
 }
 
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
-pub fn compile_cached_in(
-    dir: &Path,
-    src: &str,
-    entry: &str,
-    profile: &str,
-) -> Result<(Vec<u8>, bool), String> {
+pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
     let file = dir.join(format!("{:016x}.dxil", cache_key(src, entry, profile)));
     if let Ok(b) = std::fs::read(&file) {
         if !b.is_empty() {
@@ -227,10 +190,7 @@ mod cache_tests {
         assert!(!hit);
         let (b, hit) = compile_cached_in(&dir, src, "main", "cs_6_6").unwrap();
         assert!(hit && a == b);
-        assert_ne!(
-            cache_key(src, "main", "cs_6_6"),
-            cache_key(src, "main", "cs_6_7")
-        );
+        assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

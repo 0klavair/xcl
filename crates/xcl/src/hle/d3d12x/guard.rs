@@ -29,11 +29,7 @@ unsafe extern "system" fn classify(caller: usize, info: *const StubInfo) -> usiz
 }
 
 pub fn make_guard(original: usize, info: &'static StubInfo) -> usize {
-    thunk(
-        Tail::GuardOr(original),
-        info as *const StubInfo as u64,
-        classify as usize,
-    )
+    thunk(Tail::GuardOr(original), info as *const StubInfo as u64, classify as usize)
 }
 
 unsafe extern "system" fn pick(caller: usize, targets: *const [usize; 2]) -> usize {
@@ -47,11 +43,7 @@ unsafe extern "system" fn pick(caller: usize, targets: *const [usize; 2]) -> usi
 /// A slot whose console method differs from the PC one: calls from a game image go to
 /// `console`, everything else (the runtime) to `pc`.
 pub fn make_split(console: usize, pc: usize) -> usize {
-    thunk(
-        Tail::JumpToResult,
-        Box::leak(Box::new([console, pc])) as *const [usize; 2] as u64,
-        pick as usize,
-    )
+    thunk(Tail::JumpToResult, Box::leak(Box::new([console, pc])) as *const [usize; 2] as u64, pick as usize)
 }
 
 enum Tail {
@@ -63,22 +55,14 @@ enum Tail {
 
 unsafe extern "system" fn trace(caller: usize, name: *const String) -> usize {
     if crate::modules::image_base_for_addr(caller).is_some() {
-        crate::xlog_info!(
-            "D3D12 trace: {} ← {}",
-            *name,
-            crate::modules::describe_address(caller)
-        );
+        crate::xlog_info!("D3D12 trace: {} ← {}", *name, crate::modules::describe_address(caller));
     }
     0
 }
 
 /// Like a guard, but always forwards: calls from a game image are logged (`XCL_D3D12_TRACE`).
 pub fn make_tracer(original: usize, name: String) -> usize {
-    thunk(
-        Tail::GuardOr(original),
-        Box::leak(Box::new(name)) as *const String as u64,
-        trace as usize,
-    )
+    thunk(Tail::GuardOr(original), Box::leak(Box::new(name)) as *const String as u64, trace as usize)
 }
 
 /// Thunk: `decide(return address, data)` with all argument registers preserved, then `tail`.
@@ -138,8 +122,7 @@ mod tests {
     #[test]
     fn split_sends_non_game_callers_to_the_pc_method() {
         let s = make_split(console as usize, original as usize);
-        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 =
-            unsafe { std::mem::transmute(s) };
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(s) };
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
     }
 
@@ -147,8 +130,7 @@ mod tests {
     fn guard_forwards_calls_that_do_not_come_from_a_game_image() {
         let info = stubs::new_info("unit.dll", "IGuard::#7", 0);
         let g = make_guard(original as usize, info);
-        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 =
-            unsafe { std::mem::transmute(g) };
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(g) };
         // all integer args, a stack arg and a float arg survive the round trip
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
         assert_eq!(info.calls.load(std::sync::atomic::Ordering::Relaxed), 0);

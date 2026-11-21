@@ -45,18 +45,8 @@ pub fn scan(d: &[u8], from: usize) -> Vec<Record> {
             && (d[i + 1].is_ascii_alphabetic() || d[i + 1] == b'_')
             && d[i + 2..p].iter().all(|&c| ident(c))
         {
-            let (c1, c2, u) = (
-                rd32(d, p + 2) as usize,
-                rd32(d, p + 10) as usize,
-                rd32(d, p + 14) as usize,
-            );
-            if c1 == c2
-                && c1 > 0
-                && c1 < 16 << 20
-                && u > 0
-                && u < 64 << 20
-                && p + 18 + c1 <= d.len()
-            {
+            let (c1, c2, u) = (rd32(d, p + 2) as usize, rd32(d, p + 10) as usize, rd32(d, p + 14) as usize);
+            if c1 == c2 && c1 > 0 && c1 < 16 << 20 && u > 0 && u < 64 << 20 && p + 18 + c1 <= d.len() {
                 out.push(Record {
                     name: String::from_utf8_lossy(&d[i + 1..p]).into_owned(),
                     offset: i,
@@ -82,9 +72,7 @@ pub fn inflate(d: &[u8], r: &Record) -> Option<Vec<u8>> {
 /// Stage prefix of a shader name (`PS_Foo` → `PS`).
 pub fn name_stage(name: &str) -> Option<&'static str> {
     let up = name.get(..2)?.to_ascii_uppercase();
-    ["PS", "VS", "MS", "GS", "CS", "HS", "DS", "AS"]
-        .into_iter()
-        .find(|s| *s == up)
+    ["PS", "VS", "MS", "GS", "CS", "HS", "DS", "AS"].into_iter().find(|s| *s == up)
 }
 
 #[cfg(test)]
@@ -97,12 +85,7 @@ mod tests {
         v.extend_from_slice(name.as_bytes());
         v.push(0);
         v.push(50);
-        for x in [
-            z.len() as u32,
-            0xddce7,
-            z.len() as u32,
-            payload.len() as u32,
-        ] {
+        for x in [z.len() as u32, 0xddce7, z.len() as u32, payload.len() as u32] {
             v.extend_from_slice(&x.to_le_bytes());
         }
         v.extend_from_slice(&z);
@@ -113,22 +96,13 @@ mod tests {
     fn finds_records_between_noise() {
         let mut pack = b"9FPR".to_vec();
         pack.resize(0x40, 0xAA);
-        let a = crate::gpu::xbox::tests::sample(
-            0,
-            &[crate::gpu::xbox::tests::fssm(
-                &crate::gpu::xbox::tests::CODE,
-                &[(5, 1)],
-            )],
-        );
+        let a = crate::gpu::xbox::tests::sample(0, &[crate::gpu::xbox::tests::fssm(&crate::gpu::xbox::tests::CODE, &[(5, 1)])]);
         pack.extend(record("PS_Test_1234abcd_Wrapped", &a));
         pack.extend_from_slice(&[0x13, 0x37, 0, 1, 2, 3]);
         pack.extend(record("VS_Other", b"DXBC-not-really"));
         pack.extend_from_slice(&[0u8; 40]);
         let recs = scan(&pack, 0x40);
-        assert_eq!(
-            recs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            vec!["PS_Test_1234abcd_Wrapped", "VS_Other"]
-        );
+        assert_eq!(recs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["PS_Test_1234abcd_Wrapped", "VS_Other"]);
         assert_eq!(inflate(&pack, &recs[0]).unwrap(), a);
         assert_eq!(recs[0].flag, 50);
         assert_eq!(name_stage(&recs[0].name), Some("PS"));

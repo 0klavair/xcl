@@ -103,12 +103,8 @@ fn is_device(p: &str) -> bool {
         return true;
     }
     let base = l.trim_end_matches(':');
-    matches!(
-        base,
-        "con" | "nul" | "prn" | "aux" | "conin$" | "conout$" | "clock$"
-    ) || (base.len() == 4
-        && (base.starts_with("com") || base.starts_with("lpt"))
-        && base.as_bytes()[3].is_ascii_digit())
+    matches!(base, "con" | "nul" | "prn" | "aux" | "conin$" | "conout$" | "clock$")
+        || (base.len() == 4 && (base.starts_with("com") || base.starts_with("lpt")) && base.as_bytes()[3].is_ascii_digit())
 }
 
 /// Full path via GetFullPathNameW (no file system access).
@@ -116,27 +112,13 @@ pub fn full_path(p: &str) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
     let w = crate::util::wide(p);
     let mut buf = vec![0u16; 1024];
-    let n = unsafe {
-        GetFullPathNameW(
-            w.as_ptr(),
-            buf.len() as u32,
-            buf.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    } as usize;
+    let n = unsafe { GetFullPathNameW(w.as_ptr(), buf.len() as u32, buf.as_mut_ptr(), std::ptr::null_mut()) } as usize;
     if n == 0 {
         return None;
     }
     if n > buf.len() {
         buf.resize(n + 1, 0);
-        let n2 = unsafe {
-            GetFullPathNameW(
-                w.as_ptr(),
-                buf.len() as u32,
-                buf.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        } as usize;
+        let n2 = unsafe { GetFullPathNameW(w.as_ptr(), buf.len() as u32, buf.as_mut_ptr(), std::ptr::null_mut()) } as usize;
         return (n2 > 0).then(|| String::from_utf16_lossy(&buf[..n2]));
     }
     Some(String::from_utf16_lossy(&buf[..n]))
@@ -152,23 +134,11 @@ impl Vfs {
         let overlay_dir = data_dir.join("overlay");
         let whiteout_file = overlay_dir.join(".xcl_whiteouts");
         let whiteouts = std::fs::read_to_string(&whiteout_file)
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
             .unwrap_or_default();
         let mut mounts: Vec<(String, String)> = mounts
             .into_iter()
-            .map(|(p, t)| {
-                (
-                    p.to_ascii_lowercase()
-                        .trim_end_matches(['\\', '/'])
-                        .to_string(),
-                    trim_sep(&norm(&t)),
-                )
-            })
+            .map(|(p, t)| (p.to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string(), trim_sep(&norm(&t))))
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -203,11 +173,7 @@ impl Vfs {
                 continue;
             }
             let tail = rest.trim_start_matches('\\');
-            return Some(if tail.is_empty() {
-                target.clone()
-            } else {
-                format!("{target}\\{tail}")
-            });
+            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
         }
         // Embedded "...\GAME:\rest": some runtimes treat "GAME:\x" as a relative path and
         // prepend the current directory. A component ending in ':' is never a valid file
@@ -224,11 +190,7 @@ impl Vfs {
                 let rest = &p[after..];
                 if rest.is_empty() || rest.starts_with('\\') {
                     let tail = rest.trim_start_matches('\\');
-                    return Some(if tail.is_empty() {
-                        target.clone()
-                    } else {
-                        format!("{target}\\{tail}")
-                    });
+                    return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
                 }
                 from = after;
             }
@@ -266,9 +228,7 @@ impl Vfs {
                 }
             }
         }
-        let Some(abs) = full(&p) else {
-            return Target::Pass;
-        };
+        let Some(abs) = full(&p) else { return Target::Pass };
         let abs = trim_sep(&strip_verbatim(&norm(&abs)));
         let lc = abs.to_lowercase();
         if lc == self.game_root_lc {
@@ -276,9 +236,7 @@ impl Vfs {
         }
         if let Some(rest) = lc.strip_prefix(&self.game_root_lc) {
             if rest.starts_with('\\') {
-                return Target::Game {
-                    rel: abs[self.game_root.len() + 1..].to_string(),
-                };
+                return Target::Game { rel: abs[self.game_root.len() + 1..].to_string() };
             }
         }
         if translated {
@@ -436,13 +394,7 @@ impl Vfs {
             || flags & FILE_FLAG_DELETE_ON_CLOSE != 0
     }
 
-    pub fn open_decision_for(
-        &self,
-        target: Target,
-        access: u32,
-        disposition: u32,
-        flags: u32,
-    ) -> Decision {
+    pub fn open_decision_for(&self, target: Target, access: u32, disposition: u32, flags: u32) -> Decision {
         match target {
             Target::Pass => Decision::Pass,
             Target::Translated(p) => {
@@ -457,8 +409,7 @@ impl Vfs {
                 let in_ov = self.visible_in_overlay(&rel);
                 let in_orig = self.visible_in_original(&rel);
                 let visible = in_ov || in_orig;
-                let write = Self::is_write(access, disposition, flags)
-                    || (disposition == OPEN_ALWAYS && !visible);
+                let write = Self::is_write(access, disposition, flags) || (disposition == OPEN_ALWAYS && !visible);
                 if !write {
                     return match self.read_path_rel(&rel) {
                         Some(p) => Decision::Use(p),
@@ -467,9 +418,7 @@ impl Vfs {
                 }
                 match disposition {
                     CREATE_NEW if visible => return Decision::Fail(ERROR_FILE_EXISTS),
-                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => {
-                        return Decision::Fail(ERROR_FILE_NOT_FOUND)
-                    }
+                    OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
                     _ => {}
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
@@ -535,25 +484,15 @@ impl Vfs {
     }
 
     pub fn unmapped_paths(&self) -> Vec<String> {
-        self.unmapped
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default()
+        self.unmapped.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
     }
 
     pub fn redirected_writes(&self) -> Vec<String> {
-        self.writes
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default()
+        self.writes.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
     }
 
     pub fn whiteouts(&self) -> Vec<String> {
-        let mut v: Vec<String> = self
-            .whiteouts
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default();
+        let mut v: Vec<String> = self.whiteouts.lock().map(|g| g.iter().cloned().collect()).unwrap_or_default();
         v.sort();
         v
     }
@@ -580,10 +519,7 @@ mod tests {
             let mounts = vec![
                 ("G:".to_string(), game.to_string_lossy().to_string()),
                 ("GAME:".to_string(), game.to_string_lossy().to_string()),
-                (
-                    "T:".to_string(),
-                    data.join("temp").to_string_lossy().to_string(),
-                ),
+                ("T:".to_string(), data.join("temp").to_string_lossy().to_string()),
             ];
             let vfs = Vfs::new(&game, &data, mounts);
             Fixture { dir, vfs }
@@ -603,49 +539,17 @@ mod tests {
     fn mounts_and_classification() {
         let f = Fixture::new("cls");
         let v = &f.vfs;
-        assert_eq!(
-            v.classify("G:\\data\\hello.txt"),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
-        assert_eq!(
-            v.classify("g:/data/hello.txt"),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
-        assert_eq!(
-            v.classify("GAME:\\data\\hello.txt"),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
+        assert_eq!(v.classify("G:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("g:/data/hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("GAME:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("G:\\"), Target::Game { rel: String::new() });
         // "GAME:\x" absolutised by a runtime as if it were relative
         let mangled = format!("\\\\?\\{}\\GAME:\\data\\hello.txt", f.game().display());
-        assert_eq!(
-            v.classify(&mangled),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
-        assert_eq!(
-            v.classify("C:\\somewhere\\G:\\data\\hello.txt"),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
+        assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
+        assert_eq!(v.classify("C:\\somewhere\\G:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         let real = f.game().join("data").join("hello.txt");
-        assert_eq!(
-            v.classify(&real.to_string_lossy()),
-            Target::Game {
-                rel: "data\\hello.txt".into()
-            }
-        );
-        assert!(
-            matches!(v.classify("T:\\scratch.bin"), Target::Translated(p) if p.ends_with("xcldata\\temp\\scratch.bin"))
-        );
+        assert_eq!(v.classify(&real.to_string_lossy()), Target::Game { rel: "data\\hello.txt".into() });
+        assert!(matches!(v.classify("T:\\scratch.bin"), Target::Translated(p) if p.ends_with("xcldata\\temp\\scratch.bin")));
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
@@ -663,36 +567,21 @@ mod tests {
         );
         // write → overlay copy with original content
         let d = v.open_decision("G:\\data\\hello.txt", 0x4000_0000, OPEN_EXISTING, 0);
-        let Decision::Use(ov) = d else {
-            panic!("{d:?}")
-        };
+        let Decision::Use(ov) = d else { panic!("{d:?}") };
         assert!(ov.contains("overlay"));
         assert_eq!(std::fs::read(&ov).unwrap(), b"original");
         std::fs::write(&ov, b"modified").unwrap();
         // later reads see the overlay
-        assert_eq!(
-            v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0),
-            Decision::Use(ov.clone())
-        );
+        assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(ov.clone()));
         // original untouched
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
         // CREATE_ALWAYS on a new file → overlay, nothing created in the game folder
-        let Decision::Use(newp) =
-            v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0)
-        else {
-            panic!()
-        };
+        let Decision::Use(newp) = v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
         assert!(newp.contains("overlay"));
         assert!(!f.game().join("data").join("new.bin").exists());
         // CREATE_NEW on an existing file fails
-        assert_eq!(
-            v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0),
-            Decision::Fail(ERROR_FILE_EXISTS)
-        );
-        assert_eq!(
-            v.redirected_writes(),
-            vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]
-        );
+        assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
+        assert_eq!(v.redirected_writes(), vec!["data\\hello.txt".to_string(), "data\\new.bin".to_string()]);
     }
 
     #[test]
@@ -700,24 +589,15 @@ mod tests {
         let f = Fixture::new("wo");
         let v = &f.vfs;
         assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
-        assert!(
-            f.game().join("data").join("gone.txt").exists(),
-            "original must stay"
-        );
-        assert_eq!(
-            v.open_decision("G:\\data\\gone.txt", 0x8000_0000, OPEN_EXISTING, 0),
-            Decision::Fail(ERROR_FILE_NOT_FOUND)
-        );
+        assert!(f.game().join("data").join("gone.txt").exists(), "original must stay");
+        assert_eq!(v.open_decision("G:\\data\\gone.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Fail(ERROR_FILE_NOT_FOUND));
         assert_eq!(v.delete_file("data\\gone.txt"), Err(ERROR_FILE_NOT_FOUND));
         assert!(v.needs_merge("data"));
         // persisted
         let v2 = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
         assert!(v2.is_whiteout("data\\gone.txt"));
         // re-creating the file un-hides it (in the overlay)
-        let Decision::Use(p) = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0)
-        else {
-            panic!()
-        };
+        let Decision::Use(p) = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
         assert!(p.contains("overlay"));
         assert!(!v.is_whiteout("data\\gone.txt"));
     }
@@ -732,9 +612,6 @@ mod tests {
         assert!(v.visible_in_overlay("saves\\slot1"));
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(f.game().join("data").exists());
-        assert!(
-            v.is_whiteout("data\\hello.txt"),
-            "children of a removed dir are hidden"
-        );
+        assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
     }
 }

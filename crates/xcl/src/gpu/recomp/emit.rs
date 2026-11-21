@@ -3,10 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{
-    ps_input_vgpr, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES,
-    KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER,
-};
+use super::{ps_input_vgpr, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -42,32 +39,10 @@ pub(super) struct Em {
 
 /// Instructions without an effect in this execution model.
 const NOOPS: &[&str] = &[
-    "s_nop",
-    "s_waitcnt",
-    "s_waitcnt_vscnt",
-    "s_waitcnt_vmcnt",
-    "s_waitcnt_expcnt",
-    "s_waitcnt_lgkmcnt",
-    "s_waitcnt_depctr",
-    "s_inst_prefetch",
-    "s_clause",
-    "s_code_end",
-    "s_setprio",
-    "s_sleep",
-    "s_icache_inv",
-    "s_dcache_inv",
-    "s_gl1_inv",
-    "s_ttracedata",
-    "s_ttracedata_imm",
-    "v_nop",
-    "s_denorm_mode",
-    "s_round_mode",
-    "s_setreg_imm32_b32",
-    "s_setreg_b32",
-    "s_sendmsg",
-    "s_sendmsghalt",
-    "s_set_gpr_idx_off",
-    "s_version",
+    "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
+    "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
+    "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_round_mode", "s_setreg_imm32_b32", "s_setreg_b32", "s_sendmsg", "s_sendmsghalt",
+    "s_set_gpr_idx_off", "s_version",
 ];
 
 fn sname(code: u64) -> Option<String> {
@@ -148,9 +123,7 @@ fn ext_encoding(d: &Decoded) -> Option<&'static Encoding> {
 fn dpp16_src(ctrl: u64) -> Option<String> {
     let n = ctrl & 15;
     Some(match ctrl {
-        0x000..=0x0FF => {
-            format!("(int)((lane_id & ~3u) | (({ctrl}u >> (2u * (lane_id & 3u))) & 3u))")
-        }
+        0x000..=0x0FF => format!("(int)((lane_id & ~3u) | (({ctrl}u >> (2u * (lane_id & 3u))) & 3u))"),
         0x101..=0x10F => format!("(((lane_id & 15u) + {n}u < 16u) ? (int)(lane_id + {n}u) : -1)"),
         0x111..=0x11F => format!("(((lane_id & 15u) >= {n}u) ? (int)(lane_id - {n}u) : -1)"),
         0x121..=0x12F => format!("(int)((lane_id & ~15u) | (((lane_id & 15u) - {n}u) & 15u))"),
@@ -180,16 +153,10 @@ fn buffer_op(name: &str) -> Option<(BufKind, u64)> {
             _ => return None,
         })
     };
-    if let Some(r) = name
-        .strip_prefix("buffer_load_format_")
-        .or_else(|| name.strip_prefix("tbuffer_load_format_"))
-    {
+    if let Some(r) = name.strip_prefix("buffer_load_format_").or_else(|| name.strip_prefix("tbuffer_load_format_")) {
         return Some((BufKind::FormatLoad, n(r)?));
     }
-    if let Some(r) = name
-        .strip_prefix("buffer_store_format_")
-        .or_else(|| name.strip_prefix("tbuffer_store_format_"))
-    {
+    if let Some(r) = name.strip_prefix("buffer_store_format_").or_else(|| name.strip_prefix("tbuffer_store_format_")) {
         return Some((BufKind::FormatStore, n(r)?));
     }
     if let Some(r) = name.strip_prefix("buffer_load_") {
@@ -203,84 +170,17 @@ fn buffer_op(name: &str) -> Option<(BufKind, u64)> {
 
 /// GFX10 unified buffer formats (index = FORMAT value; LLVM `UfmtSymbolicGFX10`).
 pub const BUF_FORMATS: [&str; 78] = [
-    "INVALID",
-    "8_UNORM",
-    "8_SNORM",
-    "8_USCALED",
-    "8_SSCALED",
-    "8_UINT",
-    "8_SINT",
-    "16_UNORM",
-    "16_SNORM",
-    "16_USCALED",
-    "16_SSCALED",
-    "16_UINT",
-    "16_SINT",
-    "16_FLOAT",
-    "8_8_UNORM",
-    "8_8_SNORM",
-    "8_8_USCALED",
-    "8_8_SSCALED",
-    "8_8_UINT",
-    "8_8_SINT",
-    "32_UINT",
-    "32_SINT",
-    "32_FLOAT",
-    "16_16_UNORM",
-    "16_16_SNORM",
-    "16_16_USCALED",
-    "16_16_SSCALED",
-    "16_16_UINT",
-    "16_16_SINT",
-    "16_16_FLOAT",
-    "10_11_11_UNORM",
-    "10_11_11_SNORM",
-    "10_11_11_USCALED",
-    "10_11_11_SSCALED",
-    "10_11_11_UINT",
-    "10_11_11_SINT",
-    "10_11_11_FLOAT",
-    "11_11_10_UNORM",
-    "11_11_10_SNORM",
-    "11_11_10_USCALED",
-    "11_11_10_SSCALED",
-    "11_11_10_UINT",
-    "11_11_10_SINT",
-    "11_11_10_FLOAT",
-    "10_10_10_2_UNORM",
-    "10_10_10_2_SNORM",
-    "10_10_10_2_USCALED",
-    "10_10_10_2_SSCALED",
-    "10_10_10_2_UINT",
-    "10_10_10_2_SINT",
-    "2_10_10_10_UNORM",
-    "2_10_10_10_SNORM",
-    "2_10_10_10_USCALED",
-    "2_10_10_10_SSCALED",
-    "2_10_10_10_UINT",
-    "2_10_10_10_SINT",
-    "8_8_8_8_UNORM",
-    "8_8_8_8_SNORM",
-    "8_8_8_8_USCALED",
-    "8_8_8_8_SSCALED",
-    "8_8_8_8_UINT",
-    "8_8_8_8_SINT",
-    "32_32_UINT",
-    "32_32_SINT",
-    "32_32_FLOAT",
-    "16_16_16_16_UNORM",
-    "16_16_16_16_SNORM",
-    "16_16_16_16_USCALED",
-    "16_16_16_16_SSCALED",
-    "16_16_16_16_UINT",
-    "16_16_16_16_SINT",
-    "16_16_16_16_FLOAT",
-    "32_32_32_UINT",
-    "32_32_32_SINT",
-    "32_32_32_FLOAT",
-    "32_32_32_32_UINT",
-    "32_32_32_32_SINT",
-    "32_32_32_32_FLOAT",
+    "INVALID", "8_UNORM", "8_SNORM", "8_USCALED", "8_SSCALED", "8_UINT", "8_SINT", "16_UNORM", "16_SNORM", "16_USCALED",
+    "16_SSCALED", "16_UINT", "16_SINT", "16_FLOAT", "8_8_UNORM", "8_8_SNORM", "8_8_USCALED", "8_8_SSCALED", "8_8_UINT", "8_8_SINT",
+    "32_UINT", "32_SINT", "32_FLOAT", "16_16_UNORM", "16_16_SNORM", "16_16_USCALED", "16_16_SSCALED", "16_16_UINT", "16_16_SINT",
+    "16_16_FLOAT", "10_11_11_UNORM", "10_11_11_SNORM", "10_11_11_USCALED", "10_11_11_SSCALED", "10_11_11_UINT", "10_11_11_SINT",
+    "10_11_11_FLOAT", "11_11_10_UNORM", "11_11_10_SNORM", "11_11_10_USCALED", "11_11_10_SSCALED", "11_11_10_UINT", "11_11_10_SINT",
+    "11_11_10_FLOAT", "10_10_10_2_UNORM", "10_10_10_2_SNORM", "10_10_10_2_USCALED", "10_10_10_2_SSCALED", "10_10_10_2_UINT",
+    "10_10_10_2_SINT", "2_10_10_10_UNORM", "2_10_10_10_SNORM", "2_10_10_10_USCALED", "2_10_10_10_SSCALED", "2_10_10_10_UINT",
+    "2_10_10_10_SINT", "8_8_8_8_UNORM", "8_8_8_8_SNORM", "8_8_8_8_USCALED", "8_8_8_8_SSCALED", "8_8_8_8_UINT", "8_8_8_8_SINT",
+    "32_32_UINT", "32_32_SINT", "32_32_FLOAT", "16_16_16_16_UNORM", "16_16_16_16_SNORM", "16_16_16_16_USCALED",
+    "16_16_16_16_SSCALED", "16_16_16_16_UINT", "16_16_16_16_SINT", "16_16_16_16_FLOAT", "32_32_32_UINT", "32_32_32_SINT",
+    "32_32_32_FLOAT", "32_32_32_32_UINT", "32_32_32_32_SINT", "32_32_32_32_FLOAT",
 ];
 
 /// Packed format info for the HLSL table: component count [2:0], numeric type [5:3]
@@ -289,9 +189,7 @@ pub const BUF_FORMATS: [&str; 78] = [
 /// at [8 + 6k +: 6].
 pub fn buf_format_info(idx: usize) -> u32 {
     let name = BUF_FORMATS[idx];
-    let Some((sizes, ty)) = name.rsplit_once('_') else {
-        return 0;
-    };
+    let Some((sizes, ty)) = name.rsplit_once('_') else { return 0 };
     let ty = match ty {
         "UNORM" => 0,
         "SNORM" => 1,
@@ -367,10 +265,7 @@ impl Em {
 
     fn unsupported(&mut self, d: &Decoded, why: &str) {
         let m = rdna2::mnemonic(d);
-        *self
-            .unsupported_why
-            .entry(format!("{m}: {why}"))
-            .or_default() += 1;
+        *self.unsupported_why.entry(format!("{m}: {why}")).or_default() += 1;
         *self.unsupported.entry(m).or_default() += 1;
         let txt = rdna2::format(d);
         self.line(&format!("/* NIEOBSŁUGIWANE ({why}): {txt} */"));
@@ -554,9 +449,7 @@ impl Em {
             Dst::V(n) => {
                 let (a, b) = (self.vreg(*n), self.vreg(*n + 1));
                 let act = self.act();
-                self.line(&format!(
-                    "{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"
-                ));
+                self.line(&format!("{a} = select({act}, {lo}, {a}); {b} = select({act}, {hi}, {b});"));
             }
             Dst::S(n) => {
                 let (a, b) = (self.sreg(*n), self.sreg(*n + 1));
@@ -602,8 +495,7 @@ impl Em {
             }
         }
         // s_sendmsg is a no-op except GS_ALLOC_REQ (mesh) and GS emit/cut (geometry)
-        let mesh_msg =
-            name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
+        let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
         if NOOPS.contains(&name.as_str()) && !mesh_msg {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
@@ -647,10 +539,7 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
-                if matches!(
-                    self.opt.mode,
-                    Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)
-                ) {
+                if matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
                     self.line("GroupMemoryBarrierWithGroupSync();");
                 }
                 Flow::Next
@@ -714,10 +603,7 @@ impl Em {
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
-        let dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::Null);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let simm = || rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
         let base = name.trim_end_matches("_b32").trim_end_matches("_b64");
         // SOPK: SDST is also the first source
@@ -733,20 +619,13 @@ impl Em {
                 "s_addk_i32" => {
                     let t = self.t();
                     self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
-                    self.line(&format!(
-                        "scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);",
-                        hex(k_s)
-                    ));
+                    self.line(&format!("scc = ((({cur} ^ {t}) & ({} ^ {t})) >> 31);", hex(k_s)));
                     self.write32(&dst, &t);
                 }
                 "s_mulk_i32" => self.write32(&dst, &format!("(uint)((int){cur} * {})", k_s as i32)),
                 _ if name.starts_with("s_cmpk_") => {
                     let (op, signed) = cmp_op(&name[7..]).ok_or("porównanie")?;
-                    let (a, b) = if signed {
-                        (format!("(int){cur}"), format!("{}", k_s as i32))
-                    } else {
-                        (cur.clone(), format!("{k_u}u"))
-                    };
+                    let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
                     self.line(&format!("scc = (uint)({a} {op} {b});"));
                 }
                 _ => return Err("SOPK"),
@@ -756,40 +635,25 @@ impl Em {
         if d.enc.name == "ENC_SOPC" {
             let a64 = name.ends_with("_u64");
             if a64 {
-                let (a, b) = (
-                    self.read64(d, ins[0]).ok_or("op")?,
-                    self.read64(d, ins[1]).ok_or("op")?,
-                );
+                let (a, b) = (self.read64(d, ins[0]).ok_or("op")?, self.read64(d, ins[1]).ok_or("op")?);
                 let op = match name {
                     "s_cmp_eq_u64" => "==",
                     "s_cmp_lg_u64" => "!=",
                     _ => return Err("SOPC"),
                 };
                 let j = if op == "==" { "&&" } else { "||" };
-                self.line(&format!(
-                    "scc = (uint)({} {op} {} {j} {} {op} {});",
-                    a.0, b.0, a.1, b.1
-                ));
+                self.line(&format!("scc = (uint)({} {op} {} {j} {} {op} {});", a.0, b.0, a.1, b.1));
                 return Ok(());
             }
-            let (a, b) = (
-                self.read(d, ins[0], false).ok_or("op")?,
-                self.read(d, ins[1], false).ok_or("op")?,
-            );
+            let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
             if let Some(rest) = name.strip_prefix("s_cmp_") {
                 let (op, signed) = cmp_op(rest).ok_or("porównanie")?;
-                let (a, b) = if signed {
-                    (format!("(int){a}"), format!("(int){b}"))
-                } else {
-                    (a, b)
-                };
+                let (a, b) = if signed { (format!("(int){a}"), format!("(int){b}")) } else { (a, b) };
                 self.line(&format!("scc = (uint)({a} {op} {b});"));
                 return Ok(());
             }
             match name {
-                "s_bitcmp0_b32" => {
-                    self.line(&format!("scc = (uint)((({a} >> ({b} & 31u)) & 1u) == 0u);"))
-                }
+                "s_bitcmp0_b32" => self.line(&format!("scc = (uint)((({a} >> ({b} & 31u)) & 1u) == 0u);")),
                 "s_bitcmp1_b32" => self.line(&format!("scc = (({a} >> ({b} & 31u)) & 1u);")),
                 _ => return Err("SOPC"),
             }
@@ -815,30 +679,19 @@ impl Em {
                     _ => return None,
                 })
             };
-            let (nl, nh) = (
-                op(&s0.0, &el).ok_or("saveexec")?,
-                op(&s0.1, &eh).ok_or("saveexec")?,
-            );
+            let (nl, nh) = (op(&s0.0, &el).ok_or("saveexec")?, op(&s0.1, &eh).ok_or("saveexec")?);
             let (t0, t1, o0, o1) = (self.t(), self.t(), self.t(), self.t());
             self.line(&format!("uint {o0} = {el}; uint {o1} = {eh};"));
             self.line(&format!("uint {t0} = {nl}; uint {t1} = {nh};"));
             if !self.opt.wave64 || name.ends_with("_b32") {
                 self.line(&format!("{el} = {t0};"));
                 self.line(&format!("scc = (uint)({t0} != 0u);"));
-                let v = if name.contains("wrexec") {
-                    t0.clone()
-                } else {
-                    o0.clone()
-                };
+                let v = if name.contains("wrexec") { t0.clone() } else { o0.clone() };
                 self.write32(&dst, &v);
             } else {
                 self.line(&format!("{el} = {t0}; {eh} = {t1};"));
                 self.line(&format!("scc = (uint)(({t0} | {t1}) != 0u);"));
-                let (a, b) = if name.contains("wrexec") {
-                    (t0, t1)
-                } else {
-                    (o0, o1)
-                };
+                let (a, b) = if name.contains("wrexec") { (t0, t1) } else { (o0, o1) };
                 self.write64(&dst, &a, &b);
             }
             return Ok(());
@@ -850,10 +703,7 @@ impl Em {
             let (sd, s0) = (Self::field(d, "SDST"), Self::field(d, "SSRC0"));
             if name == "s_swappc_b64" && sd == s0 {
                 self.line("/* wywołanie fetch shadera – atrybuty wejściowe są już w VGPR */");
-                *self
-                    .ignored
-                    .entry("s_swappc_b64 (fetch shader)".into())
-                    .or_default() += 1;
+                *self.ignored.entry("s_swappc_b64 (fetch shader)".into()).or_default() += 1;
                 return Ok(());
             }
             return Err("skok pośredni");
@@ -954,13 +804,7 @@ impl Em {
         Ok(())
     }
 
-    fn salu64(
-        &mut self,
-        d: &Decoded,
-        name: &str,
-        dst: &Dst,
-        ins: &[&Operand],
-    ) -> Result<(), &'static str> {
+    fn salu64(&mut self, d: &Decoded, name: &str, dst: &Dst, ins: &[&Operand]) -> Result<(), &'static str> {
         let a = match ins.first() {
             Some(o) => Some(self.read64(d, o).ok_or("op")?),
             None => None,
@@ -1052,10 +896,7 @@ impl Em {
     // ---------------------------------------------------------------- memory (flat model)
 
     fn smem(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
-        let count = match name
-            .trim_start_matches("s_buffer_load_")
-            .trim_start_matches("s_load_")
-        {
+        let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
             "dword" => 1,
             "dwordx2" => 2,
             "dwordx4" => 4,
@@ -1067,11 +908,7 @@ impl Em {
         let sbase = Self::field(d, "SBASE");
         let imm = rdna2::field_value(d.enc, &d.words, "OFFSET").unwrap_or(0) as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
-        let soff = if soff == 125 {
-            "0u".to_string()
-        } else {
-            self.code32(soff, None, false).ok_or("op")?
-        };
+        let soff = if soff == 125 { "0u".to_string() } else { self.code32(soff, None, false).ok_or("op")? };
         let t = self.t();
         let mut vals = Vec::new();
         if name.starts_with("s_buffer_load") {
@@ -1127,43 +964,24 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2, d3) = (
-            self.sreg(srsrc),
-            self.sreg(srsrc + 1),
-            self.sreg(srsrc + 2),
-            self.sreg(srsrc + 3),
-        );
+        let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
-        let voff = if offen {
-            self.vreg(vaddr + idxen as u64)
-        } else {
-            "0u".into()
-        };
+        let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!(
-            "uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"
-        ));
+        self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         let act = self.act();
-        let in_range = |bytes: String| {
-            format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
-        };
+        let in_range = |bytes: String| format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})");
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
             let v = self.vreg(vdata);
             if store {
-                self.line(&format!(
-                    "if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"
-                ));
+                self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
                 let bits = 8 * n;
                 let val = if signed {
-                    format!(
-                        "(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)",
-                        32 - bits,
-                        32 - bits
-                    )
+                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
                     format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
                 };
@@ -1177,10 +995,7 @@ impl Em {
                 for i in 0..count {
                     let ok = in_range(format!("{}u", 4 * i + 4));
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!(
-                        "{v} = {ok} ? mem.Load(({t}_a + {}u) & ~3u) : 0u;",
-                        4 * i
-                    ));
+                    assigns.push(format!("{v} = {ok} ? mem.Load(({t}_a + {}u) & ~3u) : 0u;", 4 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -1189,26 +1004,16 @@ impl Em {
                 for i in 0..count {
                     let ok = in_range(format!("{}u", 4 * i + 4));
                     let v = self.vreg(vdata + i);
-                    st.push(format!(
-                        "if ({ok}) mem.Store(({t}_a + {}u) & ~3u, {v});",
-                        4 * i
-                    ));
+                    st.push(format!("if ({ok}) mem.Store(({t}_a + {}u) & ~3u, {v});", 4 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             }
             BufKind::FormatLoad => {
                 // format from the instruction (tbuffer) or from the V# (dword3 [18:12]); DST_SEL from the V#
-                let fmt = if d.enc.name == "ENC_MTBUF" {
-                    format!("{}u", f("FORMAT"))
-                } else {
-                    format!("(({d3} >> 12) & 0x7Fu)")
-                };
+                let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
-                self.line(&format!(
-                    "bool {t}_ok = and(({t}_info & 7u) != 0u, {});",
-                    in_range(format!("fmt_bytes({t}_info)"))
-                ));
+                self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
                 self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
                 self.line(&format!(
                     "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
@@ -1216,33 +1021,15 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!(
-                        "{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);",
-                        3 * i
-                    ));
+                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
             BufKind::FormatStore => {
-                let fmt = if d.enc.name == "ENC_MTBUF" {
-                    format!("{}u", f("FORMAT"))
-                } else {
-                    format!("(({d3} >> 12) & 0x7Fu)")
-                };
+                let fmt = if d.enc.name == "ENC_MTBUF" { format!("{}u", f("FORMAT")) } else { format!("(({d3} >> 12) & 0x7Fu)") };
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
-                self.line(&format!(
-                    "bool {t}_ok = and(({t}_info & 7u) != 0u, {});",
-                    in_range(format!("fmt_bytes({t}_info)"))
-                ));
-                let vals: Vec<String> = (0..4)
-                    .map(|i| {
-                        if i < count {
-                            self.vreg(vdata + i)
-                        } else {
-                            "0u".into()
-                        }
-                    })
-                    .collect();
+                self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
+                let vals: Vec<String> = (0..4).map(|i| if i < count { self.vreg(vdata + i) } else { "0u".into() }).collect();
                 self.line(&format!("if (and({act}, {t}_ok)) st_bytes({t}_a, fmt_pack(uint4({}), {t}_info), fmt_bytes({t}_info));", vals.join(", ")));
             }
         }
@@ -1269,18 +1056,11 @@ impl Em {
             } else {
                 srcs[c as usize].clone()
             };
-            let bit = if compr {
-                1 << (c / 2 * 2) | 2 << (c / 2 * 2)
-            } else {
-                1 << c
-            };
+            let bit = if compr { 1 << (c / 2 * 2) | 2 << (c / 2 * 2) } else { 1 << c };
             if en & bit == 0 {
                 continue;
             }
-            st.push(format!(
-                "res.Store(({}u + (({tgt}u * {}u + xcl_hw_lane) * 4u + {c}u)) * 4u, {val});",
-                KERNEL_EXPORTS, KERNEL_LANES
-            ));
+            st.push(format!("res.Store(({}u + (({tgt}u * {}u + xcl_hw_lane) * 4u + {c}u)) * 4u, {val});", KERNEL_EXPORTS, KERNEL_LANES));
         }
         if !st.is_empty() {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -1302,32 +1082,16 @@ impl Em {
         }
     }
 
-    fn export_graphics(
-        &mut self,
-        d: &Decoded,
-        en: u64,
-        tgt: u64,
-        compr: bool,
-        srcs: &[String],
-    ) -> Result<(), &'static str> {
+    fn export_graphics(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[String]) -> Result<(), &'static str> {
         let act = self.act();
         let done = rdna2::field_value(d.enc, &d.words, "DONE") == Some(1);
-        let enabled = |c: usize| {
-            if compr {
-                en >> (c / 2 * 2) & 3 != 0
-            } else {
-                en >> c & 1 == 1
-            }
-        };
+        let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
         let mut st = Vec::new();
         match (&self.opt.mode, tgt) {
             (Mode::Vertex(_), 12) => {
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!(
-                            "xo.pos[{c}] = asfloat({});",
-                            Self::exp_comp(srcs, compr, c)
-                        ));
+                        st.push(format!("xo.pos[{c}] = asfloat({});", Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -1343,26 +1107,14 @@ impl Em {
                 for c in 0..n {
                     if enabled(c) {
                         let v = Self::exp_comp(srcs, compr, c);
-                        let v = if e.component_type == 3 {
-                            format!("asfloat({v})")
-                        } else {
-                            format!("{v}")
-                        };
-                        let comp = if n == 1 {
-                            String::new()
-                        } else {
-                            format!("[{c}]")
-                        };
+                        let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
+                        let comp = if n == 1 { String::new() } else { format!("[{c}]") };
                         st.push(format!("xo.p{k}{comp} = {v};"));
                     }
                 }
             }
             (Mode::Pixel(ps), 0..=7) => {
-                let Some(e) = ps
-                    .outputs
-                    .iter()
-                    .find(|e| e.system_value == 64 && e.index as u64 == tgt)
-                else {
+                let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) else {
                     self.line("/* eksport do nieopisanego SV_Target */");
                     if done {
                         self.ps_done = true;
@@ -1386,12 +1138,7 @@ impl Em {
                 }
             }
             (Mode::Pixel(ps), 8) => {
-                if en & 1 == 1
-                    && ps
-                        .outputs
-                        .iter()
-                        .any(|e| matches!(e.system_value, 65 | 67 | 68))
-                {
+                if en & 1 == 1 && ps.outputs.iter().any(|e| matches!(e.system_value, 65 | 67 | 68)) {
                     st.push(format!("xo.xcl_depth = asfloat({});", srcs[0]));
                 }
             }
@@ -1399,10 +1146,7 @@ impl Em {
             (Mode::Mesh(_), 12) => {
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!(
-                            "res.Store((xcl_vtx + {c}u) * 4u, {});",
-                            Self::exp_comp(srcs, compr, c)
-                        ));
+                        st.push(format!("res.Store((xcl_vtx + {c}u) * 4u, {});", Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -1415,11 +1159,7 @@ impl Em {
                 }
                 for c in 0..4 {
                     if enabled(c) {
-                        st.push(format!(
-                            "res.Store((xcl_vtx + {}u) * 4u, {});",
-                            4 * (k + 1) + c,
-                            Self::exp_comp(srcs, compr, c)
-                        ));
+                        st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (k + 1) + c, Self::exp_comp(srcs, compr, c)));
                     }
                 }
             }
@@ -1444,20 +1184,13 @@ impl Em {
             (f("VDST"), f("VSRC"), f("ATTR"), f("ATTRCHAN"))
         } else {
             let s1 = f("SRC1");
-            (
-                f("VDST"),
-                if s1 >= 256 { s1 - 256 } else { s1 },
-                f("SRC0") & 0x3F,
-                f("SRC0") >> 6 & 3,
-            )
+            (f("VDST"), if s1 >= 256 { s1 - 256 } else { s1 }, f("SRC0") & 0x3F, f("SRC0") >> 6 & 3)
         }
     }
 
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
-        let Mode::Pixel(ps) = &self.opt.mode else {
-            return Err("interpolacja poza PS");
-        };
+        let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolacja poza PS") };
         let n_attrs = ranked(&ps.inputs, false).len() as u64;
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
         if attr >= n_attrs {
@@ -1484,11 +1217,7 @@ impl Em {
                 let v = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
                 let h = format!("(f32tof16((float){src}) & 0xFFFFu)");
-                let e = if hi {
-                    format!("({v} & 0xFFFFu) | ({h} << 16)")
-                } else {
-                    format!("({v} & 0xFFFF0000u) | {h}")
-                };
+                let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("if ({act}) {v} = {e};"));
             }
             _ => return Err("interpolacja"),
@@ -1534,12 +1263,7 @@ impl Em {
             let k = if wide { 2 } else { 1 };
             let fl = |s: &mut Self, j: u64| format!("asfloat({})", r(s, j));
             let extent = fl(self, k);
-            let origin = format!(
-                "float3({}, {}, {})",
-                fl(self, k + 1),
-                fl(self, k + 2),
-                fl(self, k + 3)
-            );
+            let origin = format!("float3({}, {}, {})", fl(self, k + 1), fl(self, k + 2), fl(self, k + 3));
             let (dir, inv) = if a16 {
                 // A16: dir.xy | dir.z inv.x | inv.yz as half pairs
                 let (h0, h1, h2) = (r(self, k + 4), r(self, k + 5), r(self, k + 6));
@@ -1549,18 +1273,8 @@ impl Em {
                 )
             } else {
                 (
-                    format!(
-                        "float3({}, {}, {})",
-                        fl(self, k + 4),
-                        fl(self, k + 5),
-                        fl(self, k + 6)
-                    ),
-                    format!(
-                        "float3({}, {}, {})",
-                        fl(self, k + 7),
-                        fl(self, k + 8),
-                        fl(self, k + 9)
-                    ),
+                    format!("float3({}, {}, {})", fl(self, k + 4), fl(self, k + 5), fl(self, k + 6)),
+                    format!("float3({}, {}, {})", fl(self, k + 7), fl(self, k + 8), fl(self, k + 9)),
                 )
             };
             let (d0, d1) = (self.sreg(srsrc), self.sreg(srsrc + 1));
@@ -1568,50 +1282,26 @@ impl Em {
             let act = self.act();
             // descriptor: base address in 256-byte units (word 0), box sorting = word 1 bit 31
             self.line(&format!("uint4 {t} = bvh_intersect({node}, {d0} << 8, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
-            let st: Vec<String> = (0..4)
-                .map(|c| {
-                    format!(
-                        "{} = {t}.{};",
-                        self.vreg(vdata + c),
-                        ["x", "y", "z", "w"][c as usize]
-                    )
-                })
-                .collect();
+            let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
         }
         // body coordinates per DIM: 1D, 2D, 3D, CUBE, 1D_ARRAY, 2D_ARRAY, 2D_MSAA, 2D_MSAA_ARRAY
         let body = [1u64, 2, 3, 3, 2, 3, 3, 4][dim as usize];
         let sampling = base.starts_with("sample") || base.starts_with("gather4");
-        let rest = base
-            .trim_start_matches("sample")
-            .trim_start_matches("gather4");
-        let mods: Vec<&str> = if sampling {
-            rest.split('_').filter(|x| !x.is_empty()).collect()
-        } else {
-            Vec::new()
-        };
+        let rest = base.trim_start_matches("sample").trim_start_matches("gather4");
+        let mods: Vec<&str> = if sampling { rest.split('_').filter(|x| !x.is_empty()).collect() } else { Vec::new() };
         if mods.contains(&"cd") {
             return Err("MIMG cd");
         }
         let (has_cl, has_o) = (mods.contains(&"cl"), mods.contains(&"o"));
-        let (has_b, has_c, has_d, has_l, has_lz) = (
-            mods.contains(&"b"),
-            mods.contains(&"c"),
-            mods.contains(&"d"),
-            mods.contains(&"l"),
-            mods.contains(&"lz"),
-        );
-        let grad_n = if has_d {
-            [1u64, 2, 3, 2, 1, 2, 2, 2][dim as usize]
-        } else {
-            0
-        };
+        let (has_b, has_c, has_d, has_l, has_lz) =
+            (mods.contains(&"b"), mods.contains(&"c"), mods.contains(&"d"), mods.contains(&"l"), mods.contains(&"lz"));
+        let grad_n = if has_d { [1u64, 2, 3, 2, 1, 2, 2, 2][dim as usize] } else { 0 };
         // address components: (16-bit?, starts a dword?)
         let h = if a16 { 16 } else { 32 };
         let mut shape: Vec<(u32, bool)> = Vec::new();
-        let (mut i_bias, mut i_cmp, mut i_grad, mut i_body, mut i_extra, mut i_clamp) =
-            (None, None, 0usize, 0usize, None, None);
+        let (mut i_bias, mut i_cmp, mut i_grad, mut i_body, mut i_extra, mut i_clamp) = (None, None, 0usize, 0usize, None, None);
         if sampling {
             // address order: offset, bias, z-compare, derivatives, body, lod / clamp
             if has_o {
@@ -1686,33 +1376,19 @@ impl Em {
         let ps = matches!(self.opt.mode, Mode::Pixel(_));
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
-        let write_result = |s: &mut Self,
-                            r: &str,
-                            n: usize,
-                            sel: &dyn Fn(usize) -> u64,
-                            half: &dyn Fn(&str) -> String| {
+        let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
             let mut st = Vec::new();
             if d16 {
                 for k in (0..n).step_by(2) {
                     let v = s.vreg(vdata + k as u64 / 2);
                     let lo = half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k) as usize]));
-                    let hi = if k + 1 < n {
-                        half(&format!(
-                            "{r}.{}",
-                            ["x", "y", "z", "w"][sel(k + 1) as usize]
-                        ))
-                    } else {
-                        "0u".into()
-                    };
+                    let hi = if k + 1 < n { half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k + 1) as usize])) } else { "0u".into() };
                     st.push(format!("{v} = ({lo} & 0xFFFFu) | ({hi} << 16);"));
                 }
             } else {
                 for k in 0..n {
                     let v = s.vreg(vdata + k as u64);
-                    st.push(format!(
-                        "{v} = {r}.{};",
-                        ["x", "y", "z", "w"][sel(k) as usize]
-                    ));
+                    st.push(format!("{v} = {r}.{};", ["x", "y", "z", "w"][sel(k) as usize]));
                 }
             }
             s.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -1726,19 +1402,13 @@ impl Em {
             let bias = i_bias.map(|i| compf(self, i));
             let cmp = i_cmp.map(|i| compf(self, i));
             let grads = if has_d {
-                let dx: Vec<String> = (0..grad_n as usize)
-                    .map(|k| compf(self, i_grad + k))
-                    .collect();
-                let dy: Vec<String> = (0..grad_n as usize)
-                    .map(|k| compf(self, i_grad + grad_n as usize + k))
-                    .collect();
+                let dx: Vec<String> = (0..grad_n as usize).map(|k| compf(self, i_grad + k)).collect();
+                let dy: Vec<String> = (0..grad_n as usize).map(|k| compf(self, i_grad + grad_n as usize + k)).collect();
                 Some((dx, dy))
             } else {
                 None
             };
-            let coords: Vec<String> = (0..body as usize)
-                .map(|k| compf(self, i_body + k))
-                .collect();
+            let coords: Vec<String> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let lod = i_extra.map(|i| compf(self, i));
             let cl = i_clamp.map(|i| compf(self, i));
             // the clamp overloads take an offset first (none for cubes)
@@ -1777,69 +1447,30 @@ impl Em {
                 _ => String::new(),
             };
             let coords: Vec<String> = if offset.is_some() {
-                coords
-                    .iter()
-                    .enumerate()
-                    .map(|(k, c)| {
-                        if (dim == 4 && k == 1) || (dim == 5 && k == 2) {
-                            c.clone()
-                        } else {
-                            format!("({c} + {t}_o[{k}])")
-                        }
-                    })
-                    .collect()
+                coords.iter().enumerate().map(|(k, c)| if (dim == 4 && k == 1) || (dim == 5 && k == 2) { c.clone() } else { format!("({c} + {t}_o[{k}])") }).collect()
             } else {
                 coords
             };
             let (ty, coord) = match dim {
                 0 => ("Texture1D<float4>", coords[0].clone()),
-                1 => (
-                    "Texture2D<float4>",
-                    format!("float2({}, {})", coords[0], coords[1]),
-                ),
-                2 => (
-                    "Texture3D<float4>",
-                    format!("float3({}, {}, {})", coords[0], coords[1], coords[2]),
-                ),
-                3 => (
-                    "TextureCube<float4>",
-                    format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2]),
-                ),
-                4 => (
-                    "Texture1DArray<float4>",
-                    format!("float2({}, round({}))", coords[0], coords[1]),
-                ),
-                5 => (
-                    "Texture2DArray<float4>",
-                    format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2]),
-                ),
+                1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
+                2 => ("Texture3D<float4>", format!("float3({}, {}, {})", coords[0], coords[1], coords[2])),
+                3 => ("TextureCube<float4>", format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2])),
+                4 => ("Texture1DArray<float4>", format!("float2({}, round({}))", coords[0], coords[1])),
+                5 => ("Texture2DArray<float4>", format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2])),
                 _ => return Err("MIMG dim"),
             };
             if f("UNORM") != 0 && dim != 3 {
                 return Err("MIMG unorm");
             }
-            let samp = if has_c {
-                "SamplerComparisonState"
-            } else {
-                "SamplerState"
-            };
-            self.line(&format!(
-                "{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"
-            ));
-            self.line(&format!(
-                "{samp} {t}_S = SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)];"
-            ));
+            let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
+            self.line(&format!("{samp} {t}_S = SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)];"));
             if let Some(o) = &offset {
-                let level = match (
-                    &lod,
-                    has_lz || base.starts_with("gather4"),
-                    ps && grads.is_none() && !has_c,
-                ) {
+                let level = match (&lod, has_lz || base.starts_with("gather4"), ps && grads.is_none() && !has_c) {
                     (_, true, _) => "0u".to_string(),
                     (Some(l), _, _) => format!("(uint)max(round({l}), 0.0f)"),
-                    (None, _, true) => format!(
-                        "(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"
-                    ),
+                    (None, _, true) => format!("(uint)max(round({t}_T.CalculateLevelOfDetail({t}_S, {coord0})), 0.0f)"),
                     _ => "0u".to_string(),
                 };
                 let dims = match dim {
@@ -1847,13 +1478,9 @@ impl Em {
                     1 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_n);"),
                     2 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n);"),
                     4 => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_d, {t}_n); {t}_d = 1u;"),
-                    _ => format!(
-                        "{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d = 1u;"
-                    ),
+                    _ => format!("{t}_T.GetDimensions({level}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d = 1u;"),
                 };
-                self.line(&format!(
-                    "uint {t}_w = 1u, {t}_h = 1u, {t}_d = 1u, {t}_n; {dims}"
-                ));
+                self.line(&format!("uint {t}_w = 1u, {t}_h = 1u, {t}_d = 1u, {t}_n; {dims}"));
                 self.line(&format!(
                     "float3 {t}_o = float3((float)(((int)({o} << 26)) >> 26) / (float){t}_w, (float)(((int)({o} << 18)) >> 26) / (float){t}_h, (float)(((int)({o} << 10)) >> 26) / (float){t}_d);"
                 ));
@@ -1875,37 +1502,16 @@ impl Em {
                     None => l,
                 };
                 match (&cmp, &grads, &lod, &bias) {
-                    (Some(z), _, _, _) if has_lz || !ps => {
-                        format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)")
-                    }
-                    (Some(z), _, _, _) => format!(
-                        "float4({t}_T.SampleCmp({t}_S, {}).xxxx)",
-                        tail(format!("{coord}, {z}"))
-                    ),
+                    (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
+                    (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
                     (None, Some((dx, dy)), _, _) => {
-                        let v = |x: &[String]| {
-                            if x.len() == 1 {
-                                x[0].clone()
-                            } else {
-                                format!("float{}({})", x.len(), x.join(", "))
-                            }
-                        };
-                        format!(
-                            "{t}_T.SampleGrad({t}_S, {})",
-                            tail(format!("{coord}, {}, {}", v(dx), v(dy)))
-                        )
+                        let v = |x: &[String]| if x.len() == 1 { x[0].clone() } else { format!("float{}({})", x.len(), x.join(", ")) };
+                        format!("{t}_T.SampleGrad({t}_S, {})", tail(format!("{coord}, {}, {}", v(dx), v(dy))))
                     }
                     (None, None, Some(l), _) => format!("{t}_T.SampleLevel({t}_S, {coord}, {l})"),
-                    (None, None, None, Some(b)) if ps => {
-                        format!("{t}_T.SampleBias({t}_S, {})", tail(format!("{coord}, {b}")))
-                    }
-                    (None, None, None, Some(b)) => {
-                        format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(b.clone()))
-                    }
-                    _ if has_lz || !ps => format!(
-                        "{t}_T.SampleLevel({t}_S, {coord}, {})",
-                        floor("0.0f".into())
-                    ),
+                    (None, None, None, Some(b)) if ps => format!("{t}_T.SampleBias({t}_S, {})", tail(format!("{coord}, {b}"))),
+                    (None, None, None, Some(b)) => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(b.clone())),
+                    _ if has_lz || !ps => format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor("0.0f".into())),
                     _ => format!("{t}_T.Sample({t}_S, {})", tail(coord.clone())),
                 }
             };
@@ -1921,128 +1527,55 @@ impl Em {
             if !ps {
                 return Err("image_get_lod poza PS");
             }
-            let coords: Vec<String> = (0..body as usize)
-                .map(|k| compf(self, i_body + k))
-                .collect();
+            let coords: Vec<String> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let (ty, coord) = match dim {
                 0 => ("Texture1D<float4>", coords[0].clone()),
-                1 => (
-                    "Texture2D<float4>",
-                    format!("float2({}, {})", coords[0], coords[1]),
-                ),
-                2 => (
-                    "Texture3D<float4>",
-                    format!("float3({}, {}, {})", coords[0], coords[1], coords[2]),
-                ),
-                3 => (
-                    "TextureCube<float4>",
-                    format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2]),
-                ),
-                4 => (
-                    "Texture1DArray<float4>",
-                    format!("float2({}, round({}))", coords[0], coords[1]),
-                ),
-                5 => (
-                    "Texture2DArray<float4>",
-                    format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2]),
-                ),
+                1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
+                2 => ("Texture3D<float4>", format!("float3({}, {}, {})", coords[0], coords[1], coords[2])),
+                3 => ("TextureCube<float4>", format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2])),
+                4 => ("Texture1DArray<float4>", format!("float2({}, round({}))", coords[0], coords[1])),
+                5 => ("Texture2DArray<float4>", format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2])),
                 _ => return Err("MIMG dim"),
             };
             let s3 = self.sreg(ssamp + 3);
-            self.line(&format!(
-                "{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"
-            ));
+            self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
             self.line(&format!("SamplerState {t}_S = SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)];"));
             self.line(&format!(
                 "uint4 {t}_r = asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f));"
             ));
             let comps2 = comps.clone();
-            write_result(
-                self,
-                &format!("{t}_r"),
-                comps.len(),
-                &move |k| comps2[k],
-                &f16,
-            );
+            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &f16);
             return Ok(());
         }
 
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let (ty, call) = match dim {
-                0 => (
-                    "Texture1D",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;"),
-                ),
-                1 => (
-                    "Texture2D",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;"),
-                ),
-                2 => (
-                    "Texture3D",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);"),
-                ),
-                3 => (
-                    "TextureCube",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;"),
-                ),
-                4 => (
-                    "Texture1DArray",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_d, {t}_n); {t}_h = 1u;"),
-                ),
-                5 => (
-                    "Texture2DArray",
-                    format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);"),
-                ),
+                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
+                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
+                3 => ("TextureCube", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_d, {t}_n); {t}_h = 1u;")),
+                5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
             };
-            self.line(&format!(
-                "{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"
-            ));
+            self.line(&format!("{ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
             self.line(&format!("uint {t}_w, {t}_h, {t}_d, {t}_n; {call}"));
             self.line(&format!("uint4 {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n);"));
             let comps2 = comps.clone();
-            write_result(
-                self,
-                &format!("{t}_r"),
-                comps.len(),
-                &move |k| comps2[k],
-                &|e: &str| e.to_string(),
-            );
+            write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());
         }
 
         // integer coordinates for load / store / atomics
-        let ic: Vec<String> = (0..body as usize)
-            .map(|k| compu(self, i_body + k))
-            .collect();
+        let ic: Vec<String> = (0..body as usize).map(|k| compu(self, i_body + k)).collect();
         let mip = i_extra.map(|i| compu(self, i)).unwrap_or("0u".into());
         let (rty, icoord, load_arg) = match dim {
-            0 => (
-                "1D",
-                format!("int({})", ic[0]),
-                format!("int2({}, {mip})", ic[0]),
-            ),
-            1 => (
-                "2D",
-                format!("int2({}, {})", ic[0], ic[1]),
-                format!("int3({}, {}, {mip})", ic[0], ic[1]),
-            ),
-            2 => (
-                "3D",
-                format!("int3({}, {}, {})", ic[0], ic[1], ic[2]),
-                format!("int4({}, {}, {}, {mip})", ic[0], ic[1], ic[2]),
-            ),
-            4 => (
-                "1DArray",
-                format!("int2({}, {})", ic[0], ic[1]),
-                format!("int3({}, {}, {mip})", ic[0], ic[1]),
-            ),
-            5 | 3 => (
-                "2DArray",
-                format!("int3({}, {}, {})", ic[0], ic[1], ic[2]),
-                format!("int4({}, {}, {}, {mip})", ic[0], ic[1], ic[2]),
-            ),
+            0 => ("1D", format!("int({})", ic[0]), format!("int2({}, {mip})", ic[0])),
+            1 => ("2D", format!("int2({}, {})", ic[0], ic[1]), format!("int3({}, {}, {mip})", ic[0], ic[1])),
+            2 => ("3D", format!("int3({}, {}, {})", ic[0], ic[1], ic[2]), format!("int4({}, {}, {}, {mip})", ic[0], ic[1], ic[2])),
+            4 => ("1DArray", format!("int2({}, {})", ic[0], ic[1]), format!("int3({}, {}, {mip})", ic[0], ic[1])),
+            5 | 3 => ("2DArray", format!("int3({}, {}, {})", ic[0], ic[1], ic[2]), format!("int4({}, {}, {}, {mip})", ic[0], ic[1], ic[2])),
             6 => ("2DMS", format!("int2({}, {})", ic[0], ic[1]), String::new()),
             _ => return Err("MIMG dim"),
         };
@@ -2053,17 +1586,8 @@ impl Em {
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r;"));
-                let ld = if dim == 6 {
-                    format!(
-                        "{t}_T.Load({icoord}, {})",
-                        ic.get(2).cloned().unwrap_or("0u".into())
-                    )
-                } else {
-                    format!("{t}_T.Load({load_arg})")
-                };
-                let tex = |vt: &str| {
-                    format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];")
-                };
+                let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
+                let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
                 self.line(&format!(
                     "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
@@ -2071,17 +1595,9 @@ impl Em {
                     tex("float")
                 ));
                 let cls = format!("{t}_cls");
-                let half = move |e: &str| {
-                    format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))")
-                };
+                let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
                 let comps2 = comps.clone();
-                write_result(
-                    self,
-                    &format!("{t}_r"),
-                    comps.len(),
-                    &move |k| comps2[k],
-                    &half,
-                );
+                write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &half);
             }
             "store" | "store_mip" => {
                 if base == "store_mip" {
@@ -2100,9 +1616,7 @@ impl Em {
                     });
                 }
                 let v4 = format!("uint4({})", vals.join(", "));
-                let uav = |vt: &str| {
-                    format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];")
-                };
+                let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
                 self.line(&format!(
                     "if ({act}) {{ if ({t}_cls == 1u) {{ {} {t}_U[{icoord}] = {v4}; }} else if ({t}_cls == 2u) {{ {} {t}_U[{icoord}] = (int4){v4}; }} else {{ {} {t}_U[{icoord}] = asfloat({v4}); }} }}",
                     uav("uint"),
@@ -2124,16 +1638,10 @@ impl Em {
                 let signed = base.ends_with("smin") || base.ends_with("smax");
                 let v = self.vreg(vdata);
                 let vt = if signed { "int" } else { "uint" };
-                let val = if signed {
-                    format!("(int){v}")
-                } else {
-                    v.clone()
-                };
+                let val = if signed { format!("(int){v}") } else { v.clone() };
                 self.line(&format!("RWTexture{rty}<{vt}> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"));
                 self.line(&format!("{vt} {t}_old = 0;"));
-                self.line(&format!(
-                    "if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"
-                ));
+                self.line(&format!("if ({act}) {{ {op}({t}_U[{icoord}], {val}, {t}_old); }}"));
                 if f("GLC") == 1 {
                     self.line(&format!("if ({act}) {v} = (uint){t}_old;"));
                 }
@@ -2211,12 +1719,7 @@ impl Em {
 
     /// u32 source expressions in operand order; SGPR-pair masks come as "lo|hi".
     /// SDWA selects/extends its two sources, DPP reads src0 from another lane.
-    fn sources(
-        &mut self,
-        d: &Decoded,
-        ins: &[&Operand],
-        src_f16: bool,
-    ) -> Result<Vec<String>, &'static str> {
+    fn sources(&mut self, d: &Decoded, ins: &[&Operand], src_f16: bool) -> Result<Vec<String>, &'static str> {
         let mut u = Vec::new();
         for o in ins {
             if d.variant != Variant::Plain && o.field == Some("SRC0") {
@@ -2237,30 +1740,14 @@ impl Em {
             Variant::Sdwa => {
                 let e = ext_encoding(d).ok_or("SDWA")?;
                 let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
-                let s0 = if fv("S0") == 1 {
-                    self.code32(fv("VSRC0"), None, false).ok_or("op")?
-                } else {
-                    self.vreg(fv("VSRC0"))
-                };
+                let s0 = if fv("S0") == 1 { self.code32(fv("VSRC0"), None, false).ok_or("op")? } else { self.vreg(fv("VSRC0")) };
                 if !u.is_empty() {
-                    u[0] = format!(
-                        "sdwa_sel({s0}, {}u, {})",
-                        fv("SRC0_SEL"),
-                        fv("SRC0_SEXT") == 1
-                    );
+                    u[0] = format!("sdwa_sel({s0}, {}u, {})", fv("SRC0_SEL"), fv("SRC0_SEXT") == 1);
                 }
                 if d.enc.field("VSRC1").is_some() && u.len() > 1 {
                     let v1 = fv("VSRC1");
-                    let s1 = if fv("S1") == 1 {
-                        self.code32(v1, None, false).ok_or("op")?
-                    } else {
-                        self.vreg(v1)
-                    };
-                    u[1] = format!(
-                        "sdwa_sel({s1}, {}u, {})",
-                        fv("SRC1_SEL"),
-                        fv("SRC1_SEXT") == 1
-                    );
+                    let s1 = if fv("S1") == 1 { self.code32(v1, None, false).ok_or("op")? } else { self.vreg(v1) };
+                    u[1] = format!("sdwa_sel({s1}, {}u, {})", fv("SRC1_SEL"), fv("SRC1_SEXT") == 1);
                 }
             }
             Variant::Dpp16 | Variant::Dpp8 => {
@@ -2289,18 +1776,12 @@ impl Em {
                     }
                     self.dpp_enable = Some(en);
                 } else {
-                    let sel: u64 = (0..8)
-                        .map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i))
-                        .sum();
+                    let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
-                    self.line(&format!(
-                        "uint {t}_l = (lane_id & ~7u) | (({sel}u >> (3u * (lane_id & 7u))) & 7u);"
-                    ));
+                    self.line(&format!("uint {t}_l = (lane_id & ~7u) | (({sel}u >> (3u * (lane_id & 7u))) & 7u);"));
                     self.line(&format!("uint {t} = rla({v}, {t}_l);"));
                     if !fi {
-                        self.line(&format!(
-                            "{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"
-                        ));
+                        self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                     }
                 }
                 if !u.is_empty() {
@@ -2319,11 +1800,7 @@ impl Em {
                 let fv = |k: &str| rdna2::field_value(e, &d.words, k).unwrap_or(0);
                 if e.field("DST_SEL").is_some() {
                     let cur = self.vreg(*n);
-                    val = format!(
-                        "sdwa_dst({val}, {cur}, {}u, {}u)",
-                        fv("DST_SEL"),
-                        fv("DST_UNUSED")
-                    );
+                    val = format!("sdwa_dst({val}, {cur}, {}u, {}u)", fv("DST_SEL"), fv("DST_UNUSED"));
                 }
             }
         }
@@ -2346,22 +1823,11 @@ impl Em {
         let (outs, ins) = Self::ops(d);
         let vop3p = d.enc.name == "ENC_VOP3P";
         let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
-        let (sel, sel_hi) = if vop3p {
-            (fv("OP_SEL"), fv("OP_SEL_HI") | fv("OP_SEL_HI_2") << 2)
-        } else {
-            (0, 0b111)
-        };
-        let (neg, neg_hi) = if vop3p {
-            (fv("NEG"), fv("NEG_HI"))
-        } else {
-            (0, 0)
-        };
+        let (sel, sel_hi) = if vop3p { (fv("OP_SEL"), fv("OP_SEL_HI") | fv("OP_SEL_HI_2") << 2) } else { (0, 0b111) };
+        let (neg, neg_hi) = if vop3p { (fv("NEG"), fv("NEG_HI")) } else { (0, 0) };
         let clamp = vop3p && fv("CLAMP") == 1;
         let u = self.sources(d, &ins, name.ends_with("_f16"))?;
-        let dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::Null);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
             Dst::V(n) => self.vreg(*n),
             _ => "0u".into(),
@@ -2384,13 +1850,7 @@ impl Em {
             }
         };
         let si = |i: usize, hi: bool| format!("(((int)({} << 16)) >> 16)", h(i, hi));
-        let fr = |e: String| {
-            if clamp {
-                format!("(f32tof16(saturate({e})) & 0xFFFFu)")
-            } else {
-                format!("(f32tof16({e}) & 0xFFFFu)")
-            }
-        };
+        let fr = |e: String| if clamp { format!("(f32tof16(saturate({e})) & 0xFFFFu)") } else { format!("(f32tof16({e}) & 0xFFFFu)") };
         let t = self.t();
         // dot products: one 32-bit result
         let dot: Option<String> = match name {
@@ -2399,43 +1859,13 @@ impl Em {
                 if neg >> 2 & 1 == 1 {
                     c = format!("(-{c})");
                 }
-                let e = format!(
-                    "mad({}, {}, mad({}, {}, {c}))",
-                    fh(0, true),
-                    fh(1, true),
-                    fh(0, false),
-                    fh(1, false)
-                );
-                Some(if clamp {
-                    format!("asuint(saturate({e}))")
-                } else {
-                    format!("asuint({e})")
-                })
+                let e = format!("mad({}, {}, mad({}, {}, {c}))", fh(0, true), fh(1, true), fh(0, false), fh(1, false));
+                Some(if clamp { format!("asuint(saturate({e}))") } else { format!("asuint({e})") })
             }
-            "v_dot2c_f32_f16" => Some(format!(
-                "asuint(mad({}, {}, mad({}, {}, asfloat({cur}))))",
-                fh(0, true),
-                fh(1, true),
-                fh(0, false),
-                fh(1, false)
-            )),
+            "v_dot2c_f32_f16" => Some(format!("asuint(mad({}, {}, mad({}, {}, asfloat({cur}))))", fh(0, true), fh(1, true), fh(0, false), fh(1, false))),
             "v_dot4c_i32_i8" => Some(format!("dot4_i8({}, {}, {cur})", src(0), src(1))),
-            "v_dot2_i32_i16" => Some(format!(
-                "(uint)({} * {} + {} * {} + (int){})",
-                si(0, false),
-                si(1, false),
-                si(0, true),
-                si(1, true),
-                src(2)
-            )),
-            "v_dot2_u32_u16" => Some(format!(
-                "({} * {} + {} * {} + {})",
-                h(0, false),
-                h(1, false),
-                h(0, true),
-                h(1, true),
-                src(2)
-            )),
+            "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
+            "v_dot2_u32_u16" => Some(format!("({} * {} + {} * {} + {})", h(0, false), h(1, false), h(0, true), h(1, true), src(2))),
             "v_dot4_u32_u8" => Some(format!("dot4_u8({}, {}, {})", src(0), src(1), src(2))),
             "v_dot4_i32_i8" => Some(format!("dot4_i8({}, {}, {})", src(0), src(1), src(2))),
             "v_dot8_u32_u4" => Some(format!("dot8_u4({}, {}, {})", src(0), src(1), src(2))),
@@ -2449,20 +1879,12 @@ impl Em {
         }
         let half = |hi: bool| -> Option<String> {
             let (a, b, c) = (h(0, hi), h(1, hi), h(2, hi));
-            let curh = if hi {
-                format!("({cur} >> 16)")
-            } else {
-                format!("({cur} & 0xFFFFu)")
-            };
+            let curh = if hi { format!("({cur} >> 16)") } else { format!("({cur} & 0xFFFFu)") };
             Some(match name {
                 "v_pk_add_f16" => fr(format!("{} + {}", fh(0, hi), fh(1, hi))),
                 "v_pk_mul_f16" => fr(format!("{} * {}", fh(0, hi), fh(1, hi))),
                 "v_pk_fma_f16" => fr(format!("mad({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
-                "v_pk_fmac_f16" => fr(format!(
-                    "mad({}, {}, f16tof32({curh}))",
-                    fh(0, hi),
-                    fh(1, hi)
-                )),
+                "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
                 "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
                 "v_pk_max_f16" => fr(format!("max({}, {})", fh(0, hi), fh(1, hi))),
                 "v_pk_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
@@ -2471,12 +1893,7 @@ impl Em {
                 "v_pk_sub_i16" => format!("((uint)({} - {}) & 0xFFFFu)", si(0, hi), si(1, hi)),
                 "v_pk_mul_lo_u16" => format!("(({a} * {b}) & 0xFFFFu)"),
                 "v_pk_mad_u16" => format!("(({a} * {b} + {c}) & 0xFFFFu)"),
-                "v_pk_mad_i16" => format!(
-                    "((uint)({} * {} + {}) & 0xFFFFu)",
-                    si(0, hi),
-                    si(1, hi),
-                    si(2, hi)
-                ),
+                "v_pk_mad_i16" => format!("((uint)({} * {} + {}) & 0xFFFFu)", si(0, hi), si(1, hi), si(2, hi)),
                 "v_pk_lshlrev_b16" => format!("(({b} << ({a} & 15u)) & 0xFFFFu)"),
                 "v_pk_lshrrev_b16" => format!("({b} >> ({a} & 15u))"),
                 "v_pk_ashrrev_i16" => format!("((uint)({} >> ({a} & 15u)) & 0xFFFFu)", si(1, hi)),
@@ -2512,10 +1929,7 @@ impl Em {
             "v_movrels_b32" => (Some(m0.clone()), None),
             "v_movreld_b32" => (None, Some(m0.clone())),
             "v_movrelsd_b32" => (Some(m0.clone()), Some(m0.clone())),
-            "v_movrelsd_2_b32" => (
-                Some(format!("({m0} & 0x3FFu)")),
-                Some(format!("(({m0} >> 16) & 0x3FFu)")),
-            ),
+            "v_movrelsd_2_b32" => (Some(format!("({m0} & 0x3FFu)")), Some(format!("(({m0} >> 16) & 0x3FFu)"))),
             _ => return Err("movrel"),
         };
         let value = match &rd_idx {
@@ -2529,9 +1943,7 @@ impl Em {
                     let v = self.vreg(base + k);
                     cases.push_str(&format!(" case {k}u: {t} = {v}; break;"));
                 }
-                self.line(&format!(
-                    "uint {t} = 0u; switch ({idx}) {{{cases} default: break; }}"
-                ));
+                self.line(&format!("uint {t} = 0u; switch ({idx}) {{{cases} default: break; }}"));
                 t.clone()
             }
             None => self.code32(src_code, d.literal, false).ok_or("op")?,
@@ -2543,9 +1955,7 @@ impl Em {
                     let v = self.vreg(vdst + k);
                     cases.push_str(&format!(" case {k}u: {v} = {value}; break;"));
                 }
-                self.line(&format!(
-                    "if ({act}) {{ switch ({idx}) {{{cases} default: break; }} }}"
-                ));
+                self.line(&format!("if ({act}) {{ switch ({idx}) {{{cases} default: break; }} }}"));
             }
             None => {
                 let v = self.vreg(vdst);
@@ -2594,19 +2004,12 @@ impl Em {
             }
             format!("(f32tof16({s}) & 0xFFFFu)")
         };
-        let dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::Null);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
             Dst::V(n) => self.vreg(*n),
             _ => "0u".into(),
         };
-        let curh = if plain && m.opsel >> 3 & 1 == 1 {
-            format!("({cur} >> 16)")
-        } else {
-            format!("({cur} & 0xFFFFu)")
-        };
+        let curh = if plain && m.opsel >> 3 & 1 == 1 { format!("({cur} >> 16)") } else { format!("({cur} & 0xFFFFu)") };
         let (a, b, c) = (half(0), half(1), half(2));
         let r: String = match name {
             "v_add_f16" => fr(format!("{} + {}", fh(0), fh(1))),
@@ -2623,35 +2026,15 @@ impl Em {
             "v_min3_u16" => format!("min(min({a}, {b}), {c})"),
             "v_max3_u16" => format!("max(max({a}, {b}), {c})"),
             "v_med3_i16" => format!("((uint)med3i({}, {}, {}) & 0xFFFFu)", si(0), si(1), si(2)),
-            "v_min3_i16" => format!(
-                "((uint)min(min({}, {}), {}) & 0xFFFFu)",
-                si(0),
-                si(1),
-                si(2)
-            ),
-            "v_max3_i16" => format!(
-                "((uint)max(max({}, {}), {}) & 0xFFFFu)",
-                si(0),
-                si(1),
-                si(2)
-            ),
+            "v_min3_i16" => format!("((uint)min(min({}, {}), {}) & 0xFFFFu)", si(0), si(1), si(2)),
+            "v_max3_i16" => format!("((uint)max(max({}, {}), {}) & 0xFFFFu)", si(0), si(1), si(2)),
             "v_frexp_mant_f16" => fr(format!("frexp_mant({})", fh(0))),
             "v_frexp_exp_i16_f16" => format!("((uint)frexp_exp({}) & 0xFFFFu)", fh(0)),
             "v_cndmask_b16" => return Err("VALU 16-bit"),
             "v_mad_f16" => fr(format!("mad_nf({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
-            "v_fmamk_f16" => fr(format!(
-                "mad({}, f16tof32({} & 0xFFFFu), {})",
-                fh(0),
-                u[1],
-                fh(2)
-            )),
-            "v_fmaak_f16" => fr(format!(
-                "mad({}, {}, f16tof32({} & 0xFFFFu))",
-                fh(0),
-                fh(1),
-                u[2]
-            )),
+            "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
+            "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
             "v_ldexp_f16" => fr(format!("ldexp({}, (float){})", fh(0), si(1))),
             "v_rcp_f16" => fr(format!("rcp({})", fh(0))),
             "v_rsq_f16" => fr(format!("rsqrt({})", fh(0))),
@@ -2667,14 +2050,8 @@ impl Em {
             "v_rndne_f16" => fr(format!("round({})", fh(0))),
             "v_cvt_f16_u16" => fr(format!("(float){a}")),
             "v_cvt_f16_i16" => fr(format!("(float){}", si(0))),
-            "v_cvt_u16_f16" => format!(
-                "(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))",
-                fh(0),
-                fh(0)
-            ),
-            "v_cvt_i16_f16" => {
-                format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0))
-            }
+            "v_cvt_u16_f16" => format!("(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))", fh(0), fh(0)),
+            "v_cvt_i16_f16" => format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0)),
             "v_add_nc_u16" | "v_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
             "v_sub_nc_u16" | "v_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
             "v_subrev_nc_u16" | "v_subrev_u16" => format!("(({b} - {a}) & 0xFFFFu)"),
@@ -2697,11 +2074,7 @@ impl Em {
         if d.variant == Variant::Sdwa {
             self.vwrite(d, &dst, &t);
         } else {
-            let merged = if m.opsel >> 3 & 1 == 1 {
-                format!("({cur} & 0xFFFFu) | ({t} << 16)")
-            } else {
-                format!("({cur} & 0xFFFF0000u) | {t}")
-            };
+            let merged = if m.opsel >> 3 & 1 == 1 { format!("({cur} & 0xFFFFu) | ({t} << 16)") } else { format!("({cur} & 0xFFFF0000u) | {t}") };
             self.vwrite(d, &dst, &merged);
         }
         Ok(())
@@ -2723,12 +2096,7 @@ impl Em {
                 lo_hi.push((v, "0u".into()));
             }
         }
-        let u64v = |i: usize| {
-            format!(
-                "(((uint64_t){} << 32) | (uint64_t){})",
-                lo_hi[i].1, lo_hi[i].0
-            )
-        };
+        let u64v = |i: usize| format!("(((uint64_t){} << 32) | (uint64_t){})", lo_hi[i].1, lo_hi[i].0);
         let f64v = |i: usize| {
             let mut s = format!("asdouble({}, {})", lo_hi[i].0, lo_hi[i].1);
             if m.abs[i.min(2)] {
@@ -2739,22 +2107,13 @@ impl Em {
             }
             s
         };
-        let dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::Null);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let t = self.t();
-        if let Some(rest) = name
-            .strip_prefix("v_cmpx_")
-            .or_else(|| name.strip_prefix("v_cmp_"))
-        {
+        if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             let (op, ty) = rest.rsplit_once('_').ok_or("VOPC")?;
             let (a, b) = match ty {
                 "u64" => (u64v(0), u64v(1)),
-                "i64" => (
-                    format!("(int64_t){}", u64v(0)),
-                    format!("(int64_t){}", u64v(1)),
-                ),
+                "i64" => (format!("(int64_t){}", u64v(0)), format!("(int64_t){}", u64v(1))),
                 "f64" => (f64v(0), f64v(1)),
                 _ => return Err("VOPC 64"),
             };
@@ -2779,41 +2138,25 @@ impl Em {
                 "t" | "tru" => "true".to_string(),
                 _ => return Err("VOPC 64"),
             };
-            let dst = if name.starts_with("v_cmpx_") {
-                Dst::S(126)
-            } else {
-                dst
-            };
+            let dst = if name.starts_with("v_cmpx_") { Dst::S(126) } else { dst };
             self.write_mask(&dst, &cond);
             return Ok(());
         }
         let r64: String = match name {
             "v_lshlrev_b64" => format!("({} << ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_lshrrev_b64" => format!("({} >> ({} & 63u))", u64v(1), lo_hi[0].0),
-            "v_ashrrev_i64" => {
-                format!("(uint64_t)((int64_t){} >> ({} & 63u))", u64v(1), lo_hi[0].0)
-            }
+            "v_ashrrev_i64" => format!("(uint64_t)((int64_t){} >> ({} & 63u))", u64v(1), lo_hi[0].0),
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 let p = if name == "v_mad_u64_u32" {
                     format!("((uint64_t){} * (uint64_t){})", lo_hi[0].0, lo_hi[1].0)
                 } else {
-                    format!(
-                        "(uint64_t)((int64_t)(int){} * (int64_t)(int){})",
-                        lo_hi[0].0, lo_hi[1].0
-                    )
+                    format!("(uint64_t)((int64_t)(int){} * (int64_t)(int){})", lo_hi[0].0, lo_hi[1].0)
                 };
-                self.line(&format!(
-                    "uint64_t {t}_p = {p}; uint64_t {t}_c = {};",
-                    u64v(2)
-                ));
+                self.line(&format!("uint64_t {t}_p = {p}; uint64_t {t}_c = {};", u64v(2)));
                 self.line(&format!("uint64_t {t}_w = {t}_p + {t}_c;"));
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
                 self.write_mask(&sdst, &format!("{t}_w < {t}_c"));
-                self.write64(
-                    &dst,
-                    &format!("(uint){t}_w"),
-                    &format!("(uint)({t}_w >> 32)"),
-                );
+                self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
                 return Ok(());
             }
             _ => {
@@ -2830,27 +2173,19 @@ impl Em {
                     "v_cvt_f64_u32" => format!("(double){}", lo_hi[0].0),
                     "v_floor_f64" => format!("floor_d({})", f64v(0)),
                     "v_trunc_f64" => format!("(double)(int64_t){}", f64v(0)),
-                    "v_ldexp_f64" => {
-                        format!("({} * (double)exp2((float)(int){}))", f64v(0), lo_hi[1].0)
-                    }
+                    "v_ldexp_f64" => format!("({} * (double)exp2((float)(int){}))", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
                         self.line(&format!("uint {t} = asuint((float){});", f64v(0)));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
                     "v_cvt_i32_f64" => {
-                        self.line(&format!(
-                            "uint {t} = (uint)(int)clamp({}, -2147483648.0, 2147483647.0);",
-                            f64v(0)
-                        ));
+                        self.line(&format!("uint {t} = (uint)(int)clamp({}, -2147483648.0, 2147483647.0);", f64v(0)));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
                     "v_cvt_u32_f64" => {
-                        self.line(&format!(
-                            "uint {t} = (uint)clamp({}, 0.0, 4294967295.0);",
-                            f64v(0)
-                        ));
+                        self.line(&format!("uint {t} = (uint)clamp({}, 0.0, 4294967295.0);", f64v(0)));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -2860,19 +2195,13 @@ impl Em {
                 if m.clamp {
                     e = format!("saturate({e})");
                 }
-                self.line(&format!(
-                    "double {t}_d = {e}; uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);"
-                ));
+                self.line(&format!("double {t}_d = {e}; uint {t}_l, {t}_h; asuint({t}_d, {t}_l, {t}_h);"));
                 self.write64(&dst, &format!("{t}_l"), &format!("{t}_h"));
                 return Ok(());
             }
         };
         self.line(&format!("uint64_t {t}_w = {r64};"));
-        self.write64(
-            &dst,
-            &format!("(uint){t}_w"),
-            &format!("(uint)({t}_w >> 32)"),
-        );
+        self.write64(&dst, &format!("(uint){t}_w"), &format!("(uint)({t}_w >> 32)"));
         Ok(())
     }
 
@@ -2881,14 +2210,10 @@ impl Em {
             return self.interp(d, name);
         }
         let (outs, ins) = Self::ops(d);
-        let f16 = name.contains("f16")
-            || name.contains("_i16")
-            || name.contains("_u16")
-            || name.contains("_b16");
+        let f16 = name.contains("f16") || name.contains("_i16") || name.contains("_u16") || name.contains("_b16");
         let cmp = name.starts_with("v_cmp");
         // inline constants are f16 patterns only where the source itself is 16-bit
-        let src_f16 =
-            matches!(name, "v_cvt_f32_f16" | "v_pack_b32_f16") || (cmp && name.ends_with("_f16"));
+        let src_f16 = matches!(name, "v_cvt_f32_f16" | "v_pack_b32_f16") || (cmp && name.ends_with("_f16"));
         let mix = name.starts_with("v_fma_mix");
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
@@ -2903,35 +2228,18 @@ impl Em {
             return Err("SDWA/DPP w tym kodowaniu");
         }
         self.dpp_enable = None;
-        if name.contains("f64")
-            || name.contains("_i64")
-            || name.contains("_u64")
-            || name.contains("_b64")
-        {
+        if name.contains("f64") || name.contains("_i64") || name.contains("_u64") || name.contains("_b64") {
             return self.valu64(d, name);
         }
-        if f16
-            && !mix
-            && !cmp
-            && !matches!(
-                name,
-                "v_cvt_f32_f16" | "v_cvt_f16_f32" | "v_cvt_pkrtz_f16_f32" | "v_pack_b32_f16"
-            )
-        {
+        if f16 && !mix && !cmp && !matches!(name, "v_cvt_f32_f16" | "v_cvt_f16_f32" | "v_cvt_pkrtz_f16_f32" | "v_pack_b32_f16") {
             return self.valu16(d, name);
         }
         let m = Self::mods(d);
         let u = self.sources(d, &ins, src_f16)?;
-        if let Some(rest) = name
-            .strip_prefix("v_cmpx_")
-            .or_else(|| name.strip_prefix("v_cmp_"))
-        {
+        if let Some(rest) = name.strip_prefix("v_cmpx_").or_else(|| name.strip_prefix("v_cmp_")) {
             return self.vopc(d, rest, name.starts_with("v_cmpx_"), &outs, &u, &m);
         }
-        let dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::Null);
+        let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
             Dst::V(n) => self.vreg(*n),
             _ => "0u".into(),
@@ -3187,27 +2495,13 @@ impl Em {
         Ok(())
     }
 
-    fn vopc(
-        &mut self,
-        d: &Decoded,
-        rest: &str,
-        cmpx: bool,
-        outs: &[&Operand],
-        u: &[String],
-        m: &Mods,
-    ) -> Result<(), &'static str> {
+    fn vopc(&mut self, d: &Decoded, rest: &str, cmpx: bool, outs: &[&Operand], u: &[String], m: &Mods) -> Result<(), &'static str> {
         let (op, ty) = rest.rsplit_once('_').ok_or("VOPC")?;
         if u.len() < 2 {
             return Err("VOPC");
         }
         let (mut ua, mut ub) = (u[0].clone(), u[1].clone());
-        let half = |i: u64, s: &str| {
-            if m.opsel >> i & 1 == 1 {
-                format!("(({s}) >> 16)")
-            } else {
-                format!("(({s}) & 0xFFFFu)")
-            }
-        };
+        let half = |i: u64, s: &str| if m.opsel >> i & 1 == 1 { format!("(({s}) >> 16)") } else { format!("(({s}) & 0xFFFFu)") };
         let ty = match ty {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
@@ -3264,11 +2558,7 @@ impl Em {
                 }
             }
             "i32" | "u32" => {
-                let (a, b) = if ty == "i32" {
-                    (format!("(int){ua}"), format!("(int){ub}"))
-                } else {
-                    (ua.clone(), ub.clone())
-                };
+                let (a, b) = if ty == "i32" { (format!("(int){ua}"), format!("(int){ub}")) } else { (ua.clone(), ub.clone()) };
                 match op {
                     "f" => "false".to_string(),
                     "lt" => format!("{a} < {b}"),
@@ -3287,17 +2577,8 @@ impl Em {
     }
 
     /// Destination of a compare: VCC / SDST (SDWA SD) / EXEC (cmpx).
-    fn vopc_write(
-        &mut self,
-        d: &Decoded,
-        cmpx: bool,
-        outs: &[&Operand],
-        cond: &str,
-    ) -> Result<(), &'static str> {
-        let mut dst = outs
-            .first()
-            .map(|o| Self::dst_of(d, o))
-            .unwrap_or(Dst::S(106));
+    fn vopc_write(&mut self, d: &Decoded, cmpx: bool, outs: &[&Operand], cond: &str) -> Result<(), &'static str> {
+        let mut dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
         if d.variant == Variant::Sdwa {
             // SDWA compares write VCC unless SD selects SDST
             if let Some(e) = ext_encoding(d) {
@@ -3336,20 +2617,12 @@ impl Em {
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
-        let voff = if offen {
-            self.vreg(vaddr + idxen as u64)
-        } else {
-            "0u".into()
-        };
+        let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
-        self.line(&format!(
-            "uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~3u;"
-        ));
-        self.line(&format!(
-            "bool {t}_ok = select({t}_stride == 0u, {t}_off + 4u <= {d2}, {index} < {d2});"
-        ));
+        self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~3u;"));
+        self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + 4u <= {d2}, {index} < {d2});"));
         let v = self.vreg(vdata);
         let act = self.act();
         let signed = op == "smin" || op == "smax";
@@ -3365,9 +2638,7 @@ impl Em {
         };
         self.line(&format!("if (and({act}, {t}_ok)) {{ {call} }}"));
         if f("GLC") == 1 {
-            self.line(&format!(
-                "{v} = select({act}, select({t}_ok, (uint){t}_old, 0u), {v});"
-            ));
+            self.line(&format!("{v} = select({act}, select({t}_ok, (uint){t}_old, 0u), {v});"));
         }
         Ok(())
     }
@@ -3375,9 +2646,7 @@ impl Em {
     /// FLAT / global: the flat memory model (address = low 32 bits).
     fn flat(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
-        let op = name
-            .trim_start_matches("global_")
-            .trim_start_matches("flat_");
+        let op = name.trim_start_matches("global_").trim_start_matches("flat_");
         if let Some(a) = op.strip_prefix("atomic_") {
             return self.flat_atomic(d, a);
         }
@@ -3402,11 +2671,7 @@ impl Em {
             addr
         };
         let raw = f("OFFSET") as u32;
-        let off = if global {
-            (((raw << 20) as i32) >> 20) as u32
-        } else {
-            raw
-        };
+        let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
         self.line(&format!("uint {t}_a = {base} + {};", hex(off)));
         let act = self.act();
@@ -3430,17 +2695,9 @@ impl Em {
         let global = d.enc.name == "ENC_FLAT_GLBL";
         let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
-        let base = if global && saddr != 0x7D && saddr != 0x7F {
-            format!("{} + {addr}", self.sreg(saddr))
-        } else {
-            addr
-        };
+        let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
         let raw = f("OFFSET") as u32;
-        let off = if global {
-            (((raw << 20) as i32) >> 20) as u32
-        } else {
-            raw
-        };
+        let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
         self.line(&format!("uint {t}_a = ({base} + {}) & ~3u;", hex(off)));
         let v = self.vreg(f("DATA"));
@@ -3455,12 +2712,8 @@ impl Em {
             "swap" => format!("mem.InterlockedExchange({t}_a, {v}, {t}_old);"),
             "umin" => format!("mem.InterlockedMin({t}_a, {v}, {t}_old);"),
             "umax" => format!("mem.InterlockedMax({t}_a, {v}, {t}_old);"),
-            "smin" => format!(
-                "int {t}_s; mem.InterlockedMin({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"
-            ),
-            "smax" => format!(
-                "int {t}_s; mem.InterlockedMax({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"
-            ),
+            "smin" => format!("int {t}_s; mem.InterlockedMin({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
+            "smax" => format!("int {t}_s; mem.InterlockedMax({t}_a, (int){v}, {t}_s); {t}_old = (uint){t}_s;"),
             "cmpswap" => {
                 let cmp = self.vreg(f("DATA") + 1);
                 format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
@@ -3469,11 +2722,7 @@ impl Em {
             // ints, negative ones like unsigned ints in reverse (no CAS loop – a program with
             // 168 such loops was too much for the driver's compiler)
             "fmin" | "fmax" => {
-                let (pos, neg) = if op == "fmin" {
-                    ("InterlockedMin", "InterlockedMax")
-                } else {
-                    ("InterlockedMax", "InterlockedMin")
-                };
+                let (pos, neg) = if op == "fmin" { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
                 format!(
                     "if (asfloat({v}) >= 0.0f) {{ int {t}_s; mem.{pos}({t}_a, asint({v}), {t}_s); {t}_old = asuint({t}_s); }} \
 else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
@@ -3516,19 +2765,14 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let m = if self.opt.wave64 { 63 } else { 31 };
-                self.line(&format!(
-                    "uint {t} = rla({v}, (({a} + {off16}u) >> 2) & {m}u);"
-                ));
+                self.line(&format!("uint {t} = rla({v}, (({a} + {off16}u) >> 2) & {m}u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
             }
             _ => {}
         }
-        if !matches!(
-            self.opt.mode,
-            Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)
-        ) {
+        if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
             return Err("LDS poza compute");
         }
         // geometry mode: where each GS lane puts its output vertices (lowest LDS address written)
@@ -3588,11 +2832,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             } else {
                 let v = self.vreg(f("VDST"));
                 let val = if signed {
-                    format!(
-                        "(uint)(((int)((({slot} >> {sh}) & {mask}u) << {}u)) >> {}u)",
-                        32 - bits,
-                        32 - bits
-                    )
+                    format!("(uint)(((int)((({slot} >> {sh}) & {mask}u) << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
                     format!("(({slot} >> {sh}) & {mask}u)")
                 };
@@ -3602,10 +2842,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
         }
         if let Some((write, n, stride, two)) = rw(name) {
             let addrs: Vec<String> = if two {
-                vec![
-                    format!("{a} + {}u", o0 * stride),
-                    format!("{a} + {}u", o1 * stride),
-                ]
+                vec![format!("{a} + {}u", o0 * stride), format!("{a} + {}u", o1 * stride)]
             } else {
                 vec![format!("{a} + {off16}u")]
             };
@@ -3624,14 +2861,8 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             }
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             if write && gs_phase {
-                let lowest = addrs
-                    .iter()
-                    .map(|x| format!("({x})"))
-                    .reduce(|p, q| format!("min({p}, {q})"))
-                    .unwrap_or_default();
-                self.line(&format!(
-                    "if ({act}) xcl_gs_base = min(xcl_gs_base, {lowest});"
-                ));
+                let lowest = addrs.iter().map(|x| format!("({x})")).reduce(|p, q| format!("min({p}, {q})")).unwrap_or_default();
+                self.line(&format!("if ({act}) xcl_gs_base = min(xcl_gs_base, {lowest});"));
             }
             return Ok(());
         }
@@ -3655,15 +2886,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             return Err("DS min/max i32");
         }
         let v = self.vreg(f("DATA0"));
-        let val = if op == "sub_u32" {
-            format!("(0u - {v})")
-        } else {
-            v
-        };
+        let val = if op == "sub_u32" { format!("(0u - {v})") } else { v };
         let slot = lds(format!("{a} + {off16}u"));
-        self.line(&format!(
-            "uint {t}_o = 0u; if ({act}) {{ {func}({slot}, {val}, {t}_o); }}"
-        ));
+        self.line(&format!("uint {t}_o = 0u; if ({act}) {{ {func}({slot}, {val}, {t}_o); }}"));
         if rtn {
             let r = self.vreg(f("VDST"));
             self.line(&format!("if ({act}) {r} = {t}_o;"));
@@ -3676,9 +2901,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
     pub fn finish(&self, body: &str) -> String {
         let mut h = String::new();
         h.push_str("// generated by XCL (RDNA2 -> HLSL), do not edit\n");
-        h.push_str(
-            "RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n",
-        );
+        h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
@@ -3688,14 +2911,8 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             h.push_str("RWByteAddressBuffer mem : register(u2);\n");
         }
         h.push_str(PRELUDE);
-        let infos: Vec<String> = (0..BUF_FORMATS.len())
-            .map(|i| format!("0x{:08X}u", buf_format_info(i)))
-            .collect();
-        let _ = writeln!(
-            h,
-            "static const uint FMT_INFO[78] = {{ {} }};",
-            infos.join(", ")
-        );
+        let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
+        let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
@@ -3716,18 +2933,12 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 if split {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
                 } else {
-                    h.push_str(
-                        "    uint xcl_hw_lane = WaveGetLaneIndex();\n    lane_id = xcl_hw_lane;\n",
-                    );
+                    h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    lane_id = xcl_hw_lane;\n");
                 }
                 load_sgprs(&mut h);
                 let _ = writeln!(h, "    uint scc = io.Load({}u);", KERNEL_SCC_SLOT * 4);
                 for &v in &self.vgprs {
-                    let _ = writeln!(
-                        h,
-                        "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);",
-                        KERNEL_SGPRS, KERNEL_VGPRS
-                    );
+                    let _ = writeln!(h, "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
                 h.push_str(body);
                 h.push_str("    if (xcl_hw_lane == 0u) {\n");
@@ -3737,33 +2948,17 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 let _ = writeln!(h, "        res.Store({}u, scc);", KERNEL_SCC_SLOT * 4);
                 h.push_str("    }\n");
                 for &v in &self.vgprs {
-                    let _ = writeln!(
-                        h,
-                        "    res.Store(({}u + xcl_hw_lane * {}u + {v}u) * 4u, v{v});",
-                        KERNEL_SGPRS, KERNEL_VGPRS
-                    );
+                    let _ = writeln!(h, "    res.Store(({}u + xcl_hw_lane * {}u + {v}u) * 4u, v{v});", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
                 h.push_str("}\n");
             }
             Mode::Vertex(vs) => {
                 h.push_str("struct XclIn {\n");
-                let inputs: Vec<&SigElement> = vs
-                    .inputs
-                    .iter()
-                    .filter(|e| e.system_value == 0 && !e.name.starts_with("SV_"))
-                    .collect();
+                let inputs: Vec<&SigElement> = vs.inputs.iter().filter(|e| e.system_value == 0 && !e.name.starts_with("SV_")).collect();
                 for e in &inputs {
-                    let _ = writeln!(
-                        h,
-                        "    {}4 a{} : {};",
-                        hlsl_type(e),
-                        e.register,
-                        e.semantic()
-                    );
+                    let _ = writeln!(h, "    {}4 a{} : {};", hlsl_type(e), e.register, e.semantic());
                 }
-                h.push_str(
-                    "    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n",
-                );
+                h.push_str("    uint xcl_vid : SV_VertexID;\n    uint xcl_iid : SV_InstanceID;\n};\n");
                 out_struct(&mut h, "XclOut", &vs.outputs);
                 h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
@@ -3772,34 +2967,18 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 for &v in &self.vgprs {
                     // SV_VertexID / SV_InstanceID listed in ISG1 come through the fetch shader like an
                     // attribute: v[base + 4r] (retail VInstanced* read the instance id in v8 = r1)
-                    let sv_at = vs.inputs.iter().find(|e| {
-                        matches!(e.system_value, 6 | 8) && v == vs.attr_base + 4 * e.register as u64
-                    });
+                    let sv_at = vs.inputs.iter().find(|e| matches!(e.system_value, 6 | 8) && v == vs.attr_base + 4 * e.register as u64);
                     let init = if v == 0 {
                         "xi.xcl_vid".to_string()
                     } else if v == 3 {
                         "xi.xcl_iid".to_string()
                     } else if let Some(e) = sv_at {
-                        if e.system_value == 6 {
-                            "xi.xcl_vid"
-                        } else {
-                            "xi.xcl_iid"
-                        }
-                        .to_string()
+                        if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
                         inputs
                             .iter()
-                            .find(|e| {
-                                v >= vs.attr_base + 4 * e.register as u64
-                                    && v < vs.attr_base + 4 * e.register as u64 + 4
-                            })
-                            .map(|e| {
-                                format!(
-                                    "asuint(xi.a{}[{}])",
-                                    e.register,
-                                    v - vs.attr_base - 4 * e.register as u64
-                                )
-                            })
+                            .find(|e| v >= vs.attr_base + 4 * e.register as u64 && v < vs.attr_base + 4 * e.register as u64 + 4)
+                            .map(|e| format!("asuint(xi.a{}[{}])", e.register, v - vs.attr_base - 4 * e.register as u64))
                             .unwrap_or_else(|| "0u".into())
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -3830,12 +3009,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     }
                 }
                 if cs.tg_size && sg.contains(&next) {
-                    let _ = writeln!(
-                        h,
-                        "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);",
-                        sname(next).unwrap(),
-                        x * y * z
-                    );
+                    let _ = writeln!(h, "    {} = ({}u / {lanes}u) | ((gi / {lanes}u) << 6);", sname(next).unwrap(), x * y * z);
                 }
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
@@ -3861,27 +3035,15 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 // thread index in the group as the console numbers it: wave · lanes + lane
                 let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());
-                let _ = writeln!(
-                    h,
-                    "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;",
-                    ms.vert_dwords()
-                );
-                let _ = writeln!(
-                    h,
-                    "    uint xcl_prm = xcl_rec + {}u + xcl_slot;",
-                    MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords()
-                );
+                let _ = writeln!(h, "    uint xcl_vtx = xcl_rec + {MESH_HEADER}u + xcl_slot * {}u;", ms.vert_dwords());
+                let _ = writeln!(h, "    uint xcl_prm = xcl_rec + {}u + xcl_slot;", MESH_HEADER + ms.max_vertices as usize * ms.vert_dwords());
                 load_sgprs(&mut h);
                 if sg.contains(&3) {
                     h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
                 }
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
-                    let init = if v == 5 {
-                        format!("gid.x * {t}u + xcl_slot")
-                    } else {
-                        "0u".into()
-                    };
+                    let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
                 }
                 h.push_str(body);
@@ -3897,22 +3059,13 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
                 h.push_str("    lane_id = WaveGetLaneIndex();\n");
-                let _ = writeln!(
-                    h,
-                    "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);",
-                    super::IO_GS_PRIMS * 4,
-                    super::IO_GS_VERTICES * 4
-                );
+                let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
                 let _ = writeln!(h, "    uint xcl_p0 = gid.x * {pg}u;\n    uint xcl_np = xcl_total > xcl_p0 ? min({pg}u, xcl_total - xcl_p0) : 0u;\n    uint xcl_nv = 3u * xcl_np;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", rec.record_dwords());
                 let _ = writeln!(h, "    uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n    uint xcl_tri[{maxt}];");
                 load_sgprs(&mut h);
                 if sg.contains(&2) {
-                    let _ = writeln!(
-                        h,
-                        "    s2 = {}u; // GS output area in LDS (after the ES items)",
-                        g.es_ring_bytes()
-                    );
+                    let _ = writeln!(h, "    s2 = {}u; // GS output area in LDS (after the ES items)", g.es_ring_bytes());
                 }
                 let item = g.es_item_bytes() / 4; // dwords per ES vertex
                 if sg.contains(&3) {
@@ -3936,15 +3089,8 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 }
                 h.push_str(body);
                 // emitted vertices (LDS, register r at +16·r) and strip triangles → the record
-                let pos_reg = g
-                    .outputs
-                    .iter()
-                    .find(|e| e.system_value == 1)
-                    .map(|e| e.register)
-                    .unwrap_or(0);
-                let regs: Vec<u32> = std::iter::once(pos_reg)
-                    .chain(ranked(&g.outputs, true).iter().map(|e| e.register))
-                    .collect();
+                let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
+                let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
                 h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tb = WavePrefixSum(xcl_ntri);\n");
                 // wave sums with every lane active (not inside the lane-0 branch)
                 h.push_str("    uint xcl_tv = WaveActiveSum(xcl_emitted);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
@@ -3984,13 +3130,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 for e in &ps.outputs {
                     match e.system_value {
                         64 => {
-                            let _ = writeln!(
-                                h,
-                                "    {}4 t{} : SV_Target{};",
-                                hlsl_type(e),
-                                e.index,
-                                e.index
-                            );
+                            let _ = writeln!(h, "    {}4 t{} : SV_Target{};", hlsl_type(e), e.index, e.index);
                         }
                         65 => h.push_str("    float xcl_depth : SV_Depth;\n"),
                         67 => h.push_str("    float xcl_depth : SV_DepthGreaterEqual;\n"),
@@ -3998,11 +3138,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                         _ => {}
                     }
                 }
-                if !ps
-                    .outputs
-                    .iter()
-                    .any(|e| matches!(e.system_value, 64 | 65 | 67 | 68))
-                {
+                if !ps.outputs.iter().any(|e| matches!(e.system_value, 64 | 65 | 67 | 68)) {
                     h.push_str("    float4 xcl_unused : SV_Target7;\n");
                 }
                 h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
@@ -4045,11 +3181,7 @@ fn out_struct(h: &mut String, name: &str, outputs: &[SigElement]) {
     let _ = writeln!(h, "struct {name} {{\n    float4 pos : SV_Position;");
     for (k, e) in ranked(outputs, true).iter().enumerate() {
         let n = out_comps(e);
-        let ty = if n == 1 {
-            hlsl_type(e).to_string()
-        } else {
-            format!("{}{n}", hlsl_type(e))
-        };
+        let ty = if n == 1 { hlsl_type(e).to_string() } else { format!("{}{n}", hlsl_type(e)) };
         let _ = writeln!(h, "    {ty} p{k} : {};", e.semantic());
     }
     h.push_str("};\n");
@@ -4064,12 +3196,7 @@ pub fn mesh_passthrough(ms: &MsInterface) -> String {
     h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
     out_struct(&mut h, "XclVert", &ms.outputs);
     h.push_str("struct XclPrim { bool cull : SV_CullPrimitive; };\n");
-    let (mv, mp, vd, rec) = (
-        ms.max_vertices,
-        ms.max_primitives,
-        ms.vert_dwords(),
-        ms.record_dwords(),
-    );
+    let (mv, mp, vd, rec) = (ms.max_vertices, ms.max_primitives, ms.vert_dwords(), ms.record_dwords());
     let t = ms.threads.clamp(1, 128);
     let _ = writeln!(
         h,
@@ -4079,10 +3206,7 @@ pub fn mesh_passthrough(ms: &MsInterface) -> String {
     let _ = writeln!(h, "    uint nv = min(res.Load(rec * 4u), {mv}u);\n    uint np = min(res.Load(rec * 4u + 4u), {mp}u);");
     h.push_str("    SetMeshOutputCounts(nv, np);\n");
     let _ = writeln!(h, "    for (uint i = gi; i < nv; i += {t}u) {{");
-    let _ = writeln!(
-        h,
-        "        uint b = (rec + {MESH_HEADER}u + i * {vd}u) * 4u;"
-    );
+    let _ = writeln!(h, "        uint b = (rec + {MESH_HEADER}u + i * {vd}u) * 4u;");
     h.push_str("        XclVert o;\n        o.pos = asfloat(res.Load4(b));\n");
     for (k, e) in ranked(&ms.outputs, true).iter().enumerate() {
         let n = out_comps(e);
@@ -4097,11 +3221,7 @@ pub fn mesh_passthrough(ms: &MsInterface) -> String {
     }
     h.push_str("        verts[i] = o;\n    }\n");
     let _ = writeln!(h, "    for (uint j = gi; j < np; j += {t}u) {{");
-    let _ = writeln!(
-        h,
-        "        uint p = res.Load((rec + {}u + j) * 4u);",
-        MESH_HEADER + mv as usize * vd
-    );
+    let _ = writeln!(h, "        uint p = res.Load((rec + {}u + j) * 4u);", MESH_HEADER + mv as usize * vd);
     h.push_str("        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);\n");
     h.push_str("        bool bad = (p >> 31) != 0u || any(x >= nv);\n");
     h.push_str("        tris[j] = bad ? uint3(0u, 0u, 0u) : x;\n        XclPrim q; q.cull = bad; prims[j] = q;\n    }\n}\n");
@@ -4137,16 +3257,9 @@ pub fn ps_attr_modes(insts: &[Decoded], ena: u32) -> BTreeMap<u32, String> {
         let mode = if name == "v_interp_mov_f32" {
             "nointerpolation"
         } else {
-            let pair = [
-                (0u32, "sample"),
-                (1, ""),
-                (2, "centroid"),
-                (4, "noperspective sample"),
-                (5, "noperspective"),
-                (6, "noperspective centroid"),
-            ]
-            .into_iter()
-            .find(|&(bit, _)| ps_input_vgpr(ena, bit).is_some_and(|b| ij == b || ij == b + 1));
+            let pair = [(0u32, "sample"), (1, ""), (2, "centroid"), (4, "noperspective sample"), (5, "noperspective"), (6, "noperspective centroid")]
+                .into_iter()
+                .find(|&(bit, _)| ps_input_vgpr(ena, bit).is_some_and(|b| ij == b || ij == b + 1));
             match pair {
                 Some((_, m)) => m,
                 None => continue,

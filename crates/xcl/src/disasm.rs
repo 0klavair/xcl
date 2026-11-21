@@ -16,11 +16,7 @@ fn parse_num(s: &str) -> Option<usize> {
 fn print_lines(code: &[u8], base: usize, stop: bool) {
     for l in rdna2::disassemble(code, base as u64, stop) {
         let hex: Vec<String> = l.bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let mark = if l.flags & rdna2::F_BRANCH != 0 {
-            "  ; →"
-        } else {
-            ""
-        };
+        let mark = if l.flags & rdna2::F_BRANCH != 0 { "  ; →" } else { "" };
         println!("  {:08x}: {:<52} {}{mark}", l.pc, l.text, hex.join(" "));
     }
 }
@@ -28,16 +24,7 @@ fn print_lines(code: &[u8], base: usize, stop: bool) {
 fn hexdump(data: &[u8], base: usize) {
     for (i, row) in data.chunks(16).enumerate() {
         let hex: Vec<String> = row.iter().map(|b| format!("{b:02x}")).collect();
-        let txt: String = row
-            .iter()
-            .map(|&b| {
-                if (0x20..0x7f).contains(&b) {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
+        let txt: String = row.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
         println!("    {:06x}: {:<47}  {txt}", base + i * 16, hex.join(" "));
     }
 }
@@ -57,19 +44,10 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
         sh.stage, sh.shader_model.0, sh.shader_model.1, sh.xdat_offset
     );
     for e in &sh.entries {
-        println!(
-            "  XDAT {:#04x}  +{:#x}  {} B  {}",
-            e.id,
-            e.offset,
-            e.size,
-            xdat_label(e.id)
-        );
+        println!("  XDAT {:#04x}  +{:#x}  {} B  {}", e.id, e.offset, e.size, xdat_label(e.id));
     }
     if let Some(h) = sh.hash {
-        println!(
-            "  hash: {}",
-            h.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
+        println!("  hash: {}", h.iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
     for n in &sh.notes {
         println!("  UWAGA: {n}");
@@ -87,33 +65,18 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
             println!("  UWAGA: {e}");
         }
         for s in &f.stages {
-            println!(
-                "  etap sprzętowy: {} – deskryptor @ +{:#x}",
-                s.label(),
-                s.offset
-            );
+            println!("  etap sprzętowy: {} – deskryptor @ +{:#x}", s.label(), s.offset);
         }
         match f.code {
             Some((o, l)) => println!(
                 "  kod: +{o:#x}, {l} B ({}), programów: {}",
-                if f.code_from_header {
-                    "wskaźnik z nagłówka +0xC0"
-                } else {
-                    "znaleziony skanowaniem"
-                },
+                if f.code_from_header { "wskaźnik z nagłówka +0xC0" } else { "znaleziony skanowaniem" },
                 f.programs.len()
             ),
             None => println!("  kod: nie znaleziono"),
         }
         let limit = if full_hex { usize::MAX } else { 0x140 };
-        println!(
-            "  nagłówek – niezerowe qwordy (bez wypełniacza 0xDEADBEEF){}:",
-            if full_hex {
-                ""
-            } else {
-                ", do +0x140; --hex: całość"
-            }
-        );
+        println!("  nagłówek – niezerowe qwordy (bez wypełniacza 0xDEADBEEF){}:", if full_hex { "" } else { ", do +0x140; --hex: całość" });
         for (o, q) in xbox::header_qwords(f, limit) {
             println!("    +{o:#05x}: {q:016x}");
         }
@@ -124,11 +87,7 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
             }
         }
         if let Some(out) = fssm_out {
-            let name = if i == 0 {
-                out.to_string()
-            } else {
-                format!("{out}.{i}")
-            };
+            let name = if i == 0 { out.to_string() } else { format!("{out}.{i}") };
             match std::fs::write(&name, &f.data) {
                 Ok(()) => println!("  zapisano FSSM do {name}"),
                 Err(e) => eprintln!("xcl disasm: {name}: {e}"),
@@ -145,28 +104,16 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let opt = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| parse_num(v))
-    };
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| parse_num(v));
     let all = args.iter().any(|a| a == "--all");
-    println!(
-        "{} – {} B, dekoder: {}",
-        path.display(),
-        data.len(),
-        crate::gpu::RDNA2_ARCH
-    );
+    println!("{} – {} B, dekoder: {}", path.display(), data.len(), crate::gpu::RDNA2_ARCH);
 
     if let Some(off) = opt("--offset") {
         if off >= data.len() {
             eprintln!("xcl disasm: offset {off:#x} poza plikiem");
             return 2;
         }
-        let len = opt("--length")
-            .unwrap_or(data.len() - off)
-            .min(data.len() - off);
+        let len = opt("--length").unwrap_or(data.len() - off).min(data.len() - off);
         print_lines(&data[off..off + len], off, !all);
         return 0;
     }
@@ -181,11 +128,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     if kind == shader::Kind::XboxNative {
         if let Some(sh) = xbox::parse(&data) {
-            let out = args
-                .iter()
-                .position(|a| a == "--fssm")
-                .and_then(|i| args.get(i + 1))
-                .map(String::as_str);
+            let out = args.iter().position(|a| a == "--fssm").and_then(|i| args.get(i + 1)).map(String::as_str);
             print_xbox(&sh, args.iter().any(|a| a == "--hex"), out);
         }
     }

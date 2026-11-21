@@ -18,12 +18,7 @@ pub struct PipeConfig {
 impl PipeConfig {
     /// row group in the RB+ tables (addrlib Gfx10Lib::HwlInitGlobalParams, m_colorBaseIndex)
     fn group(self) -> usize {
-        (self.pipes_log2
-            + if self.pkrs_log2 >= 2 {
-                2 * self.pkrs_log2 - 2
-            } else {
-                0
-            }) as usize
+        (self.pipes_log2 + if self.pkrs_log2 >= 2 { 2 * self.pkrs_log2 - 2 } else { 0 }) as usize
     }
 }
 
@@ -90,16 +85,7 @@ impl Layout {
                 })
                 .collect()
         };
-        Some(Layout {
-            mode,
-            elem_log2,
-            block_w: bw,
-            block_h: bh,
-            block_bytes: 1 << blk,
-            base_xor: 0,
-            ox: table(bw, 0),
-            oy: table(bh, 16),
-        })
+        Some(Layout { mode, elem_log2, block_w: bw, block_h: bh, block_bytes: 1 << blk, base_xor: 0, ox: table(bw, 0), oy: table(bh, 16) })
     }
 
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
@@ -117,8 +103,7 @@ impl Layout {
     pub fn offset(&self, x: usize, y: usize, w: usize) -> usize {
         let pitch_blocks = w.div_ceil(self.block_w);
         let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
-        block * self.block_bytes
-            + ((self.ox[x % self.block_w] ^ self.oy[y % self.block_h]) as usize ^ self.base_xor)
+        block * self.block_bytes + ((self.ox[x % self.block_w] ^ self.oy[y % self.block_h]) as usize ^ self.base_xor)
     }
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
@@ -174,11 +159,7 @@ pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, 
     let (e, side) = element(t.format)?;
     let mut l = Layout::new(t.swizzle_mode, e, cfg)?;
     l.base_xor = (t.address as usize) & (l.block_bytes - 1);
-    Some((
-        l,
-        t.width.div_ceil(side) as usize,
-        t.height.div_ceil(side) as usize,
-    ))
+    Some((l, t.width.div_ceil(side) as usize, t.height.div_ceil(side) as usize))
 }
 
 #[cfg(test)]
@@ -189,22 +170,8 @@ mod tests {
 
     fn configs() -> Vec<PipeConfig> {
         let mut v = vec![];
-        for (p, k) in [
-            (0, 0),
-            (1, 0),
-            (2, 0),
-            (3, 1),
-            (2, 2),
-            (3, 2),
-            (4, 2),
-            (3, 3),
-            (4, 3),
-            (5, 3),
-        ] {
-            v.push(PipeConfig {
-                pipes_log2: p,
-                pkrs_log2: k,
-            });
+        for (p, k) in [(0, 0), (1, 0), (2, 0), (3, 1), (2, 2), (3, 2), (4, 2), (3, 3), (4, 3), (5, 3)] {
+            v.push(PipeConfig { pipes_log2: p, pkrs_log2: k });
         }
         v
     }
@@ -217,24 +184,13 @@ mod tests {
             for e in 0..5 {
                 for cfg in configs() {
                     let l = Layout::new(mode, e, cfg).unwrap();
-                    assert_eq!(
-                        l.block_w * l.block_h << e,
-                        l.block_bytes,
-                        "mode {mode} e {e}"
-                    );
+                    assert_eq!(l.block_w * l.block_h << e, l.block_bytes, "mode {mode} e {e}");
                     let mut seen = vec![false; l.block_bytes >> e];
                     for y in 0..l.block_h {
                         for x in 0..l.block_w {
                             let o = l.offset(x, y, l.block_w);
-                            assert_eq!(
-                                o & ((1 << e) - 1),
-                                0,
-                                "mode {mode} e {e} {cfg:?}: misaligned"
-                            );
-                            assert!(
-                                !std::mem::replace(&mut seen[o >> e], true),
-                                "mode {mode} e {e} {cfg:?}: ({x},{y}) collides"
-                            );
+                            assert_eq!(o & ((1 << e) - 1), 0, "mode {mode} e {e} {cfg:?}: misaligned");
+                            assert!(!std::mem::replace(&mut seen[o >> e], true), "mode {mode} e {e} {cfg:?}: ({x},{y}) collides");
                         }
                     }
                 }
@@ -245,15 +201,7 @@ mod tests {
     /// SW_256B_S with bytes: a 16×16 block stored row by row (addrlib's first nibble row)
     #[test]
     fn sw_256b_s_bytes_are_row_major() {
-        let l = Layout::new(
-            1,
-            0,
-            PipeConfig {
-                pipes_log2: 0,
-                pkrs_log2: 0,
-            },
-        )
-        .unwrap();
+        let l = Layout::new(1, 0, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
         assert_eq!((l.block_w, l.block_h), (16, 16));
         assert_eq!(l.offset(5, 3, 16), 3 * 16 + 5);
         assert_eq!(l.offset(1, 16, 32), 2 * 256 + 1); // second block row of a 2-block-wide surface
@@ -276,18 +224,8 @@ mod tests {
             swizzle_mode: 10,
             min_lod: 0.0,
         };
-        let (l, w, h) = image_layout(
-            &t,
-            PipeConfig {
-                pipes_log2: 0,
-                pkrs_log2: 0,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            (w, h, l.block_w, l.block_h, l.base_xor),
-            (64, 33, 64, 64, 0x300)
-        );
+        let (l, w, h) = image_layout(&t, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
+        assert_eq!((w, h, l.block_w, l.block_h, l.base_xor), (64, 33, 64, 64, 0x300));
         assert_eq!(l.size(w, h), 65536); // 33 block rows fit one 64×64 tile
         assert_eq!(element(56), Some((2, 1)));
         assert_eq!(element(72), None);
@@ -295,15 +233,7 @@ mod tests {
 
     #[test]
     fn tile_then_detile_round_trips_with_partial_blocks() {
-        let l = Layout::new(
-            25,
-            2,
-            PipeConfig {
-                pipes_log2: 4,
-                pkrs_log2: 2,
-            },
-        )
-        .unwrap();
+        let l = Layout::new(25, 2, PipeConfig { pipes_log2: 4, pkrs_log2: 2 }).unwrap();
         let (w, h) = (200, 130);
         let lin: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 + i / 977) as u8).collect();
         let t = l.tile(&lin, w, h);
@@ -328,15 +258,7 @@ mod tests {
             (5, 0, "xxxxyyyyyxyx"),
         ];
         for (mode, e, want) in retail {
-            let l = Layout::new(
-                mode,
-                e,
-                PipeConfig {
-                    pipes_log2: 0,
-                    pkrs_log2: 0,
-                },
-            )
-            .unwrap();
+            let l = Layout::new(mode, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
             // bit i of the element index: which coordinate moves it
             let got: String = (0..want.len())
                 .map(|i| {
@@ -354,3 +276,4 @@ mod tests {
         }
     }
 }
+

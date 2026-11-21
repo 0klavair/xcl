@@ -17,11 +17,7 @@ pub fn slot(iface: &Iface, method: &str) -> Option<usize> {
 pub fn chain(base: &str) -> Vec<&'static Iface> {
     let mut v: Vec<&'static Iface> = IFACES
         .iter()
-        .filter(|i| {
-            i.name == base
-                || (i.name.starts_with(base)
-                    && i.name[base.len()..].chars().all(|c| c.is_ascii_digit()))
-        })
+        .filter(|i| i.name == base || (i.name.starts_with(base) && i.name[base.len()..].chars().all(|c| c.is_ascii_digit())))
         .collect();
     v.sort_by(|a, b| b.methods.len().cmp(&a.methods.len()));
     v
@@ -35,17 +31,7 @@ pub fn parse_guid(s: &str) -> GUID {
 pub fn guid_string(g: &GUID) -> String {
     format!(
         "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        g.data1,
-        g.data2,
-        g.data3,
-        g.data4[0],
-        g.data4[1],
-        g.data4[2],
-        g.data4[3],
-        g.data4[4],
-        g.data4[5],
-        g.data4[6],
-        g.data4[7]
+        g.data1, g.data2, g.data3, g.data4[0], g.data4[1], g.data4[2], g.data4[3], g.data4[4], g.data4[5], g.data4[6], g.data4[7]
     )
 }
 
@@ -66,9 +52,7 @@ mod tests {
         let c = chain("ID3D12Device");
         assert!(c.len() >= 10 && c[0].methods.len() > c[c.len() - 1].methods.len());
         assert!(c.iter().all(|i| i.name.starts_with("ID3D12Device")));
-        assert!(!chain("ID3D12Device")
-            .iter()
-            .any(|i| i.name == "ID3D12DeviceChild"));
+        assert!(!chain("ID3D12Device").iter().any(|i| i.name == "ID3D12DeviceChild"));
         let g = parse_guid(dev.iid);
         assert_eq!(guid_string(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
     }

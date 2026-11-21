@@ -77,22 +77,11 @@ unsafe fn set_state(b: *mut XAsyncBlock, s: Option<Arc<State>>) {
     }
 }
 
-unsafe fn call_provider(
-    s: &State,
-    op: u32,
-    b: *mut XAsyncBlock,
-    buffer: *mut c_void,
-    size: usize,
-) -> HRESULT {
+unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_void, size: usize) -> HRESULT {
     if s.provider == 0 {
         return S_OK;
     }
-    let data = XAsyncProviderData {
-        async_: b,
-        buffer_size: size,
-        buffer,
-        context: s.context as *mut c_void,
-    };
+    let data = XAsyncProviderData { async_: b, buffer_size: size, buffer, context: s.context as *mut c_void };
     let f: XAsyncProvider = std::mem::transmute(s.provider);
     f(op, &data)
 }
@@ -142,12 +131,7 @@ pub unsafe extern "system" fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         work: 0,
-        inner: Mutex::new(Inner {
-            status: E_PENDING,
-            result_size: 0,
-            done: false,
-            cleaned: false,
-        }),
+        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, done: false, cleaned: false }),
         cv: Condvar::new(),
     });
     set_state(b, Some(s.clone()));
@@ -162,26 +146,12 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     if b.is_null() {
         return E_INVALIDARG;
     }
-    let Some(q) = taskqueue::queue_from((*b).queue) else {
-        return E_INVALIDARG;
-    };
-    taskqueue::submit_delayed(
-        &q,
-        PORT_WORK,
-        delay_ms,
-        Item {
-            cb: do_work_cb as usize,
-            ctx: b as usize,
-        },
-    );
+    let Some(q) = taskqueue::queue_from((*b).queue) else { return E_INVALIDARG };
+    taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize });
     S_OK
 }
 
-pub unsafe extern "system" fn XAsyncComplete(
-    b: *mut XAsyncBlock,
-    result: HRESULT,
-    required: usize,
-) {
+pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
     let Some(s) = state_of(b) else { return };
     let cleanup_now;
     {
@@ -189,11 +159,7 @@ pub unsafe extern "system" fn XAsyncComplete(
         if g.done {
             return;
         }
-        g.status = if result == E_PENDING {
-            crate::util::E_FAIL
-        } else {
-            result
-        };
+        g.status = if result == E_PENDING { crate::util::E_FAIL } else { result };
         g.result_size = if result >= 0 { required } else { 0 };
         g.done = true;
         cleanup_now = g.result_size == 0;
@@ -207,22 +173,13 @@ pub unsafe extern "system" fn XAsyncComplete(
     s.cv.notify_all();
     if (*b).callback != 0 {
         if let Some(q) = taskqueue::queue_from((*b).queue) {
-            taskqueue::submit_now(
-                &q,
-                PORT_COMPLETION,
-                Item {
-                    cb: completion_cb as usize,
-                    ctx: b as usize,
-                },
-            );
+            taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
-    let Some(s) = state_of(b) else {
-        return E_INVALIDARG;
-    };
+    let Some(s) = state_of(b) else { return E_INVALIDARG };
     let mut g = s.inner.lock().unwrap();
     if wait {
         while !g.done {
@@ -236,13 +193,8 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
     }
 }
 
-pub unsafe extern "system" fn XAsyncGetResultSize(
-    b: *mut XAsyncBlock,
-    size: *mut usize,
-) -> HRESULT {
-    let Some(s) = state_of(b) else {
-        return E_INVALIDARG;
-    };
+pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    let Some(s) = state_of(b) else { return E_INVALIDARG };
     let g = s.inner.lock().unwrap();
     if !g.done {
         return E_PENDING;
@@ -260,9 +212,7 @@ pub unsafe extern "system" fn XAsyncGetResult(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
-    let Some(s) = state_of(b) else {
-        return E_INVALIDARG;
-    };
+    let Some(s) = state_of(b) else { return E_INVALIDARG };
     let (status, need, cleaned) = {
         let g = s.inner.lock().unwrap();
         if !g.done {
@@ -315,12 +265,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
         context: 0,
         identity: 0,
         work,
-        inner: Mutex::new(Inner {
-            status: E_PENDING,
-            result_size: 0,
-            done: false,
-            cleaned: false,
-        }),
+        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, done: false, cleaned: false }),
         cv: Condvar::new(),
     });
     set_state(b, Some(s));
@@ -354,11 +299,7 @@ unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderD
         }
         OP_GET_RESULT => {
             if let Some(Ok(v)) = p.result.lock().unwrap().as_ref() {
-                std::ptr::copy_nonoverlapping(
-                    v.as_ptr(),
-                    d.buffer as *mut u8,
-                    v.len().min(d.buffer_size),
-                );
+                std::ptr::copy_nonoverlapping(v.as_ptr(), d.buffer as *mut u8, v.len().min(d.buffer_size));
             }
             S_OK
         }
@@ -375,18 +316,9 @@ pub unsafe fn begin_with<F>(b: *mut XAsyncBlock, identity: usize, work: F) -> HR
 where
     F: FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 {
-    let p = Box::into_raw(Box::new(Payload {
-        result: Mutex::new(None),
-        work: Mutex::new(Some(Box::new(work))),
-    }));
+    let p = Box::into_raw(Box::new(Payload { result: Mutex::new(None), work: Mutex::new(Some(Box::new(work))) }));
     // On failure XAsyncBegin completes the block, which runs OP_CLEANUP and frees `p`.
-    XAsyncBegin(
-        b,
-        p as *mut c_void,
-        identity as *const c_void,
-        std::ptr::null(),
-        payload_provider as usize,
-    )
+    XAsyncBegin(b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize)
 }
 
 #[cfg(test)]
@@ -412,14 +344,8 @@ mod tests {
             assert_eq!(size, 5);
             let mut buf = [0u8; 8];
             let mut used = 0usize;
-            assert_eq!(
-                XAsyncGetResult(&mut b, id as _, 2, buf.as_mut_ptr() as _, &mut used),
-                E_NOT_SUFFICIENT_BUFFER
-            );
-            assert_eq!(
-                XAsyncGetResult(&mut b, id as _, 8, buf.as_mut_ptr() as _, &mut used),
-                S_OK
-            );
+            assert_eq!(XAsyncGetResult(&mut b, id as _, 2, buf.as_mut_ptr() as _, &mut used), E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(XAsyncGetResult(&mut b, id as _, 8, buf.as_mut_ptr() as _, &mut used), S_OK);
             assert_eq!(&buf[..5], b"hello");
             assert_eq!(used, 5);
             // completion callback is delivered on the (thread pool) completion port

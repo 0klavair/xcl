@@ -16,9 +16,8 @@ use super::{rdna2, xbox};
 
 /// DXBC container part FourCCs that are well understood on PC.
 const KNOWN_PARTS: &[&str] = &[
-    "DXIL", "SHEX", "SHDR", "ISGN", "OSGN", "ISG1", "OSG1", "PSG1", "PCSG", "PSV0", "RTS0", "STAT",
-    "ILDB", "ILDN", "HASH", "SFI0", "RDEF", "SPDB", "PRIV", "VERS", "SRCI", "PDBI", "SPDB", "OSG5",
-    "IFCE", "RDAT", "MESH",
+    "DXIL", "SHEX", "SHDR", "ISGN", "OSGN", "ISG1", "OSG1", "PSG1", "PCSG", "PSV0", "RTS0", "STAT", "ILDB", "ILDN",
+    "HASH", "SFI0", "RDEF", "SPDB", "PRIV", "VERS", "SRCI", "PDBI", "SPDB", "OSG5", "IFCE", "RDAT", "MESH",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,10 +32,7 @@ pub fn container_parts(blob: &[u8]) -> Option<Vec<Part>> {
     if blob.len() < 32 || &blob[0..4] != b"DXBC" {
         return None;
     }
-    let rd = |o: usize| {
-        blob.get(o..o + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-    };
+    let rd = |o: usize| blob.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
     let count = rd(28)?;
     if count > 64 {
         return None;
@@ -50,10 +46,7 @@ pub fn container_parts(blob: &[u8]) -> Option<Vec<Part>> {
             return None;
         }
         parts.push(Part {
-            fourcc: String::from_utf8_lossy(fourcc)
-                .chars()
-                .map(|c| if c.is_ascii_graphic() { c } else { '?' })
-                .collect(),
+            fourcc: String::from_utf8_lossy(fourcc).chars().map(|c| if c.is_ascii_graphic() { c } else { '?' }).collect(),
             offset: off + 8,
             size,
         });
@@ -101,11 +94,7 @@ pub fn classify(blob: &[u8]) -> (Kind, Vec<Part>) {
             Kind::Dxil
         } else if has("SHEX") || has("SHDR") {
             Kind::Dxbc
-        } else if has("RTS0")
-            && parts
-                .iter()
-                .all(|p| KNOWN_PARTS.contains(&p.fourcc.as_str()))
-        {
+        } else if has("RTS0") && parts.iter().all(|p| KNOWN_PARTS.contains(&p.fourcc.as_str())) {
             Kind::Dxbc // root signature container
         } else {
             Kind::ContainerUnknown
@@ -129,10 +118,7 @@ pub fn rdna2_listing(blob: &[u8]) -> String {
     let mut regions: Vec<(String, usize, usize)> = Vec::new();
     match container_parts(blob) {
         Some(parts) => {
-            for p in parts
-                .iter()
-                .filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str()))
-            {
+            for p in parts.iter().filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str())) {
                 regions.push((format!("part {}", p.fourcc), p.offset, p.size));
             }
         }
@@ -142,19 +128,10 @@ pub fn rdna2_listing(blob: &[u8]) -> String {
     for (label, off, size) in regions {
         let data = &blob[off..off + size];
         for (start, len) in rdna2::find_programs(data) {
-            out.push_str(&format!(
-                "; {label}: program at +{:#x} ({} bytes)\n",
-                off + start,
-                len
-            ));
+            out.push_str(&format!("; {label}: program at +{:#x} ({} bytes)\n", off + start, len));
             for l in rdna2::disassemble(&data[start..start + len], (off + start) as u64, false) {
                 let hex: Vec<String> = l.bytes.iter().map(|b| format!("{b:02x}")).collect();
-                out.push_str(&format!(
-                    "  {:08x}: {:<48} {}\n",
-                    l.pc,
-                    l.text,
-                    hex.join(" ")
-                ));
+                out.push_str(&format!("  {:08x}: {:<48} {}\n", l.pc, l.text, hex.join(" ")));
             }
         }
     }
@@ -227,9 +204,7 @@ fn dump_dir() -> PathBuf {
 /// Is `[p, p+len)` committed, readable memory? (Game-provided pointers may be garbage
 /// when our guess of a console struct layout is wrong.)
 pub fn readable(p: usize, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
-    };
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS};
     if p == 0 || len == 0 || len > 256 << 20 {
         return false;
     }
@@ -240,18 +215,8 @@ pub fn readable(p: usize, len: usize) -> bool {
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let n = unsafe {
-            VirtualQuery(
-                cur as *const _,
-                &mut mbi,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if n == 0
-            || mbi.State != MEM_COMMIT
-            || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
-            || mbi.Protect == 0
-        {
+        let n = unsafe { VirtualQuery(cur as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 || mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || mbi.Protect == 0 {
             return false;
         }
         cur = mbi.BaseAddress as usize + mbi.RegionSize;
@@ -265,11 +230,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         return; // unused stage
     }
     let mut g = STATE.lock().unwrap();
-    let st = g.get_or_insert_with(|| State {
-        seen: HashSet::new(),
-        stats: ShaderStats::default(),
-        insts: xbox::InstStats::default(),
-    });
+    let st = g.get_or_insert_with(|| State { seen: HashSet::new(), stats: ShaderStats::default(), insts: xbox::InstStats::default() });
     st.stats.submitted += 1;
     if !readable(ptr, len) {
         st.stats.rejected_pointers += 1;
@@ -286,14 +247,8 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
     }
     st.stats.unique += 1;
     let (kind, parts) = classify(&blob);
-    *st.stats
-        .by_kind
-        .entry(kind.label().to_string())
-        .or_default() += 1;
-    for p in parts
-        .iter()
-        .filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str()))
-    {
+    *st.stats.by_kind.entry(kind.label().to_string()).or_default() += 1;
+    for p in parts.iter().filter(|p| !KNOWN_PARTS.contains(&p.fourcc.as_str())) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
@@ -302,25 +257,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
     let base = dir.join(format!("{h:016x}_{stage}"));
     let _ = std::fs::write(base.with_extension("bin"), &blob);
     let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
-    crate::xlog_info!(
-        "[SHADER] {stage} {h:016x}: {} B, format {}, części [{}]",
-        blob.len(),
-        kind.label(),
-        names.join(",")
-    );
+    crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, części [{}]", blob.len(), kind.label(), names.join(","));
     if kind == Kind::XboxNative {
         capture_xbox(&blob, &base, h);
-    } else if matches!(
-        kind,
-        Kind::ContainerUnknown | Kind::Rdna2Raw | Kind::Unknown
-    ) {
+    } else if matches!(kind, Kind::ContainerUnknown | Kind::Rdna2Raw | Kind::Unknown) {
         let listing = rdna2_listing(&blob);
         if !listing.is_empty() {
             let _ = std::fs::write(base.with_extension("rdna2.txt"), listing);
-            crate::xlog_info!(
-                "[SHADER] {h:016x}: znaleziono kod RDNA2 – dezasemblacja w {}",
-                base.with_extension("rdna2.txt").display()
-            );
+            crate::xlog_info!("[SHADER] {h:016x}: znaleziono kod RDNA2 – dezasemblacja w {}", base.with_extension("rdna2.txt").display());
         }
     }
 }
@@ -331,11 +275,7 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
     let Some(sh) = xbox::parse(blob) else { return };
     let mut insts = xbox::InstStats::default();
     insts.add_shader(&sh);
-    let failed = !sh.notes.is_empty()
-        || sh
-            .fssm
-            .iter()
-            .any(|f| f.error.is_some() || f.programs.is_empty());
+    let failed = !sh.notes.is_empty() || sh.fssm.iter().any(|f| f.error.is_some() || f.programs.is_empty());
     if let Some(st) = STATE.lock().unwrap().as_mut() {
         for f in &sh.fssm {
             *st.stats.xbox_hw_stages.entry(f.stage_label()).or_default() += 1;
@@ -357,11 +297,7 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
         sh.shader_model.1,
         stages.join(", "),
         insts.instructions,
-        if failed {
-            " – UWAGA: niepełny parse (xcl disasm)"
-        } else {
-            ""
-        }
+        if failed { " – UWAGA: niepełny parse (xcl disasm)" } else { "" }
     );
 }
 
@@ -382,26 +318,12 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
         };
         for (j, p) in f.programs.iter().enumerate() {
             let code = &f.data[p.offset..p.offset + p.len];
-            let opt = recomp::Options {
-                mode: mode.clone(),
-                wave64: recomp::detect_wave64(code),
-                ..Default::default()
-            };
-            let Ok(t) = recomp::translate(code, &opt) else {
-                continue;
-            };
+            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
+            let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
-            let built = if dxc && t.complete() {
-                Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile))
-            } else {
-                None
-            };
+            let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
             if let Some(Err(e)) = &built {
-                crate::xlog_warn!(
-                    "[SHADER] DXC odrzucił tłumaczenie {}: {}",
-                    base.display(),
-                    e.lines().next().unwrap_or("")
-                );
+                crate::xlog_warn!("[SHADER] DXC odrzucił tłumaczenie {}: {}", base.display(), e.lines().next().unwrap_or(""));
             }
             if let Some(st) = STATE.lock().unwrap().as_mut() {
                 let s = &mut st.stats;
@@ -424,10 +346,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
 
 pub fn stats() -> ShaderStats {
     let g = STATE.lock().ok();
-    let mut s = g
-        .as_ref()
-        .and_then(|g| g.as_ref().map(|st| st.stats.clone()))
-        .unwrap_or_default();
+    let mut s = g.as_ref().and_then(|g| g.as_ref().map(|st| st.stats.clone())).unwrap_or_default();
     if let Some(st) = g.as_ref().and_then(|g| g.as_ref()) {
         s.rdna2_instructions = st.insts.instructions;
         s.rdna2_undecoded_dwords = st.insts.undecoded;
@@ -461,10 +380,7 @@ mod tests {
 
     #[test]
     fn classifies_containers() {
-        assert_eq!(
-            classify(&container(&[(b"ISG1", b"x"), (b"DXIL", b"bitcode")])).0,
-            Kind::Dxil
-        );
+        assert_eq!(classify(&container(&[(b"ISG1", b"x"), (b"DXIL", b"bitcode")])).0, Kind::Dxil);
         assert_eq!(classify(&container(&[(b"SHEX", b"code")])).0, Kind::Dxbc);
         // a made-up console part with RDNA2 code inside: s_mov_b32 s0, s1 ; s_endpgm
         let code = [0x01u8, 0x03, 0x80, 0xbe, 0x00, 0x00, 0x81, 0xbf];

@@ -48,12 +48,7 @@ pub struct Port {
 
 impl Port {
     fn new(mode: u32) -> Port {
-        Port {
-            mode,
-            items: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(),
-            running: AtomicBool::new(false),
-        }
+        Port { mode, items: Mutex::new(VecDeque::new()), cv: Condvar::new(), running: AtomicBool::new(false) }
     }
 }
 
@@ -83,10 +78,7 @@ fn pool() -> &'static Mutex<mpsc::Sender<Job>> {
     POOL.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 8);
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
         for i in 0..n {
             let rx = rx.clone();
             std::thread::Builder::new()
@@ -257,11 +249,7 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
     let p = &q.ports[port as usize];
     let mut g = p.items.lock().unwrap();
     if g.is_empty() && timeout_ms != 0 {
-        let dur = if timeout_ms == u32::MAX {
-            Duration::from_secs(u64::MAX / 4)
-        } else {
-            Duration::from_millis(timeout_ms as u64)
-        };
+        let dur = if timeout_ms == u32::MAX { Duration::from_secs(u64::MAX / 4) } else { Duration::from_millis(timeout_ms as u64) };
         let deadline = Instant::now() + dur.min(Duration::from_secs(365 * 24 * 3600));
         while g.is_empty() {
             let now = Instant::now();
@@ -271,9 +259,7 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
             g = p.cv.wait_timeout(g, deadline - now).unwrap().0;
         }
     }
-    let Some(item) = g.pop_front() else {
-        return false;
-    };
+    let Some(item) = g.pop_front() else { return false };
     drop(g);
     unsafe { q.execute(item) };
     true
@@ -284,10 +270,7 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
 // ---------------------------------------------------------------------------------------
 
 pub fn new_handle(q: Arc<Queue>) -> *mut QueueHandle {
-    Box::into_raw(Box::new(QueueHandle {
-        magic: MAGIC,
-        queue: q,
-    }))
+    Box::into_raw(Box::new(QueueHandle { magic: MAGIC, queue: q }))
 }
 
 pub unsafe fn queue_from(h: *mut c_void) -> Option<Arc<Queue>> {
@@ -312,11 +295,7 @@ pub fn process_queue() -> Arc<Queue> {
 // exported API
 // ---------------------------------------------------------------------------------------
 
-pub unsafe extern "system" fn XTaskQueueCreate(
-    work: u32,
-    completion: u32,
-    out: *mut *mut c_void,
-) -> HRESULT {
+pub unsafe extern "system" fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() || work > 3 || completion > 3 {
         return E_INVALIDARG;
     }
@@ -324,10 +303,7 @@ pub unsafe extern "system" fn XTaskQueueCreate(
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueDuplicateHandle(
-    h: *mut c_void,
-    out: *mut *mut c_void,
-) -> HRESULT {
+pub unsafe extern "system" fn XTaskQueueDuplicateHandle(h: *mut c_void, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
@@ -351,51 +327,21 @@ pub unsafe extern "system" fn XTaskQueueCloseHandle(h: *mut c_void) {
     }
 }
 
-pub unsafe extern "system" fn XTaskQueueSubmitCallback(
-    h: *mut c_void,
-    port: u32,
-    ctx: *mut c_void,
-    cb: usize,
-) -> HRESULT {
+pub unsafe extern "system" fn XTaskQueueSubmitCallback(h: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if cb == 0 || port > 1 {
         return E_INVALIDARG;
     }
-    let Some(q) = queue_from(h) else {
-        return E_INVALIDARG;
-    };
-    submit_now(
-        &q,
-        port,
-        Item {
-            cb,
-            ctx: ctx as usize,
-        },
-    );
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    submit_now(&q, port, Item { cb, ctx: ctx as usize });
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueSubmitDelayedCallback(
-    h: *mut c_void,
-    port: u32,
-    delay: u32,
-    ctx: *mut c_void,
-    cb: usize,
-) -> HRESULT {
+pub unsafe extern "system" fn XTaskQueueSubmitDelayedCallback(h: *mut c_void, port: u32, delay: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
     if cb == 0 || port > 1 {
         return E_INVALIDARG;
     }
-    let Some(q) = queue_from(h) else {
-        return E_INVALIDARG;
-    };
-    submit_delayed(
-        &q,
-        port,
-        delay,
-        Item {
-            cb,
-            ctx: ctx as usize,
-        },
-    );
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    submit_delayed(&q, port, delay, Item { cb, ctx: ctx as usize });
     S_OK
 }
 
@@ -411,23 +357,13 @@ pub unsafe extern "system" fn XTaskQueueDispatch(h: *mut c_void, port: u32, time
 
 pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bool {
     match queue_from(h) {
-        Some(q) if port <= 1 => {
-            q.ports[port as usize].items.lock().unwrap().is_empty()
-                && q.inflight.load(Ordering::Acquire) == 0
-        }
+        Some(q) if port <= 1 => q.ports[port as usize].items.lock().unwrap().is_empty() && q.inflight.load(Ordering::Acquire) == 0,
         _ => true,
     }
 }
 
-pub unsafe extern "system" fn XTaskQueueTerminate(
-    h: *mut c_void,
-    wait: bool,
-    ctx: *mut c_void,
-    cb: usize,
-) -> HRESULT {
-    let Some(q) = queue_from(h) else {
-        return E_INVALIDARG;
-    };
+pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT {
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
     q.terminated.store(true, Ordering::Release);
     // cancel everything still queued on manual/serialized ports
     for port in 0..2 {
@@ -495,34 +431,14 @@ pub unsafe extern "system" fn XTaskQueueRegisterWaiter(
     cb: usize,
     token: *mut RegistrationToken,
 ) -> HRESULT {
-    use windows_sys::Win32::System::Threading::{
-        RegisterWaitForSingleObject, INFINITE, WT_EXECUTEDEFAULT,
-    };
-    let Some(q) = queue_from(h) else {
-        return E_INVALIDARG;
-    };
+    use windows_sys::Win32::System::Threading::{RegisterWaitForSingleObject, INFINITE, WT_EXECUTEDEFAULT};
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
     if token.is_null() || cb == 0 {
         return E_INVALIDARG;
     }
-    let w = Box::into_raw(Box::new(Waiter {
-        queue: q,
-        port,
-        item: Item {
-            cb,
-            ctx: ctx as usize,
-        },
-        wait: 0,
-    }));
+    let w = Box::into_raw(Box::new(Waiter { queue: q, port, item: Item { cb, ctx: ctx as usize }, wait: 0 }));
     let mut wh = std::ptr::null_mut();
-    if RegisterWaitForSingleObject(
-        &mut wh,
-        handle,
-        Some(waiter_fired),
-        w as *const c_void,
-        INFINITE,
-        WT_EXECUTEDEFAULT,
-    ) == 0
-    {
+    if RegisterWaitForSingleObject(&mut wh, handle, Some(waiter_fired), w as *const c_void, INFINITE, WT_EXECUTEDEFAULT) == 0 {
         drop(Box::from_raw(w));
         return crate::util::E_FAIL;
     }
@@ -531,28 +447,17 @@ pub unsafe extern "system" fn XTaskQueueRegisterWaiter(
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueUnregisterWaiter(
-    _h: *mut c_void,
-    token: RegistrationToken,
-) {
+pub unsafe extern "system" fn XTaskQueueUnregisterWaiter(_h: *mut c_void, token: RegistrationToken) {
     use windows_sys::Win32::System::Threading::UnregisterWaitEx;
     let w = token.token as *mut Waiter;
     if w.is_null() {
         return;
     }
-    UnregisterWaitEx(
-        (*w).wait as *mut c_void,
-        windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
-    );
+    UnregisterWaitEx((*w).wait as *mut c_void, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
     drop(Box::from_raw(w));
 }
 
-pub unsafe extern "system" fn XTaskQueueRegisterMonitor(
-    _h: *mut c_void,
-    _ctx: *mut c_void,
-    _cb: usize,
-    token: *mut RegistrationToken,
-) -> HRESULT {
+pub unsafe extern "system" fn XTaskQueueRegisterMonitor(_h: *mut c_void, _ctx: *mut c_void, _cb: usize, token: *mut RegistrationToken) -> HRESULT {
     // Monitors are notified when work is queued; games use them to wake manual pumps.
     // Not needed for thread-pool queues – accept and never fire.
     if !token.is_null() {
@@ -561,11 +466,7 @@ pub unsafe extern "system" fn XTaskQueueRegisterMonitor(
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueUnregisterMonitor(
-    _h: *mut c_void,
-    _token: RegistrationToken,
-) {
-}
+pub unsafe extern "system" fn XTaskQueueUnregisterMonitor(_h: *mut c_void, _token: RegistrationToken) {}
 
 #[cfg(test)]
 mod tests {
@@ -588,15 +489,8 @@ mod tests {
             let mut h = std::ptr::null_mut();
             assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_IMMEDIATE, &mut h), S_OK);
             let before = HITS.load(Ordering::SeqCst);
-            assert_eq!(
-                XTaskQueueSubmitCallback(h, PORT_WORK, 1 as _, bump as usize),
-                S_OK
-            );
-            assert_eq!(
-                HITS.load(Ordering::SeqCst),
-                before,
-                "manual port must wait for dispatch"
-            );
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, 1 as _, bump as usize), S_OK);
+            assert_eq!(HITS.load(Ordering::SeqCst), before, "manual port must wait for dispatch");
             assert!(XTaskQueueDispatch(h, PORT_WORK, 0));
             assert_eq!(HITS.load(Ordering::SeqCst), before + 1);
             assert!(!XTaskQueueDispatch(h, PORT_WORK, 0));

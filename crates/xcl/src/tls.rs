@@ -58,10 +58,7 @@ pub struct CarrierOpts {
 
 impl Default for CarrierOpts {
     fn default() -> Self {
-        CarrierOpts {
-            entry_point: true,
-            with_import: true,
-        }
+        CarrierOpts { entry_point: true, with_import: true }
     }
 }
 
@@ -103,17 +100,13 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put16(&mut f, coff + 2, 3); // NumberOfSections
     put16(&mut f, coff + 16, 240); // SizeOfOptionalHeader
     put16(&mut f, coff + 18, 0x0002 | 0x0020 | 0x2000); // EXECUTABLE | LARGE_ADDRESS_AWARE | DLL
-                                                        // Optional header (PE32+)
+    // Optional header (PE32+)
     let opt = coff + 20;
     put16(&mut f, opt, 0x20B);
     f[opt + 2] = 14;
     put32(&mut f, opt + 4, FILE_ALIGN as u32); // SizeOfCode
     put32(&mut f, opt + 8, (FILE_ALIGN * 2) as u32); // SizeOfInitializedData
-    put32(
-        &mut f,
-        opt + 16,
-        if opts.entry_point { TEXT_RVA } else { 0 },
-    );
+    put32(&mut f, opt + 16, if opts.entry_point { TEXT_RVA } else { 0 });
     put32(&mut f, opt + 20, TEXT_RVA); // BaseOfCode
     put64(&mut f, opt + 24, CARRIER_BASE);
     put32(&mut f, opt + 32, 0x1000); // SectionAlignment
@@ -152,30 +145,9 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
         put32(f, sec + 36, ch);
         sec += 40;
     };
-    section(
-        &mut f,
-        b".text",
-        6,
-        TEXT_RVA,
-        FILE_ALIGN,
-        0x0000_0020 | 0x2000_0000 | 0x4000_0000,
-    );
-    section(
-        &mut f,
-        b".reloc",
-        reloc_size,
-        RELOC_RVA,
-        FILE_ALIGN * 2,
-        0x0000_0040 | 0x0200_0000 | 0x4000_0000,
-    );
-    section(
-        &mut f,
-        b".data",
-        data_vsize,
-        DATA_RVA,
-        FILE_ALIGN * 3,
-        0x0000_0040 | 0x4000_0000 | 0x8000_0000,
-    );
+    section(&mut f, b".text", 6, TEXT_RVA, FILE_ALIGN, 0x0000_0020 | 0x2000_0000 | 0x4000_0000);
+    section(&mut f, b".reloc", reloc_size, RELOC_RVA, FILE_ALIGN * 2, 0x0000_0040 | 0x0200_0000 | 0x4000_0000);
+    section(&mut f, b".data", data_vsize, DATA_RVA, FILE_ALIGN * 3, 0x0000_0040 | 0x4000_0000 | 0x8000_0000);
     // .text: DllMain = mov eax, 1 ; ret
     f[FILE_ALIGN..FILE_ALIGN + 6].copy_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
     // .reloc: four DIR64 entries for the TLS directory's VA fields
@@ -183,21 +155,13 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
     put32(&mut f, r, DATA_RVA);
     put32(&mut f, r + 4, reloc_size);
     for i in 0..4u16 {
-        put16(
-            &mut f,
-            r + 8 + i as usize * 2,
-            (10 << 12) | (OFF_TLS_DIR as u16 + i * 8),
-        );
+        put16(&mut f, r + 8 + i as usize * 2, (10 << 12) | (OFF_TLS_DIR as u16 + i * 8));
     }
     // .data: IMAGE_TLS_DIRECTORY64
     let d = FILE_ALIGN * 3;
     let va = |off: u32| CARRIER_BASE + (DATA_RVA + off) as u64;
     put64(&mut f, d + OFF_TLS_DIR as usize, va(OFF_TEMPLATE));
-    put64(
-        &mut f,
-        d + OFF_TLS_DIR as usize + 8,
-        va(OFF_TEMPLATE + template_size),
-    );
+    put64(&mut f, d + OFF_TLS_DIR as usize + 8, va(OFF_TEMPLATE + template_size));
     put64(&mut f, d + OFF_TLS_DIR as usize + 16, va(OFF_INDEX));
     put64(&mut f, d + OFF_TLS_DIR as usize + 24, va(OFF_CALLBACKS));
     // SizeOfZeroFill = 0, Characteristics = 0
@@ -207,16 +171,8 @@ pub fn build_carrier_dll_with(template_size: u32, opts: CarrierOpts) -> Vec<u8> 
         put32(&mut f, desc, DATA_RVA + OFF_INT);
         put32(&mut f, desc + 12, DATA_RVA + OFF_DLLNAME);
         put32(&mut f, desc + 16, DATA_RVA + OFF_IAT);
-        put64(
-            &mut f,
-            d + OFF_INT as usize,
-            (DATA_RVA + OFF_HINTNAME) as u64,
-        );
-        put64(
-            &mut f,
-            d + OFF_IAT as usize,
-            (DATA_RVA + OFF_HINTNAME) as u64,
-        );
+        put64(&mut f, d + OFF_INT as usize, (DATA_RVA + OFF_HINTNAME) as u64);
+        put64(&mut f, d + OFF_IAT as usize, (DATA_RVA + OFF_HINTNAME) as u64);
         let hn = d + OFF_HINTNAME as usize + 2;
         f[hn..hn + 12].copy_from_slice(b"GetTickCount");
         let dn = d + OFF_DLLNAME as usize;
@@ -288,9 +244,7 @@ unsafe fn fill_block(block: *mut u8, img: &TlsImage) {
 /// Called for every new thread from xcl.exe's TLS callback (DLL_THREAD_ATTACH).
 pub unsafe fn on_thread_attach() {
     let teb = current_teb();
-    let Ok(images) = IMAGES.try_read() else {
-        return;
-    };
+    let Ok(images) = IMAGES.try_read() else { return };
     for img in images.iter() {
         let idx = img.index.load(Ordering::Acquire);
         if idx != NO_INDEX {
@@ -368,10 +322,7 @@ pub unsafe fn install(
         template_len,
         index: AtomicU32::new(NO_INDEX),
     });
-    IMAGES
-        .write()
-        .map_err(|_| "TLS lock poisoned")?
-        .push(img.clone());
+    IMAGES.write().map_err(|_| "TLS lock poisoned")?.push(img.clone());
 
     let size = carrier_template_size_for(total_len);
     let bytes = build_carrier_dll(size);
@@ -386,8 +337,7 @@ pub unsafe fn install(
         SEQ.fetch_add(1, Ordering::Relaxed),
         safe
     ));
-    std::fs::write(&path, &bytes)
-        .map_err(|e| format!("zapis nośnika TLS {}: {e}", path.display()))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("zapis nośnika TLS {}: {e}", path.display()))?;
     let h = LoadLibraryW(wide(&path.to_string_lossy()).as_ptr());
     if h.is_null() {
         return Err(format!(
@@ -397,9 +347,7 @@ pub unsafe fn install(
     }
     let index = *((h as usize + (DATA_RVA + OFF_INDEX) as usize) as *const u32);
     if index == NO_INDEX {
-        return Err(
-            "Windows nie przydzielił slotu TLS dla nośnika (katalog TLS zignorowany)".into(),
-        );
+        return Err("Windows nie przydzielił slotu TLS dla nośnika (katalog TLS zignorowany)".into());
     }
     *index_ptr = index;
     img.index.store(index, Ordering::Release);
@@ -436,10 +384,7 @@ mod tests {
         let tls = pe.tls().unwrap().unwrap();
         assert_eq!(tls.template_len(), 0x3000);
         assert_eq!(tls.size_of_zero_fill, 0);
-        assert_eq!(
-            pe.va_to_rva(tls.address_of_index),
-            Some(DATA_RVA + OFF_INDEX)
-        );
+        assert_eq!(pe.va_to_rva(tls.address_of_index), Some(DATA_RVA + OFF_INDEX));
         let relocs = pe.relocations().unwrap();
         assert_eq!(relocs.len(), 4);
         assert!(relocs.iter().all(|r| r.kind == IMAGE_REL_BASED_DIR64));
@@ -464,27 +409,14 @@ mod tests {
         use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
         let dir = std::env::temp_dir().join(format!("xcl_tls_probe_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (i, (entry, imp)) in [(false, false), (true, false), (false, true), (true, true)]
-            .into_iter()
-            .enumerate()
-        {
-            let bytes = build_carrier_dll_with(
-                0x1000,
-                CarrierOpts {
-                    entry_point: entry,
-                    with_import: imp,
-                },
-            );
+        for (i, (entry, imp)) in [(false, false), (true, false), (false, true), (true, true)].into_iter().enumerate() {
+            let bytes = build_carrier_dll_with(0x1000, CarrierOpts { entry_point: entry, with_import: imp });
             let p = dir.join(format!("probe{i}.dll"));
             std::fs::write(&p, bytes).unwrap();
             let h = unsafe { LoadLibraryW(wide(&p.to_string_lossy()).as_ptr()) };
-            let idx = (!h.is_null()).then(|| unsafe {
-                *((h as usize + (DATA_RVA + OFF_INDEX) as usize) as *const u32)
-            });
-            println!(
-                "entry={entry} import={imp} -> loaded={} index={idx:?}",
-                !h.is_null()
-            );
+            let idx = (!h.is_null())
+                .then(|| unsafe { *((h as usize + (DATA_RVA + OFF_INDEX) as usize) as *const u32) });
+            println!("entry={entry} import={imp} -> loaded={} index={idx:?}", !h.is_null());
         }
     }
 
@@ -500,15 +432,7 @@ mod tests {
         let mut index_var: u32 = 0xDEAD;
         let total = 0x2000u64;
         let idx = unsafe {
-            install(
-                "unit",
-                template.as_ptr() as usize,
-                64,
-                total,
-                &mut index_var,
-                &dir,
-            )
-            .unwrap()
+            install("unit", template.as_ptr() as usize, 64, total, &mut index_var, &dir).unwrap()
         };
         assert_eq!(index_var, idx);
         unsafe {

@@ -11,8 +11,7 @@ pub fn data_root() -> PathBuf {
     if let Ok(p) = std::env::var("XCL_DATA_ROOT") {
         return PathBuf::from(p);
     }
-    let base = std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
     PathBuf::from(base).join("XCL")
 }
 
@@ -24,15 +23,11 @@ fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
     let mut from = 0;
     while let Some(i) = xml[from..].find(&open).map(|i| from + i) {
         from = i + open.len();
-        let Some(next) = xml[from..].chars().next() else {
-            break;
-        };
+        let Some(next) = xml[from..].chars().next() else { break };
         if !(next.is_whitespace() || next == '/' || next == '>') {
             continue;
         }
-        let Some(end) = xml[from..].find('>') else {
-            break;
-        };
+        let Some(end) = xml[from..].find('>') else { break };
         let t = &xml[from..from + end];
         // attribute must start at a whitespace boundary ("Name=" but not "DisplayName=")
         let mut pos = 0;
@@ -57,26 +52,16 @@ fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
 /// (executables, title) from MicrosoftGame.config if present.
 pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
     let p = root.join("MicrosoftGame.config");
-    let Ok(xml) = std::fs::read_to_string(p) else {
-        return (Vec::new(), None);
-    };
-    (
-        xml_attrs(&xml, "Executable", "Name"),
-        xml_attr(&xml, "Identity", "Name"),
-    )
+    let Ok(xml) = std::fs::read_to_string(p) else { return (Vec::new(), None) };
+    (xml_attrs(&xml, "Executable", "Name"), xml_attr(&xml, "Identity", "Name"))
 }
 
 /// `xcl.exe` itself (by name, path or identical bytes) must never be picked as the game.
 fn is_xcl_copy(p: &Path) -> bool {
-    if p.file_name()
-        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("xcl.exe"))
-        .unwrap_or(false)
-    {
+    if p.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("xcl.exe")).unwrap_or(false) {
         return true;
     }
-    let Ok(me) = std::env::current_exe() else {
-        return false;
-    };
+    let Ok(me) = std::env::current_exe() else { return false };
     if std::fs::canonicalize(p).ok() == std::fs::canonicalize(&me).ok() {
         return true;
     }
@@ -87,18 +72,13 @@ fn is_xcl_copy(p: &Path) -> bool {
 }
 
 fn is_exe(p: &Path) -> bool {
-    p.is_file()
-        && p.extension()
-            .map(|x| x.eq_ignore_ascii_case("exe"))
-            .unwrap_or(false)
+    p.is_file() && p.extension().map(|x| x.eq_ignore_ascii_case("exe")).unwrap_or(false)
 }
 
 /// Executables in `dir` and its subfolders (up to `depth` levels), excluding XCL itself.
 fn find_exes(dir: &Path, depth: u32, skipped_self: &mut bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return out;
-    };
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
     let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     entries.sort();
     for p in entries {
@@ -133,21 +113,13 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
     let mut skipped_self = false;
     let rel = |p: &PathBuf| p.strip_prefix(root).unwrap_or(p).display().to_string();
     let top = find_exes(root, 0, &mut skipped_self);
-    let candidates = if top.is_empty() {
-        find_exes(root, 2, &mut skipped_self)
-    } else {
-        top
-    };
+    let candidates = if top.is_empty() { find_exes(root, 2, &mut skipped_self) } else { top };
     match candidates.len() {
         1 => Ok(candidates.into_iter().next().unwrap()),
         0 => Err(format!(
             "w {} nie ma pliku .exe gry{}",
             root.display(),
-            if skipped_self {
-                " (jest tylko xcl.exe – czyli sam XCL; nie kopiuj go do folderu gry)"
-            } else {
-                ""
-            }
+            if skipped_self { " (jest tylko xcl.exe – czyli sam XCL; nie kopiuj go do folderu gry)" } else { "" }
         )),
         _ => Err(format!(
             "kilka plików .exe ({}) – wskaż exe gry bezpośrednio albo ustaw 'exe' w xcl.toml",
@@ -157,16 +129,7 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn sanitize(s: &str) -> String {
-    let t: String = s
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || "._-".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let t: String = s.chars().map(|c| if c.is_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
     if t.is_empty() {
         "title".into()
     } else {
@@ -181,25 +144,12 @@ pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), Strin
         (target.clone(), pick_exe(&target)?)
     } else {
         if is_xcl_copy(&target) {
-            return Err(format!(
-                "{} to sam XCL, nie gra – podaj exe albo folder gry",
-                target.display()
-            ));
+            return Err(format!("{} to sam XCL, nie gra – podaj exe albo folder gry", target.display()));
         }
-        (
-            target
-                .parent()
-                .ok_or("brak folderu nadrzędnego")?
-                .to_path_buf(),
-            target.clone(),
-        )
+        (target.parent().ok_or("brak folderu nadrzędnego")?.to_path_buf(), target.clone())
     };
     let (_, identity) = read_game_config(&root);
-    let title = sanitize(&identity.unwrap_or_else(|| {
-        root.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }));
+    let title = sanitize(&identity.unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
     Ok((root, exe, title))
 }
 
@@ -248,23 +198,10 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let exe = if !config.exe.is_empty() && root.join(&config.exe).is_file() {
-        root.join(&config.exe)
-    } else {
-        exe
-    };
-    config.exe = exe
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let exe = if !config.exe.is_empty() && root.join(&config.exe).is_file() { root.join(&config.exe) } else { exe };
+    config.exe = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     crate::tls::cleanup_cache(&data_dir.join("cache"));
-    let boot = Boot {
-        title: title.clone(),
-        exe_path: exe.clone(),
-        game_root: root.clone(),
-        data_dir: data_dir.clone(),
-        config,
-    };
+    let boot = Boot { title: title.clone(), exe_path: exe.clone(), game_root: root.clone(), data_dir: data_dir.clone(), config };
     let boot_path = data_dir.join("cache").join("boot.json");
     if let Err(e) = std::fs::write(&boot_path, serde_json::to_string_pretty(&boot).unwrap()) {
         eprintln!("xcl: zapis {}: {e}", boot_path.display());
@@ -302,8 +239,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION,
-        STARTUPINFOW,
+        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
     };
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     std::env::set_var("XCL_HOST", boot_path);
@@ -349,50 +285,28 @@ fn summarize(boot: &Boot, code: u32) {
     println!();
     println!("Gra zakończyła się kodem {code:#x} ({code})");
     let Some(r) = report else {
-        println!(
-            "Brak raportu – zobacz log: {}",
-            boot.logs_dir().join("xcl.log").display()
-        );
+        println!("Brak raportu – zobacz log: {}", boot.logs_dir().join("xcl.log").display());
         return;
     };
     if let Some(c) = &r.crash {
         println!("CRASH: {c}");
     }
     let total: usize = r.imports_by_source.values().sum();
-    println!(
-        "Importy: {total} ({})",
-        r.imports_by_source
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    println!("Importy: {total} ({})", r.imports_by_source.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", "));
     if !r.called_stubs.is_empty() {
-        println!(
-            "Wywołane niezaimplementowane funkcje ({}):",
-            r.called_stubs.len()
-        );
+        println!("Wywołane niezaimplementowane funkcje ({}):", r.called_stubs.len());
         for s in r.called_stubs.iter().take(15) {
-            println!(
-                "  {:>8}×  {}!{}   (pierwsze wywołanie: {})",
-                s.calls, s.dll, s.function, s.first_caller
-            );
+            println!("  {:>8}×  {}!{}   (pierwsze wywołanie: {})", s.calls, s.dll, s.function, s.first_caller);
         }
     }
     if !r.vfs.unmapped_paths.is_empty() {
-        println!(
-            "Niezmapowane ścieżki konsolowe: {}",
-            r.vfs.unmapped_paths.len()
-        );
+        println!("Niezmapowane ścieżki konsolowe: {}", r.vfs.unmapped_paths.len());
         for p in r.vfs.unmapped_paths.iter().take(5) {
             println!("  {p}");
         }
     }
     if !r.vfs.redirected_writes.is_empty() {
-        println!(
-            "Zapisy do plików gry przekierowane do nakładki: {}",
-            r.vfs.redirected_writes.len()
-        );
+        println!("Zapisy do plików gry przekierowane do nakładki: {}", r.vfs.redirected_writes.len());
     }
     println!("Raport: {}", path.display());
     println!("Log:    {}", boot.logs_dir().join("xcl.log").display());
@@ -406,29 +320,16 @@ mod tests {
     fn microsoft_game_config_parsing() {
         let xml = r#"<?xml version="1.0"?><Game configVersion="1"><Identity Name="Contoso.Game" Publisher="CN=X" Version="1.0.0.0"/>
             <ExecutableList><Executable Name="game_scarlett.exe" TargetDeviceFamily="Scarlett" Id="Game"/></ExecutableList></Game>"#;
-        assert_eq!(
-            xml_attr(xml, "Identity", "Name").as_deref(),
-            Some("Contoso.Game")
-        );
-        assert_eq!(
-            xml_attr(xml, "Executable", "Name").as_deref(),
-            Some("game_scarlett.exe")
-        );
+        assert_eq!(xml_attr(xml, "Identity", "Name").as_deref(), Some("Contoso.Game"));
+        assert_eq!(xml_attr(xml, "Executable", "Name").as_deref(), Some("game_scarlett.exe"));
     }
 
     #[test]
     fn several_executables_in_config() {
         let xml = r#"<ExecutableList><Executable Name="Bin\game.exe" Id="Game"/><Executable Name="tool.exe" Id="T"/></ExecutableList>
             <ShellVisuals DefaultDisplayName="X" Name="no"/>"#;
-        assert_eq!(
-            xml_attrs(xml, "Executable", "Name"),
-            vec!["Bin\\game.exe".to_string(), "tool.exe".to_string()]
-        );
-        assert_eq!(
-            xml_attr(xml, "ShellVisuals", "Name").as_deref(),
-            Some("no"),
-            "DisplayName= must not match Name="
-        );
+        assert_eq!(xml_attrs(xml, "Executable", "Name"), vec!["Bin\\game.exe".to_string(), "tool.exe".to_string()]);
+        assert_eq!(xml_attr(xml, "ShellVisuals", "Name").as_deref(), Some("no"), "DisplayName= must not match Name=");
     }
 
     struct TempDir(PathBuf);
@@ -454,9 +355,7 @@ mod tests {
         std::fs::copy(&me, d.0.join("renamed_copy.exe")).unwrap(); // byte-identical copy of XCL
         let e = resolve_target(&d.0).unwrap_err();
         assert!(e.contains("xcl.exe") && e.contains("sam XCL"), "{e}");
-        assert!(resolve_target(&d.0.join("xcl.exe"))
-            .unwrap_err()
-            .contains("sam XCL"));
+        assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("sam XCL"));
         // a real game exe next to it wins
         std::fs::write(d.0.join("game.exe"), b"MZ not really a game").unwrap();
         let (_, exe, _) = resolve_target(&d.0).unwrap();
@@ -484,9 +383,7 @@ mod tests {
         // a plain Windows binary imports no console DLLs
         let me = std::env::current_exe().unwrap();
         assert_eq!(crate::inspect::console_imports(&me), Some(vec![]));
-        let sys =
-            std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or("C:\\Windows".into()))
-                .join("System32\\notepad.exe");
+        let sys = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or("C:\\Windows".into())).join("System32\\notepad.exe");
         assert_eq!(crate::inspect::console_imports(&sys), Some(vec![]));
         let d = TempDir::new("pe");
         std::fs::write(d.0.join("junk.exe"), b"not a PE").unwrap();
@@ -496,10 +393,7 @@ mod tests {
     #[test]
     fn command_line_quoting() {
         assert_eq!(quote("plain"), "plain");
-        assert_eq!(
-            quote("C:\\Games\\My Game\\a.exe"),
-            "\"C:\\Games\\My Game\\a.exe\""
-        );
+        assert_eq!(quote("C:\\Games\\My Game\\a.exe"), "\"C:\\Games\\My Game\\a.exe\"");
         assert_eq!(quote("say \"hi\""), "\"say \\\"hi\\\"\"");
         assert_eq!(quote(""), "\"\"");
     }

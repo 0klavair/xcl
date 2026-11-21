@@ -106,12 +106,7 @@ pub fn sanitize_protect(p: u32) -> u32 {
 
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); everything else from Windows.
-pub unsafe extern "system" fn VirtualAlloc(
-    addr: *const c_void,
-    size: usize,
-    t: u32,
-    p: u32,
-) -> *mut c_void {
+pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 0)) {
             return q as *mut c_void;
@@ -135,50 +130,22 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     mem::VirtualFree(addr, size, t)
 }
 
-pub unsafe extern "system" fn VirtualFreeEx(
-    proc_: HANDLE,
-    addr: *mut c_void,
-    size: usize,
-    t: u32,
-) -> BOOL {
+pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
     if crate::gpu::uma::get().is_some_and(|u| u.contains(addr as usize)) {
         return VirtualFree(addr, size, t);
     }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
 
-pub unsafe extern "system" fn VirtualAllocEx(
-    proc_: HANDLE,
-    addr: *const c_void,
-    size: usize,
-    t: u32,
-    p: u32,
-) -> *mut c_void {
-    mem::VirtualAllocEx(
-        proc_,
-        addr,
-        size,
-        sanitize_alloc_type(t),
-        sanitize_protect(p),
-    )
+pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    mem::VirtualAllocEx(proc_, addr, size, sanitize_alloc_type(t), sanitize_protect(p))
 }
 
-pub unsafe extern "system" fn VirtualProtect(
-    addr: *const c_void,
-    size: usize,
-    p: u32,
-    old: *mut u32,
-) -> BOOL {
+pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
     mem::VirtualProtect(addr, size, sanitize_protect(p), old)
 }
 
-pub unsafe extern "system" fn VirtualProtectEx(
-    proc_: HANDLE,
-    addr: *const c_void,
-    size: usize,
-    p: u32,
-    old: *mut u32,
-) -> BOOL {
+pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
     mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
 }
 
@@ -227,17 +194,10 @@ pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut 
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
         aligned_heap_alloc(size, 1usize << a.alignment.max(4))
-    } else if let Some(q) =
-        crate::gpu::uma::get().and_then(|u| u.alloc(size, 1usize << a.alignment.min(30)))
-    {
+    } else if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 1usize << a.alignment.min(30))) {
         q as *mut c_void // graphics memory types: GPU-visible
     } else {
-        mem::VirtualAlloc(
-            std::ptr::null(),
-            size,
-            mem::MEM_COMMIT | mem::MEM_RESERVE,
-            mem::PAGE_READWRITE,
-        )
+        mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE)
     }
 }
 
@@ -275,30 +235,16 @@ pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
 /// (signature from XboxBvhBuilder.dll's call sites): MEMORY_BASIC_INFORMATION plus a field
 /// at +48 whose bits 0-1 the caller requires for "CPU-readable memory" – set to 1 (CPU
 /// cached) for committed readable memory. The caller zeroes the rest.
-pub unsafe extern "system" fn XMemVirtualQuery(
-    process: HANDLE,
-    address: *const c_void,
-    info: *mut c_void,
-) -> BOOL {
+pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const c_void, info: *mut c_void) -> BOOL {
     if info.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
     let mbi = info as *mut mem::MEMORY_BASIC_INFORMATION;
-    if mem::VirtualQueryEx(
-        process,
-        address,
-        mbi,
-        std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>(),
-    ) == 0
-    {
+    if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
-    const READABLE: u32 = mem::PAGE_READONLY
-        | mem::PAGE_READWRITE
-        | mem::PAGE_WRITECOPY
-        | mem::PAGE_EXECUTE_READ
-        | mem::PAGE_EXECUTE_READWRITE;
+    const READABLE: u32 = mem::PAGE_READONLY | mem::PAGE_READWRITE | mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_READ | mem::PAGE_EXECUTE_READWRITE;
     let cpu = (*mbi).State == mem::MEM_COMMIT && (*mbi).Protect & READABLE != 0;
     *(info as *mut u8).add(48).cast::<u32>() = cpu as u32;
     1
@@ -307,10 +253,7 @@ pub unsafe extern "system" fn XMemVirtualQuery(
 /// `BOOL XMemGetWorkingSetStatistics(UINT32 allocator, void* stats)` (as FSR's upscaler calls
 /// it: allocator 0x20000001, 128-byte buffer, reads +8 only on success). No statistics:
 /// FALSE, which the caller reports as 0 bytes.
-pub unsafe extern "system" fn XMemGetWorkingSetStatistics(
-    _allocator: u32,
-    _stats: *mut c_void,
-) -> BOOL {
+pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_allocator: u32, _stats: *mut c_void) -> BOOL {
     0
 }
 
@@ -353,14 +296,11 @@ pub struct TitleMemoryStatusT {
 }
 
 fn process_private_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
-    };
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
     unsafe {
         let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0
-        {
+        if K32GetProcessMemoryInfo(thr::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb) != 0 {
             c.PrivateUsage as u64
         } else {
             0
@@ -408,15 +348,9 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
 const PHYS_PAGE: usize = 0x1_0000;
 
 /// first page number → (pages in the block, pages still allocated)
-static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-pub unsafe extern "system" fn AllocateTitlePhysicalPages(
-    _p: HANDLE,
-    _t: u32,
-    num: *mut usize,
-    arr: *mut usize,
-) -> BOOL {
+pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
@@ -439,14 +373,8 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(
     1
 }
 
-pub unsafe extern "system" fn FreeTitlePhysicalPages(
-    _p: HANDLE,
-    n: usize,
-    arr: *mut usize,
-) -> BOOL {
-    let Some(u) = crate::gpu::uma::get() else {
-        return 0;
-    };
+pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: *mut usize) -> BOOL {
+    let Some(u) = crate::gpu::uma::get() else { return 0 };
     if arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
@@ -455,9 +383,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(
     for i in 0..n {
         let page = *arr.add(i);
         // the block holding this page
-        let Some((&first, &(count, _))) = g.range(..=page).next_back() else {
-            continue;
-        };
+        let Some((&first, &(count, _))) = g.range(..=page).next_back() else { continue };
         if page >= first + count {
             continue;
         }
@@ -471,16 +397,8 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(
     1
 }
 
-pub unsafe extern "system" fn MapTitlePhysicalPages(
-    va: *mut c_void,
-    n: usize,
-    _t: u32,
-    _p: u32,
-    arr: *mut usize,
-) -> *mut c_void {
-    let Some(u) = crate::gpu::uma::get() else {
-        return std::ptr::null_mut();
-    };
+pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+    let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
     if n == 0 || arr.is_null() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -510,12 +428,7 @@ pub unsafe extern "system" fn SetThreadName(h: HANDLE, name: *const u16) -> BOOL
     (thr::SetThreadDescription(h, name) >= 0) as BOOL
 }
 
-pub unsafe extern "system" fn GetThreadName(
-    h: HANDLE,
-    buf: *mut u16,
-    len: usize,
-    ret_len: *mut usize,
-) -> BOOL {
+pub unsafe extern "system" fn GetThreadName(h: HANDLE, buf: *mut u16, len: usize, ret_len: *mut usize) -> BOOL {
     let mut p: *mut u16 = std::ptr::null_mut();
     if thr::GetThreadDescription(h, &mut p) < 0 || p.is_null() {
         return 0;
@@ -591,12 +504,7 @@ pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) 
         return;
     }
     let (major, minor, build) = host_os_version();
-    *out = SystemOsVersionInfo {
-        major: major as u8,
-        minor: minor as u8,
-        build: build as u16,
-        revision: 0,
-    };
+    *out = SystemOsVersionInfo { major: major as u8, minor: minor as u8, build: build as u16, revision: 0 };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -632,9 +540,7 @@ pub unsafe extern "system" fn LoadLibraryA(name: *const u8) -> usize {
 }
 
 unsafe fn load_as_data(name: &str, file: HANDLE, flags: u32) -> usize {
-    let real = crate::vfs::get()
-        .and_then(|v| v.real_path_for_read(name))
-        .unwrap_or_else(|| name.to_string());
+    let real = crate::vfs::get().and_then(|v| v.real_path_for_read(name)).unwrap_or_else(|| name.to_string());
     ll::LoadLibraryExW(crate::util::wide(&real).as_ptr(), file, flags) as usize
 }
 
@@ -660,16 +566,9 @@ pub unsafe extern "system" fn GetProcAddress(h: usize, name: *const u8) -> usize
     let what = if (name as usize) >> 16 == 0 {
         ImportName::Ordinal(name as usize as u16)
     } else {
-        ImportName::Name {
-            hint: 0,
-            name: crate::util::from_cstr_ptr(name).unwrap_or_default(),
-        }
+        ImportName::Name { hint: 0, name: crate::util::from_cstr_ptr(name).unwrap_or_default() }
     };
-    let h = if h == 0 {
-        modules::main_module().map(|m| m.base).unwrap_or(0)
-    } else {
-        h
-    };
+    let h = if h == 0 { modules::main_module().map(|m| m.base).unwrap_or(0) } else { h };
     match resolver::get_proc_address(h, &what) {
         Some(a) => a,
         None => {
@@ -759,29 +658,13 @@ unsafe fn module_handle_ex(flags: u32, name: Option<String>, addr: usize, out: *
     }
 }
 
-pub unsafe extern "system" fn GetModuleHandleExW(
-    flags: u32,
-    name: *const u16,
-    out: *mut usize,
-) -> BOOL {
-    let n = if flags & FROM_ADDRESS != 0 {
-        None
-    } else {
-        from_wide_ptr(name)
-    };
+pub unsafe extern "system" fn GetModuleHandleExW(flags: u32, name: *const u16, out: *mut usize) -> BOOL {
+    let n = if flags & FROM_ADDRESS != 0 { None } else { from_wide_ptr(name) };
     module_handle_ex(flags, n, name as usize, out)
 }
 
-pub unsafe extern "system" fn GetModuleHandleExA(
-    flags: u32,
-    name: *const u8,
-    out: *mut usize,
-) -> BOOL {
-    let n = if flags & FROM_ADDRESS != 0 {
-        None
-    } else {
-        from_ansi_ptr(name)
-    };
+pub unsafe extern "system" fn GetModuleHandleExA(flags: u32, name: *const u8, out: *mut usize) -> BOOL {
+    let n = if flags & FROM_ADDRESS != 0 { None } else { from_ansi_ptr(name) };
     module_handle_ex(flags, n, name as usize, out)
 }
 
@@ -836,12 +719,7 @@ mod tests {
         assert_eq!(sanitize_protect(0x1000_0004), 0x04);
         assert_eq!(sanitize_protect(0x2000_0000), mem::PAGE_READWRITE);
         unsafe {
-            let p = VirtualAlloc(
-                std::ptr::null(),
-                0x10000,
-                MEM_GRAPHICS | MEM_TITLE | 0x3000,
-                0x0400_0004,
-            );
+            let p = VirtualAlloc(std::ptr::null(), 0x10000, MEM_GRAPHICS | MEM_TITLE | 0x3000, 0x0400_0004);
             assert!(!p.is_null());
             *(p as *mut u64) = 0xABCD;
             // graphics memory: from the GPU-visible region (when it could be created)
@@ -863,9 +741,7 @@ mod tests {
             let p = XMemAlloc(1000, attrs(8, 0));
             assert!(!p.is_null());
             assert_eq!(p as usize % 256, 0);
-            assert!(std::slice::from_raw_parts(p as *const u8, 1000)
-                .iter()
-                .all(|&b| b == 0));
+            assert!(std::slice::from_raw_parts(p as *const u8, 1000).iter().all(|&b| b == 0));
             XMemFree(p, attrs(8, 0));
             let g = XMemAlloc(0x20000, attrs(0, 1)); // graphics memory → VirtualAlloc
             assert!(!g.is_null());
@@ -880,20 +756,12 @@ mod tests {
             let mut info = [0u8; 64];
             let x = 5u32;
             let proc_ = thr::GetCurrentProcess();
-            assert_eq!(
-                XMemVirtualQuery(proc_, &x as *const u32 as _, info.as_mut_ptr() as _),
-                1
-            );
+            assert_eq!(XMemVirtualQuery(proc_, &x as *const u32 as _, info.as_mut_ptr() as _), 1);
             let mbi = &*(info.as_ptr() as *const mem::MEMORY_BASIC_INFORMATION);
             assert_eq!(mbi.State, mem::MEM_COMMIT);
             assert_eq!(u32::from_le_bytes(info[48..52].try_into().unwrap()) & 3, 1);
             // reserved, not committed: not CPU-readable
-            let r = mem::VirtualAlloc(
-                std::ptr::null(),
-                0x10000,
-                mem::MEM_RESERVE,
-                mem::PAGE_NOACCESS,
-            );
+            let r = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
             let mut info = [0u8; 64];
             assert_eq!(XMemVirtualQuery(proc_, r, info.as_mut_ptr() as _), 1);
             assert_eq!(info[48] & 3, 0);
@@ -904,22 +772,15 @@ mod tests {
     #[test]
     fn physical_pages_in_uma() {
         unsafe {
-            let Some(u) = crate::gpu::uma::get() else {
-                return;
-            };
+            let Some(u) = crate::gpu::uma::get() else { return };
             let mut n = 3usize;
             let mut pages = [0usize; 3];
-            assert_eq!(
-                AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()),
-                1
-            );
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
             assert_eq!(pages[1], pages[0] + 1);
             let p = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr());
-            assert!(
-                !p.is_null() && u.contains(p as usize) && (p as usize - u.base()) % PHYS_PAGE == 0
-            );
+            assert!(!p.is_null() && u.contains(p as usize) && (p as usize - u.base()) % PHYS_PAGE == 0);
             *(p as *mut u32).add(PHYS_PAGE / 4) = 0x55AA; // page 1
-                                                          // the same pages mapped again: the same memory
+            // the same pages mapped again: the same memory
             let q = MapTitlePhysicalPages(p, 3, 0, 4, pages.as_mut_ptr());
             assert_eq!(q, p);
             // a single page of the block maps to its own place
@@ -927,15 +788,9 @@ mod tests {
             assert_eq!(*(r as *const u32), 0x55AA);
             // scattered pages: refused
             let mut scattered = [pages[2], pages[0]];
-            assert!(
-                MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr())
-                    .is_null()
-            );
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr()).is_null());
             let used = u.used();
-            assert_eq!(
-                FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()),
-                1
-            );
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert_eq!(u.used(), used - 3 * PHYS_PAGE);
         }
     }

@@ -108,29 +108,11 @@ const _: () = assert!(std::mem::size_of::<XAudio2Buffer>() == 44);
 
 type CreateWithVersionFn = unsafe extern "system" fn(*mut *mut c_void, u32, u32, u32) -> HRESULT;
 type CreateFn = unsafe extern "system" fn(*mut *mut c_void, u32, u32) -> HRESULT;
-type CreateSourceVoiceFn = unsafe extern "system" fn(
-    *mut c_void,
-    *mut *mut c_void,
-    *const WaveFormatEx,
-    u32,
-    f32,
-    *mut c_void,
-    *const c_void,
-    *const c_void,
-) -> HRESULT;
-type CreateMasteringVoiceFn = unsafe extern "system" fn(
-    *mut c_void,
-    *mut *mut c_void,
-    u32,
-    u32,
-    u32,
-    *const u16,
-    *const c_void,
-    u32,
-) -> HRESULT;
+type CreateSourceVoiceFn =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *const WaveFormatEx, u32, f32, *mut c_void, *const c_void, *const c_void) -> HRESULT;
+type CreateMasteringVoiceFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32, u32, u32, *const u16, *const c_void, u32) -> HRESULT;
 type DestroyVoiceFn = unsafe extern "system" fn(*mut c_void);
-type SubmitSourceBufferFn =
-    unsafe extern "system" fn(*mut c_void, *const XAudio2Buffer, *const c_void) -> HRESULT;
+type SubmitSourceBufferFn = unsafe extern "system" fn(*mut c_void, *const XAudio2Buffer, *const c_void) -> HRESULT;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![XAudio2Create, XAudio2CreateWithVersionInfo]
@@ -225,10 +207,7 @@ pub fn is_xma(tag: u16) -> bool {
 
 /// Formats the Windows engine decodes itself – never replaced.
 pub fn is_plain_pcm(tag: u16) -> bool {
-    matches!(
-        tag,
-        WAVE_FORMAT_PCM | WAVE_FORMAT_IEEE_FLOAT | WAVE_FORMAT_EXTENSIBLE
-    )
+    matches!(tag, WAVE_FORMAT_PCM | WAVE_FORMAT_IEEE_FLOAT | WAVE_FORMAT_EXTENSIBLE)
 }
 
 /// Voice info from a format (XMA2WAVEFORMATEX fields only when cbSize says they are there).
@@ -243,9 +222,7 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
         avg_bytes: w.avg_bytes,
         ..Default::default()
     };
-    if w.tag == WAVE_FORMAT_XMA2
-        && w.cb_size as usize >= std::mem::size_of::<Xma2WaveFormatEx>() - 18
-    {
+    if w.tag == WAVE_FORMAT_XMA2 && w.cb_size as usize >= std::mem::size_of::<Xma2WaveFormatEx>() - 18 {
         let x = (fmt as *const Xma2WaveFormatEx).read_unaligned();
         i.samples_encoded = x.samples_encoded;
         i.bytes_per_block = x.bytes_per_block;
@@ -257,15 +234,7 @@ pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
 /// PCM16 format with the channel count and sample rate of an XMA voice.
 pub fn pcm16_for(i: &XmaInfo) -> WaveFormatEx {
     let block = i.channels * 2;
-    WaveFormatEx {
-        tag: WAVE_FORMAT_PCM,
-        channels: i.channels,
-        rate: i.rate,
-        avg_bytes: i.rate * block as u32,
-        block_align: block,
-        bits: 16,
-        cb_size: 0,
-    }
+    WaveFormatEx { tag: WAVE_FORMAT_PCM, channels: i.channels, rate: i.rate, avg_bytes: i.rate * block as u32, block_align: block, bits: 16, cb_size: 0 }
 }
 
 /// Frames (samples per channel) a compressed buffer of `audio_bytes` decodes to: XMA2 in
@@ -286,24 +255,10 @@ pub fn estimate_frames(i: &XmaInfo, audio_bytes: u32) -> u64 {
 /// The PCM16 silence buffer that stands in for an XMA buffer: same play/loop region and
 /// flags/context; length from PlayBegin+PlayLength (or the estimate), clamped to
 /// `max_bytes` (then the whole – shorter – buffer is played).
-pub fn silent_buffer(
-    i: &XmaInfo,
-    b: &XAudio2Buffer,
-    silence: *const u8,
-    max_bytes: usize,
-) -> XAudio2Buffer {
+pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_bytes: usize) -> XAudio2Buffer {
     let mut nb = *b;
-    let (pb, pl, lb, ll) = (
-        b.play_begin as u64,
-        b.play_length as u64,
-        b.loop_begin as u64,
-        b.loop_length as u64,
-    );
-    let mut frames = if pl > 0 {
-        pb + pl
-    } else {
-        estimate_frames(i, b.audio_bytes).max(pb + 1)
-    };
+    let (pb, pl, lb, ll) = (b.play_begin as u64, b.play_length as u64, b.loop_begin as u64, b.loop_length as u64);
+    let mut frames = if pl > 0 { pb + pl } else { estimate_frames(i, b.audio_bytes).max(pb + 1) };
     if b.loop_count > 0 {
         frames = frames.max(lb + ll);
     }
@@ -360,12 +315,7 @@ unsafe fn patch(obj: *mut c_void, slot: usize, hook: usize) {
 /// The original implementation of `slot` for `obj`'s class.
 unsafe fn original(obj: *mut c_void, slot: usize) -> Option<usize> {
     let vt = vtable(obj) as usize;
-    ORIGINALS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|&&(v, s, _)| v == vt && s == slot)
-        .map(|&(_, _, f)| f)
+    ORIGINALS.lock().unwrap().iter().find(|&&(v, s, _)| v == vt && s == slot).map(|&(_, _, f)| f)
 }
 
 fn system_create() -> Option<(Option<CreateWithVersionFn>, Option<CreateFn>)> {
@@ -373,16 +323,7 @@ fn system_create() -> Option<(Option<CreateWithVersionFn>, Option<CreateFn>)> {
     let &(a, b) = F
         .get_or_init(|| {
             let h = crate::resolver::system_module("xaudio2_9.dll")?;
-            let name = |n: &str| {
-                crate::resolver::system_proc_in(
-                    h,
-                    &crate::pe::ImportName::Name {
-                        hint: 0,
-                        name: n.into(),
-                    },
-                )
-                .unwrap_or(0)
-            };
+            let name = |n: &str| crate::resolver::system_proc_in(h, &crate::pe::ImportName::Name { hint: 0, name: n.into() }).unwrap_or(0);
             Some((name("XAudio2CreateWithVersionInfo"), name("XAudio2Create")))
         })
         .as_ref()?;
@@ -412,42 +353,22 @@ unsafe fn create_engine(pp: *mut *mut c_void, flags: u32, processor: u32) -> HRE
         _ => E_FAIL,
     };
     if hr < 0 || (*pp).is_null() {
-        crate::xlog_error!(
-            "XAudio2: utworzenie silnika nie powiodło się ({:#x})",
-            hr as u32
-        );
+        crate::xlog_error!("XAudio2: utworzenie silnika nie powiodło się ({:#x})", hr as u32);
         ENGINE_ERRORS.fetch_add(1, Ordering::Relaxed);
         return if hr < 0 { hr } else { E_FAIL };
     }
-    patch(
-        *pp,
-        ENGINE_CREATE_SOURCE_VOICE,
-        create_source_voice as usize,
-    );
-    patch(
-        *pp,
-        ENGINE_CREATE_MASTERING_VOICE,
-        create_mastering_voice as usize,
-    );
+    patch(*pp, ENGINE_CREATE_SOURCE_VOICE, create_source_voice as usize);
+    patch(*pp, ENGINE_CREATE_MASTERING_VOICE, create_mastering_voice as usize);
     ENGINES.fetch_add(1, Ordering::Relaxed);
     crate::xlog_info!("XAudio2: silnik utworzony (systemowe XAudio2 2.9, flagi {clean:#x})");
     S_OK
 }
 
-pub unsafe extern "system" fn XAudio2Create(
-    pp: *mut *mut c_void,
-    flags: u32,
-    processor: u32,
-) -> HRESULT {
+pub unsafe extern "system" fn XAudio2Create(pp: *mut *mut c_void, flags: u32, processor: u32) -> HRESULT {
     create_engine(pp, flags, processor)
 }
 
-pub unsafe extern "system" fn XAudio2CreateWithVersionInfo(
-    pp: *mut *mut c_void,
-    flags: u32,
-    processor: u32,
-    _ntddi: u32,
-) -> HRESULT {
+pub unsafe extern "system" fn XAudio2CreateWithVersionInfo(pp: *mut *mut c_void, flags: u32, processor: u32, _ntddi: u32) -> HRESULT {
     create_engine(pp, flags, processor)
 }
 
@@ -461,9 +382,7 @@ unsafe extern "system" fn create_source_voice(
     sends: *const c_void,
     chain: *const c_void,
 ) -> HRESULT {
-    let Some(orig) = original(this, ENGINE_CREATE_SOURCE_VOICE) else {
-        return E_FAIL;
-    };
+    let Some(orig) = original(this, ENGINE_CREATE_SOURCE_VOICE) else { return E_FAIL };
     let orig: CreateSourceVoiceFn = std::mem::transmute(orig);
     note_dropped("CreateSourceVoice", flags, VOICE_FLAGS);
     let flags = flags & VOICE_FLAGS;
@@ -498,25 +417,15 @@ unsafe extern "system" fn create_source_voice(
     }
     if hr < 0 || (*pp).is_null() {
         SOURCE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        crate::xlog_warn!(
-            "XAudio2: CreateSourceVoice (format {tag:#x}) nie powiodło się ({:#x})",
-            hr as u32
-        );
+        crate::xlog_warn!("XAudio2: CreateSourceVoice (format {tag:#x}) nie powiodło się ({:#x})", hr as u32);
         return hr;
     }
     let voice = *pp;
-    patch(
-        voice,
-        VOICE_SUBMIT_SOURCE_BUFFER,
-        submit_source_buffer as usize,
-    );
+    patch(voice, VOICE_SUBMIT_SOURCE_BUFFER, submit_source_buffer as usize);
     patch(voice, VOICE_DESTROY, destroy_voice as usize);
     SOURCE_VOICES.fetch_add(1, Ordering::Relaxed);
     if let Some(i) = silent {
-        XMA.lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(voice as usize, i);
+        XMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(voice as usize, i);
         SILENT_VOICES.fetch_add(1, Ordering::Relaxed);
         if is_xma(tag) && XMA_VOICES.fetch_add(1, Ordering::Relaxed) == 0 {
             crate::xlog_warn!(
@@ -540,45 +449,19 @@ unsafe extern "system" fn create_mastering_voice(
     chain: *const c_void,
     category: u32,
 ) -> HRESULT {
-    let Some(orig) = original(this, ENGINE_CREATE_MASTERING_VOICE) else {
-        return E_FAIL;
-    };
+    let Some(orig) = original(this, ENGINE_CREATE_MASTERING_VOICE) else { return E_FAIL };
     let orig: CreateMasteringVoiceFn = std::mem::transmute(orig);
     note_dropped("CreateMasteringVoice", flags, MASTERING_FLAGS);
     if !device.is_null() {
         crate::xlog_info!("XAudio2: CreateMasteringVoice – identyfikator urządzenia konsoli pominięty (domyślne urządzenie)");
     }
     let flags = flags & MASTERING_FLAGS;
-    let mut hr = orig(
-        this,
-        pp,
-        channels,
-        rate,
-        flags,
-        std::ptr::null(),
-        chain,
-        category,
-    );
+    let mut hr = orig(this, pp, channels, rate, flags, std::ptr::null(), chain, category);
     if hr == CO_E_NOTINITIALIZED {
         // the console needs no COM for audio; Windows' device enumeration does
-        let ci = windows_sys::Win32::System::Com::CoInitializeEx(
-            std::ptr::null(),
-            windows_sys::Win32::System::Com::COINIT_MULTITHREADED as u32,
-        );
-        crate::xlog_info!(
-            "XAudio2: COM nie był zainicjowany na wątku tytułu – CoInitializeEx(MTA) → {:#x}",
-            ci as u32
-        );
-        hr = orig(
-            this,
-            pp,
-            channels,
-            rate,
-            flags,
-            std::ptr::null(),
-            chain,
-            category,
-        );
+        let ci = windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_MULTITHREADED as u32);
+        crate::xlog_info!("XAudio2: COM nie był zainicjowany na wątku tytułu – CoInitializeEx(MTA) → {:#x}", ci as u32);
+        hr = orig(this, pp, channels, rate, flags, std::ptr::null(), chain, category);
     }
     if hr < 0 {
         MASTERING_RETRIES.fetch_add(1, Ordering::Relaxed);
@@ -586,35 +469,14 @@ unsafe extern "system" fn create_mastering_voice(
             "XAudio2: CreateMasteringVoice({channels} kan., {rate} Hz, kategoria {category}) → {:#x}; ponawiam z domyślnymi",
             hr as u32
         );
-        hr = orig(
-            this,
-            pp,
-            0,
-            0,
-            flags,
-            std::ptr::null(),
-            chain,
-            AUDIO_CATEGORY_GAME_EFFECTS,
-        );
+        hr = orig(this, pp, 0, 0, flags, std::ptr::null(), chain, AUDIO_CATEGORY_GAME_EFFECTS);
         if hr < 0 && !chain.is_null() {
-            hr = orig(
-                this,
-                pp,
-                0,
-                0,
-                flags,
-                std::ptr::null(),
-                std::ptr::null(),
-                AUDIO_CATEGORY_GAME_EFFECTS,
-            );
+            hr = orig(this, pp, 0, 0, flags, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS);
         }
     }
     if hr < 0 {
         MASTERING_ERRORS.fetch_add(1, Ordering::Relaxed);
-        crate::xlog_error!(
-            "XAudio2: CreateMasteringVoice nie powiodło się ({:#x}) – brak urządzenia audio?",
-            hr as u32
-        );
+        crate::xlog_error!("XAudio2: CreateMasteringVoice nie powiodło się ({:#x}) – brak urządzenia audio?", hr as u32);
     } else {
         MASTERING.fetch_add(1, Ordering::Relaxed);
     }
@@ -622,34 +484,15 @@ unsafe extern "system" fn create_mastering_voice(
 }
 
 fn silence() -> *const u8 {
-    use windows_sys::Win32::System::Memory::{
-        VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY,
-    };
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READONLY};
     static P: OnceLock<usize> = OnceLock::new();
-    *P.get_or_init(|| unsafe {
-        VirtualAlloc(
-            std::ptr::null(),
-            SILENCE_BYTES,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READONLY,
-        ) as usize
-    }) as *const u8
+    *P.get_or_init(|| unsafe { VirtualAlloc(std::ptr::null(), SILENCE_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY) as usize }) as *const u8
 }
 
-unsafe extern "system" fn submit_source_buffer(
-    this: *mut c_void,
-    buf: *const XAudio2Buffer,
-    wma: *const c_void,
-) -> HRESULT {
-    let Some(orig) = original(this, VOICE_SUBMIT_SOURCE_BUFFER) else {
-        return E_FAIL;
-    };
+unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XAudio2Buffer, wma: *const c_void) -> HRESULT {
+    let Some(orig) = original(this, VOICE_SUBMIT_SOURCE_BUFFER) else { return E_FAIL };
     let orig: SubmitSourceBufferFn = std::mem::transmute(orig);
-    let info = XMA
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|m| m.get(&(this as usize)).copied());
+    let info = XMA.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
     match info {
         Some(i) if !buf.is_null() => {
             let s = silence();
@@ -665,9 +508,7 @@ unsafe extern "system" fn submit_source_buffer(
 }
 
 unsafe extern "system" fn destroy_voice(this: *mut c_void) {
-    let Some(orig) = original(this, VOICE_DESTROY) else {
-        return;
-    };
+    let Some(orig) = original(this, VOICE_DESTROY) else { return };
     let orig: DestroyVoiceFn = std::mem::transmute(orig);
     if let Some(m) = XMA.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
@@ -681,15 +522,7 @@ mod tests {
 
     fn xma2(channels: u16, rate: u32, samples: u32, bpb: u32, blocks: u16) -> Xma2WaveFormatEx {
         Xma2WaveFormatEx {
-            wfx: WaveFormatEx {
-                tag: WAVE_FORMAT_XMA2,
-                channels,
-                rate,
-                avg_bytes: 0,
-                block_align: 1,
-                bits: 16,
-                cb_size: 34,
-            },
+            wfx: WaveFormatEx { tag: WAVE_FORMAT_XMA2, channels, rate, avg_bytes: 0, block_align: 1, bits: 16, cb_size: 34 },
             samples_encoded: samples,
             bytes_per_block: bpb,
             block_count: blocks,
@@ -715,29 +548,9 @@ mod tests {
     fn xma2_format_to_pcm16() {
         let f = xma2(2, 44_100, 441_000, 0x8000, 4);
         let i = unsafe { xma_info(&f as *const Xma2WaveFormatEx as *const WaveFormatEx) };
-        assert_eq!(
-            i,
-            XmaInfo {
-                channels: 2,
-                rate: 44_100,
-                avg_bytes: 0,
-                samples_encoded: 441_000,
-                bytes_per_block: 0x8000,
-                block_count: 4
-            }
-        );
+        assert_eq!(i, XmaInfo { channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
         let p = pcm16_for(&i);
-        assert_eq!(
-            (
-                p.tag,
-                p.channels,
-                p.rate,
-                p.block_align,
-                p.bits,
-                p.avg_bytes
-            ),
-            (1, 2, 44_100, 4, 16, 176_400)
-        );
+        assert_eq!((p.tag, p.channels, p.rate, p.block_align, p.bits, p.avg_bytes), (1, 2, 44_100, 4, 16, 176_400));
         // plain XMA (or a short cbSize): no XMA2 fields are read
         let mut w = f.wfx;
         w.cb_size = 0;
@@ -747,27 +560,12 @@ mod tests {
 
     #[test]
     fn silence_has_the_length_of_the_xma_buffer() {
-        let i = XmaInfo {
-            channels: 2,
-            rate: 48_000,
-            avg_bytes: 0,
-            samples_encoded: 480_000,
-            bytes_per_block: 0x10000,
-            block_count: 2,
-        };
+        let i = XmaInfo { channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
         let z = 0x5000 as *const u8;
         // explicit play region: PlayBegin + PlayLength frames
         let b = silent_buffer(&i, &buffer(4096, 128, 4800, 0, 0, 0), z, 1 << 20);
         assert_eq!({ b.audio_bytes }, (128 + 4800) * 4);
-        assert_eq!(
-            (
-                { b.play_begin },
-                { b.play_length },
-                { b.flags },
-                b.audio_data
-            ),
-            (128, 4800, 0x40, z)
-        );
+        assert_eq!(({ b.play_begin }, { b.play_length }, { b.flags }, b.audio_data), (128, 4800, 0x40, z));
         assert_eq!({ b.context } as usize, 0x1234);
         // whole buffer: in proportion to SamplesEncoded (1/32 of the stream here)
         let b = silent_buffer(&i, &buffer(0x1000, 0, 0, 0, 0, 0), z, 1 << 20);
@@ -777,29 +575,15 @@ mod tests {
         assert_eq!({ b.audio_bytes } / 4, 9000);
         // too long for the silence buffer → clamped, regions reset
         let b = silent_buffer(&i, &buffer(0x1000, 1000, 1_000_000, 0, 0, 0), z, 4000);
-        assert_eq!(
-            ({ b.audio_bytes }, { b.play_begin }, { b.play_length }),
-            (4000, 0, 0)
-        );
+        assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }), (4000, 0, 0));
         // no XMA2 metadata: rough ratio, never empty
-        let j = XmaInfo {
-            channels: 1,
-            rate: 48_000,
-            ..Default::default()
-        };
+        let j = XmaInfo { channels: 1, rate: 48_000, ..Default::default() };
         assert_eq!(estimate_frames(&j, 2048), 8192);
         assert_eq!(estimate_frames(&j, 0), 128);
         // other compressed formats: from the average byte rate (Opus at 64 kbit/s: 8000 B/s)
-        let o = XmaInfo {
-            channels: 1,
-            rate: 48_000,
-            avg_bytes: 8000,
-            ..Default::default()
-        };
+        let o = XmaInfo { channels: 1, rate: 48_000, avg_bytes: 8000, ..Default::default() };
         assert_eq!(estimate_frames(&o, 8000), 48_000);
-        assert!(
-            is_plain_pcm(1) && is_plain_pcm(3) && is_plain_pcm(0xFFFE) && !is_plain_pcm(0x704F)
-        );
+        assert!(is_plain_pcm(1) && is_plain_pcm(3) && is_plain_pcm(0xFFFE) && !is_plain_pcm(0x704F));
     }
 
     #[test]
@@ -811,31 +595,16 @@ mod tests {
             assert_eq!(hr, S_OK, "{:#x}", hr as u32);
             assert!(!eng.is_null());
             let vt = vtable(eng);
-            assert_eq!(
-                vt.add(ENGINE_CREATE_SOURCE_VOICE).read(),
-                create_source_voice as usize
-            );
+            assert_eq!(vt.add(ENGINE_CREATE_SOURCE_VOICE).read(), create_source_voice as usize);
             assert!(original(eng, ENGINE_CREATE_SOURCE_VOICE).is_some());
             // a second engine shares the vtable: no double patch, originals kept
             let mut eng2: *mut c_void = std::ptr::null_mut();
             assert_eq!(XAudio2CreateWithVersionInfo(&mut eng2, 0, 1, 0), S_OK);
-            assert_eq!(
-                ORIGINALS
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|o| o.1 == ENGINE_CREATE_SOURCE_VOICE)
-                    .count(),
-                1
-            );
-            let release: unsafe extern "system" fn(*mut c_void) -> u32 =
-                std::mem::transmute(vtable(eng2).add(2).read());
+            assert_eq!(ORIGINALS.lock().unwrap().iter().filter(|o| o.1 == ENGINE_CREATE_SOURCE_VOICE).count(), 1);
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(eng2).add(2).read());
             release(eng2);
             release(eng);
-            assert!(stats()
-                .dropped_flags
-                .iter()
-                .any(|f| f == "XAudio2Create:0x1"));
+            assert!(stats().dropped_flags.iter().any(|f| f == "XAudio2Create:0x1"));
         }
     }
 }

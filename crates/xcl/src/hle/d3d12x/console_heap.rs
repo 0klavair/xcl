@@ -25,31 +25,16 @@ static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 /// `obj` is a PC heap with 2·`n` descriptors from `pc_cpu` (increment `inc`): give it `n`
 /// console slots in unified memory.
 pub fn register(obj: usize, n: u32, pc_cpu: u64, inc: u32) -> bool {
-    let Some(u) = crate::gpu::uma::get() else {
-        return false;
-    };
-    let Some(p) = u.alloc((n.max(1) * SLOT) as usize, 256) else {
-        return false;
-    };
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    let Some(p) = u.alloc((n.max(1) * SLOT) as usize, 256) else { return false };
     unsafe { std::ptr::write_bytes(p, 0, (n * SLOT) as usize) };
-    HEAPS.lock().unwrap().push(Heap {
-        obj,
-        shadow: p as usize,
-        n,
-        pc_cpu,
-        inc,
-    });
+    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, inc });
     true
 }
 
 /// Start of the console slots of heap `obj` (CPU handle = GPU handle on the console).
 pub fn start(obj: usize) -> Option<u64> {
-    HEAPS
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|h| h.obj == obj)
-        .map(|h| h.shadow as u64)
+    HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
 }
 
 /// A console slot: where its descriptor goes and its two PC descriptors.
@@ -65,16 +50,9 @@ pub struct Slot {
 /// The slot behind a console CPU handle (None: not one of XCL's console heaps).
 pub fn slot(cpu: u64) -> Option<Slot> {
     let heaps = HEAPS.lock().unwrap();
-    let h = heaps
-        .iter()
-        .find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * SLOT) as usize) as u64)?;
+    let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * SLOT) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / SLOT as u64) as u32;
-    Some(Slot {
-        at: h.shadow + (k * SLOT) as usize,
-        index: 2 * k,
-        pc_srv: h.pc_cpu + (2 * k * h.inc) as u64,
-        pc_uav: h.pc_cpu + ((2 * k + 1) * h.inc) as u64,
-    })
+    Some(Slot { at: h.shadow + (k * SLOT) as usize, index: 2 * k, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + ((2 * k + 1) * h.inc) as u64 })
 }
 
 pub fn write(s: &Slot, words: &[u32]) {

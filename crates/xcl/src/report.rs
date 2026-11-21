@@ -91,11 +91,7 @@ pub fn build() -> Report {
         };
         *by_source.entry(label).or_default() += 1;
         if r.source == Source::Stub {
-            stubbed.push(MissingImport {
-                importer: r.importer.clone(),
-                dll: r.dll.clone(),
-                function: r.function.clone(),
-            });
+            stubbed.push(MissingImport { importer: r.importer.clone(), dll: r.dll.clone(), function: r.function.clone() });
         }
     }
     let mut called: Vec<StubCall> = crate::stubs::all_stubs()
@@ -111,18 +107,10 @@ pub fn build() -> Report {
     called.sort_by(|a, b| b.calls.cmp(&a.calls));
     let modules = crate::modules::mapped_modules()
         .iter()
-        .map(|m| ModuleInfo {
-            name: m.name.clone(),
-            base: format!("{:#x}", m.base),
-            size: format!("{:#x}", m.size),
-        })
+        .map(|m| ModuleInfo { name: m.name.clone(), base: format!("{:#x}", m.base), size: format!("{:#x}", m.size) })
         .collect();
     let vfs = crate::vfs::get()
-        .map(|v| VfsInfo {
-            unmapped_paths: v.unmapped_paths(),
-            redirected_writes: v.redirected_writes(),
-            whiteouts: v.whiteouts(),
-        })
+        .map(|v| VfsInfo { unmapped_paths: v.unmapped_paths(), redirected_writes: v.redirected_writes(), whiteouts: v.whiteouts() })
         .unwrap_or_default();
     Report {
         xcl_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -148,17 +136,13 @@ pub fn build() -> Report {
 
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
-    let Ok(_g) = WRITE_LOCK.try_lock() else {
-        return;
-    };
+    let Ok(_g) = WRITE_LOCK.try_lock() else { return };
     if let Some(c) = crash {
         if let Ok(mut g) = CRASH.lock() {
             g.get_or_insert(c);
         }
     }
-    let Some(boot) = crate::state::boot() else {
-        return;
-    };
+    let Some(boot) = crate::state::boot() else { return };
     let r = build();
     if let Ok(s) = serde_json::to_string_pretty(&r) {
         let _ = std::fs::write(boot.report_path(), s);
