@@ -13,8 +13,8 @@
 //! * IXAudio2 slot 7 `CreateMasteringVoice` – console device ids are ignored (default
 //!   device); on failure retried with default channels/rate and the game-effects category,
 //! * IXAudio2SourceVoice slot 21 `SubmitSourceBuffer` – on such voices the buffer becomes
-//!   silence of the same length, so callbacks (OnBufferEnd, OnStreamEnd, loops) keep the
-//!   title's timing,
+//!   silence of the same length; length-prefixed console Opus blocks use their exact RFC 6716
+//!   packet duration, so callbacks (OnBufferEnd, OnStreamEnd, loops) keep the title's timing,
 //! * IXAudio2SourceVoice slot 18 `DestroyVoice` – forget the silent voice.
 //!
 //! Next step: a real XMA2 decoder (FFmpeg libavcodec, LGPL-2.1+).
@@ -35,6 +35,7 @@ use crate::util::{E_FAIL, E_POINTER, HRESULT, S_OK};
 pub const WAVE_FORMAT_PCM: u16 = 1;
 pub const WAVE_FORMAT_XMA: u16 = 0x165;
 pub const WAVE_FORMAT_XMA2: u16 = 0x166;
+pub const WAVE_FORMAT_OPUS: u16 = 0x704F;
 pub const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
@@ -56,6 +57,8 @@ const VOICE_SUBMIT_SOURCE_BUFFER: usize = 21;
 
 /// Size of the shared silence buffer (zero pages are only backed once read).
 const SILENCE_BYTES: usize = 32 << 20;
+const OPUS_STREAM_BLOCK_BYTES: usize = 512 << 10;
+const OPUS_STREAM_HEADER_BYTES: usize = 2048;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -192,6 +195,7 @@ fn note_dropped(what: &str, flags: u32, allowed: u32) {
 /// to size its buffers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XmaInfo {
+    pub tag: u16,
     pub channels: u16,
     pub rate: u32,
     /// WAVEFORMATEX.nAvgBytesPerSec of the original format
@@ -217,6 +221,7 @@ pub fn is_plain_pcm(tag: u16) -> bool {
 pub unsafe fn xma_info(fmt: *const WaveFormatEx) -> XmaInfo {
     let w = fmt.read_unaligned();
     let mut i = XmaInfo {
+        tag: w.tag,
         channels: w.channels.clamp(1, 8),
         rate: if w.rate == 0 { 48_000 } else { w.rate },
         avg_bytes: w.avg_bytes,
@@ -252,13 +257,138 @@ pub fn estimate_frames(i: &XmaInfo, audio_bytes: u32) -> u64 {
     f.max(128)
 }
 
+/// Number of 48 kHz samples in an RFC 6716 Opus packet. This only inspects the
+/// packet framing bytes; it does not decode compressed content.
+pub fn opus_packet_frames(packet: &[u8]) -> Option<u64> {
+    fn vbr_len(packet: &[u8], pos: &mut usize, end: usize) -> Option<usize> {
+        let first = *packet.get(*pos)? as usize;
+        *pos += 1;
+        let len = if first < 252 {
+            first
+        } else {
+            let second = *packet.get(*pos)? as usize;
+            *pos += 1;
+            first + second * 4
+        };
+        (len <= 1275 && *pos <= end).then_some(len)
+    }
+
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let samples_per_frame = match config {
+        0..=3 => 480, 4..=7 => 960, 8..=11 => 1920,
+        12..=13 => 480, 14..=15 => 960,
+        16..=31 => [120, 240, 480, 960][(config & 3) as usize],
+        _ => unreachable!(),
+    };
+    let frames = match toc & 3 {
+        0 => {
+            (packet.len() - 1 <= 1275).then_some(1)?
+        }
+        1 => {
+            let payload = packet.len() - 1;
+            (payload % 2 == 0 && payload / 2 <= 1275).then_some(2)?
+        }
+        2 => {
+            let mut pos = 1;
+            let first = vbr_len(packet, &mut pos, packet.len())?;
+            (first <= packet.len() - pos && packet.len() - pos - first <= 1275).then_some(2)?
+        }
+        3 => {
+            let control = *packet.get(1)?;
+            let count = (control & 0x3f) as usize;
+            if count == 0 { return None; }
+            let mut pos = 2usize;
+            let mut padding = 0usize;
+            if control & 0x40 != 0 {
+                loop {
+                    let p = *packet.get(pos)? as usize;
+                    pos += 1;
+                    padding = padding.checked_add(if p == 255 { 254 } else { p })?;
+                    if p != 255 { break; }
+                }
+            }
+            let end = packet.len().checked_sub(padding)?;
+            if pos > end { return None; }
+            if control & 0x80 != 0 {
+                let mut used = 0usize;
+                for _ in 1..count {
+                    let len = vbr_len(packet, &mut pos, end)?;
+                    used = used.checked_add(len)?;
+                    if used > end - pos { return None; }
+                }
+                if end - pos - used > 1275 { return None; }
+            } else {
+                let payload = end - pos;
+                if payload % count != 0 || payload / count > 1275 { return None; }
+            }
+            count as u64
+        }
+        _ => unreachable!(),
+    };
+    let samples = samples_per_frame * frames;
+    (frames > 0 && samples <= 5_760).then_some(samples) // Opus maximum: 120 ms
+}
+
+/// Exact duration of console Opus blocks. Each 2048-byte block contains
+/// little-endian packet lengths followed by packets and zero padding.
+pub fn framed_opus_frames(data: &[u8]) -> Option<u64> {
+    let mut total = 0u64;
+    let mut packets = 0usize;
+    for block in data.chunks(2048) {
+        let mut pos = 0usize;
+        while pos + 2 <= block.len() {
+            let len = u16::from_le_bytes([block[pos], block[pos + 1]]) as usize;
+            pos += 2;
+            if len == 0 {
+                if block[pos..].iter().any(|&b| b != 0) { return None; }
+                pos = block.len();
+                break;
+            }
+            let end = pos.checked_add(len)?;
+            total = total.checked_add(opus_packet_frames(block.get(pos..end)?)?)?;
+            packets += 1;
+            pos = end;
+        }
+        // A partial final block may have fewer than two padding bytes, but they
+        // are still padding and therefore must be zero.
+        if block[pos..].iter().any(|&b| b != 0) { return None; }
+    }
+    (packets > 0).then_some(total)
+}
+
+/// Duration of either ordinary framed Opus data or the streaming form: fixed
+/// 512 KiB blocks whose first 2048-byte page starts with the -1 sentinel and
+/// contains the seek table. Only the following packet pages contribute audio.
+pub fn console_opus_frames(data: &[u8]) -> Option<u64> {
+    if !data.is_empty() && data.len() % OPUS_STREAM_BLOCK_BYTES == 0 {
+        let mut total = 0u64;
+        let mut streaming = true;
+        for block in data.chunks_exact(OPUS_STREAM_BLOCK_BYTES) {
+            if block.get(..4) != Some(&u32::MAX.to_le_bytes()) {
+                streaming = false;
+                break;
+            }
+            total = total.checked_add(framed_opus_frames(&block[OPUS_STREAM_HEADER_BYTES..])?)?;
+        }
+        if streaming {
+            return Some(total);
+        }
+    }
+    framed_opus_frames(data)
+}
+
 /// The PCM16 silence buffer that stands in for an XMA buffer: same play/loop region and
 /// flags/context; length from PlayBegin+PlayLength (or the estimate), clamped to
 /// `max_bytes` (then the whole – shorter – buffer is played).
 pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_bytes: usize) -> XAudio2Buffer {
+    silent_buffer_with_frames(i, b, silence, max_bytes, None)
+}
+
+fn silent_buffer_with_frames(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_bytes: usize, exact_frames: Option<u64>) -> XAudio2Buffer {
     let mut nb = *b;
     let (pb, pl, lb, ll) = (b.play_begin as u64, b.play_length as u64, b.loop_begin as u64, b.loop_length as u64);
-    let mut frames = if pl > 0 { pb + pl } else { estimate_frames(i, b.audio_bytes).max(pb + 1) };
+    let mut frames = if pl > 0 { pb + pl } else { exact_frames.unwrap_or_else(|| estimate_frames(i, b.audio_bytes)).max(pb + 1) };
     if b.loop_count > 0 {
         frames = frames.max(lb + ll);
     }
@@ -499,7 +629,13 @@ unsafe extern "system" fn submit_source_buffer(this: *mut c_void, buf: *const XA
             if s.is_null() {
                 return E_FAIL;
             }
-            let nb = silent_buffer(&i, &buf.read_unaligned(), s, SILENCE_BYTES);
+            let source = buf.read_unaligned();
+            let exact_frames = if i.tag == WAVE_FORMAT_OPUS && !source.audio_data.is_null() {
+                console_opus_frames(std::slice::from_raw_parts(source.audio_data, source.audio_bytes as usize))
+            } else {
+                None
+            };
+            let nb = silent_buffer_with_frames(&i, &source, s, SILENCE_BYTES, exact_frames);
             SILENCED.fetch_add(1, Ordering::Relaxed);
             orig(this, &nb, std::ptr::null())
         }
@@ -548,7 +684,7 @@ mod tests {
     fn xma2_format_to_pcm16() {
         let f = xma2(2, 44_100, 441_000, 0x8000, 4);
         let i = unsafe { xma_info(&f as *const Xma2WaveFormatEx as *const WaveFormatEx) };
-        assert_eq!(i, XmaInfo { channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
+        assert_eq!(i, XmaInfo { tag: WAVE_FORMAT_XMA2, channels: 2, rate: 44_100, avg_bytes: 0, samples_encoded: 441_000, bytes_per_block: 0x8000, block_count: 4 });
         let p = pcm16_for(&i);
         assert_eq!((p.tag, p.channels, p.rate, p.block_align, p.bits, p.avg_bytes), (1, 2, 44_100, 4, 16, 176_400));
         // plain XMA (or a short cbSize): no XMA2 fields are read
@@ -560,7 +696,7 @@ mod tests {
 
     #[test]
     fn silence_has_the_length_of_the_xma_buffer() {
-        let i = XmaInfo { channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
+        let i = XmaInfo { tag: WAVE_FORMAT_XMA2, channels: 2, rate: 48_000, avg_bytes: 0, samples_encoded: 480_000, bytes_per_block: 0x10000, block_count: 2 };
         let z = 0x5000 as *const u8;
         // explicit play region: PlayBegin + PlayLength frames
         let b = silent_buffer(&i, &buffer(4096, 128, 4800, 0, 0, 0), z, 1 << 20);
@@ -584,6 +720,83 @@ mod tests {
         let o = XmaInfo { channels: 1, rate: 48_000, avg_bytes: 8000, ..Default::default() };
         assert_eq!(estimate_frames(&o, 8000), 48_000);
         assert!(is_plain_pcm(1) && is_plain_pcm(3) && is_plain_pcm(0xFFFE) && !is_plain_pcm(0x704F));
+    }
+
+    #[test]
+    fn opus_toc_and_console_blocks_have_exact_duration() {
+        assert_eq!(opus_packet_frames(&[4 << 3]), Some(960));
+        assert_eq!(opus_packet_frames(&[(14 << 3) | 1]), Some(1920));
+        assert_eq!(opus_packet_frames(&[(31 << 3) | 3, 6]), Some(5760));
+        assert_eq!(opus_packet_frames(&[(31 << 3) | 3, 7]), None);
+        assert_eq!(opus_packet_frames(&[(31 << 3) | 3]), None);
+
+        let mut block = vec![0u8; 2048];
+        block[0..2].copy_from_slice(&1u16.to_le_bytes());
+        block[2] = 4 << 3;
+        block[3..5].copy_from_slice(&1u16.to_le_bytes());
+        block[5] = (14 << 3) | 1;
+        assert_eq!(framed_opus_frames(&block), Some(960 + 1920));
+
+        let i = XmaInfo { tag: WAVE_FORMAT_OPUS, channels: 1, rate: 48_000, avg_bytes: 1, ..Default::default() };
+        let b = buffer(block.len() as u32, 0, 0, 0, 0, 0);
+        let timed = silent_buffer_with_frames(&i, &b, std::ptr::null(), 1 << 20, framed_opus_frames(&block));
+        assert_eq!({ timed.audio_bytes }, (960 + 1920) * 2);
+
+        assert_eq!(framed_opus_frames(&[]), None);
+        assert_eq!(framed_opus_frames(&[3, 0, 0]), None); // truncated packet
+        assert_eq!(framed_opus_frames(&[1, 0, (31 << 3) | 3]), None); // missing frame-count byte
+
+        let exact = [1, 0, 4 << 3];
+        assert_eq!(framed_opus_frames(&exact), Some(960));
+        assert_eq!(framed_opus_frames(&[1, 0, 4 << 3, 0]), Some(960)); // partial zero padding
+        assert_eq!(framed_opus_frames(&[1, 0, 4 << 3, 7]), None); // non-zero partial padding
+        assert_eq!(framed_opus_frames(&[1, 0, 4 << 3, 0, 0, 7]), None); // data after terminator
+    }
+
+    #[test]
+    fn opus_packet_framing_is_validated() {
+        let toc = 4 << 3; // 20 ms SILK
+        assert_eq!(opus_packet_frames(&[toc, 0xaa]), Some(960)); // code 0
+
+        assert_eq!(opus_packet_frames(&[toc | 1, 0xaa, 0xbb]), Some(1920)); // CBR
+        assert_eq!(opus_packet_frames(&[toc | 1, 0xaa]), None); // unequal CBR frames
+
+        assert_eq!(opus_packet_frames(&[toc | 2, 1, 0xaa, 0xbb, 0xcc]), Some(1920)); // VBR: 1 + 2
+        assert_eq!(opus_packet_frames(&[toc | 2, 5, 0xaa]), None); // first frame exceeds packet
+        let mut long_vbr = vec![toc | 2, 252, 0]; // two-byte length: 252 + 4*0
+        long_vbr.extend(vec![0xaa; 253]);
+        assert_eq!(opus_packet_frames(&long_vbr), Some(1920));
+
+        assert_eq!(opus_packet_frames(&[toc | 3, 2, 1, 2, 3, 4]), Some(1920)); // code 3 CBR
+        assert_eq!(opus_packet_frames(&[toc | 3, 2, 1, 2, 3]), None); // indivisible CBR
+        assert_eq!(opus_packet_frames(&[toc | 3, 0x82, 1, 0xaa, 0xbb]), Some(1920)); // code 3 VBR
+        assert_eq!(opus_packet_frames(&[toc | 3, 0x41, 2, 0xaa, 0, 0]), Some(960)); // padding
+        assert_eq!(opus_packet_frames(&[toc | 3, 0]), None); // zero frames
+        assert_eq!(opus_packet_frames(&[toc | 3, 0x41, 255]), None); // truncated padding length
+    }
+
+    #[test]
+    fn streaming_opus_blocks_skip_the_seek_header() {
+        fn stream_block(toc: u8) -> Vec<u8> {
+            let mut b = vec![0u8; OPUS_STREAM_BLOCK_BYTES];
+            b[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let at = OPUS_STREAM_HEADER_BYTES;
+            b[at..at + 2].copy_from_slice(&1u16.to_le_bytes());
+            b[at + 2] = toc;
+            b
+        }
+
+        let one = stream_block(4 << 3); // 20 ms
+        assert_eq!(console_opus_frames(&one), Some(960));
+        let mut two = one;
+        two.extend(stream_block((14 << 3) | 1)); // two 20 ms frames
+        assert_eq!(console_opus_frames(&two), Some(960 + 1920));
+
+        let mut wrong_sentinel = stream_block(4 << 3);
+        wrong_sentinel[0] = 0;
+        assert_eq!(console_opus_frames(&wrong_sentinel), None);
+        let truncated = stream_block(4 << 3);
+        assert_eq!(console_opus_frames(&truncated[..truncated.len() - 1]), None);
     }
 
     #[test]
