@@ -1975,3 +1975,146 @@ fn raw_rdna2_listing() {
         println!("  {:06x}: {}", l.pc, l.text);
     }
 }
+
+/// Every FSSM variant of the pack through the translator (no GPU): how many translate
+/// completely, per stage, and which instructions are missing (weighted by shaders).
+/// `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N` (every N-th record, default 1);
+/// `XCL_SURVEY_DXC=1` also compiles each one with DXC (4 threads, process capped at 8 GB):
+/// failures and compile times.
+#[test]
+#[ignore]
+fn retail_translation_survey() {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let every: usize = std::env::var("XCL_SURVEY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let data = std::fs::read(path).unwrap();
+    let records: Vec<_> = crate::gpu::pack::scan(&data, 0x40).into_iter().step_by(every).collect();
+    #[derive(Default)]
+    struct Acc {
+        // stage → (variants, complete)
+        stages: BTreeMap<String, (usize, usize)>,
+        // "mnemonic: reason" → shaders
+        missing: BTreeMap<String, usize>,
+        // error / no interface → shaders (with one example name)
+        errors: BTreeMap<String, (usize, String)>,
+        instructions: usize,
+        // DXC: seconds per variant, failures "stage: first line" → (count, example)
+        dxc_times: Vec<(f64, String)>,
+        dxc_errors: BTreeMap<String, (usize, String)>,
+    }
+    let with_dxc = std::env::var_os("XCL_SURVEY_DXC").is_some() && super::dxc::location().is_ok();
+    if with_dxc {
+        unsafe {
+            use windows_sys::Win32::System::JobObjects::*;
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            info.ProcessMemoryLimit = 8 << 30;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+            AssignProcessToJobObject(job, GetCurrentProcess());
+        }
+    }
+    let workers = if with_dxc { 4 } else { std::thread::available_parallelism().map_or(4, |n| n.get()) };
+    let acc = Mutex::new(Acc::default());
+    let next = AtomicUsize::new(0);
+    let t0 = std::time::Instant::now();
+    std::panic::set_hook(Box::new(|_| {}));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(r) = records.get(i) else { break };
+                let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                for f in &sh.fssm {
+                    let hw = f.stages.first().map_or(0, |s| s.hw);
+                    let stage = format!("{} ({})", sh.stage, crate::gpu::xbox::hw_stage_name(hw));
+                    let res = std::panic::catch_unwind(|| -> Result<(super::Translation, &'static str), String> {
+                        let mode = super::interface(&blob, &sh, f).ok_or("brak interfejsu")?;
+                        let profile = match &mode {
+                            Mode::Vertex(_) => "vs_6_6",
+                            Mode::Pixel(_) => "ps_6_6",
+                            // MS (NGG) and GS run as compute shaders feeding a pass-through mesh shader
+                            Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Kernel => "cs_6_6",
+                        };
+                        let p = f.programs.first().ok_or("FSSM bez programu")?;
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?, profile))
+                    });
+                    // DXC outside the lock
+                    let dxc = match (&res, with_dxc) {
+                        (Ok(Ok((t, profile))), true) => {
+                            let t1 = std::time::Instant::now();
+                            let r = super::dxc::compile(&t.hlsl, "main", profile, &[]);
+                            Some((t1.elapsed().as_secs_f64(), r.err().map(|e| e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or("")).to_string())))
+                        }
+                        _ => None,
+                    };
+                    let mut a = acc.lock().unwrap();
+                    let e = a.stages.entry(stage.clone()).or_default();
+                    e.0 += 1;
+                    let error = |a: &mut Acc, msg: String| {
+                        let x = a.errors.entry(format!("{stage}: {msg}")).or_insert((0, r.name.clone()));
+                        x.0 += 1;
+                    };
+                    if let Some((secs, err)) = dxc {
+                        a.dxc_times.push((secs, r.name.clone()));
+                        if let Some(e) = err {
+                            // drop the file:line:col prefix so equal errors group
+                            let e = e.split("error:").nth(1).unwrap_or(&e).trim().to_string();
+                            let x = a.dxc_errors.entry(format!("{stage}: {e}")).or_insert((0, r.name.clone()));
+                            x.0 += 1;
+                        }
+                    }
+                    match res {
+                        Ok(Ok((t, _))) => {
+                            a.instructions += t.instructions;
+                            if t.complete() {
+                                a.stages.get_mut(&stage).unwrap().1 += 1;
+                            }
+                            for k in t.unsupported_why.keys() {
+                                *a.missing.entry(k.clone()).or_default() += 1;
+                            }
+                        }
+                        Ok(Err(m)) => error(&mut a, m),
+                        Err(_) => error(&mut a, "panika tłumacza".into()),
+                    }
+                }
+            });
+        }
+    });
+    let _ = std::panic::take_hook();
+    let a = acc.into_inner().unwrap();
+    let (all, done): (usize, usize) = a.stages.values().fold((0, 0), |s, v| (s.0 + v.0, s.1 + v.1));
+    println!("rekordów: {} (co {every}.), wariantów FSSM: {all}, przetłumaczonych w całości: {done} ({:.1}%), instrukcji: {}, czas {:.1} s", records.len(), 100.0 * done as f64 / all.max(1) as f64, a.instructions, t0.elapsed().as_secs_f64());
+    for (st, (n, ok)) in &a.stages {
+        println!("  {st:<14} {ok:>6} / {n:<6} ({:.1}%)", 100.0 * *ok as f64 / (*n).max(1) as f64);
+    }
+    let mut missing: Vec<_> = a.missing.into_iter().collect();
+    missing.sort_by(|x, y| y.1.cmp(&x.1));
+    println!("brakujące instrukcje (w ilu wariantach):");
+    for (k, n) in missing.iter().take(40) {
+        println!("  {n:>6}  {k}");
+    }
+    let mut errors: Vec<_> = a.errors.into_iter().collect();
+    errors.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
+    println!("błędy:");
+    for (k, (n, ex)) in errors.iter().take(20) {
+        println!("  {n:>6}  {k}   (np. {ex})");
+    }
+    if with_dxc {
+        let mut t = a.dxc_times;
+        t.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let q = |f: f64| t.get(((t.len() as f64 * f) as usize).min(t.len().saturating_sub(1))).map_or(0.0, |x| x.0);
+        let failed: usize = a.dxc_errors.values().map(|v| v.0).sum();
+        println!("DXC: {} skompilowanych, {failed} błędów; czas mediana {:.2} s, p90 {:.2} s, max {:.1} s ({}), suma {:.0} s", t.len(), q(0.5), q(0.9), t.last().map_or(0.0, |x| x.0), t.last().map_or("", |x| x.1.as_str()), t.iter().map(|x| x.0).sum::<f64>());
+        let mut errs: Vec<_> = a.dxc_errors.into_iter().collect();
+        errs.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
+        for (k, (n, ex)) in errs.iter().take(20) {
+            println!("  {n:>6}  {k}   (np. {ex})");
+        }
+    }
+}

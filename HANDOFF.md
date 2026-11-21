@@ -536,6 +536,19 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## Przegląd tłumacza na całej paczce (sesja 5, 2026-11-21)
+- Test `retail_translation_survey` (ignorowany; `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N`, `XCL_SURVEY_DXC=1`):
+  - **tłumaczenie: 24 064 / 24 064 wariantów FSSM w całości** (PS 12 101, MS/NGG 9 282, VS 2 236, GS 195, ES 195,
+    CS 55), 28,97 mln instrukcji, 0 brakujących instrukcji, 0 błędów, 0 panik; 110 s (debug, wszystkie rdzenie);
+  - **DXC (co 100. rekord, 241 wariantów): 0 błędów**; czas mediana 0,26 s, p90 3,0 s, max 9,1 s
+    (PS_PedTextured_Eight_Fire), suma 224 s → **cała paczka ≈ 6 h CPU** (rząd 30 min na wszystkich rdzeniach, jeśli
+    starczy pamięci). Pierwszy start gry bez gotowego cache DXIL byłby bardzo długi → potrzebna kompilacja w tle +
+    cache (`dxc::compile_cached`, klucz = HLSL) albo wcześniejsze zapełnienie cache z `shaders.rpf`.
+  - MS (NGG) i GS/ES kompilować jako **cs_6_6** (działają jako compute + przejściowy mesh shader; profil ms/gs →
+    „WaveSize only allowed on compute”).
+- Gra **nie używa FSPX/ACCC**: wszystkie 23 869 shaderów w `shaders.rpf` to XDAT/XBCH/FSSM – FSPX to tylko własne
+  pipeline'y FSR4 (dla gry bez znaczenia, ewentualnie test).
+
 ## Shadery konsoli – otwarte pytania (z analizy `shaders.rpf`)
 - Nierozpoznane metadane FSSM: +0x10 (zawsze 6), +0x78/+0x80, +0xD0, +0xF8, +0x110 (przypomina SPI_SHADER_PGM_RSRC1,
   ale bity się nie zgadzają), za kodem tablica wpisów 5×u32 (3, PC co 8 B, 1, wartość, 8 – wygląda na mapowanie PC → linia
