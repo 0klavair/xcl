@@ -12,6 +12,7 @@ use crate::util::glob_match;
 
 pub mod d3d12_layout;
 pub mod d3d12x;
+pub mod dstorage;
 pub mod dxcompiler;
 pub mod kernelx;
 pub mod opus;
@@ -73,6 +74,8 @@ pub const XGAMERUNTIME: &str = "xgameruntime.dll";
 pub const D3D12X: &str = "d3d12_xs.dll";
 pub const XAUDIO2: &str = "xaudio2_9.dll";
 pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
+/// the console's DirectStorage (`dstorage`)
+pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
 pub const MINUSERX: &str = "minuserx.dll";
 
@@ -84,6 +87,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
         HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
         HleModule::new(MINUSERX, Vec::new(), &["user32.dll"]),
+        HleModule::new(XCRDAPI, dstorage::exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -133,6 +137,8 @@ fn build(config: &Config) -> Registry {
     }
     let u = idx(MINUSERX);
     routes.push((MINUSERX.into(), Route::Hle(u)));
+    let s = idx(XCRDAPI);
+    routes.push((XCRDAPI.into(), Route::Hle(s)));
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));

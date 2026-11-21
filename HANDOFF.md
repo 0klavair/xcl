@@ -617,6 +617,17 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   SetThreadAffinityMask – the title sees the PC's processors), `advapi32legacy.dll` (RegOpenKeyW) → kernelx;
   `minappmodelx.dll` → kernelx's Register/UnregisterApp{State,Constrained}ChangeNotification (a registration, the
   callbacks never come: titles are not suspended or constrained here).
+- **DirectStorage (`xcrdapi.dll`, `hle/dstorage.rs`)** – Fortnite (Series) reads all its data through it.
+  `DStorageGetFactory` → IDStorageFactoryX (console vtable order: CreateQueue, OpenFile, CreateStatusArray,
+  SetCpuAffinity, SetDebugFlags, SetStagingBufferSize, …), queue desc 0x18 (source type @0, capacity u16 @8, priority i8
+  @10, name @0x10), request 0x48 (options @0 – compression bits 0–7: 0 none / 1 zlib, bit 22 memory source –,
+  destination @8, size @0x18, source @0x20, file offset @0x28, source size @0x30, intermediate size @0x34, tag @0x38,
+  name @0x40), RetrieveErrorRecord 0x290, Query 0x1C. A worker thread per queue runs the submitted requests in order:
+  file reads through the VFS (as the title's own CreateFileW), memory copies, zlib (miniz_oxide); a status entry gets
+  the first failure since the previous one, a signal sets the D3D12 fence from the CPU; a half-full queue submits by
+  itself. BCPack (and other console formats) are refused; the unlisted interface slots are logged E_NOTIMPL. The test
+  title reads the start of its own exe through it and waits on the fence. Not yet: cancelling submitted requests,
+  multi-stage (intermediate-size) decompression, destinations that are not plain memory.
 - XGameRuntime task queues: handles are looked up in a set of live ones before being read – an XAsync completing on a
   worker after its queue was closed read freed memory (a rare lib-test panic in `queue_from`).
 

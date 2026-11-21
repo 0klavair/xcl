@@ -19,6 +19,12 @@ extern "system" {
     fn D3D12SerializeRootSignature(desc: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT;
 }
 
+// Fortnite reads its data through the console's DirectStorage
+#[link(name = "xcrdapi", kind = "raw-dylib")]
+extern "system" {
+    fn DStorageGetFactory(riid: *const windows::core::GUID, factory: *mut *mut c_void) -> HRESULT;
+}
+
 #[link(name = "d3dcompiler_47", kind = "raw-dylib")]
 extern "system" {
     fn D3DCompile(
@@ -469,6 +475,57 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01) && r32(0x200) == 0 && r32(0xFC) == 0, "FillMemoryWith32BitValueX");
         ensure!((0..64).all(|i| *mem.add(0x2000 + i) == i as u8 ^ 0x5A) && *mem.add(0x2040) == 0, "CopyMemoryToMemoryX");
         crate::XMemFree(mem as *mut c_void, graphics);
+        Ok(())
+    }
+}
+
+/// The console's DirectStorage as a title uses it: a file queue reads the start of the title's
+/// own executable into memory, a status array entry reports it and a D3D12 fence is signalled.
+pub fn direct_storage() -> Result<(), String> {
+    const IID_FACTORY: windows::core::GUID = windows::core::GUID::from_u128(0xfb3b54ac_bf82_463a_b777_73195837864d);
+    const IID_QUEUE: windows::core::GUID = windows::core::GUID::from_u128(0xa3f6649a_8c2c_4b3a_8b6e_10186a04b9bc);
+    const IID_FILE: windows::core::GUID = windows::core::GUID::from_u128(0x43704f9f_27c6_4a9f_8815_d16527894df4);
+    const IID_STATUS: windows::core::GUID = windows::core::GUID::from_u128(0xcd66d752_2786_44f7_9070_e2a6fdad3f1b);
+    type Create = unsafe extern "system" fn(*mut c_void, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type Open = unsafe extern "system" fn(*mut c_void, *const u16, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type Status = unsafe extern "system" fn(*mut c_void, u32, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    unsafe {
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let mut f = std::ptr::null_mut();
+        ensure!(DStorageGetFactory(&IID_FACTORY, &mut f) == 0 && !f.is_null(), "DStorageGetFactory");
+        let mut desc = [0u8; 0x18];
+        desc[8..10].copy_from_slice(&16u16.to_le_bytes()); // file source, capacity 16, normal priority
+        let mut q = std::ptr::null_mut();
+        ensure!(std::mem::transmute::<usize, Create>(slot(f, 3))(f, desc.as_ptr(), &IID_QUEUE, &mut q) == 0, "CreateQueue");
+        let exe = std::env::current_exe().map_err(|x| x.to_string())?;
+        let path: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
+        let mut file = std::ptr::null_mut();
+        ensure!(std::mem::transmute::<usize, Open>(slot(f, 4))(f, path.as_ptr(), &IID_FILE, &mut file) == 0, "OpenFile {}", exe.display());
+        let mut status = std::ptr::null_mut();
+        ensure!(std::mem::transmute::<usize, Status>(slot(f, 5))(f, 1, std::ptr::null(), &IID_STATUS, &mut status) == 0, "CreateStatusArray");
+
+        let mut dst = vec![0u8; 512];
+        let mut req = [0u8; 0x48];
+        req[8..16].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
+        req[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
+        req[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
+        let dev = device()?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q, 4))(q, status, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q, 5))(q, fence.as_raw(), 1);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q, 6))(q);
+        let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE(ev)).map_err(e)?;
+        ensure!(WaitForSingleObject(ev, 5000) == 0, "the DirectStorage fence was not signalled");
+        let hr = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status, 4))(status, 0);
+        ensure!(hr == 0, "request status {hr:#x}");
+        let disk = std::fs::read(&exe).map_err(|x| x.to_string())?;
+        ensure!(dst[..] == disk[..512] && dst.starts_with(b"MZ"), "the read bytes are not the file's");
+        for o in [status, file, q] {
+            std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(o, 2))(o);
+        }
         Ok(())
     }
 }
