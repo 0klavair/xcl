@@ -46,6 +46,19 @@ macro_rules! ensure {
     ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
 }
 
+/// A command list method at its console slot: from SetDescriptorHeaps (PC 28) on, the
+/// console list has the PC methods 4 slots further (the query methods come first).
+unsafe fn xslot<F: Copy>(list: &ID3D12GraphicsCommandList, slot: usize) -> F {
+    transmute_copy(&*(*(list.as_raw() as *const *const usize)).add(slot))
+}
+
+type OmSetRenderTargets = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_CPU_DESCRIPTOR_HANDLE, i32, *const D3D12_CPU_DESCRIPTOR_HANDLE);
+type ClearRtv = unsafe extern "system" fn(*mut c_void, D3D12_CPU_DESCRIPTOR_HANDLE, *const [f32; 4], u32, *const RECT);
+type SetRootSignature = unsafe extern "system" fn(*mut c_void, *mut c_void);
+const X_SET_GRAPHICS_ROOT_SIGNATURE: usize = 34;
+const X_OM_SET_RENDER_TARGETS: usize = 50;
+const X_CLEAR_RENDER_TARGET_VIEW: usize = 52;
+
 fn e(x: windows::core::Error) -> String {
     format!("{x}")
 }
@@ -273,7 +286,7 @@ pub fn present_x_frame() -> Result<(), String> {
         dev.CreateRenderTargetView(&bb, None, rtv);
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
-        list.ClearRenderTargetView(rtv, &[0.1, 0.5, 0.9, 1.0], None);
+        xslot::<ClearRtv>(&list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.1, 0.5, 0.9, 1.0], 0, std::ptr::null());
         // consoles want the back buffer in COMMON / PRESENT for PresentX
         list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -382,11 +395,12 @@ pub fn render_triangle() -> Result<(), String> {
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
-        list.OMSetRenderTargets(1, Some(&rtv), false, None);
-        list.ClearRenderTargetView(rtv, &[0.0, 0.0, 1.0, 1.0], None);
+        // console slots (OMSetRenderTargets #50, ClearRenderTargetView #52, SetGraphicsRootSignature #34)
+        xslot::<OmSetRenderTargets>(&list, X_OM_SET_RENDER_TARGETS)(list.as_raw(), 1, &rtv, 0, std::ptr::null());
+        xslot::<ClearRtv>(&list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.0, 0.0, 1.0, 1.0], 0, std::ptr::null());
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
-        list.SetGraphicsRootSignature(&rs);
+        xslot::<SetRootSignature>(&list, X_SET_GRAPHICS_ROOT_SIGNATURE)(list.as_raw(), rs.as_raw());
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list.DrawInstanced(3, 1, 0, 0);
         let barrier = D3D12_RESOURCE_BARRIER {

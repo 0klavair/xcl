@@ -518,6 +518,29 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
 ## In progress (unfinished)
 Nothing open.
 
+## PresentX, frame pacing, the console command list layout (session 5, 2026-11-21; Fortnite is the next test title)
+Slots and semantics as observed on Fortnite (UE RHI call sites); XCL's own evidence agrees where it has any.
+- **PresentX = command queue #30** `(planeCount, planes, parameters)`, plane 0 `{ u64 frame token; u32 resource count @8;
+  ID3D12Resource** @0x10 }` → `present::present_x` presents that resource at once (S_OK always) and marks the token
+  flipped; the back-buffer guessing only runs until a title's first PresentX.
+- **Frame clock = device #78–#81** (`d3d12x/frame.rs`): SetFrameIntervalX(output, µs, periodicity, flags) → S_FALSE
+  (16 667 / 33 333 / 50 000 / 66 667 µs; 8 333 / 25 000 only on a ≥ 119 Hz display, else E_INVALIDARG);
+  ScheduleFrameEventX(type 0 origin / 1 / 2, offset µs, ancillary `{ u32 count; HANDLE* @8; i32* signaled @0x10 }`,
+  flags 1 = unschedule) → S_FALSE, 0x10000000 when it starts the clock; WaitFrameEventX(type, timeout ms, ancillary,
+  flags 1 wait all / 2 token on timeout, token in/out) → S_OK / S_FALSE (timeout), a new 48-bit token at each origin;
+  GetFrameStatisticsX(token, type, count, stats `{ u32 type; i64 origin @0x10; i64 flip @0x18 }`). A clock thread
+  (high-resolution waitable timer + spin) releases the origin semaphore / sets the events and the ancillary handles;
+  not locked to the host vblank.
+- **ID3D12GraphicsCommandList console layout** (`real::console_remap`): 0–27 and 56–59 as on PC; 28–31 = PC 52–55
+  (BeginQuery, EndQuery, ResolveQueryData, SetPredication); 32–55 = PC 28–51 (SetDescriptorHeaps … DiscardResource, so
+  SetGraphicsRootSignature #34, OMSetRenderTargets #50, ClearRenderTargetView #52, ClearUnorderedAccessViewUint #53 –
+  as FSR4 calls it); List1 at 104–109 (PC 60–65); shading rate 124 / 125 (PC 77 / 78). Title calls only (make_split);
+  the console-only methods in between (depth bounds 68, KickoffX 93, depth bias 94, …) stay guarded and are reported.
+- Console slots past a class's public PC methods now work (inside the runtime's internal entries: title → console
+  method, runtime → its own). The test title calls the console layout (#34 / #50 / #52) and runs frame clock + PresentX.
+- Next with the exe: the console-only command-list methods Fortnite calls (report.json lists them), title heaps /
+  placed resources at title addresses, occlusion queries (the console allows nesting them, PC does not).
+
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
   sqrt / rsq / class, v_swaprel, pknorm f16…) with tests. Fixed on the GPU (RX 9070), where its GPU tests had not run:

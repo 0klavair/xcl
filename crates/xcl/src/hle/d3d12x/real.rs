@@ -456,6 +456,17 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             }
         }
     }
+    // the console's layout of the same PC methods (title calls only; the runtime keeps PC's)
+    let pc = v.clone();
+    for (x, p) in console_remap(kind) {
+        if x < public {
+            v[1 + x] = super::guard::make_split(pc[1 + p], pc[1 + x]);
+        } else if x < scanned {
+            v[1 + x] = super::guard::make_split(pc[1 + p], *ot.add(x));
+        } else if x < total {
+            v[1 + x] = pc[1 + p];
+        }
+    }
     // slots where the console's method differs from the PC one at the same index
     for (slot, f) in console_slots(kind) {
         if slot < public {
@@ -504,6 +515,20 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 ///   assumed to follow it (each checks its arguments and otherwise goes to the PC method).
 /// * device #12 `CreateCommandList` (only with console lists on): console code gets a
 ///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
+/// (console slot, PC slot) of PC methods that sit elsewhere in the console's vtable.
+/// ID3D12GraphicsCommandList (from the Fortnite RHI call sites, matching XCL's own evidence
+/// – FSR4 calls ClearUnorderedAccessViewUint at #53): 0–27 and 56–59 as on PC; the query
+/// methods come right after ExecuteBundle (28–31 = PC 52–55: BeginQuery, EndQuery,
+/// ResolveQueryData, SetPredication), so SetDescriptorHeaps … DiscardResource move up by 4
+/// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65), the shading-rate
+/// methods at 124 / 125 (PC 77 / 78). The console-only methods in between stay guarded.
+fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
+    match kind {
+        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::Device => {
