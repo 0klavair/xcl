@@ -1267,6 +1267,73 @@ fn gpu_unified_memory_arena() {
     }
 }
 
+/// Memory above 4 GiB: two UMA windows 4 GiB apart; every access kind picks its window from
+/// the high address bits (V#, SGPR pair, 64-bit VGPR address, SADDR pair) and reaches the
+/// right one – s_load, buffer load / store, global load / store / atomic in window 1 next to
+/// accesses in window 0.
+#[test]
+fn gpu_memory_windows_above_4_gib() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    *word(w1 + 0x1000) = 0xC0FFEE;
+    *word(w1 + 0x1004) = 0x1234;
+    for l in 0..64u64 {
+        *word(w1 + 0x2000 + 4 * l) = 1000 + l as u32;
+        *word(w1 + 0x4000 + 4 * l) = 5000 + l as u32;
+        *word(w0 + 0x4000 + 4 * l) = 9; // same low address in window 0: must not be read
+    }
+    let glbl = |n: &'static str, f: &[(&str, u64)]| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        (n, "ENC_FLAT_GLBL", f.iter().map(|&(a, b)| (unsafe { std::mem::transmute::<&str, &'static str>(a) }, b)).collect(), None)
+    };
+    let list = vec![
+        ("S_LOAD_DWORDX2", "ENC_SMEM", vec![("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3] → window 1
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None), // V# in window 1
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None), // V# in window 0
+        glbl("GLOBAL_LOAD_DWORD", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[4:5] → window 1
+        glbl("GLOBAL_STORE_DWORD", &[("ADDR", 8), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[8:9] → window 1
+        glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 10), ("ADDR", 3), ("DATA", 11), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)]), // s[16:17] + v3 → window 1
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let p = prog(&refs);
+    let one = translate(&p, &Options::default()).unwrap();
+    assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
+    let t = translate(&p, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let hi = |a: u64| (a >> 32) as u32;
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
+    st.sgpr[8..12].copy_from_slice(&[(w1 + 0x2000) as u32, hi(w1) & 0xFFFF | 4 << 16, 64, 0]);
+    st.sgpr[12..16].copy_from_slice(&[(w0 + 0x3000) as u32, hi(w0) & 0xFFFF | 4 << 16, 64, 0]);
+    st.sgpr[16..18].copy_from_slice(&[(w1 + 0x6000) as u32, hi(w1)]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u64;
+        r[0] = l as u32;
+        r[2] = 7 * l as u32;
+        r[3] = 0; // atomic offset: all lanes on one counter
+        r[4] = (w1 + 0x4000 + 4 * l) as u32;
+        r[5] = hi(w1);
+        r[8] = (w1 + 0x5000 + 4 * l) as u32;
+        r[9] = hi(w1);
+        r[11] = 1;
+    }
+    let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
+    for l in 0..64u64 {
+        assert_eq!(r.vgpr[l as usize][1], 1000 + l as u32, "lane {l}: buffer_load from window 1");
+        assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window 1");
+        assert_eq!(*word(w0 + 0x3000 + 4 * l), 7 * l as u32, "lane {l}: buffer_store into window 0");
+        assert_eq!(*word(w1 + 0x5000 + 4 * l), 7 * l as u32, "lane {l}: global_store into window 1");
+    }
+    assert_eq!(*word(w1 + 0x6000), 64, "global_atomic_add in window 1");
+    assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
+}
+
 /// Experiment: does OpenExistingHeapFromAddress accept a reservation with only part committed?
 #[test]
 #[ignore]
@@ -2271,7 +2338,9 @@ fn retail_translation_survey() {
                         };
                         let p = f.programs.first().ok_or("FSSM without a program")?;
                         let code = &f.data[p.offset..p.offset + p.len];
-                        Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?, profile))
+                        // XCL_SURVEY_WINDOWS=N: translate for N memory windows (above 4 GiB)
+                        let mem_windows = std::env::var("XCL_SURVEY_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+                        Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), mem_windows, ..Default::default() })?, profile))
                     });
                     // DXC outside the lock
                     let guarded = matches!(&res, Ok(Ok((t, _))) if t.hlsl.contains("pc =="));

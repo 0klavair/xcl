@@ -309,11 +309,15 @@ pub struct Options {
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
+    /// 4 GiB memory windows the program may address (`gpu::uma`): 1 = `mem` only (the HLSL is
+    /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
+    /// every access from the high address bits
+    pub mem_windows: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0 }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0, mem_windows: 1 }
     }
 }
 

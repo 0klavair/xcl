@@ -930,6 +930,7 @@ impl Em {
         if name.starts_with("s_buffer_load") {
             // V#: base = dw0 | dw1[15:0] << 32, stride = dw1[29:16], num_records = dw2
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
+            self.window(&d1);
             self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
             self.line(&format!("uint {t}_lim = ((({d1} >> 16) & 0x3FFFu) == 0u) ? {d2} : {d2} * (({d1} >> 16) & 0x3FFFu);"));
             for i in 0..count {
@@ -940,6 +941,8 @@ impl Em {
         } else {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
+            let hi = self.sreg(sbase + 1);
+            self.window(&hi);
             self.line(&format!("uint {t}_a = {b} + {} + {soff};", hex(imm)));
             for i in 0..count {
                 let v = format!("{t}_{i}");
@@ -952,6 +955,23 @@ impl Em {
             self.line(&format!("{s} = {v};"));
         }
         Ok(())
+    }
+
+    /// Several memory windows: the accesses that follow go to the window of the address
+    /// whose high dword (bits 32..63) is `hi` (`xcl_w`, read by the `mem` accessors).
+    fn window(&mut self, hi: &str) {
+        if self.opt.mem_windows > 1 {
+            self.line(&format!("xcl_w = ({hi}) & 3u;"));
+        }
+    }
+
+    /// `window` for a FLAT / global address: SADDR pair (global with SADDR) or the 64-bit
+    /// VGPR address.
+    fn flat_window(&mut self, global: bool, saddr: u64, addr: u64) {
+        if self.opt.mem_windows > 1 {
+            let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(addr + 1) };
+            self.window(&hi);
+        }
     }
 
     /// The sampler of the MIMG instruction at `pc`: a static sampler when its S# is constant
@@ -999,6 +1019,7 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
+        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -1315,6 +1336,7 @@ impl Em {
             let t = self.t();
             let act = self.act();
             // descriptor: base address in 256-byte units (word 0), box sorting = word 1 bit 31
+            self.window(&format!("{d0} >> 24"));
             self.line(&format!("uint4 {t} = bvh_intersect({node}, {d0} << 8, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -2709,6 +2731,7 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -2757,6 +2780,7 @@ impl Em {
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
         let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        self.window(&d1);
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
@@ -2791,6 +2815,7 @@ impl Em {
             let addr = self.vreg(f("ADDR"));
             let saddr = f("SADDR");
             let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
+            self.flat_window(global, saddr, f("ADDR"));
             let raw = f("OFFSET") as u32;
             let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
             let t = self.t();
@@ -2825,6 +2850,7 @@ impl Em {
         } else {
             addr
         };
+        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
@@ -2896,6 +2922,7 @@ impl Em {
         let addr = self.vreg(f("ADDR"));
         let saddr = f("SADDR");
         let base = if global && saddr != 0x7D && saddr != 0x7F { format!("{} + {addr}", self.sreg(saddr)) } else { addr };
+        self.flat_window(global, saddr, f("ADDR"));
         let raw = f("OFFSET") as u32;
         let off = if global { (((raw << 20) as i32) >> 20) as u32 } else { raw };
         let t = self.t();
@@ -3129,10 +3156,15 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
         // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
         // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
         // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        if matches!(self.opt.mode, Mode::Compute(_)) {
-            h.push_str("globallycoherent RWByteAddressBuffer mem : register(u2);\n");
-        } else {
-            h.push_str("RWByteAddressBuffer mem : register(u2);\n");
+        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        let windows = self.opt.mem_windows.clamp(1, 4);
+        let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem : register(u2);");
+        if windows > 1 {
+            for k in 1..windows {
+                let _ = writeln!(h, "{coherent}RWByteAddressBuffer mem{k} : register(u{});", 2 + k);
+            }
+            h.push_str("static uint xcl_w = 0u;\n");
+            h.push_str(MEM_ACCESSORS_HERE);
         }
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
@@ -3406,6 +3438,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 }
                 h.push_str("    return xo;\n}\n");
             }
+        }
+        if windows > 1 {
+            h = windowed(&h, windows);
         }
         h
     }
@@ -3699,6 +3734,70 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
     };
     let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
     Some(format!("mem.{f}({a}, {val}, {old});"))
+}
+
+/// Placeholder where the memory window accessors go (after the `mem` declarations).
+const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
+
+/// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
+/// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
+/// definitions replace the placeholder.
+fn windowed(h: &str, windows: u32) -> String {
+    let mut out = String::with_capacity(h.len() + 8192);
+    let mut rest = h;
+    while let Some(i) = rest.find("mem.") {
+        let before_ok = rest[..i].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        let tail = &rest[i + 4..];
+        let name_len = tail.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(tail.len());
+        if before_ok && tail[name_len..].starts_with('(') {
+            out.push_str(&rest[..i]);
+            out.push_str("xcl_m");
+            out.push_str(&tail[..name_len]);
+            rest = &tail[name_len..];
+        } else {
+            out.push_str(&rest[..i + 4]);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows), 1)
+}
+
+/// The accessor functions: one per `mem` method (and overload) the translator emits.
+fn mem_accessors(windows: u32) -> String {
+    let mut sigs: Vec<(&str, String, &str, &str)> = vec![
+        ("uint", "Load".into(), "uint a", "a"),
+        ("uint2", "Load2".into(), "uint a", "a"),
+        ("uint3", "Load3".into(), "uint a", "a"),
+        ("uint4", "Load4".into(), "uint a", "a"),
+        ("void", "Store".into(), "uint a, uint v", "a, v"),
+        ("void", "Store2".into(), "uint a, uint2 v", "a, v"),
+        ("void", "Store3".into(), "uint a, uint3 v", "a, v"),
+        ("void", "Store4".into(), "uint a, uint4 v", "a, v"),
+        ("void", "InterlockedCompareExchange".into(), "uint a, uint c, uint v, out uint o", "a, c, v, o"),
+        ("void", "InterlockedCompareExchange64".into(), "uint a, uint64_t c, uint64_t v, out uint64_t o", "a, c, v, o"),
+    ];
+    for op in ["Add", "And", "Or", "Xor", "Exchange", "Min", "Max"] {
+        sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v, out uint o", "a, v, o"));
+        if op != "Exchange" {
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, uint v", "a, v"));
+        }
+        sigs.push(("void", format!("Interlocked{op}64"), "uint a, uint64_t v, out uint64_t o", "a, v, o"));
+        if op == "Min" || op == "Max" {
+            sigs.push(("void", format!("Interlocked{op}"), "uint a, int v, out int o", "a, v, o"));
+            sigs.push(("void", format!("Interlocked{op}64"), "uint a, int64_t v, out int64_t o", "a, v, o"));
+        }
+    }
+    let mut s = String::new();
+    for (ret, name, params, args) in sigs {
+        let r = if ret == "void" { "" } else { "return " };
+        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: {r}mem{k}.{name}({args}); break; ");
+        }
+        let _ = writeln!(s, "default: {r}mem.{name}({args}); break; }} }}");
+    }
+    s
 }
 
 /// Sub-dword d16 forms: (bytes, sign-extend, store, half: 0 low / 1 high) by the name after

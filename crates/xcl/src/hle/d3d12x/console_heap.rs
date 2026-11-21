@@ -45,7 +45,8 @@ static HEAPS: Mutex<Vec<Heap>> = Mutex::new(Vec::new());
 pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler: bool) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     let bytes = n.max(1) * if sampler { SAMPLER_SLOT } else { SLOT };
-    let Some(p) = u.alloc(bytes as usize, 256) else { return false };
+    // descriptor tables are 32-bit console addresses: window 0
+    let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
     unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
     HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler });
     true

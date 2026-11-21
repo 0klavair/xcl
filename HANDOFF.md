@@ -536,6 +536,27 @@ Nothing open.
   Unexplained: 6 packets per subblock with a table difference of 12·960 – TOC 0xFC is CELT FB 20 ms **stereo**, so the table
   probably counts samples × channels.
 
+## Title memory above 4 GB: UMA windows (session 5, 2026-11-21)
+- **Gap:** shaders addressed one `mem` buffer with the low 32 bits of the address, and D3D12 opens a heap from an
+  address only below 4 GiB (4095 MiB) – so at most 4 GB of title graphics memory, while a Series X title has ~13.5 GB.
+- **Now** (`gpu/uma.rs`): up to 4 *windows* of ≤ 4095 MiB, window k at `base + k · 4 GiB`, `base` 16 GiB-aligned ⇒ the
+  window of an address is `(addr >> 32) & 3`, the low 32 bits the offset in its heap. `Uma::new(size)` splits into as few
+  equal windows as fit; `with_windows(n, size)`, `window(k)`, `window_of(p)`, `alloc_in(k, …)`; allocations never straddle
+  windows. Console descriptor heaps and descriptor-table copies stay in window 0 (32-bit console addresses).
+- Root signature: u2..u5 = windows 0..3 (`pso::abi_root_signature_with`, 6 root UAVs). Runtime: one heap + placed buffer
+  per window (`real::UMA_HEAPS`, `uma_window_vas`, `uma_va_of`); console buffers placed in their window's heap; console
+  lists bind all windows. Runner: arenas with several windows (`run_in_arena`).
+- Translator: `Options::mem_windows` (from `pso::mem_windows()` = UMA windows). 1 = the single-window HLSL unchanged
+  (DXIL cache stays valid). >1: every access site sets `xcl_w` from the high address bits – V# word 1 (MUBUF / MTBUF,
+  buffer atomics, d16, s_buffer_load), the SGPR pair (s_load), the 64-bit VGPR address or SADDR pair (FLAT / global,
+  atomics), BVH descriptor `dw0 >> 24`; `finish()` declares `mem1`.. and turns every `mem.Method(` (program and
+  preludes) into an accessor `xcl_mMethod(` switching on `xcl_w` (`windowed`, `mem_accessors`).
+- Config: `uma_mb` up to 16380 (default unchanged: 4095 "advanced", 2048 "standard"; `report.json` shows `uma_used_kb`).
+- Tests: `windows_are_4_gib_apart_and_allocations_stay_inside`, GPU `gpu_memory_windows_above_4_gib` (s_load, buffer
+  load / store, global load / store / atomic in window 1 next to window 0); DXC with 2 windows on a random 2 % of the pack
+  (480 programs, seed 1795270997254744600 region): 0 errors, median 0.29 s (vs ~0.2 s with one window). Survey:
+  `XCL_SURVEY_WINDOWS=N`.
+
 ## XGameRuntime through the GDK thunks (session 5, 2026-11-21)
 - **Gap (blocked the start of every GDK game):** titles do not import XTaskQueueCreate / XUserAddAsync… by name – they have
   compiled-in thunks that load `xgameruntime.dll` and take `InitializeApiImpl(Ex/Ex2)`, `QueryApiImpl`,

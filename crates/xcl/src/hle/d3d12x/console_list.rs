@@ -520,7 +520,7 @@ unsafe fn free_uma(blocks: &[usize]) {
 
 unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
-    let p = u.alloc(bytes.len().max(16), 256)?;
+    let p = u.alloc_in(0, bytes.len().max(16), 256)?; // 32-bit console addresses: window 0
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
     st.uma.push(p as usize);
     Some(p as usize)
@@ -570,7 +570,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     if uma_va == 0 {
         return Err("the UMA buffer is not open on the GPU".into());
     }
-    let va = |p: usize| uma_va + (p - u.base()) as u64;
+    let _ = u;
+    let windows = super::real::uma_window_vas();
+    let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
     let mut layout: Option<Arc<Layout>> = None;
     let mut table: Vec<u8> = Vec::new();
@@ -692,7 +694,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
-                        list.SetComputeRootUnorderedAccessView(2, uma_va);
+                        for k in 0..4 {
+                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
+                        }
                         let raw = (*p).pc as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);

@@ -151,11 +151,12 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
     }
     unsafe { ID3D12RootSignature::from_raw_borrowed(&raw).cloned() }
 }
-/// UMA as one D3D12 buffer (placed in a heap opened over the process memory): the `mem`
-/// of recompiled shaders. Kept for the process lifetime.
-static UMA_BUFFER: Mutex<Option<(usize, u64)>> = Mutex::new(None);
-/// the unified memory opened as a D3D12 heap (console buffers are placed in it)
-static UMA_HEAP: AtomicU64 = AtomicU64::new(0);
+/// Each UMA window as one D3D12 buffer (placed in a heap opened over the process memory):
+/// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
+/// lifetime.
+static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+/// the UMA windows opened as D3D12 heaps (console buffers are placed in them)
+static UMA_HEAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// console buffers placed in unified memory: resource → (address, bytes)
 static UMA_BUFFERS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
 
@@ -170,9 +171,21 @@ pub fn console_buffers() -> usize {
 }
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
-/// GPU virtual address of the unified memory buffer (0: not available).
+/// GPU virtual address of the unified memory buffer of window 0 (0: not available).
 pub fn uma_gpu_va() -> u64 {
-    UMA_BUFFER.lock().ok().and_then(|g| g.map(|b| b.1)).unwrap_or(0)
+    uma_window_vas().first().copied().unwrap_or(0)
+}
+
+/// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
+pub fn uma_window_vas() -> Vec<u64> {
+    UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
+}
+
+/// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
+pub fn uma_va_of(p: usize) -> Option<u64> {
+    let u = crate::gpu::uma::get()?;
+    let k = u.window_of(p)?;
+    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {
@@ -180,12 +193,13 @@ unsafe fn open_uma(device: &ID3D12Device) {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
-    let r = (|| -> Result<(usize, u64), String> {
+    let open = |k: usize| -> Result<(usize, u64, usize), String> {
+        let (base, size) = u.window(k);
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(u.base() as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress: {e}"))?;
+        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress (window {k}): {e}"))?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: u.size() as u64,
+            Width: size as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -198,13 +212,14 @@ unsafe fn open_uma(device: &ID3D12Device) {
         device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
         let buf = buf.ok_or("CreatePlacedResource")?;
         let va = buf.GetGPUVirtualAddress();
-        UMA_HEAP.store(heap.into_raw() as u64, Ordering::Release);
-        Ok((buf.into_raw() as usize, va))
-    })();
+        Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
+    };
+    let r: Result<Vec<(usize, u64, usize)>, String> = (0..u.windows()).map(open).collect();
     match r {
-        Ok(b) => {
-            crate::xlog_info!("D3D12.X: UMA ({} MB) opened as a GPU heap, buffer at VA {:#x}", u.size() >> 20, b.1);
-            *UMA_BUFFER.lock().unwrap() = Some(b);
+        Ok(w) => {
+            crate::xlog_info!("D3D12.X: UMA ({} MB, {} window(s)) opened as GPU heaps, window 0 buffer at VA {:#x}", u.size() >> 20, w.len(), w[0].1);
+            *UMA_HEAPS.lock().unwrap() = w.iter().map(|x| x.2).collect();
+            *UMA_BUFFER.lock().unwrap() = w.iter().map(|x| (x.0, x.1)).collect();
         }
         Err(e) => {
             crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
@@ -639,9 +654,8 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
 /// what the recompiled shaders read through `mem`. None: not placed (fall back to committed).
 unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    let heap = UMA_HEAP.load(Ordering::Acquire) as usize;
     let u = crate::gpu::uma::get()?;
-    if heap == 0 || ppv.is_null() {
+    if UMA_HEAPS.lock().unwrap().is_empty() || ppv.is_null() {
         return None;
     }
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
@@ -654,7 +668,9 @@ unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, cle
     d.Alignment = 0;
     let bytes = d.Width as usize;
     let p = u.alloc((bytes + 0xFFFF) & !0xFFFF, 0x1_0000)? as usize;
-    let hr = dev_create_placed_resource(this, heap, p - u.base(), &d as *const _ as usize, state, clear, riid, ppv);
+    let k = u.window_of(p)?;
+    let heap = UMA_HEAPS.lock().unwrap()[k];
+    let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, state, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
         static ONCE: AtomicU64 = AtomicU64::new(0);

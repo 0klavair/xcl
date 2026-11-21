@@ -1012,10 +1012,9 @@ pub fn mesh_draw_split(
     }
 }
 
-/// A process memory region for `run_in_region` (see `gpu::uma`).
+/// Process memory regions for `run_in_region` (see `gpu::uma`): the memory windows.
 struct Arena {
-    pub base: *mut u8,
-    pub size: usize,
+    pub windows: Vec<(*mut u8, usize)>,
 }
 
 unsafe impl Send for Arena {}
@@ -1025,7 +1024,7 @@ unsafe impl Sync for Arena {}
 /// `run` with a unified memory region as `mem` (u2): the GPU works on the process memory
 /// itself, no copies.
 pub fn run_in_arena(dxil: &[u8], state: &KernelState, arena: &crate::gpu::uma::Uma) -> Result<KernelResult, String> {
-    let arena = Arena { base: arena.base() as *mut u8, size: arena.size() };
+    let arena = Arena { windows: (0..arena.windows()).map(|k| (arena.window(k).0 as *mut u8, arena.window(k).1)).collect() };
     let r = run_in_region(dxil, state, &arena);
     std::mem::forget(arena); // owned by the Uma
     r
@@ -1045,10 +1044,12 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
     unsafe {
         let dev = &gpu.dev;
         let dev3: ID3D12Device3 = dev.cast().map_err(e)?;
-        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(arena.base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
+        let mut bufs: Vec<ID3D12Resource> = Vec::new();
+        for &(base, size) in &arena.windows {
+        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const std::ffi::c_void).map_err(|x| format!("OpenExistingHeapFromAddress: {x}"))?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: arena.size as u64,
+            Width: size as u64,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -1059,7 +1060,9 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         };
         let mut mem_buf: Option<ID3D12Resource> = None;
         dev.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut mem_buf).map_err(|x| format!("CreatePlacedResource: {x}"))?;
-        let mem_buf = mem_buf.ok_or("arena")?;
+        bufs.push(mem_buf.ok_or("arena")?);
+        }
+        let mem_buf = bufs[0].clone();
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: transmute_copy(&gpu.rs),
@@ -1085,15 +1088,23 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             transition(&mem_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
+        for b in &bufs[1..] {
+            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        }
         list.SetComputeRootSignature(&gpu.rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
-        list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
+        for k in 0..4 {
+            list.SetComputeRootUnorderedAccessView(2 + k as u32, bufs.get(k).unwrap_or(&mem_buf).GetGPUVirtualAddress());
+        }
         list.Dispatch(1, 1, 1);
         list.ResourceBarrier(&[
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
         ]);
+        for b in &bufs[1..] {
+            list.ResourceBarrier(&[transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+        }
         list.CopyBufferRegion(&readback, 0, &res_buf, 0, res_bytes);
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);

@@ -24,7 +24,8 @@ pub struct Config {
     pub title_memory: String,
     /// Persistent local storage quota (MiB); 0 = MicrosoftGame.Config, else 4096.
     pub pls_mb: u64,
-    /// Unified (GPU-visible) memory (MiB, ≤ 4095); 0 = 4095 for "advanced" title memory,
+    /// Unified (GPU-visible) memory (MiB, up to 4 × 4095: above 4095 it is split into 4 GiB
+    /// windows, see `gpu::uma`); 0 = 4095 for "advanced" title memory,
     /// else 2048. `XCL_UMA_MB` overrides.
     pub uma_mb: u64,
     pub log_level: String,

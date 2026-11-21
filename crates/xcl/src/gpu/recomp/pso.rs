@@ -23,6 +23,11 @@ pub fn is_console(blob: &[u8]) -> bool {
     xbox::is_xbox(blob)
 }
 
+/// Memory windows of the title's unified memory (1 without it).
+pub fn mem_windows() -> u32 {
+    crate::gpu::uma::get().map_or(1, |u| u.windows() as u32)
+}
+
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
 pub type StaticSampler = ([u32; 4], bool);
 
@@ -68,7 +73,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -160,7 +165,8 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..3)
+        // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
+        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -177,7 +183,7 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
                 Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                    NumParameters: 3,
+                    NumParameters: params.len() as u32,
                     pParameters: params.as_ptr(),
                     NumStaticSamplers: statics.len() as u32,
                     pStaticSamplers: if statics.is_empty() { std::ptr::null() } else { statics.as_ptr() },
