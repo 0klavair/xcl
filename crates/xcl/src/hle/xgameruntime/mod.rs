@@ -151,8 +151,21 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
     INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
-pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(_feature: u32) -> bool {
-    true
+pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
+    matches!(
+        feature,
+        2  // XAsync
+            | 3  // XAsyncProvider
+            | 5  // XGame
+            | 7  // XGameSave
+            | 11 // XPackage
+            | 12 // XPersistentLocalStorage
+            | 15 // XSystem
+            | 16 // XTaskQueue
+            | 17 // XThread
+            | 18 // XUser
+            | 19 // XError
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -590,6 +603,19 @@ pub unsafe extern "system" fn XStoreCloseContextHandle(_h: *mut c_void) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_availability_reports_only_implemented_families() {
+        let expected = [2, 3, 5, 7, 11, 12, 15, 16, 17, 18, 19];
+        for feature in 0..=21 {
+            assert_eq!(
+                unsafe { XGameRuntimeIsFeatureAvailable(feature) },
+                expected.contains(&feature),
+                "unexpected availability for public feature {feature}"
+            );
+        }
+        assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
+    }
 
     #[test]
     fn user_add_and_queries() {
