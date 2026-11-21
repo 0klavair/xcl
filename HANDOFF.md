@@ -628,6 +628,22 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   itself. BCPack (and other console formats) are refused; the unlisted interface slots are logged E_NOTIMPL. The test
   title reads the start of its own exe through it and waits on the fence. Not yet: cancelling submitted requests,
   multi-stage (intermediate-size) decompression, destinations that are not plain memory.
+- **Texture layout library (`xg_xs.dll`, `hle/xg.rs`)** – Fortnite imports `XGCreateTextureComputer`. XCL's own GFX10
+  model behind the console's interface, checked against the console's own library (`tests/xg_oracle.rs`,
+  `XCL_SAMPLE_XG` = the user's console `xg_xs.dll`, 10.0.22000; nothing of it is in the repo):
+  - 29 700 descs (15 formats, 15 sizes incl. odd ones, mip counts, arrays, every explicit mode, the library's own
+    choice for textures and UAVs): every XG_RESOURCE_LAYOUT byte the same or both refuse; texel offsets of every mode ×
+    element size match (`texel_offsets_and_the_console_pipe_configuration`); 162 subresources tile to the same bytes.
+  - What it took (the console's rules, now in `gpu::tiling` – the TTPF retail check still fits 909 / 912): levels are
+    padded from mip 0 halved rounding up (also linear, and for the mip tail decision); Z modes of 1 / 2-byte elements
+    have a 64 × 128 tail; the XOR modes take pipe bits from coordinates above the block and from the array slice (z of
+    the 2D patterns) – `Layout` / `Chain::detile_level` / `tile_level` now have them.
+  - **The console's pipe configuration** (`texture::console_pipes`): 32 pipes / 8 packers by default (Series X),
+    8 / 4 with XGSetHardwareVersion(4) (taken to be Series S – then mip fields +0x50 / +0x58 are 0xE000 / 0x2000 instead
+    of 0x8000 / 0x8000 for the 64KB Z/S/D/R_X modes); it follows the reported device type.
+  - Modes the library takes for 2D: 1 2 5 6 9 10 17 18 21 22 25 26 27, 24 (and VAR 28) for ≤ 8-byte non-BC elements,
+    VAR 31; `Layout` 0 / 2 = its choice (64KB_D for 2, 4KB_S, UAVs 4KB_S_X up to 64 KB else 64KB_R_X). Not modelled
+    (E_NOTIMPL): render targets / depth (CMASK / HTILE planes), planar depth-stencil formats, MSAA, 1D / 3D, VAR modes.
 - XGameRuntime task queues: handles are looked up in a set of live ones before being read – an XAsync completing on a
   worker after its queue was closed read freed memory (a rare lib-test panic in `queue_from`).
 

@@ -17,6 +17,7 @@ pub mod dxcompiler;
 pub mod kernelx;
 pub mod opus;
 pub mod xaudio2;
+pub mod xg;
 pub mod xgameruntime;
 
 /// Build an export list from functions whose Rust names equal the exported names.
@@ -74,6 +75,8 @@ pub const XGAMERUNTIME: &str = "xgameruntime.dll";
 pub const D3D12X: &str = "d3d12_xs.dll";
 pub const XAUDIO2: &str = "xaudio2_9.dll";
 pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
+/// the console's texture layout library (`xg`)
+pub const XG: &str = "xg_xs.dll";
 /// the console's DirectStorage (`dstorage`)
 pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
@@ -88,6 +91,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
         HleModule::new(MINUSERX, Vec::new(), &["user32.dll"]),
         HleModule::new(XCRDAPI, dstorage::exports(), &[]),
+        HleModule::new(XG, xg::exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -139,6 +143,8 @@ fn build(config: &Config) -> Registry {
     routes.push((MINUSERX.into(), Route::Hle(u)));
     let s = idx(XCRDAPI);
     routes.push((XCRDAPI.into(), Route::Hle(s)));
+    let g = idx(XG);
+    routes.push((XG.into(), Route::Hle(g)));
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));

@@ -66,6 +66,11 @@ pub struct Layout {
     ox: Vec<u32>,
     oy: Vec<u32>,
     oz: Vec<u32>,
+    /// the in-block bits the coordinates above the block give (XOR modes with many pipes take
+    /// pipe bits from neighbouring blocks' coordinates), by `x >> log2(block_w)` etc.
+    hx: Vec<u32>,
+    hy: Vec<u32>,
+    hz: Vec<u32>,
 }
 
 impl Layout {
@@ -79,7 +84,7 @@ impl Layout {
         if mode == 0 {
             let bw = 256 >> elem_log2;
             let ox = (0..bw as u32).map(|x| x << elem_log2).collect();
-            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0] });
+            return Some(Layout { mode, elem_log2, block_w: bw, block_h: 1, block_d: 1, block_bytes: 256, base_xor: 0, ox, oy: vec![0], oz: vec![0], hx: vec![0], hy: vec![0], hz: vec![0] });
         }
         let blk = block_log2(mode)?;
         let bits = pattern_bits(PATTERNS, mode, elem_log2, cfg)?;
@@ -111,20 +116,37 @@ impl Layout {
 
     /// The offset tables of a block `1 << wl` × `1 << hl` × `1 << dl` elements.
     fn from_bits(mode: u32, elem_log2: u32, blk: u32, bits: &[u64; 20], (wl, hl, dl): (u32, u32, u32)) -> Layout {
-        let table = |n: usize, shift: u32| -> Vec<u32> {
+        // the in-block offset bits coordinate `c << lo` gives
+        let table = |n: usize, shift: u32, lo: u32| -> Vec<u32> {
             (0..n as u32)
                 .map(|c| {
                     let mut off = 0u32;
                     for (i, &b) in bits[..blk as usize].iter().enumerate() {
                         let mask = ((b >> shift) & 0xFFFF) as u32;
-                        off |= ((mask & c).count_ones() & 1) << i;
+                        off |= ((mask & (c << lo)).count_ones() & 1) << i;
                     }
                     off
                 })
                 .collect()
         };
         let (bw, bh, bd) = (1usize << wl, 1usize << hl, 1usize << dl);
-        Layout { mode, elem_log2, block_w: bw, block_h: bh, block_d: bd, block_bytes: 1 << blk, base_xor: 0, ox: table(bw, 0), oy: table(bh, 16), oz: table(bd, 32) }
+        // the pattern masks are 16 bits: coordinates above them do not matter
+        let high = |l: u32, shift: u32| table(1 << (16 - l.min(16)), shift, l);
+        Layout {
+            mode,
+            elem_log2,
+            block_w: bw,
+            block_h: bh,
+            block_d: bd,
+            block_bytes: 1 << blk,
+            base_xor: 0,
+            ox: table(bw, 0, 0),
+            oy: table(bh, 16, 0),
+            oz: table(bd, 32, 0),
+            hx: high(wl, 0),
+            hy: high(hl, 16),
+            hz: high(dl, 32),
+        }
     }
 
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
@@ -148,7 +170,9 @@ impl Layout {
     pub fn offset_z(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
         let pitch_blocks = w.div_ceil(self.block_w);
         let block = (y / self.block_h) * pitch_blocks + x / self.block_w;
-        block * self.block_bytes + ((self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d]) as usize ^ self.base_xor)
+        let hi = |t: &[u32], c: usize, b: usize| t[(c / b) % t.len()];
+        let xor = self.ox[x % self.block_w] ^ self.oy[y % self.block_h] ^ self.oz[z % self.block_d] ^ hi(&self.hx, x, self.block_w) ^ hi(&self.hy, y, self.block_h) ^ hi(&self.hz, z, self.block_d);
+        block * self.block_bytes + (xor as usize ^ self.base_xor)
     }
 
     /// tiled → linear rows (`w << elem_log2` bytes each); bytes past the end of `src` read as 0
@@ -220,6 +244,8 @@ pub struct MipLevel {
     pub pitch: usize,
     /// where the level lies inside the mip tail block (levels in the tail), else (0, 0)
     pub origin: (usize, usize),
+    /// a level in the mip tail: its byte offset inside the tail block
+    pub tail: Option<usize>,
 }
 
 /// The mip chain of a tiled surface (addrlib Gfx10Lib::ComputeSurfaceInfoMacroTiled /
@@ -251,11 +277,21 @@ impl Chain {
         let thick = layout.block_d > 1;
         let blk = layout.block_bytes.trailing_zeros() as usize;
         let size = |i: usize| (((width >> i).max(1)).div_ceil(side) as usize, ((height >> i).max(1)).div_ceil(side) as usize);
+        // what a level is padded from: mip 0's elements halved rounding up (addrlib ShiftCeil;
+        // the console's layout library agrees), which only differs for odd sizes
+        let (w0, h0) = (width.div_ceil(side) as usize, height.div_ceil(side) as usize);
+        let padded = |i: usize| (w0.div_ceil(1 << i), h0.div_ceil(1 << i));
         let depth_of = |i: usize| (depth >> i).max(1) as usize;
         // the largest level the tail holds (GetMipTailDim: a thick block halves h, w or d by
         // log2(block) % 3) and at most this many levels in it (GetMaxNumMipsInTail)
         let (tw, th) = if !thick {
-            (bw / 2, bh)
+            // Z (depth) modes of 1- and 2-byte elements: 64 × 128 elements, as for 4-byte ones
+            // (seen on the console's layout library)
+            if layout.mode != 0 && layout.mode.is_multiple_of(4) && layout.elem_log2 <= 1 {
+                (bw / 4, bh >> (1 - layout.elem_log2))
+            } else {
+                (bw / 2, bh)
+            }
         } else {
             match blk % 3 {
                 0 => (bw, bh / 2),
@@ -272,7 +308,7 @@ impl Chain {
         let first_tail = if mips > 1 && max_tail > 0 {
             (0..mips)
                 .find(|&i| {
-                    let (w, h) = size(i);
+                    let (w, h) = padded(i);
                     w <= tw && h <= th && mips - i <= max_tail
                 })
                 .unwrap_or(mips)
@@ -283,8 +319,9 @@ impl Chain {
         let mut offset = if first_tail < mips { layout.block_bytes } else { 0 };
         for i in (0..first_tail).rev() {
             let (w, h) = size(i);
-            levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset, pitch: w.div_ceil(bw) * bw, origin: (0, 0) };
-            offset += layout.size(w, h);
+            let (pw, ph) = padded(i);
+            levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset, pitch: pw.div_ceil(bw) * bw, origin: (0, 0), tail: None };
+            offset += layout.size(pw, ph);
         }
         // a level in the tail: its offset there (256-byte units, largest level first) gives its
         // origin, x from the odd and y from the even address bits above 256 B, in 256 B
@@ -300,7 +337,7 @@ impl Chain {
                 my |= ((at >> (8 + 2 * b)) & 1) << b;
             }
             let (w, h) = size(i);
-            levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset: 0, pitch: bw, origin: (mx * w256, my * h256) };
+            levels[i] = MipLevel { width: w, height: h, depth: depth_of(i), offset: 0, pitch: bw, origin: (mx * w256, my * h256), tail: Some(at) };
         }
         Chain { layout, levels, slice_bytes: offset }
     }
@@ -310,8 +347,10 @@ impl Chain {
         self.levels[0].depth.div_ceil(self.layout.block_d)
     }
 
-    fn element_at(&self, l: &MipLevel, x: usize, y: usize) -> usize {
-        l.offset + self.layout.offset(x + l.origin.0, y + l.origin.1, l.pitch)
+    /// element (x, y) of level `l` in array slice `slice` (from the slice's start): the slice
+    /// is z of the 2D patterns – the XOR modes take pipe bits from it
+    fn element_at(&self, l: &MipLevel, x: usize, y: usize, slice: usize) -> usize {
+        l.offset + self.layout.offset_z(x + l.origin.0, y + l.origin.1, slice, l.pitch)
     }
 
     /// element (x, y, z) of level `l` from the start of the texture (all its slices)
@@ -353,15 +392,15 @@ impl Chain {
         }
     }
 
-    /// level `i` of one slice (`src` = the slice's bytes) → linear rows of elements; bytes
-    /// past the end of `src` read as 0
-    pub fn detile_level(&self, src: &[u8], i: usize) -> Vec<u8> {
+    /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
+    /// bytes past the end of `src` read as 0
+    pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         let mut out = vec![0u8; l.width * l.height * e];
         for y in 0..l.height {
             for x in 0..l.width {
-                let o = self.element_at(&l, x, y);
+                let o = self.element_at(&l, x, y, slice);
                 if let Some(s) = src.get(o..o + e) {
                     out[(y * l.width + x) * e..][..e].copy_from_slice(s);
                 }
@@ -370,13 +409,13 @@ impl Chain {
         out
     }
 
-    /// linear rows of level `i` → its place in one slice (`dst`, `slice_bytes` long)
-    pub fn tile_level(&self, dst: &mut [u8], i: usize, linear: &[u8]) {
+    /// linear rows of level `i` → its place in array slice `slice` (`dst`, `slice_bytes` long)
+    pub fn tile_level(&self, dst: &mut [u8], i: usize, slice: usize, linear: &[u8]) {
         let l = self.levels[i];
         let e = 1usize << self.layout.elem_log2;
         for y in 0..l.height {
             for x in 0..l.width {
-                let o = self.element_at(&l, x, y);
+                let o = self.element_at(&l, x, y, slice);
                 dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
             }
         }
@@ -465,11 +504,11 @@ mod tests {
                         (n >> 16) as u8 | 1
                     })
                     .collect();
-                c.tile_level(&mut slice, i, &lin);
+                c.tile_level(&mut slice, i, 0, &lin);
                 want.push(lin);
             }
             for (i, lin) in want.iter().enumerate() {
-                assert_eq!(&c.detile_level(&slice, i), lin, "mode {mode} e{e}: level {i} overwritten");
+                assert_eq!(&c.detile_level(&slice, i, 0), lin, "mode {mode} e{e}: level {i} overwritten");
             }
         }
     }
@@ -544,16 +583,17 @@ mod tests {
     }
 
     /// Linear: rows padded to 256 bytes, levels from the smallest (addrlib
-    /// HwlComputeSurfaceInfoLinear).
+    /// HwlComputeSurfaceInfoLinear); a level is padded from mip 0 halved rounding up (as the
+    /// console's layout library lays it out).
     #[test]
     fn linear_rows_are_padded_to_256_bytes() {
         let l = Layout::new(0, 2, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap();
         assert_eq!((l.block_w, l.block_h, l.block_bytes), (64, 1, 256));
         assert_eq!(l.offset(3, 2, 100), (2 * 128 + 3) * 4); // 100 px → 128 px per row
         let c = Chain::new(l, 100, 30, 1, 3);
-        // mip 2 (25×7 → 64 px rows), mip 1 (50×15), mip 0 (100×30)
-        assert_eq!((c.levels[2].offset, c.levels[1].offset, c.levels[0].offset), (0, 7 * 256, 7 * 256 + 15 * 256));
-        assert_eq!(c.slice_bytes, 7 * 256 + 15 * 256 + 30 * 512);
+        // mip 2 (25×7, padded from 30 / 4 → 8 rows of 64 px), mip 1 (50×15), mip 0 (100×30)
+        assert_eq!((c.levels[2].height, c.levels[2].offset, c.levels[1].offset, c.levels[0].offset), (7, 0, 8 * 256, 8 * 256 + 15 * 256));
+        assert_eq!(c.slice_bytes, 8 * 256 + 15 * 256 + 30 * 512);
     }
 
     /// SW_256B_S with bytes: a 16×16 block stored row by row (addrlib's first nibble row)

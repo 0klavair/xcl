@@ -5,8 +5,8 @@
 //! (`tiling::Chain`) into a D3D12 subresource and copied in. SW_LINEAR resources use
 //! the GFX10 256-byte row, level and slice alignment directly.
 //!
-//! 2D textures, arrays and cubes, 3D textures (thick and thin modes) and linear ones. What is
-//! not here yet: MSAA, the console's pipe configuration for the _X modes (`CONSOLE_PIPES`),
+//! 2D textures, arrays and cubes, 3D textures (thick and thin modes) and linear ones, the _X
+//! modes with the console's pipe configuration (`console_pipes`). What is not here yet: MSAA,
 //! and the binding to the console API that creates textures in title memory (and tells when
 //! the title rewrote one) – that comes with the game executable.
 
@@ -15,10 +15,20 @@ use super::tiling::{self, Chain, PipeConfig};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
-/// Not known yet (to be found on an _X texture from the game); the non-XOR modes the
-/// archives use do not need it. Series S and X differ (the console's layout library takes
-/// the hardware version): the value has to follow the device type XCL reports.
-pub const CONSOLE_PIPES: PipeConfig = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+/// From the console's own layout library: every texel of every mode matches with 32 pipes /
+/// 8 packers by default (Series X), 8 pipes / 4 packers with its hardware version 4 (taken
+/// to be Series S).
+pub const CONSOLE_PIPES: PipeConfig = PipeConfig { pipes_log2: 5, pkrs_log2: 3 };
+pub const SERIES_S_PIPES: PipeConfig = PipeConfig { pipes_log2: 3, pkrs_log2: 2 };
+
+/// The pipe configuration of the console XCL reports to the title (`XSystemGetDeviceType`).
+pub fn console_pipes() -> PipeConfig {
+    if crate::state::config().is_series_s() {
+        SERIES_S_PIPES
+    } else {
+        CONSOLE_PIPES
+    }
+}
 
 /// Linear data of one subresource: `depth` slices (3D, else 1) of `rows` rows of `row_bytes`
 /// (elements: pixels or 4×4 blocks).
@@ -93,7 +103,7 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
     for s in 0..p.slices {
         let slice = &mem[s * chain.slice_bytes..(s + 1) * chain.slice_bytes];
         for (i, l) in chain.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * e, data: chain.detile_level(slice, i) });
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * e, data: chain.detile_level(slice, i, s) });
         }
     }
     Ok(out)
@@ -375,7 +385,7 @@ mod tests {
             let slice = &mut mem[s * chain.slice_bytes..(s + 1) * chain.slice_bytes];
             for (i, l) in chain.levels.iter().enumerate() {
                 let data = random(l.width * l.height * e);
-                chain.tile_level(slice, i, &data);
+                chain.tile_level(slice, i, s, &data);
                 subs.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * e, data });
             }
         }
@@ -659,7 +669,7 @@ mod tests {
                 if l.origin != (0, 0) && l.width >= 2 && l.height >= 2 {
                     let mut wrong = chain.clone();
                     wrong.levels[k].origin = (0, 0);
-                    let ws = Subresource { depth: 1, rows: l.height, row_bytes: subs[k].row_bytes, data: wrong.detile_level(&mem, k) };
+                    let ws = Subresource { depth: 1, rows: l.height, row_bytes: subs[k].row_bytes, data: wrong.detile_level(&mem, k, 0) };
                     tail_levels += 1;
                     tail_err += err;
                     wrong_err += mip_error(&subs[k - 1], &ws, ch, cb).unwrap();
