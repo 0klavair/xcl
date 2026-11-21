@@ -2,6 +2,7 @@
 //! (device → IDXGIDevice1 → GetAdapter → EnumOutputs, the output SetFrameIntervalX takes –
 //! as Microsoft's public GDK samples do). A PC D3D12 device is not, so a small object answers
 //! IDXGIDevice / 1 / 2 with the device's real adapter; every other interface is the device's.
+//! Console code only (`real::dev_qi_x`): DXGI asks the device the same and needs the PC answer.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};

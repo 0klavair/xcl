@@ -581,6 +581,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::Device => {
             vec![
+                (0, dev_qi_x as usize),
                 (8, x::create_command_queue_x as usize),
                 (9, x::create_command_allocator_x as usize),
                 (10, x::create_graphics_pso_pc as usize),
@@ -1225,24 +1226,23 @@ unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv:
     let f: QiFn = std::mem::transmute(orig_fn(this, 0));
     let hr = f(this, riid, ppv);
     if hr == E_NOINTERFACE && !riid.is_null() {
-        // the console device is also an IDXGIDevice (`dxgi_device`)
-        let iid: windows::core::GUID = std::mem::transmute(*riid);
-        if super::dxgi_device::answers(&iid) && !ppv.is_null() {
-            let device: GUID = std::mem::transmute(ID3D12Device::IID);
-            let mut d = std::ptr::null_mut();
-            if f(this, &device, &mut d) >= 0 && !d.is_null() {
-                let release: RefFn = std::mem::transmute(orig_fn(d, 2));
-                release(d);
-                *ppv = super::dxgi_device::create(this);
-                return S_OK;
-            }
-        }
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
             crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");
         }
     }
     hr
+}
+
+/// device #0 QueryInterface for console code: the console device is also an IDXGIDevice
+/// (`dxgi_device`). Only the title gets it – DXGI asks a D3D12 device the same while creating
+/// a swap chain and must keep getting the PC answer.
+unsafe extern "system" fn dev_qi_x(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    if !riid.is_null() && !ppv.is_null() && super::dxgi_device::answers(&std::mem::transmute::<GUID, windows::core::GUID>(*riid)) {
+        *ppv = super::dxgi_device::create(this);
+        return S_OK;
+    }
+    qi_override(this, riid, ppv)
 }
 
 fn pc_iid(kind: Kind) -> GUID {
