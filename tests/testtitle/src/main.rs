@@ -440,6 +440,7 @@ fn main() {
     check("D3D12.X: triangle rendered on the real GPU and read back (console + derived pipeline)", gpu::render_triangle);
     check("D3D12.X: frame clock + PresentX of the title's back buffer", gpu::present_x_frame);
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
+    check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy)", gpu::console_list_methods);
     check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);
 
     let failures = FAILURES.load(Ordering::SeqCst);

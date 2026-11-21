@@ -1,0 +1,381 @@
+//! The console command list's own methods.
+//!
+//! The console's ID3D12GraphicsCommandList keeps the PC methods (some moved:
+//! `real::console_remap`) and holds console extensions from #60 on (as observed on Fortnite):
+//! CopyMemoryToMemoryX #60, FillMemoryWith{32,64,128}BitValueX #61–#63, depth bounds #68,
+//! Write{32,64}BitValueBottomOfPipeX #69 / #70, DispatchX #78, DrawIndexedX #81,
+//! CopyResourceX #84, SetPredicationBufferX #85, Write{32,64}BitValueTopOfPipeX #88 / #89,
+//! Write32BitValueBottomOfShaderX #90. A title call of any other extension (waits on memory,
+//! GDS, KickoffX, depth bias, hints…) is logged and does nothing (`real::class_for`).
+//!
+//! Console GPU addresses in unified memory are the title's own addresses; memory operations
+//! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
+//! An index buffer at such an address is given to the PC as the window buffer's GPU address.
+
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::mem::{transmute_copy, ManuallyDrop};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+
+use super::real;
+
+const PC_GET_TYPE: usize = 8;
+const PC_DRAW_INDEXED: usize = 13;
+const PC_DISPATCH: usize = 14;
+const PC_COPY_BUFFER_REGION: usize = 15;
+const PC_COPY_RESOURCE: usize = 17;
+const PC_RESOURCE_BARRIER: usize = 26;
+const PC_IA_SET_INDEX_BUFFER: usize = 43;
+const PC_END_QUERY: usize = 53;
+const PC_RESOLVE_QUERY_DATA: usize = 54;
+const PC_SET_PREDICATION: usize = 55;
+const PC_OM_SET_DEPTH_BOUNDS: usize = 62;
+const PC_WRITE_BUFFER_IMMEDIATE: usize = 66;
+
+/// Write64BitValueBottomOfPipeX flags 1 / 2, Write64BitValueTopOfPipeX flags 4 / 8: the value
+/// written is a GPU / system timestamp
+const BOTTOM_TIMESTAMPS: u32 = 0x3;
+const TOP_TIMESTAMPS: u32 = 0xC;
+/// fills larger than this are not done (one pattern buffer per value, up to this size)
+const MAX_FILL: u64 = 256 << 20;
+
+fn once(counter: &AtomicU64, n: u64) -> bool {
+    counter.fetch_add(1, Ordering::Relaxed) < n
+}
+
+/// a PC method of the list (its runtime's own)
+unsafe fn pc<F: Copy>(list: *mut c_void, slot: usize) -> F {
+    transmute_copy(&real::orig_fn(list, slot))
+}
+
+unsafe fn list_type(list: *mut c_void) -> D3D12_COMMAND_LIST_TYPE {
+    pc::<unsafe extern "system" fn(*mut c_void) -> D3D12_COMMAND_LIST_TYPE>(list, PC_GET_TYPE)(list)
+}
+
+unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) {
+    let b = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: transmute_copy(&res),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+}
+
+/// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
+unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
+    transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    op();
+    transition(list, res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+}
+
+unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
+}
+
+fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
+    if once(counter, 4) {
+        crate::xlog_warn!("D3D12.X: {what}: {why} – not done");
+    }
+}
+
+/// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
+pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    const W: &str = "CopyMemoryToMemoryX";
+    if size == 0 || !size.is_multiple_of(4) {
+        return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
+    }
+    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+        return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
+    };
+    if d == s && dst < src + size && src < dst + size {
+        return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
+    }
+    if d == s {
+        // one window: the buffer is the source and the destination (the ranges do not overlap)
+        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+        return;
+    }
+    transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+    transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
+    let mut dev: Option<ID3D12Device> = None;
+    ID3D12GraphicsCommandList::from_raw_borrowed(&list)?.GetDevice(&mut dev).ok()?;
+    dev
+}
+
+/// upload buffers holding a repeated 16-byte pattern: (pattern, buffer, bytes)
+static PATTERNS: Mutex<Vec<([u8; 16], ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// A buffer of at least `n` bytes repeating `pat` (the device's upload heap).
+unsafe fn pattern_buffer(list: *mut c_void, pat: [u8; 16], n: u64) -> Option<usize> {
+    let mut cache = PATTERNS.lock().unwrap();
+    if let Some((_, b, _)) = cache.iter().find(|(p, _, len)| *p == pat && *len >= n) {
+        return Some(b.as_raw() as usize);
+    }
+    // a larger one replaces an older pattern buffer only when nothing may still read it: kept
+    if cache.len() >= 32 {
+        return None;
+    }
+    let dev = device_of(list)?;
+    let len = n.next_power_of_two().max(0x1_0000);
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut b: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        None,
+        &mut b,
+    )
+    .ok()?;
+    let b = b?;
+    let mut p: *mut c_void = std::ptr::null_mut();
+    b.Map(0, None, Some(&mut p)).ok()?;
+    for chunk in std::slice::from_raw_parts_mut(p as *mut u8, len as usize).chunks_exact_mut(16) {
+        chunk.copy_from_slice(&pat);
+    }
+    b.Unmap(0, None);
+    let raw = b.as_raw() as usize;
+    cache.push((pat, b, len));
+    Some(raw)
+}
+
+unsafe fn fill(list: *mut c_void, va: u64, size: u64, pat: [u8; 16], unit: u64, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if size == 0 || !size.is_multiple_of(unit) || size > MAX_FILL {
+        return warn(&N, what, format_args!("size {size:#x} (a non-zero multiple of {unit} up to {MAX_FILL:#x} is filled)"));
+    }
+    let Some((d, off)) = real::uma_window_buffer(va as usize, size as usize) else {
+        return warn(&N, what, format_args!("{va:#x} ({size:#x} bytes) is not in unified memory"));
+    };
+    let Some(src) = pattern_buffer(list, pat, size) else {
+        return warn(&N, what, format_args!("no pattern buffer for {pat:x?}"));
+    };
+    as_copy_dest(list, d, || copy_buffer_region(list, d, off, src, 0, size));
+}
+
+fn pattern(bytes: &[u8]) -> [u8; 16] {
+    let mut p = [0u8; 16];
+    for (i, b) in p.iter_mut().enumerate() {
+        *b = bytes[i % bytes.len()];
+    }
+    p
+}
+
+/// command list #61 FillMemoryWith32BitValueX(address, size, value)
+pub(super) unsafe extern "system" fn fill32_x(this: *mut c_void, va: u64, size: u64, value: u32) {
+    fill(this, va, size, pattern(&value.to_le_bytes()), 4, "FillMemoryWith32BitValueX");
+}
+
+/// command list #62 FillMemoryWith64BitValueX(address, size, value)
+pub(super) unsafe extern "system" fn fill64_x(this: *mut c_void, va: u64, size: u64, value: u64) {
+    fill(this, va, size, pattern(&value.to_le_bytes()), 8, "FillMemoryWith64BitValueX");
+}
+
+/// command list #63 FillMemoryWith128BitValueX(address, size, value*)
+pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size: u64, value: *const [u8; 16]) {
+    if !value.is_null() {
+        fill(this, va, size, value.read_unaligned(), 16, "FillMemoryWith128BitValueX");
+    }
+}
+
+/// Values written by the GPU at `va` (WriteBufferImmediate: MARKER_IN = when the command is
+/// reached, MARKER_OUT = when the work before it is done).
+unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFFERIMMEDIATE_MODE, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = 4 * words.len() as u64;
+    if !va.is_multiple_of(n) {
+        return warn(&N, what, format_args!("{va:#x} is not {n}-byte aligned"));
+    }
+    let (Some((d, _)), Some(at)) = (real::uma_window_buffer(va as usize, n as usize), real::uma_va_of(va as usize)) else {
+        return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
+    };
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
+    let modes = vec![mode; words.len()];
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+    as_copy_dest(list, d, || pc::<F>(list, PC_WRITE_BUFFER_IMMEDIATE)(list, params.len() as u32, params.as_ptr(), modes.as_ptr()));
+}
+
+/// timestamp queries (one heap per device, used round-robin)
+static TIMESTAMPS: Mutex<Option<HashMap<usize, ID3D12QueryHeap>>> = Mutex::new(None);
+const TIMESTAMP_SLOTS: u32 = 4096;
+static NEXT_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
+
+/// The GPU timestamp (the PC queue's ticks) written at `va` when the work before it is done.
+unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let ty = list_type(list);
+    if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
+        return warn(&N, what, format_args!("a timestamp on a type-{} list", ty.0));
+    }
+    let Some((d, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
+        return warn(&N, what, format_args!("{va:#x} is not 8-byte aligned in unified memory"));
+    };
+    let Some(dev) = device_of(list) else { return };
+    let heap = {
+        let mut m = TIMESTAMPS.lock().unwrap();
+        let m = m.get_or_insert_with(HashMap::new);
+        if let std::collections::hash_map::Entry::Vacant(slot) = m.entry(dev.as_raw() as usize) {
+            let mut h: Option<ID3D12QueryHeap> = None;
+            let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: TIMESTAMP_SLOTS, NodeMask: 0 };
+            match dev.CreateQueryHeap(&desc, &mut h) {
+                Ok(()) if h.is_some() => slot.insert(h.unwrap()),
+                _ => return warn(&N, what, format_args!("no timestamp query heap")),
+            };
+        }
+        m[&(dev.as_raw() as usize)].as_raw() as usize
+    };
+    let i = NEXT_TIMESTAMP.fetch_add(1, Ordering::Relaxed) % TIMESTAMP_SLOTS;
+    pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
+    type Resolve = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+    as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+}
+
+/// command list #69 Write32BitValueBottomOfPipeX(address, value, flush, flags)
+pub(super) unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, _flags: u32) {
+    write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
+}
+
+/// command list #70 Write64BitValueBottomOfPipeX(address, value, flush, flags)
+pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
+    const W: &str = "Write64BitValueBottomOfPipeX";
+    if flags & BOTTOM_TIMESTAMPS != 0 {
+        return timestamp(this, va, W);
+    }
+    write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, W);
+}
+
+/// command list #88 Write32BitValueTopOfPipeX(address, value, flags)
+pub(super) unsafe extern "system" fn write32_top_x(this: *mut c_void, va: u64, value: u32, _flags: u32) {
+    write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, "Write32BitValueTopOfPipeX");
+}
+
+/// command list #89 Write64BitValueTopOfPipeX(address, value, flags)
+pub(super) unsafe extern "system" fn write64_top_x(this: *mut c_void, va: u64, value: u64, flags: u32) {
+    const W: &str = "Write64BitValueTopOfPipeX";
+    if flags & TOP_TIMESTAMPS != 0 {
+        return timestamp(this, va, W);
+    }
+    write(this, va, &[value as u32, (value >> 32) as u32], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN, W);
+}
+
+/// command list #90 Write32BitValueBottomOfShaderX(address, value, stage)
+pub(super) unsafe extern "system" fn write32_bottom_of_shader_x(this: *mut c_void, va: u64, value: u32, _stage: u32) {
+    write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfShaderX");
+}
+
+/// command list #68 OMSetDepthBounds(min, max) (PC #62)
+pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: f32, max: f32) {
+    pc::<unsafe extern "system" fn(*mut c_void, f32, f32)>(this, PC_OM_SET_DEPTH_BOUNDS)(this, min, max);
+}
+
+/// command list #78 DispatchX(x, y, z, flags)
+pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
+    pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, PC_DISPATCH)(this, x, y, z);
+}
+
+/// command list #84 CopyResourceX(destination, source, flags); in place (the console's
+/// compression operations) there is nothing to do on PC
+pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
+    if dst != src {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+    }
+}
+
+/// command list #85 SetPredicationBufferX({ u64 address; u32 operation }*)
+pub(super) unsafe extern "system" fn set_predication_buffer_x(this: *mut c_void, desc: *const u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    type F = unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP);
+    let f = pc::<F>(this, PC_SET_PREDICATION);
+    if desc.is_null() {
+        return f(this, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    }
+    let (va, op) = (desc.read_unaligned(), (desc.add(1) as *const u32).read_unaligned());
+    let Some((b, off)) = real::uma_window_buffer(va as usize, 8).filter(|_| va.is_multiple_of(8)) else {
+        return warn(&N, "SetPredicationBufferX", format_args!("{va:#x} is not 8-byte aligned in unified memory"));
+    };
+    transition(this, b, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PREDICATION);
+    f(this, b, off, D3D12_PREDICATION_OP(op as i32));
+    transition(this, b, D3D12_RESOURCE_STATE_PREDICATION, D3D12_RESOURCE_STATE_COMMON);
+}
+
+/// the index buffer each list has bound (PC addresses), for DrawIndexedX to restore
+static INDEX_BUFFERS: Mutex<Option<HashMap<usize, D3D12_INDEX_BUFFER_VIEW>>> = Mutex::new(None);
+
+/// a console GPU address as the PC's (unified memory: the window buffer's)
+fn pc_va(va: u64) -> u64 {
+    real::uma_va_of(va as usize).unwrap_or(va)
+}
+
+unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_VIEW>) {
+    let f = pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW)>(list, PC_IA_SET_INDEX_BUFFER);
+    f(list, view.map_or(std::ptr::null(), |v| v as *const _));
+}
+
+/// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
+pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
+    let mut m = INDEX_BUFFERS.lock().unwrap();
+    let m = m.get_or_insert_with(HashMap::new);
+    if view.is_null() {
+        m.remove(&(this as usize));
+        return set_index_buffer(this, None);
+    }
+    let mut v = view.read_unaligned();
+    v.BufferLocation = pc_va(v.BufferLocation);
+    m.insert(this as usize, v);
+    set_index_buffer(this, Some(&v));
+}
+
+/// command list #81 DrawIndexedX(index address, index format, index count, flags): one
+/// instance of `count` indices read from that address; the bound index buffer stays
+pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let stride = match format {
+        DXGI_FORMAT_R16_UINT => 2,
+        DXGI_FORMAT_R32_UINT => 4,
+        f => return warn(&N, "DrawIndexedX", format_args!("index format {}", f.0)),
+    };
+    if count == 0 {
+        return;
+    }
+    let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
+    set_index_buffer(this, Some(&view));
+    pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32)>(this, PC_DRAW_INDEXED)(this, count, 1, 0, 0, 0);
+    let bound = INDEX_BUFFERS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+    set_index_buffer(this, bound.as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fill_patterns_repeat_the_value() {
+        assert_eq!(super::pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(super::pattern(&[7u8; 16]), [7u8; 16]);
+    }
+}

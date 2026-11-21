@@ -569,6 +569,27 @@ must not run the PC method at that index (#44 is PC CreatePipelineLibrary, #48 O
   (#55, blend patch: green only → cyan over the blue clear).
 - Not yet: deserializing console pipeline caches, placed textures at title addresses (detiling).
 
+## The console command list's own methods (session 5, 2026-11-21, `d3d12x/list_x.rs`)
+From #60 on the console list holds its extensions (besides the moved PC methods, `real::console_remap`); a title
+call there no longer runs the PC method at that index (#60 was AtomicCopyBufferUINT, #66 WriteBufferImmediate…).
+Console GPU addresses in unified memory are the title's own: memory operations go to that window's buffer
+(`real::uma_window_buffer`), wrapped in COMMON → COPY_DEST → COMMON transitions (the window buffers stay in COMMON).
+- **#60 CopyMemoryToMemoryX**(dst, src, size, flags) → CopyBufferRegion (one window: the buffer is source and
+  destination, overlapping ranges are refused); **#61–#63 FillMemoryWith{32,64,128}BitValueX**(va, size, value) → a
+  copy from an upload buffer repeating the value (cached per value, up to 256 MiB).
+- **#69 / #70 Write{32,64}BitValueBottomOfPipeX**(va, value, flush, flags), **#88 / #89 …TopOfPipeX**(va, value,
+  flags), **#90 Write32BitValueBottomOfShaderX** → WriteBufferImmediate (MARKER_OUT / MARKER_IN); with a timestamp
+  flag (bottom 1 / 2, top 4 / 8) the GPU timestamp is resolved there from a timestamp query (PC ticks).
+- **#78 DispatchX** → Dispatch; **#81 DrawIndexedX**(index address, format, count, flags) → that index buffer for one
+  DrawIndexedInstanced, then the bound one again; **#47 IASetIndexBuffer** gives the PC the window buffer's address
+  for a title address; **#84 CopyResourceX** → CopyResource (in place: nothing); **#85 SetPredicationBufferX**
+  `{ u64 va; u32 op }`; **#68** depth bounds.
+- Not modelled (logged, no-op): Wait32 / 64BitValueX #71 / #72, GDS #76 / #77, KickoffX #93 (TomBox splits the list
+  and submits the first part), depth bias X #94 (needs pipelines with dynamic depth bias), hints (HiStencil, MSAA,
+  compression, limits, prefetch). Occlusion queries that nest (the console allows it) are not un-nested yet.
+- The test title writes / fills / copies its own graphics memory through #60–#89, takes a GPU timestamp, and draws
+  through DrawIndexedX and #47 with indices in its memory.
+
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
   sqrt / rsq / class, v_swaprel, pknorm f16…) with tests. Fixed on the GPU (RX 9070), where its GPU tests had not run:

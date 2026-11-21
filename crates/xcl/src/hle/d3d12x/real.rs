@@ -161,7 +161,9 @@ static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// the UMA windows opened as D3D12 heaps (console buffers are placed in them)
 static UMA_HEAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 /// console buffers placed in unified memory: resource → (address, bytes)
-static UMA_BUFFERS: Mutex<Option<HashMap<usize, (usize, usize, bool)>>> = Mutex::new(None);
+/// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
+type UmaBuffer = (usize, usize, bool);
+static UMA_BUFFERS: Mutex<Option<HashMap<usize, UmaBuffer>>> = Mutex::new(None);
 
 /// Where a console-created buffer lives in unified memory (its console GPU address).
 pub fn console_buffer(res: usize) -> Option<(usize, usize)> {
@@ -182,6 +184,17 @@ pub fn uma_gpu_va() -> u64 {
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
 pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
+}
+
+/// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.
+pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
+    let u = crate::gpu::uma::get()?;
+    let k = u.window_of(p)?;
+    let (base, size) = u.window(k);
+    if p - base + len > size {
+        return None;
+    }
+    Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
 }
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
@@ -489,11 +502,11 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + slot] = f;
         }
     }
-    // the device's other console extensions: a title call is logged and answered S_OK, not run
-    // as the PC method at that index
-    if kind == Kind::Device {
-        let own: HashSet<usize> = console_slots(kind).iter().map(|e| e.0).collect();
-        for i in (CONSOLE_DEVICE_EXTENSIONS..public).filter(|i| !own.contains(i)) {
+    // the other console extensions (device, command list): a title call is logged and answered
+    // S_OK, not run as the PC method at that index
+    if let Some(first) = console_extensions(kind) {
+        let own: HashSet<usize> = console_slots(kind).iter().map(|e| e.0).chain(console_remap(kind).iter().map(|e| e.0)).collect();
+        for i in (first..public).filter(|i| !own.contains(i)) {
             let (stub, _) = stubs::make_stub_info(DLL, &format!("{}::#{i} (console extension)", iface.name), 0);
             v[1 + i] = super::guard::make_split(stub, v[1 + i]);
         }
@@ -517,6 +530,33 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     ext
 }
 
+/// (console slot, PC slot) of PC methods that sit elsewhere in the console's vtable.
+/// ID3D12GraphicsCommandList (from the Fortnite RHI call sites, matching XCL's own evidence
+/// – FSR4 calls ClearUnorderedAccessViewUint at #53): 0–27 and 56–59 as on PC; the query
+/// methods come right after ExecuteBundle (28–31 = PC 52–55: BeginQuery, EndQuery,
+/// ResolveQueryData, SetPredication), so SetDescriptorHeaps … DiscardResource move up by 4
+/// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65), the shading-rate
+/// methods at 124 / 125 (PC 77 / 78). The console-only methods in between: `list_x`.
+fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
+    match kind {
+        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// console D3D12_DESCRIPTOR_HEAP_TYPE also used for CBV / SRV / UAV heaps
+const XBOX_EXTRA_CBV_SRV_UAV: u32 = 4;
+
+/// Where a class's console extensions start: the device's from #44 (`device_x`), the command
+/// list's from #60 (`list_x`).
+fn console_extensions(kind: Kind) -> Option<usize> {
+    match kind {
+        Kind::Device => Some(44),
+        Kind::CommandList => Some(60),
+        _ => None,
+    }
+}
+
 /// Console vtable slots that differ from the PC layout (found on console code calling them):
 /// * device #62: `CreateComputePipelineState` with two extra arguments (XboxBvhBuilder.dll
 ///   passes a D3D12_COMPUTE_PIPELINE_STATE_DESC, NULL, NULL, riid, ppv); PC #62 = CreateStateObject.
@@ -532,28 +572,10 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 ///   CBV/SRV/UAV and sampler heaps of console code get 32 / 16-byte slots in unified memory
 ///   (`console_heap`). #14–#19 seen from console code with the PC layout; #17 and #22–#24
 ///   assumed to follow it (each checks its arguments and otherwise goes to the PC method).
-/// * device #12 `CreateCommandList` (only with console lists on): console code gets a
-///   console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
-/// (console slot, PC slot) of PC methods that sit elsewhere in the console's vtable.
-/// ID3D12GraphicsCommandList (from the Fortnite RHI call sites, matching XCL's own evidence
-/// – FSR4 calls ClearUnorderedAccessViewUint at #53): 0–27 and 56–59 as on PC; the query
-/// methods come right after ExecuteBundle (28–31 = PC 52–55: BeginQuery, EndQuery,
-/// ResolveQueryData, SetPredication), so SetDescriptorHeaps … DiscardResource move up by 4
-/// (32–55 = PC 28–51); ID3D12GraphicsCommandList1 is at 104–109 (PC 60–65), the shading-rate
-/// methods at 124 / 125 (PC 77 / 78). The console-only methods in between stay guarded.
-fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
-    match kind {
-        Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// console D3D12_DESCRIPTOR_HEAP_TYPE also used for CBV / SRV / UAV heaps
-const XBOX_EXTRA_CBV_SRV_UAV: u32 = 4;
-
-/// The console device's methods from #44 on are its own extensions (`device_x`).
-const CONSOLE_DEVICE_EXTENSIONS: usize = 44;
-
+/// * device #12 `CreateCommandList`: console list types; with console lists on, console code
+///   gets a console-shaped list (D3D12.X inline code writes into it), XCL's own code a PC one.
+/// * the device's own methods (`device_x`, `frame`), the command list's (`list_x`), queue #30
+///   PresentX (`present`).
 fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
     use super::device_x as x;
     match kind {
@@ -600,6 +622,26 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
+        Kind::CommandList => {
+            use super::list_x as l;
+            vec![
+                (47, l::ia_set_index_buffer_x as usize),
+                (60, l::copy_memory_x as usize),
+                (61, l::fill32_x as usize),
+                (62, l::fill64_x as usize),
+                (63, l::fill128_x as usize),
+                (68, l::set_depth_bounds_x as usize),
+                (69, l::write32_bottom_x as usize),
+                (70, l::write64_bottom_x as usize),
+                (78, l::dispatch_x as usize),
+                (81, l::draw_indexed_x as usize),
+                (84, l::copy_resource_x as usize),
+                (85, l::set_predication_buffer_x as usize),
+                (88, l::write32_top_x as usize),
+                (89, l::write64_top_x as usize),
+                (90, l::write32_bottom_of_shader_x as usize),
+            ]
+        }
         _ => vec![],
     }
 }
@@ -797,7 +839,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
-    if va % 0x1_0000 != 0 || bytes == 0 || va - base + bytes > size {
+    if !va.is_multiple_of(0x1_0000) || bytes == 0 || va - base + bytes > size {
         return None;
     }
     let heap = *UMA_HEAPS.lock().unwrap().get(k)?;

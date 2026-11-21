@@ -414,6 +414,53 @@ pub fn console_device_methods() -> Result<(), String> {
     }
 }
 
+/// The console command list's memory methods as a title calls them, on its own graphics
+/// memory: Write32BitValueBottomOfPipeX #69, Write64BitValueTopOfPipeX #89, a GPU timestamp
+/// (#70), FillMemoryWith32BitValueX #61, CopyMemoryToMemoryX #60, and an extension XCL does not
+/// model (Wait32BitValueX #71).
+pub fn console_list_methods() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let graphics = 1u64 << 29;
+        let mem = crate::XMemAlloc(0x1_0000, graphics) as *mut u8;
+        ensure!(!mem.is_null(), "graphics memory");
+        let at = |o: usize| mem as u64 + o as u64;
+        for i in 0..64 {
+            *mem.add(0x1000 + i) = i as u8 ^ 0x5A;
+        }
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let l = list.as_raw();
+        let slot = |i: usize| *(*(l as *const *const usize)).add(i);
+        let write32_bottom: unsafe extern "system" fn(*mut c_void, u64, u32, u32, u32) = std::mem::transmute(slot(69));
+        let write64_bottom: unsafe extern "system" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(slot(70));
+        let write64_top: unsafe extern "system" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(slot(89));
+        let fill32: unsafe extern "system" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(slot(61));
+        let copy: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u32) = std::mem::transmute(slot(60));
+        let wait32: unsafe extern "system" fn(*mut c_void, u64, u32, u32, u32, u32) = std::mem::transmute(slot(71));
+        write32_bottom(l, at(0), 0x1234_5678, 0, 0);
+        write64_top(l, at(8), 0x1122_3344_5566_7788, 0);
+        write64_bottom(l, at(0x10), 0, 0, 1); // GPU timestamp
+        fill32(l, at(0x100), 0x100, 0xABCD_EF01);
+        copy(l, at(0x2000), at(0x1000), 64, 0);
+        wait32(l, at(0), 3, 0x1234_5678, u32::MAX, 0);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+        let r32 = |o: usize| (mem.add(o) as *const u32).read();
+        let r64 = |o: usize| (mem.add(o) as *const u64).read();
+        ensure!(r32(0) == 0x1234_5678, "Write32BitValueBottomOfPipeX: {:#x}", r32(0));
+        ensure!(r64(8) == 0x1122_3344_5566_7788, "Write64BitValueTopOfPipeX: {:#x}", r64(8));
+        ensure!(r64(0x10) != 0, "no GPU timestamp");
+        ensure!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01) && r32(0x200) == 0 && r32(0xFC) == 0, "FillMemoryWith32BitValueX");
+        ensure!((0..64).all(|i| *mem.add(0x2000 + i) == i as u8 ^ 0x5A) && *mem.add(0x2040) == 0, "CopyMemoryToMemoryX");
+        crate::XMemFree(mem as *mut c_void, graphics);
+        Ok(())
+    }
+}
+
 pub fn render_triangle() -> Result<(), String> {
     unsafe {
         let dev = device()?;
@@ -444,6 +491,14 @@ pub fn render_triangle() -> Result<(), String> {
         let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
         ensure!(hr >= 0 && !raw.is_null(), "CreateDerivedPipelineStateX hr={hr:#x}");
         let derived = ID3D12PipelineState::from_raw(raw);
+        // indices in the title's graphics memory: [0 1 2 0 1 2] for the bound index buffer,
+        // [0 1 2] at +16 for DrawIndexedX
+        let graphics = 1u64 << 29;
+        let ib = crate::XMemAlloc(0x1_0000, graphics) as *mut u16;
+        ensure!(!ib.is_null(), "graphics memory");
+        for (i, v) in [0u16, 1, 2, 0, 1, 2, 0, 0, 0, 1, 2].into_iter().enumerate() {
+            *ib.add(i) = v;
+        }
         patch[0] = 4;
         let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
         ensure!(hr < 0, "an unknown patch part must fail (hr={hr:#x})");
@@ -520,6 +575,18 @@ pub fn render_triangle() -> Result<(), String> {
         list.SetPipelineState(&derived);
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: (w / 2) as f32, Height: (h / 2) as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.DrawInstanced(3, 1, 0, 0);
+        // console index buffers at title addresses: IASetIndexBuffer #47 binds [0 1 2 0 1 2];
+        // DrawIndexedX #81 draws [0 1 2] from +16 in the top-right quadrant; the bound buffer
+        // comes back for indices 3–5 in the bottom-left one
+        type SetIb = unsafe extern "system" fn(*mut c_void, *const D3D12_INDEX_BUFFER_VIEW);
+        type DrawIndexedX = unsafe extern "system" fn(*mut c_void, u64, DXGI_FORMAT, u32, u32);
+        list.SetPipelineState(&pso);
+        xslot::<SetIb>(&list, 47)(list.as_raw(), &D3D12_INDEX_BUFFER_VIEW { BufferLocation: ib as u64, SizeInBytes: 12, Format: DXGI_FORMAT_R16_UINT });
+        let half = |x: u32, y: u32| D3D12_VIEWPORT { TopLeftX: x as f32, TopLeftY: y as f32, Width: (w / 2) as f32, Height: (h / 2) as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        list.RSSetViewports(&[half(w / 2, 0)]);
+        xslot::<DrawIndexedX>(&list, 81)(list.as_raw(), ib as u64 + 16, DXGI_FORMAT_R16_UINT, 3, 0);
+        list.RSSetViewports(&[half(0, h / 2)]);
+        list.DrawIndexedInstanced(3, 1, 3, 0, 0);
         let barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -560,7 +627,11 @@ pub fn render_triangle() -> Result<(), String> {
         let center = px(32, 32);
         let corner = px(1, 1);
         let quadrant = px(16, 16);
+        let (top_right, bottom_left) = (px(48, 16), px(16, 48));
         rb.Unmap(0, None);
+        crate::XMemFree(ib as *mut c_void, graphics);
+        ensure!(top_right == [0, 255, 0, 255], "top-right quadrant {top_right:?} (expected green: DrawIndexedX)");
+        ensure!(bottom_left == [0, 255, 0, 255], "bottom-left quadrant {bottom_left:?} (expected green: the title's index buffer, bound again)");
         ensure!(center == [0, 255, 0, 255], "centre pixel {center:?} (expected green triangle)");
         ensure!(quadrant == [0, 255, 255, 255], "top-left quadrant {quadrant:?} (expected cyan: the derived pipeline writes green only)");
         ensure!(corner == [0, 0, 255, 255], "corner pixel {corner:?} (expected blue clear colour)");
