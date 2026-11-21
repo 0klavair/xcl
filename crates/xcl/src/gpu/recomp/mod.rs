@@ -306,6 +306,8 @@ pub struct Options {
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
     /// two independent halves – the wave-size independent form VS/PS always get (tests)
     pub hw_wave: u32,
+    /// geometry mode: emulate one logical wave64 with two native wave32 phases
+    pub geometry_wave32: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -320,7 +322,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -728,7 +730,7 @@ fn emit_structured(
                 match emit_block(c, em, body, latch, b, d + 1, blocks) {
                     emit::Flow::Cond(cond, _) => body.push_str(&format!("{ipad}    if (!({cond})) break;\n")),
                     // unconditional back edge: the loop is left through the skip flags' breaks
-                    emit::Flow::Jump(_) => {}
+                    emit::Flow::Jump(_) | emit::Flow::JumpExpr(_) => {}
                     _ => body.push_str(&format!("{ipad}    break;\n")),
                 }
                 if let Some(u) = entry {
@@ -853,6 +855,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let tail = match flow {
             emit::Flow::Next => format!("pc = {fallthrough};"),
             emit::Flow::Jump(t) => format!("pc = {t}u;"),
+            emit::Flow::JumpExpr(e) => format!("pc = {e};"),
             emit::Flow::Cond(cond, t) => format!("pc = ({cond}) ? {t}u : {fallthrough};"),
             emit::Flow::End => "pc = 0xFFFFFFFFu;".to_string(),
         };
@@ -894,6 +897,82 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         }
     }
     out
+}
+
+/// Operations that cannot be split into two independent native wave32 halves while
+/// preserving one logical wave64. Split geometry translation rejects these rather than
+/// silently changing cross-half lane or mask semantics.
+pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
+    let mut out = BTreeSet::new();
+    let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
+    let mut mask_scc = false;
+    let mut off = 0;
+    while off + 4 <= code.len() {
+        let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
+        off += d.len;
+        let n = d.inst.name;
+        let (reads, writes) = rdna2::sgpr_uses(&d);
+        let reads_mask = reads.iter().any(|r| mask_regs.contains(r));
+        if reads_mask && n.ends_with("_B64") {
+            mask_regs.extend(writes.iter().copied());
+        }
+        if (n.starts_with("S_CMP") || n.starts_with("S_CMPK")) && !reads_mask {
+            mask_scc = false;
+        }
+        if reads_mask
+            && matches!(
+                n,
+                "S_AND_B64"
+                    | "S_OR_B64"
+                    | "S_XOR_B64"
+                    | "S_ANDN2_B64"
+                    | "S_ORN2_B64"
+                    | "S_NAND_B64"
+                    | "S_NOR_B64"
+                    | "S_XNOR_B64"
+            )
+        {
+            mask_scc = true;
+        }
+        if mask_scc && matches!(n, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1") {
+            out.insert("branch on a half-local scalar condition");
+        }
+        if matches!(
+            n,
+            "V_READLANE_B32"
+                | "V_WRITELANE_B32"
+                | "V_READFIRSTLANE_B32"
+                | "V_PERMLANE16_B32"
+                | "V_PERMLANEX16_B32"
+                | "DS_BPERMUTE_B32"
+                | "DS_PERMUTE_B32"
+                | "DS_SWIZZLE_B32"
+        ) || d.enc.name.contains("DPP")
+        {
+            out.insert("cross-half lane exchange");
+        }
+        if matches!(n, "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ" | "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") {
+            out.insert("branch on a whole-wave mask");
+        }
+        if matches!(n, "S_BCNT0_I32_B64" | "S_BCNT1_I32_B64" | "S_FF1_I32_B64" | "S_FLBIT_I32_B64" | "S_FLBIT_I32_I64") {
+            out.insert("whole-wave mask reduction");
+        }
+        if matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B64" | "S_BITCMP1_B64") {
+            out.insert("scalar condition from a whole-wave mask");
+        }
+    }
+    out
+}
+
+/// Translate a complete ES+GS program for the adapter-selected geometry path.
+pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
+    if geometry_wave32 {
+        let hazards = geometry_wave32_hazards(code);
+        if !hazards.is_empty() {
+            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
+        }
+    }
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
@@ -1084,7 +1163,11 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
         } else {
-            code.push_str("    uint pc = 0;\n");
+            if gs_jump.is_some() && opt.geometry_wave32 {
+                code.push_str("    uint pc = xcl_entry_pc;\n");
+            } else {
+                code.push_str("    uint pc = 0;\n");
+            }
             emit_range(&ctx, &mut em, &mut code, 0, u64::MAX, 1, &mut blocks, &mut flags);
         }
         for &t in &flags {

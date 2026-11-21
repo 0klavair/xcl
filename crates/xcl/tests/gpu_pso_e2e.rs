@@ -434,7 +434,8 @@ fn retail_es_gs_voxelize_geometry_mode() {
     use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
     let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("ES + GS pair");
     assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
-    let t = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    let split_wave32 = recomp::pso::geometry_uses_wave32_for_device(&_dev);
+    let t = recomp::translate_geometry(&code, g.clone(), split_wave32).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let rec = g.record();

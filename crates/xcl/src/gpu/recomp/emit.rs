@@ -10,6 +10,7 @@ use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 pub(super) enum Flow {
     Next,
     Jump(u64),
+    JumpExpr(String),
     Cond(String, u64),
     End,
 }
@@ -519,6 +520,7 @@ impl Em {
         if name == "s_setpc_b64" {
             if let Mode::Geometry(g) = &self.opt.mode {
                 return match g.gs_start {
+                    Some(s) if s > 0 && self.opt.geometry_wave32 => Flow::JumpExpr(format!("select(xcl_es_phase, 0xFFFFFFFFu, {s}u)")),
                     Some(s) if s > 0 => Flow::Jump(s),
                     _ => Flow::End,
                 };
@@ -3580,44 +3582,120 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 h.push_str("}\n");
             }
             Mode::Geometry(g) => {
+                if !self.opt.geometry_wave32 {
+                    let pg = super::GS_PRIMS_PER_GROUP;
+                    let rec = g.record();
+                    let (vd, vb) = (rec.vert_dwords(), g.vertex_bytes());
+                    let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
+                    let maxt = g.max_vertex_count.saturating_sub(2).max(1);
+                    let nreg = g.input_registers();
+                    h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
+                    h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                    let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
+                    let _ = writeln!(h, "    uint xcl_p0 = gid.x * {pg}u;\n    uint xcl_np = xcl_total > xcl_p0 ? min({pg}u, xcl_total - xcl_p0) : 0u;\n    uint xcl_nv = 3u * xcl_np;");
+                    let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", rec.record_dwords());
+                    let _ = writeln!(h, "    uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n    uint xcl_tri[{maxt}];");
+                    load_sgprs(&mut h);
+                    if sg.contains(&2) {
+                        let _ = writeln!(h, "    s2 = {}u; // GS output area in LDS (after the ES items)", g.es_ring_bytes());
+                    }
+                    let item = g.es_item_bytes() / 4;
+                    if sg.contains(&3) {
+                        h.push_str("    s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
+                    }
+                    h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                    for &v in &self.vgprs {
+                        let init = match v {
+                            0 => format!("(lane_id < xcl_np) ? ((lane_id * 3u * {item}u) | ((lane_id * 3u + 1u) * {item}u << 16)) : 0u"),
+                            1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
+                            2 => "xcl_p0 + lane_id".to_string(),
+                            5 => "xcl_p0 * 3u + lane_id".to_string(),
+                            v if v >= 9 && v < 9 + 4 * nreg as u64 => {
+                                let (r, c) = ((v - 9) / 4, (v - 9) % 4);
+                                format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
+                            }
+                            _ => "0u".to_string(),
+                        };
+                        let _ = writeln!(h, "    uint v{v} = {init};");
+                    }
+                    h.push_str(body);
+                    let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
+                    let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
+                    h.push_str("    uint xcl_vb = WavePrefixSum(xcl_emitted);\n    uint xcl_tb = WavePrefixSum(xcl_ntri);\n");
+                    h.push_str("    uint xcl_tv = WaveActiveSum(xcl_emitted);\n    uint xcl_tt = WaveActiveSum(xcl_ntri);\n");
+                    let _ = writeln!(h, "    if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, min(xcl_tv, {maxv}u)); res.Store(xcl_rec * 4u + 4u, min(xcl_tt, {maxp}u)); }}");
+                    let _ = writeln!(h, "    for (uint k = 0u; k < xcl_emitted && xcl_gs_base != 0xFFFFFFFFu; k++) {{\n        uint vi = xcl_vb + k;\n        if (vi >= {maxv}u) break;");
+                    let _ = writeln!(h, "        uint src = xcl_gs_base + k * {vb}u;\n        uint dst = xcl_rec + {MESH_HEADER}u + vi * {vd}u;");
+                    for (slot, r) in regs.iter().enumerate() {
+                        for c in 0..4 {
+                            let _ = writeln!(h, "        res.Store((dst + {}u) * 4u, xcl_lds[((src + {}u) >> 2) & 8191u]);", 4 * slot + c, 16 * r + 4 * c as u32);
+                        }
+                    }
+                    h.push_str("    }\n");
+                    let _ = writeln!(h, "    for (uint j = 0u; j < xcl_ntri; j++) {{\n        uint t = xcl_tri[j];\n        if (xcl_tb + j >= {maxp}u) break;");
+                    let _ = writeln!(
+                        h,
+                        "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
+                        MESH_HEADER + maxv as usize * vd
+                    );
+                    h.push_str("}\n");
+                } else {
                 let pg = super::GS_PRIMS_PER_GROUP;
                 let rec = g.record();
                 let (vd, vb) = (rec.vert_dwords(), g.vertex_bytes());
                 let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
                 let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                 let nreg = g.input_registers();
+                let native_lanes = if self.opt.geometry_wave32 { 32 } else { 64 };
                 h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
-                h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
                 let _ = writeln!(h, "    uint xcl_total = io.Load({}u);\n    uint xcl_vin = io.Load({}u);", super::IO_GS_PRIMS * 4, super::IO_GS_VERTICES * 4);
                 let _ = writeln!(h, "    uint xcl_p0 = gid.x * {pg}u;\n    uint xcl_np = xcl_total > xcl_p0 ? min({pg}u, xcl_total - xcl_p0) : 0u;\n    uint xcl_nv = 3u * xcl_np;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", rec.record_dwords());
-                let _ = writeln!(h, "    uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n    uint xcl_tri[{maxt}];");
-                load_sgprs(&mut h);
-                if sg.contains(&2) {
-                    let _ = writeln!(h, "    s2 = {}u; // GS output area in LDS (after the ES items)", g.es_ring_bytes());
-                }
                 let item = g.es_item_bytes() / 4; // dwords per ES vertex
-                if sg.contains(&3) {
-                    h.push_str("    s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
-                }
-                h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
-                for &v in &self.vgprs {
-                    let init = match v {
-                        // LDS dword offsets of the triangle's vertices (ES vertex i at i · item)
-                        0 => format!("(lane_id < xcl_np) ? ((lane_id * 3u * {item}u) | ((lane_id * 3u + 1u) * {item}u << 16)) : 0u"),
-                        1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
-                        2 => "xcl_p0 + lane_id".to_string(),
-                        5 => "xcl_p0 * 3u + lane_id".to_string(),
-                        v if v >= 9 && v < 9 + 4 * nreg as u64 => {
-                            let (r, c) = ((v - 9) / 4, (v - 9) % 4);
-                            format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
-                        }
-                        _ => "0u".to_string(),
-                    };
-                    let _ = writeln!(h, "    uint v{v} = {init};");
-                }
-                h.push_str(body);
+                let gs_start = g.gs_start.unwrap_or(0);
+                let phase = |h: &mut String, es: bool| {
+                    h.push_str("    {\n");
+                    let _ = writeln!(h, "        bool xcl_es_phase = {};", if es { "true" } else { "false" });
+                    let _ = writeln!(h, "        uint xcl_entry_pc = {}u;", if es { 0 } else { gs_start });
+                    if self.opt.geometry_wave32 {
+                        h.push_str("        lane_id = gi; xcl_half = gi >> 5; xcl_logical_wave64 = true;\n");
+                    } else {
+                        h.push_str("        lane_id = gi; xcl_half = 0u; xcl_logical_wave64 = false;\n");
+                    }
+                    let _ = writeln!(h, "        uint xcl_emitted = 0u, xcl_strip = 0u, xcl_ntri = 0u, xcl_gs_base = 0xFFFFFFFFu;\n        uint xcl_tri[{maxt}];");
+                    load_sgprs(h);
+                    if sg.contains(&2) {
+                        let _ = writeln!(h, "        s2 = {}u; // GS output area in LDS (after the ES items)", g.es_ring_bytes());
+                    }
+                    if sg.contains(&3) {
+                        h.push_str("        s3 = xcl_nv | (xcl_np << 8); // merged wave info: ES vertices, GS primitives, wave 0\n");
+                    }
+                    h.push_str("        uint scc = 0u;\n        { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
+                    for &v in &self.vgprs {
+                        let init = match v {
+                            // LDS dword offsets of the triangle's vertices (ES vertex i at i · item)
+                            0 => format!("(lane_id < xcl_np) ? ((lane_id * 3u * {item}u) | ((lane_id * 3u + 1u) * {item}u << 16)) : 0u"),
+                            1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
+                            2 => "xcl_p0 + lane_id".to_string(),
+                            5 => "xcl_p0 * 3u + lane_id".to_string(),
+                            v if v >= 9 && v < 9 + 4 * nreg as u64 => {
+                                let (r, c) = ((v - 9) / 4, (v - 9) % 4);
+                                format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
+                            }
+                            _ => "0u".to_string(),
+                        };
+                        let _ = writeln!(h, "        uint v{v} = {init};");
+                    }
+                    h.push_str(body);
+                    if es {
+                        h.push_str("    }\n");
+                    }
+                };
+                phase(&mut h, true);
+                h.push_str("    GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)\n");
+                phase(&mut h, false);
                 // emitted vertices (LDS, register r at +16·r) and strip triangles → the record
                 let pos_reg = g.outputs.iter().find(|e| e.system_value == 1).map(|e| e.register).unwrap_or(0);
                 let regs: Vec<u32> = std::iter::once(pos_reg).chain(ranked(&g.outputs, true).iter().map(|e| e.register)).collect();
@@ -3639,7 +3717,8 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     "        res.Store((xcl_rec + {}u + xcl_tb + j) * 4u, ((t & 0x3FFu) + xcl_vb) | ((((t >> 10) & 0x3FFu) + xcl_vb) << 10) | ((((t >> 20) & 0x3FFu) + xcl_vb) << 20));\n    }}",
                     MESH_HEADER + maxv as usize * vd
                 );
-                h.push_str("}\n");
+                h.push_str("    }\n}\n");
+                }
             }
             Mode::Pixel(ps) => {
                 // conservative depth output (SV_DepthGreater/LessEqual): DXIL wants the position
@@ -4283,9 +4362,19 @@ static uint lane_id;
 // wave32 program in a 64-lane hardware wave: each half is its own wave (xcl_half = 0 / 1)
 static bool xcl_w32 = false;
 static uint xcl_half = 0u;
+// A logical wave64 split over two native wave32s. Each half carries only its own mask;
+// geometry mode rejects cross-half lane reads before generating this form.
+static bool xcl_logical_wave64 = false;
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
-uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y)); }
-uint rla(uint v, uint l) { return WaveReadLaneAt(v, l + 32u * xcl_half); }
+uint2 ballot(bool b) {
+    uint4 m = WaveActiveBallot(b);
+    if (xcl_logical_wave64) return xcl_half != 0u ? uint2(0u, m.x) : uint2(m.x, 0u);
+    return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
+}
+uint rla(uint v, uint l) {
+    if (xcl_logical_wave64) return (l >> 5) == xcl_half ? WaveReadLaneAt(v, l & 31u) : 0u;
+    return WaveReadLaneAt(v, l + 32u * xcl_half);
+}
 bool lanebit_at(uint lo, uint hi, uint l) { return ((select(l < 32u, lo, hi) >> (l & 31u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
     if (sel >= 6u) return x;

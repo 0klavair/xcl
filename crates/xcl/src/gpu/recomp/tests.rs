@@ -7,6 +7,16 @@ use super::{translate, Mode, Options};
 use crate::gpu::rdna2::encode;
 
 fn gpu_ready() -> bool {
+    match (runner::adapter(), runner::wave64_supported(), super::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => true,
+        (a, w, d) => {
+            println!("GPU/DXC wave64 unavailable – skipping ({:?} / {:?} / {:?})", a.err(), w.ok(), d.err());
+            false
+        }
+    }
+}
+
+fn gpu_ready_wave32() -> bool {
     match (runner::adapter(), super::dxc::location()) {
         (Ok(_), Ok(_)) => true,
         (a, d) => {
@@ -30,6 +40,34 @@ const V: u64 = 256; // VALU source code of v0
 
 fn f(x: f32) -> u32 {
     x.to_bits()
+}
+
+#[test]
+fn geometry_wave32_rejects_cross_half_operations() {
+    let one = |name: &str, enc: &str, fields: &[(&str, u64)]| encode(name, enc, fields, None).unwrap();
+
+    let lane = one("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)]);
+    assert!(super::geometry_wave32_hazards(&lane).contains("cross-half lane exchange"));
+
+    let branch = one("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)]);
+    assert!(super::geometry_wave32_hazards(&branch).contains("branch on a whole-wave mask"));
+
+    let reduce = one("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]);
+    assert!(super::geometry_wave32_hazards(&reduce).contains("whole-wave mask reduction"));
+
+    let compare = one("S_CMP_EQ_U64", "ENC_SOPC", &[("SSRC0", 126), ("SSRC1", 106)]);
+    assert!(super::geometry_wave32_hazards(&compare).contains("scalar condition from a whole-wave mask"));
+
+    let mut scalar = one("S_AND_B64", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 126), ("SSRC1", 106)]);
+    scalar.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+    assert!(super::geometry_wave32_hazards(&scalar).contains("branch on a half-local scalar condition"));
+}
+
+#[test]
+fn geometry_wave_path_selection_preserves_native_wave64() {
+    assert!(super::pso::geometry_uses_wave32(32, 32));
+    assert!(!super::pso::geometry_uses_wave32(32, 64));
+    assert!(!super::pso::geometry_uses_wave32(64, 64));
 }
 
 #[test]
@@ -2042,7 +2080,7 @@ fn dump_retail_interfaces() {
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
@@ -2110,7 +2148,12 @@ fn gpu_geometry_mode_es_gs_strip() {
     };
     let mut code = es;
     code.extend_from_slice(&gs);
-    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    let native = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, geometry_wave32: false, ..Default::default() }).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"));
+    assert!(!native.hlsl.contains("xcl_es_phase") && !native.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
+    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, geometry_wave32: true, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("[WaveSize(32)]"));
+    assert!(t.hlsl.contains("xcl_es_phase") && t.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let rec = g.record();

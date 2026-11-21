@@ -60,6 +60,7 @@ struct Gpu {
     fence: ID3D12Fence,
     value: u64,
     adapter: String,
+    wave64: bool,
 }
 
 // D3D12 objects are free-threaded; access is serialised by the mutex.
@@ -88,14 +89,15 @@ fn init() -> Result<Gpu, String> {
         }
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut o1 as *mut _ as _, std::mem::size_of_val(&o1) as u32).map_err(e)?;
-        if !o1.WaveOps.as_bool() || o1.WaveLaneCountMax < 64 || !o1.Int64ShaderOps.as_bool() {
-            return Err(format!("{name}: no wave64/wave operations/int64 ({}..{})", o1.WaveLaneCountMin, o1.WaveLaneCountMax));
+        if !o1.WaveOps.as_bool() || !o1.Int64ShaderOps.as_bool() {
+            return Err(format!("{name}: no wave operations/int64"));
         }
+        let wave64 = o1.WaveLaneCountMin <= 64 && o1.WaveLaneCountMax >= 64;
         let queue: ID3D12CommandQueue =
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64 })
     }
 }
 
@@ -327,6 +329,12 @@ pub fn adapter() -> Result<String, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);
     gpu.as_ref().map(|x| x.adapter.clone()).map_err(|x| x.clone())
+}
+
+pub fn wave64_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.wave64).map_err(|x| x.clone())
 }
 
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
