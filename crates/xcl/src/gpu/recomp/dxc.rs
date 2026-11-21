@@ -240,7 +240,7 @@ fn cache_mutex_name(file: &Path) -> String {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
-    format!(r"Local\OlympusDxilCache-{h:016x}")
+    format!(r"Local\XclDxilCache-{h:016x}")
 }
 
 fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
@@ -318,16 +318,18 @@ where
     if let Some(b) = cached_file(&file) {
         return Ok((b, true));
     }
+    // before the locks: a cached-only attempt (non-blocking pipeline creation) must not wait
+    // for a worker compiling the same shader
+    if CACHED_ONLY.with(|c| c.get()) {
+        MISSED.with(|m| m.set(true));
+        return Err("DXIL not compiled yet".into());
+    }
     let flight = cache_flight((dir.to_path_buf(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
     if let Some(b) = cached_file(&file) {
         return Ok((b, true));
-    }
-    if CACHED_ONLY.with(|c| c.get()) {
-        MISSED.with(|m| m.set(true));
-        return Err("DXIL not compiled yet".into());
     }
     // A corrupt target must be removed before the atomic rename on Windows;
     // rename does not replace an existing file there.
@@ -437,7 +439,7 @@ mod cache_tests {
         overlap[56..60].copy_from_slice(b"DXIL");
         assert!(!valid_dxil_container(&overlap));
 
-        let dir = std::env::temp_dir().join(format!("olympus-dxil-corrupt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = cache_key("corrupt", "main", "cs_6_6");
@@ -459,7 +461,7 @@ mod cache_tests {
 
     #[test]
     fn concurrent_cache_misses_compile_once() {
-        let dir = std::env::temp_dir().join(format!("olympus-dxil-flight-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-flight-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let calls = AtomicUsize::new(0);
         let hits = AtomicUsize::new(0);
@@ -484,6 +486,23 @@ mod cache_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(hits.load(Ordering::SeqCst), 7);
 
+        // A cached-only attempt (non-blocking pipeline creation on the title's thread) does not
+        // wait for a worker compiling the same shader: it misses at once.
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| {
+                compile_cached_in_with(&dir, "slow", "main", "cs_6_6", || {
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(synthetic_dxil(5))
+                })
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let t0 = std::time::Instant::now();
+            let (r, missed) = cached_only(|| compile_cached_in_with(&dir, "slow", "main", "cs_6_6", || Ok(synthetic_dxil(5))));
+            assert!(r.is_err() && missed, "cached-only: a miss");
+            assert!(t0.elapsed() < Duration::from_millis(200), "cached-only waited {:?} for the compile", t0.elapsed());
+            worker.join().unwrap().unwrap();
+        });
+
         // A failed leader releases the flight; the next caller can retry.
         let failed = compile_cached_in_with(&dir, "retry", "main", "cs_6_6", || Err("synthetic failure".into()));
         assert!(failed.is_err());
@@ -495,7 +514,7 @@ mod cache_tests {
 
     #[test]
     fn different_cache_keys_do_not_block_each_other() {
-        let dir = std::env::temp_dir().join(format!("olympus-dxil-parallel-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-parallel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|s| {
@@ -515,7 +534,7 @@ mod cache_tests {
 
     #[test]
     fn process_cache_mutex_serializes_the_same_file() {
-        let file = std::env::temp_dir().join(format!("olympus-dxil-mutex-{}-{}.dxil", std::process::id(), cache_key("mutex", "main", "cs_6_6")));
+        let file = std::env::temp_dir().join(format!("xcl-dxil-mutex-{}-{}.dxil", std::process::id(), cache_key("mutex", "main", "cs_6_6")));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (second_tx, second_rx) = std::sync::mpsc::channel();

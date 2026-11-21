@@ -232,7 +232,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("olympus-rpf-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-rpf-{}-{nonce}", std::process::id()));
         let archive = root.join("synthetic.rpf");
         let out = root.join("out");
         std::fs::create_dir_all(&root).unwrap();
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn atomic_extraction_cleans_up_an_interrupted_write() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("olympus-rpf-atomic-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-rpf-atomic-{}-{nonce}", std::process::id()));
         let output = root.join("record.bin");
         std::fs::create_dir_all(&root).unwrap();
 
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn extraction_reports_an_unusable_output_directory() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("olympus-rpf-error-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-rpf-error-{}-{nonce}", std::process::id()));
         let archive = root.join("synthetic.rpf");
         let output_file = root.join("not-a-directory");
         std::fs::create_dir_all(&root).unwrap();
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn extraction_reports_a_corrupt_matching_record() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("olympus-rpf-corrupt-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-rpf-corrupt-{}-{nonce}", std::process::id()));
         let archive = root.join("synthetic.rpf");
         let out = root.join("out");
         std::fs::create_dir_all(&root).unwrap();
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn truncated_rpf_headers_are_reported_without_panicking() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("olympus-rpf-header-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("xcl-rpf-header-{}-{nonce}", std::process::id()));
         let archive = root.join("truncated.rpf");
         std::fs::create_dir_all(&root).unwrap();
 
