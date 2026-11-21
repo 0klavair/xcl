@@ -280,18 +280,7 @@ fn geometry_wave32_required(device: *mut c_void) -> bool {
     }
     unsafe {
         let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if dev
-            .CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS1,
-                &mut options as *mut _ as _,
-                std::mem::size_of_val(&options) as u32,
-            )
-            .is_err()
-        {
-            return true;
-        }
-        crate::gpu::recomp::pso::geometry_uses_wave32(options.WaveLaneCountMin, options.WaveLaneCountMax)
+        crate::gpu::recomp::pso::geometry_uses_wave32_for_device(dev)
     }
 }
 

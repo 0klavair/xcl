@@ -964,6 +964,17 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     out
 }
 
+/// Translate a complete ES+GS program for the adapter-selected geometry path.
+pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
+    if geometry_wave32 {
+        let hazards = geometry_wave32_hazards(code);
+        if !hazards.is_empty() {
+            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
+        }
+    }
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, ..Default::default() })
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;

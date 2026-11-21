@@ -99,6 +99,10 @@ pub struct TwoPass {
 
 fn two_pass(code: &[u8], mode: Mode, wave64: bool, geometry_wave32: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let t = translate(code, &Options { mode, wave64, geometry_wave32, ..Default::default() })?;
+    finish_two_pass(t, record, ps)
+}
+
+fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -128,17 +132,28 @@ pub fn geometry_uses_wave32(wave_min: u32, wave_max: u32) -> bool {
     !(wave_min <= 64 && wave_max >= 64)
 }
 
+pub fn geometry_uses_wave32_for_device(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            &mut options as *mut _ as _,
+            std::mem::size_of_val(&options) as u32,
+        )
+    }
+    .is_err()
+    {
+        return true;
+    }
+    geometry_uses_wave32(options.WaveLaneCountMin, options.WaveLaneCountMax)
+}
+
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, geometry_wave32: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
-    if geometry_wave32 {
-        let hazards = super::geometry_wave32_hazards(&code);
-        if !hazards.is_empty() {
-            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
-        }
-    }
     let record = g.record();
-    two_pass(&code, Mode::Geometry(g), true, geometry_wave32, record, ps)
+    let translation = super::translate_geometry(&code, g, geometry_wave32)?;
+    finish_two_pass(translation, record, ps)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
