@@ -721,9 +721,21 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        forget_pso(this as usize);
         super::pso_async::release(super::pso_async::released(this as usize));
     }
     n
+}
+
+/// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
+/// same address and must not inherit its root signature or compute pass).
+fn forget_pso(pso: usize) {
+    if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
+    let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
+    drop(gone);
 }
 
 /// resource #11 GetGPUVirtualAddress for console code
@@ -1689,6 +1701,13 @@ pub struct TwoPassPso {
     pub mesh_groups_per_record: u32,
     /// "MS" or "GS"
     pub kind: &'static str,
+}
+
+impl Drop for TwoPassPso {
+    fn drop(&mut self) {
+        // the compute pipeline state is XCL's (the root signatures are cached or the title's)
+        super::pso_async::release(self.compute);
+    }
 }
 
 static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);

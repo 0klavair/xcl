@@ -269,7 +269,7 @@ fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
     let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
     rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    let st = Stream {
+    let mut st = Stream {
         rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: game_rs.as_raw() },
         ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: code(&ms) },
         ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: code(&ps) },
@@ -281,7 +281,8 @@ fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     let mesh: ID3D12PipelineState = unsafe { d2.CreatePipelineState(&desc) }.expect("mesh stand-in");
     let call = t0.elapsed();
     let raw = mesh.as_raw() as usize;
-    drop(st); // the title's description is gone; the worker builds from its own copy
+    // the title's description is gone (scribbled over); the worker builds from its own copy
+    unsafe { std::ptr::write_bytes(&mut st as *mut Stream, 0xCD, 1) };
     assert_ne!(pso_async::resolve_wait(raw), raw);
     assert!(real::two_pass_of(raw).is_some(), "the two-pass parts through the stand-in");
     println!("mesh: the call returned after {call:?}, the real pipeline was ready after {:?}", t0.elapsed());

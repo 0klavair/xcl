@@ -134,10 +134,10 @@ mod tests {
         d.extend_from_slice(&2u32.to_le_bytes());
         d.extend_from_slice(&8u32.to_le_bytes());
         let base = 8 + 2 * 32;
-        for (i, (name_off, sv, ct, reg, mask)) in [(0u32, 0u32, 3u32, 0u32, 7u8), (9, 6, 1, 1, 1)].iter().enumerate() {
+        for (name_off, sv, ct, reg, mask) in [(0u32, 0u32, 3u32, 0u32, 7u8), (9, 6, 1, 1, 1)].iter() {
             d.extend_from_slice(&0u32.to_le_bytes()); // stream
             d.extend_from_slice(&(base + name_off).to_le_bytes());
-            d.extend_from_slice(&(i as u32 * 0).to_le_bytes());
+            d.extend_from_slice(&0u32.to_le_bytes()); // semantic index
             d.extend_from_slice(&sv.to_le_bytes());
             d.extend_from_slice(&ct.to_le_bytes());
             d.extend_from_slice(&reg.to_le_bytes());

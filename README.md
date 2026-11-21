@@ -68,10 +68,9 @@ measurements and next steps:
 
 | Needs a game executable | Not done yet | Not planned |
 |---|---|---|
-| D3D12.X draw records and `PresentX` / frame pacing | – | Xbox Live, Store licensing (offline by design) |
-| root arguments → shader registers for graphics | Opus / XMA2 audio decoding | decrypting XVC packages or any DRM |
-| texture creation in title memory (binding the detiler) | hull / domain / amplification shaders (none in the sample game) | console SDK headers / binaries in the repository |
-| – | linear / 3D / MSAA tiled textures | |
+| D3D12.X draw records and `PresentX` / frame pacing | Opus / XMA2 audio decoding | Xbox Live, Store licensing (offline by design) |
+| root arguments → shader registers for graphics | hull / domain / amplification shaders (none in the sample game) | decrypting XVC packages or any DRM |
+| texture creation in title memory (binding the detiler) | linear / 3D / MSAA tiled textures | console SDK headers / binaries in the repository |
 | Bink GPU decoding, rehydrating prebuilt BVHs | performance work (GPU buffers live in system memory) | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

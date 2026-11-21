@@ -582,8 +582,11 @@ Nothing open.
   with an empty cache (52 programs compiled in the background, compute waited for at replay) builds BLAS + TLAS.
 - Releasing a stand-in for good (PipelineState `Release` override) releases its real pipeline and forgets the address
   (a later object at the same address must not resolve to it); a stand-in released while building: the worker's result is
-  released when it arrives. Tests: `pso_through_hook` returns the real pipeline (works with a cold DXIL cache), the
-  background test restores `XCL_DXIL_CACHE` through a guard.
+  released when it arrives (outside the `done` lock: the Release override takes PENDING, `counts` takes PENDING then
+  `done`). Any pipeline released for good also leaves `PSO_RS` / `TWO_PASS` (`forget_pso`): a later pipeline at the same
+  address must not get its root signature or compute pass; the compute pass is released with the last `TwoPassPso`.
+  Tests: `pso_through_hook` returns the real pipeline (works with a cold DXIL cache), the background test restores
+  `XCL_DXIL_CACHE` through a guard and scribbles over the mesh stream description after the call.
 
 ## Title memory above 4 GB: UMA windows (session 5, 2026-11-21)
 - **Gap:** shaders addressed one `mem` buffer with the low 32 bits of the address, and D3D12 opens a heap from an

@@ -51,14 +51,20 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
                 } else {
                     BUILT.fetch_add(1, Ordering::Relaxed);
                 }
-                let mut done = p.done.lock().unwrap();
-                if p.orphan.load(Ordering::Acquire) {
+                let orphan = {
+                    let mut done = p.done.lock().unwrap();
+                    let orphan = p.orphan.load(Ordering::Acquire);
+                    if !orphan {
+                        p.real.store(real, Ordering::Release);
+                    }
+                    *done = true;
+                    p.cv.notify_all();
+                    orphan
+                };
+                // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+                if orphan {
                     release(real);
-                } else {
-                    p.real.store(real, Ordering::Release);
                 }
-                *done = true;
-                p.cv.notify_all();
             });
         }
         Mutex::new(tx)
