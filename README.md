@@ -109,8 +109,9 @@ Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) 
 (D3D12, SM 6.6; skipped without a GPU / DXC). Tests on real game data are opt-in through
 environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
 `XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4` – described in `HANDOFF.md`. No game data is part
-of the repository.
+`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4` – described in `HANDOFF.md`; without them those
+tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
+part of the repository.
 
 ## Licenses
 

@@ -46,9 +46,8 @@ fn hlsl_is_generated_for_straight_line_and_branches() {
     // forward branches only: a plain `if`, no loop and no block dispatch on pc
     assert!(t.hlsl.contains("if (!(") && !t.hlsl.contains("pc ==") && !t.hlsl.contains("for (;;)") && t.hlsl.contains("[WaveSize(64)]"), "{}", t.hlsl);
     // the guarded block chain (fallback form) for the same program
-    unsafe { std::env::set_var("XCL_RECOMP_NO_STRUCTURED", "1") };
-    let g = translate(&code, &Options::default()).unwrap();
-    unsafe { std::env::remove_var("XCL_RECOMP_NO_STRUCTURED") };
+    // (an option, not the environment variable: other tests translate at the same time)
+    let g = translate(&code, &Options { structured: false, ..Options::default() }).unwrap();
     assert!(g.hlsl.contains("if (pc == 0u)") && !g.hlsl.contains("while"), "{}", g.hlsl);
     // a backward branch: only its range becomes a loop
     let code = prog(&[

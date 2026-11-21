@@ -313,11 +313,14 @@ pub struct Options {
     /// then exactly the single-window form); 2..4 add `mem1`.. (u3..) and pick the window of
     /// every access from the high address bits
     pub mem_windows: u32,
+    /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
+    /// always the guarded block chain)
+    pub structured: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0, mem_windows: 1 }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1076,7 +1079,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
-        if gs_jump.is_none() && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
+        if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);

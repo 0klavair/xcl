@@ -287,7 +287,10 @@ fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     assert!(real::two_pass_of(raw).is_some(), "the two-pass parts through the stand-in");
     println!("mesh: the call returned after {call:?}, the real pipeline was ready after {:?}", t0.elapsed());
     // the title releases the stand-in: its real pipeline goes with it, the address is forgotten
+    // (the tests here run one at a time: the count is this test's)
+    let two_pass = real::two_pass_count();
     drop(mesh);
+    assert_eq!(real::two_pass_count(), two_pass - 1, "the released pipeline's compute pass is gone");
     assert_eq!(pso_async::resolve(raw), raw);
     assert!(real::two_pass_of(raw).is_none());
 }
