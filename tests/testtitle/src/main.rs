@@ -437,7 +437,7 @@ fn main() {
     check("D3D12.X: queue + fence signal on the GPU", gpu::queue_fence);
     check("D3D12.X: shaders captured; console shader gets a fallback PSO", gpu::pso_capture_and_fallback);
     check("D3D12.X: retail-format console shader (XDAT/XBCH/FSSM) captured + fallback PSO", gpu::xbox_native_pso);
-    check("D3D12.X: triangle rendered on the real GPU and read back", gpu::render_triangle);
+    check("D3D12.X: triangle rendered on the real GPU and read back (console + derived pipeline)", gpu::render_triangle);
     check("D3D12.X: frame clock + PresentX of the title's back buffer", gpu::present_x_frame);
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
     check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);

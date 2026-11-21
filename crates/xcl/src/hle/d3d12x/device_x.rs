@@ -2,7 +2,8 @@
 //!
 //! The console's ID3D12Device has the PC ID3D12Device methods at slots 0–43; from 44 on its
 //! vtable holds console extensions (as observed on Fortnite): CreatePlacedResourceX #44,
-//! CreateCommandQueueX #48, SetDebugFlagsX #52, the pipeline-state (de)serialisation
+//! CreateCommandQueueX #48, SetDebugFlagsX #52, CreateDerivedPipelineStateX #55, the
+//! pipeline-state (de)serialisation
 //! #56 / #57 / #66 / #67, CreateGraphicsPipelineStateX #60, CreateSamplerX #61,
 //! CreateComputePipelineStateX #62, CreateCommandListX #73, page pools #74 / #75, the frame
 //! clock #78–#81 (`frame`), CreatePipelineState #86 (streams, mesh shaders). A title call
@@ -12,9 +13,10 @@
 //! Console queue and list types add DMA (0x10, the copy engine); console queue priorities
 //! are mapped onto PC ones.
 
-use std::ffi::c_void;
+use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::core::GUID;
@@ -104,7 +106,181 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
     if extensions != 0 && once(&N, 1) {
         crate::xlog_info!("D3D12.X: CreateGraphicsPipelineStateX with {extensions} extension(s) – not modelled");
     }
-    real::dev_create_graphics_pso(this, desc, riid, ppv)
+    create_graphics_pso_pc(this, desc, riid, ppv)
+}
+
+/// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
+/// derived pipelines
+pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = real::dev_create_graphics_pso(this, desc, riid, ppv);
+    if hr >= 0 && !ppv.is_null() {
+        note_base(*ppv, desc);
+    }
+    hr
+}
+
+/// size of D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const GFX_DESC: usize = 0x290;
+/// VS, PS, DS, HS, GS { bytecode; length } in the desc
+const STAGES: [usize; 5] = [0x08, 0x18, 0x28, 0x38, 0x48];
+const SO_ENTRIES: usize = 0x60;
+const INPUT_LAYOUT: usize = 0x228;
+const CACHED_PSO: usize = 0x278;
+/// CreateDerivedPipelineStateX patch: { u32 part; payload } at this stride (the largest
+/// payload is the blend state)
+const PATCH: usize = 0x14C;
+
+/// A graphics pipeline desc as bytes, aligned like the struct for the runtime's reads.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct GfxDesc([u8; GFX_DESC]);
+
+/// A title graphics pipeline's description, kept for CreateDerivedPipelineStateX. The input
+/// layout is copied; the shaders stay the title's and are checked by hash when a pipeline is
+/// derived from it.
+struct Base {
+    desc: GfxDesc,
+    shaders: [u64; 5],
+    _elems: Vec<[u8; 32]>,
+    _names: Vec<CString>,
+}
+
+// the desc points into `_elems` / `_names` and the title's shaders; nothing is mutated
+unsafe impl Send for Base {}
+unsafe impl Sync for Base {}
+
+static BASES: Mutex<Option<HashMap<usize, Arc<Base>>>> = Mutex::new(None);
+
+fn rd32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+}
+
+fn rd64(d: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
+}
+
+/// hash of each stage's bytecode (0: none); None when one is not readable
+unsafe fn stage_hashes(d: &[u8; GFX_DESC]) -> Option<[u64; 5]> {
+    let mut h = [0; 5];
+    for (k, &o) in STAGES.iter().enumerate() {
+        let (p, n) = (rd64(d, o) as usize, rd64(d, o + 8) as usize);
+        if p != 0 && n != 0 {
+            if !crate::gpu::shader::readable(p, n) {
+                return None;
+            }
+            h[k] = crate::gpu::shader::fnv64(std::slice::from_raw_parts(p as *const u8, n));
+        }
+    }
+    Some(h)
+}
+
+/// Remember a title graphics pipeline's description (not with stream output).
+unsafe fn note_base(pso: *mut c_void, desc: *const c_void) {
+    if pso.is_null() || desc.is_null() || !crate::gpu::shader::readable(desc as usize, GFX_DESC) {
+        return;
+    }
+    let mut d = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
+    if rd32(&d.0, SO_ENTRIES) != 0 {
+        return;
+    }
+    let Some(shaders) = stage_hashes(&d.0) else { return };
+    let (p, n) = (rd64(&d.0, INPUT_LAYOUT) as usize, rd32(&d.0, INPUT_LAYOUT + 8) as usize);
+    let (mut elems, mut names) = (Vec::new(), Vec::new());
+    if n > 0 {
+        if p == 0 || n > 64 || !crate::gpu::shader::readable(p, 32 * n) {
+            return;
+        }
+        for i in 0..n {
+            // D3D12_INPUT_ELEMENT_DESC { SemanticName @0; … }
+            let mut e = ((p + 32 * i) as *const [u8; 32]).read_unaligned();
+            let s = rd64(&e, 0) as *const c_char;
+            let name = if s.is_null() { CString::default() } else { CStr::from_ptr(s).to_owned() };
+            e[0..8].copy_from_slice(&(name.as_ptr() as u64).to_le_bytes());
+            names.push(name);
+            elems.push(e);
+        }
+    }
+    let at = if elems.is_empty() { 0 } else { elems.as_ptr() as u64 };
+    d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
+    d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
+    let base = Arc::new(Base { desc: d, shaders, _elems: elems, _names: names });
+    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
+}
+
+/// A pipeline released for good is no longer a base.
+pub(super) fn forget_base(pso: usize) {
+    if let Some(m) = BASES.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+}
+
+/// Apply one CreateDerivedPipelineStateX patch to a desc: part 0 = depth-stencil state, 1 =
+/// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): part 5 (seen on Fortnite,
+/// 0x30 bytes, meaning unknown) – not applied. Err: an unknown part.
+fn apply_patch(d: &mut [u8; GFX_DESC], patch: &[u8; PATCH]) -> Result<bool, u32> {
+    let (at, n) = match rd32(patch, 0) {
+        0 => (0x1F0, 0x34),
+        1 => (0x1C4, 0x2C),
+        2 => (0x78, 0x148),
+        3 => (0x1C0, 4),
+        5 => return Ok(false),
+        t => return Err(t),
+    };
+    d[at..at + n].copy_from_slice(&patch[4..4 + n]);
+    Ok(true)
+}
+
+/// device #55 CreateDerivedPipelineStateX(base, patch count, patches, riid, pipeline): the
+/// base pipeline's description with the patched parts, created as a new pipeline (itself a
+/// base for further ones)
+pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, base: *mut c_void, count: u32, patches: *const u8, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    static N: AtomicU64 = AtomicU64::new(0);
+    static UNMODELLED: AtomicU64 = AtomicU64::new(0);
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    *ppv = std::ptr::null_mut();
+    let found = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&(base as usize)).cloned());
+    let Some(b) = found else {
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: CreateDerivedPipelineStateX – base pipeline {base:?} unknown (its creation failed, or it has stream output)");
+        }
+        return E_FAIL;
+    };
+    if stage_hashes(&b.desc.0) != Some(b.shaders) {
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: CreateDerivedPipelineStateX – the shaders of base pipeline {base:?} are gone");
+        }
+        return E_FAIL;
+    }
+    let n = count as usize;
+    if n > 64 || (n > 0 && (patches.is_null() || !crate::gpu::shader::readable(patches as usize, n * PATCH))) {
+        return E_INVALIDARG;
+    }
+    let mut d = b.desc;
+    for i in 0..n {
+        let patch = &*(patches.add(i * PATCH) as *const [u8; PATCH]);
+        match apply_patch(&mut d.0, patch) {
+            Ok(true) => {}
+            Ok(false) => {
+                if once(&UNMODELLED, 1) {
+                    crate::xlog_info!("D3D12.X: CreateDerivedPipelineStateX – patch part 5 not modelled (ignored)");
+                }
+            }
+            Err(t) => {
+                if once(&N, 4) {
+                    crate::xlog_warn!("D3D12.X: CreateDerivedPipelineStateX – unknown patch part {t}");
+                }
+                return E_FAIL;
+            }
+        }
+    }
+    let desc = d.0.as_ptr() as *const c_void;
+    let hr = real::dev_create_graphics_pso(this, desc, riid, ppv);
+    if hr >= 0 {
+        note_base(*ppv, desc);
+    }
+    hr
 }
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
@@ -305,6 +481,36 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn derived_pipeline_patches_land_on_the_desc_parts() {
+        use std::mem::{offset_of, size_of};
+        type G = D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        assert_eq!(size_of::<G>(), GFX_DESC);
+        assert_eq!(STAGES, [offset_of!(G, VS), offset_of!(G, PS), offset_of!(G, DS), offset_of!(G, HS), offset_of!(G, GS)]);
+        assert_eq!(SO_ENTRIES, offset_of!(G, StreamOutput) + offset_of!(D3D12_STREAM_OUTPUT_DESC, NumEntries));
+        assert_eq!((INPUT_LAYOUT, CACHED_PSO), (offset_of!(G, InputLayout), offset_of!(G, CachedPSO)));
+        let parts = [
+            (0, offset_of!(G, DepthStencilState), size_of::<D3D12_DEPTH_STENCIL_DESC>()),
+            (1, offset_of!(G, RasterizerState), size_of::<D3D12_RASTERIZER_DESC>()),
+            (2, offset_of!(G, BlendState), size_of::<D3D12_BLEND_DESC>()),
+            (3, offset_of!(G, SampleMask), 4),
+        ];
+        for (tag, at, n) in parts {
+            let mut d = [0u8; GFX_DESC];
+            let mut patch = [0xAAu8; PATCH];
+            patch[0..4].copy_from_slice(&(tag as u32).to_le_bytes());
+            assert_eq!(apply_patch(&mut d, &patch), Ok(true));
+            assert!(d[at..at + n].iter().all(|&b| b == 0xAA), "part {tag}");
+            assert_eq!(d.iter().filter(|&&b| b == 0xAA).count(), n, "part {tag} writes only its {n} bytes");
+        }
+        let mut d = [0u8; GFX_DESC];
+        let mut patch = [0u8; PATCH];
+        patch[0] = 5;
+        assert_eq!(apply_patch(&mut d, &patch), Ok(false));
+        patch[0] = 4;
+        assert_eq!(apply_patch(&mut d, &patch), Err(4));
     }
 
     #[test]

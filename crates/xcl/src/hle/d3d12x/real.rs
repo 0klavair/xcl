@@ -561,6 +561,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
             vec![
                 (8, x::create_command_queue_x as usize),
                 (9, x::create_command_allocator_x as usize),
+                (10, x::create_graphics_pso_pc as usize),
                 (12, x::create_command_list_pc as usize),
                 (14, dev_create_descriptor_heap_x as usize),
                 (15, dev_increment_size_x as usize),
@@ -575,6 +576,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (44, x::create_placed_resource_x as usize),
                 (48, x::create_command_queue_x as usize),
                 (52, x::set_debug_flags_x as usize),
+                (55, x::create_derived_pso_x as usize),
                 (56, x::serialize_pso_x as usize),
                 (57, x::deserialize_pso_x as usize),
                 (60, x::create_graphics_pso_x as usize),
@@ -840,6 +842,7 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);

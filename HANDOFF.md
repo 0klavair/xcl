@@ -555,12 +555,19 @@ must not run the PC method at that index (#44 is PC CreatePipelineLibrary, #48 O
   GetCopyableFootprints retried with the PC desc when the console desc is rejected; **#41** command signatures (DispatchX
   105 → Dispatch, root signature only for root arguments); descriptor heap type 4 = CBV / SRV / UAV.
 - **#52** SetDebugFlagsX → S_OK, **#56 / #66** SerializePipelineStateX → E_ACCESSDENIED (as the release runtime),
-  **#57 / #67** DeserializePipelineStateX → E_NOTIMPL (console pipeline caches hold console shaders; not decoded yet),
-  **#74 / #75** page pools (index registry). Every other device slot from #44: a logged stub answering S_OK.
+  **#57 / #67** DeserializePipelineStateX → E_NOTIMPL (a console pipeline cache is the console driver's format with
+  console shaders: `state = { root signature @0; parts { pointer; length }[] @8 }`; nothing decodes it yet – the format
+  needs blobs from the exe), **#74 / #75** page pools (index registry). Every other device slot from #44: a logged stub
+  answering S_OK.
+- **#55 CreateDerivedPipelineStateX**(base, count, patches, riid, out): patches `{ u32 part; payload }` at a 0x14C
+  stride replace parts of the base's desc – 0 depth-stencil (0x34 bytes), 1 rasterizer (0x2C), 2 blend (0x148),
+  3 sample mask; part 5 (0x30 bytes, meaning unknown) is ignored, others fail. Title graphics pipelines (#10 / #60 /
+  derived ones) keep their desc with the input layout copied; the shaders stay the title's and are checked by hash
+  before deriving (none of that for pipelines with stream output).
 - The test title copies a buffer placed at its own `XMemAlloc` graphics memory through a DMA queue / allocator / list
-  created through #48 / #9 / #73 and checks the remaining slots.
-- Not yet: CreateDerivedPipelineStateX #55 (patches over a base PSO's desc), deserializing console pipeline caches,
-  placed textures at title addresses (detiling).
+  created through #48 / #9 / #73, checks the remaining slots, and draws with a pipeline from #60 and one derived from it
+  (#55, blend patch: green only → cyan over the blue clear).
+- Not yet: deserializing console pipeline caches, placed textures at title addresses (detiling).
 
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /

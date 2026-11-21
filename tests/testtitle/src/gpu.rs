@@ -341,7 +341,7 @@ pub fn console_device_methods() -> Result<(), String> {
         let n = 0x1_0000usize;
         let graphics = 1u64 << 29;
         let mem = crate::XMemAlloc(n, graphics) as *mut u32;
-        ensure!(!mem.is_null() && mem as usize % n == 0, "graphics memory {mem:?}");
+        ensure!(!mem.is_null() && (mem as usize).is_multiple_of(n), "graphics memory {mem:?}");
         for i in 0..n / 4 {
             *mem.add(i) = 0xC0DE_0000 | i as u32;
         }
@@ -424,7 +424,29 @@ pub fn render_triangle() -> Result<(), String> {
             "vs_5_0",
         )?;
         let ps = compile("float4 main() : SV_Target { return float4(0, 1, 0, 1); }", "ps_5_0")?;
-        let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&pso_desc(&rs, bc(&vs), bc(&ps))).map_err(e)?;
+        // console pipeline creation: #60 CreateGraphicsPipelineStateX, then #55
+        // CreateDerivedPipelineStateX with a blend patch writing only green and alpha
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        type PsoX = unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        type DerivedX = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const u8, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        let desc = pso_desc(&rs, bc(&vs), bc(&ps));
+        let mut raw = std::ptr::null_mut();
+        let hr = std::mem::transmute::<usize, PsoX>(slot(dev.as_raw(), 60))(dev.as_raw(), &desc, 0, std::ptr::null(), &ID3D12PipelineState::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateGraphicsPipelineStateX hr={hr:#x}");
+        let pso = ID3D12PipelineState::from_raw(raw);
+        let mut blend = desc.BlendState;
+        blend.RenderTarget[0].RenderTargetWriteMask = (D3D12_COLOR_WRITE_ENABLE_GREEN.0 | D3D12_COLOR_WRITE_ENABLE_ALPHA.0) as u8;
+        let mut patch = [0u8; 0x14C];
+        patch[0] = 2; // blend state
+        std::ptr::copy_nonoverlapping(&blend as *const _ as *const u8, patch.as_mut_ptr().add(4), std::mem::size_of::<D3D12_BLEND_DESC>());
+        let derive: DerivedX = std::mem::transmute(slot(dev.as_raw(), 55));
+        let mut raw = std::ptr::null_mut();
+        let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateDerivedPipelineStateX hr={hr:#x}");
+        let derived = ID3D12PipelineState::from_raw(raw);
+        patch[0] = 4;
+        let hr = derive(dev.as_raw(), pso.as_raw(), 1, patch.as_ptr(), &ID3D12PipelineState::IID, &mut raw);
+        ensure!(hr < 0, "an unknown patch part must fail (hr={hr:#x})");
 
         let (w, h) = (64u32, 64u32);
         let tex = D3D12_RESOURCE_DESC {
@@ -494,6 +516,10 @@ pub fn render_triangle() -> Result<(), String> {
         xslot::<SetRootSignature>(&list, X_SET_GRAPHICS_ROOT_SIGNATURE)(list.as_raw(), rs.as_raw());
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list.DrawInstanced(3, 1, 0, 0);
+        // the derived pipeline in the top-left quadrant: green over the blue clear = cyan
+        list.SetPipelineState(&derived);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: (w / 2) as f32, Height: (h / 2) as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        list.DrawInstanced(3, 1, 0, 0);
         let barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -533,8 +559,10 @@ pub fn render_triangle() -> Result<(), String> {
         };
         let center = px(32, 32);
         let corner = px(1, 1);
+        let quadrant = px(16, 16);
         rb.Unmap(0, None);
         ensure!(center == [0, 255, 0, 255], "centre pixel {center:?} (expected green triangle)");
+        ensure!(quadrant == [0, 255, 255, 255], "top-left quadrant {quadrant:?} (expected cyan: the derived pipeline writes green only)");
         ensure!(corner == [0, 0, 255, 255], "corner pixel {corner:?} (expected blue clear colour)");
         Ok(())
     }
