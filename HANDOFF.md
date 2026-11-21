@@ -611,6 +611,14 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   path Fortnite plays through).
 - Nested occlusion queries: Fortnite nests its per-object queries in a dummy outer one, so the inner ones are now the
   real queries and the outer one ends early and resolves as visible (it was the other way round).
+- Console DLLs every analysed title (Fortnite, XDefiant, Terraria, Trackmania – TomBox's library map) imports from, which
+  XCL did not route (their imports became stubs returning 0): `minuserx.dll` (the console user32: CreateWindowExW,
+  RegisterClassW, PeekMessageW, DefWindowProcW…) → the PC user32; `kernel32legacy.dll` (Fortnite: GetProcessAffinityMask,
+  SetThreadAffinityMask – the title sees the PC's processors), `advapi32legacy.dll` (RegOpenKeyW) → kernelx;
+  `minappmodelx.dll` → kernelx's Register/UnregisterApp{State,Constrained}ChangeNotification (a registration, the
+  callbacks never come: titles are not suspended or constrained here).
+- XGameRuntime task queues: handles are looked up in a set of live ones before being read – an XAsync completing on a
+  worker after its queue was closed read freed memory (a rare lib-test panic in `queue_from`).
 
 ## Device as IDXGIDevice, XMemVirtualAlloc (session 5, 2026-11-21)
 - The console D3D12 device is also an IDXGIDevice / 1 / 2: Microsoft's public GDK samples (ATG DeviceResources) take the

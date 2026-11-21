@@ -73,6 +73,8 @@ pub const XGAMERUNTIME: &str = "xgameruntime.dll";
 pub const D3D12X: &str = "d3d12_xs.dll";
 pub const XAUDIO2: &str = "xaudio2_9.dll";
 pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
+/// the console's user32 subset (windows, the message loop): the PC user32
+pub const MINUSERX: &str = "minuserx.dll";
 
 fn build(config: &Config) -> Registry {
     let modules = vec![
@@ -81,6 +83,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
         HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
+        HleModule::new(MINUSERX, Vec::new(), &["user32.dll"]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -101,7 +104,19 @@ fn build(config: &Config) -> Registry {
         }
     }
     let k = idx(KERNELX);
-    for p in ["kernelx.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll", "api-ms-win-core-*", "ext-ms-win-core-*"] {
+    // the console's *legacy / minappmodelx DLLs: kernel32 / advapi32 functions (Fortnite takes
+    // GetProcessAffinityMask / SetThreadAffinityMask from kernel32legacy) and app-state notifications
+    for p in [
+        "kernelx.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "advapi32.dll",
+        "kernel32legacy.dll",
+        "advapi32legacy.dll",
+        "minappmodelx.dll",
+        "api-ms-win-core-*",
+        "ext-ms-win-core-*",
+    ] {
         routes.push((p.into(), Route::Hle(k)));
     }
     let x = idx(XGAMERUNTIME);
@@ -116,6 +131,8 @@ fn build(config: &Config) -> Registry {
     for p in ["xaudio2_9.dll", "xaudio2_9redist.dll"] {
         routes.push((p.into(), Route::Hle(a)));
     }
+    let u = idx(MINUSERX);
+    routes.push((MINUSERX.into(), Route::Hle(u)));
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));

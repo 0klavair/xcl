@@ -359,6 +359,21 @@ mod tests {
     /// advapi32 imports go to kernelx: the registry functions the GDK thunks use for the device
     /// type are XCL's, everything else is the real advapi32.
     #[test]
+    fn console_user32_and_legacy_dlls_reach_the_pc_functions() {
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let (a, s) = resolve_inner("minuserx.dll", &name("PeekMessageW"), 0);
+        assert!(a != 0 && matches!(s, Source::System(ref d) if d == "user32.dll"), "{s:?}");
+        let (a, s) = resolve_inner("minuserx.dll", &name("CreateWindowExW"), 0);
+        assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
+        let (a, s) = resolve_inner("kernel32legacy.dll", &name("GetProcessAffinityMask"), 0);
+        assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
+        let (a, s) = resolve_inner("minappmodelx.dll", &name("RegisterAppStateChangeNotification"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+        let (a, s) = resolve_inner("advapi32legacy.dll", &name("RegOpenKeyW"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+    }
+
+    #[test]
     fn advapi32_imports_route_through_kernelx() {
         let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
         let (a, s) = resolve_inner("advapi32.dll", &name("RegOpenKeyW"), 0);

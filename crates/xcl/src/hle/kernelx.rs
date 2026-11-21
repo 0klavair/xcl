@@ -54,6 +54,11 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         AllocateTitlePhysicalPages,
         FreeTitlePhysicalPages,
         MapTitlePhysicalPages,
+        // app state (minappmodelx): a title is never suspended or constrained here
+        RegisterAppStateChangeNotification,
+        UnregisterAppStateChangeNotification,
+        RegisterAppConstrainedChangeNotification,
+        UnregisterAppConstrainedChangeNotification,
         // threads / system
         SetThreadName,
         GetThreadName,
@@ -482,6 +487,32 @@ pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, ar
 pub unsafe extern "system" fn XMemFreePhysicalPages(n: usize, arr: *mut u64) -> BOOL {
     FreeTitlePhysicalPages(std::mem::zeroed(), n, arr as *mut usize)
 }
+
+// ---------------------------------------------------------------------------------------
+// App state (minappmodelx.dll, appnotify.h)
+// ---------------------------------------------------------------------------------------
+
+/// The registration handed out: the callbacks are never called (XCL does not suspend titles
+/// or constrain them for the system UI).
+static APP_NOTIFICATION: u8 = 0;
+
+/// `ULONG RegisterAppStateChangeNotification(routine, context, PAPPSTATE_REGISTRATION* out)`
+pub unsafe extern "system" fn RegisterAppStateChangeNotification(_routine: usize, _ctx: *mut c_void, out: *mut *const u8) -> u32 {
+    if out.is_null() {
+        return fnd::ERROR_INVALID_PARAMETER;
+    }
+    *out = &APP_NOTIFICATION;
+    0
+}
+
+pub unsafe extern "system" fn UnregisterAppStateChangeNotification(_registration: *const u8) {}
+
+/// `ULONG RegisterAppConstrainedChangeNotification(routine, context, PAPPCONSTRAIN_REGISTRATION* out)`
+pub unsafe extern "system" fn RegisterAppConstrainedChangeNotification(routine: usize, ctx: *mut c_void, out: *mut *const u8) -> u32 {
+    RegisterAppStateChangeNotification(routine, ctx, out)
+}
+
+pub unsafe extern "system" fn UnregisterAppConstrainedChangeNotification(_registration: *const u8) {}
 
 // ---------------------------------------------------------------------------------------
 // Threads / system info
@@ -965,9 +996,10 @@ mod tests {
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, outside.as_mut_ptr()).is_null());
             let mut wrapping = [usize::MAX];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, wrapping.as_mut_ptr()).is_null());
-            let used = u.used();
+            // freed: the block is gone (other tests use UMA at the same time, so not `u.used()`)
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
-            assert_eq!(u.used(), used - 3 * PHYS_PAGE);
+            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&pages[0]));
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
         }
     }
 

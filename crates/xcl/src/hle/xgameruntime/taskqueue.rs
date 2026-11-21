@@ -6,7 +6,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -270,13 +270,23 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
 // handles + process queue
 // ---------------------------------------------------------------------------------------
 
+/// Live queue handles: a handle is only read while it is in here (under the lock), so one
+/// closed on another thread – or a stale value in an XAsyncBlock – is not dereferenced.
+static HANDLES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
 pub fn new_handle(q: Arc<Queue>) -> *mut QueueHandle {
-    Box::into_raw(Box::new(QueueHandle { magic: MAGIC, queue: q }))
+    let h = Box::into_raw(Box::new(QueueHandle { magic: MAGIC, queue: q }));
+    HANDLES.lock().unwrap().get_or_insert_with(HashSet::new).insert(h as usize);
+    h
 }
 
 pub unsafe fn queue_from(h: *mut c_void) -> Option<Arc<Queue>> {
     if h.is_null() {
         return process_queue();
+    }
+    let live = HANDLES.lock().unwrap();
+    if !live.as_ref().is_some_and(|s| s.contains(&(h as usize))) {
+        return None;
     }
     let qh = &*(h as *const QueueHandle);
     (qh.magic == MAGIC).then(|| qh.queue.clone())
@@ -340,8 +350,9 @@ pub unsafe extern "system" fn XTaskQueueCloseHandle(h: *mut c_void) {
     if h.is_null() {
         return;
     }
-    let qh = h as *mut QueueHandle;
-    if (*qh).magic == MAGIC {
+    let removed = HANDLES.lock().unwrap().as_mut().is_some_and(|s| s.remove(&(h as usize)));
+    if removed {
+        let qh = h as *mut QueueHandle;
         (*qh).magic = 0;
         drop(Box::from_raw(qh));
     }
@@ -501,6 +512,19 @@ pub unsafe extern "system" fn XTaskQueueUnregisterMonitor(_h: *mut c_void, _toke
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn closed_and_stray_handles_are_not_read() {
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(0, 0, &mut h), 0);
+            assert!(queue_from(h).is_some());
+            XTaskQueueCloseHandle(h);
+            assert!(queue_from(h).is_none(), "a closed handle");
+            XTaskQueueCloseHandle(h); // twice: nothing to free
+            assert!(queue_from(0x1235 as *mut c_void).is_none(), "a stray (misaligned) value is not dereferenced");
+        }
+    }
     use super::*;
     use std::sync::atomic::AtomicU32;
 
