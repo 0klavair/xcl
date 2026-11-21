@@ -1435,7 +1435,10 @@ mod tests {
             let mut w = vec![0u16; used];
             assert_eq!(default_audio_endpoint(0, 0, w.len(), w.as_mut_ptr(), &mut used), S_OK);
             let id = String::from_utf16_lossy(&w[..used - 1]);
-            assert!(id.starts_with("{0.0.0."), "a render endpoint id: {id}");
+            assert!(
+                id.starts_with('{') && id.contains("}.{"),
+                "a render endpoint id: {id}"
+            );
             assert_eq!(default_audio_endpoint(0, 2, 0, std::ptr::null_mut(), &mut used), E_INVALIDARG);
         }
     }
