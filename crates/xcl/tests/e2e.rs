@@ -175,6 +175,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let d = &report["d3d12"];
     assert_eq!(d["backend"], "real", "d3d12: {d}");
     assert!(d["fallback_pipelines"].as_u64().unwrap_or(0) >= 1, "d3d12: {d}");
+    // PresentX through queue slot 30, the frame presented in XCL's window
+    assert!(d["frame_boundaries"].as_u64().unwrap_or(0) >= 1 && d["presents"].as_u64().unwrap_or(0) >= 1, "d3d12: {d}");
     let classes: Vec<&str> = d["classes"].as_array().unwrap().iter().filter_map(|c| c["interface"].as_str()).collect();
     assert!(classes.iter().any(|c| c.starts_with("ID3D12Device")), "classes: {classes:?}");
     assert!(classes.iter().any(|c| c.starts_with("ID3D12GraphicsCommandList")), "classes: {classes:?}");

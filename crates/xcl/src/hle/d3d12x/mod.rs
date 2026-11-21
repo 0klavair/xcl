@@ -11,6 +11,7 @@
 
 pub mod console_heap;
 pub mod console_list;
+pub mod frame;
 pub mod guard;
 pub mod layout;
 pub mod null;

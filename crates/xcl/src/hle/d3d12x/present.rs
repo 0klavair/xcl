@@ -1,13 +1,15 @@
 //! Presentation for the real backend.
 //!
 //! Console titles do not use DXGI swap chains: they render into their own back buffers
-//! and call `PresentX` (a console-only queue method whose slot is not public). XCL:
-//! * remembers which resource every RTV descriptor points to (CreateRenderTargetView),
-//! * remembers the first render target of each command list (OMSetRenderTargets),
-//! * after ExecuteCommandLists picks the latest back-buffer-like render target,
-//! * presents it in its own window – on every call of a console-only queue method
-//!   (very likely PresentX → exact frame boundaries), or rate-limited after submissions
-//!   when no such call has been seen.
+//! and call `PresentX` – command queue slot 30, `PresentX(planeCount, planes, parameters)`
+//! with plane 0 `{ u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }` (as
+//! observed on Fortnite). XCL presents that resource in its own window at once and tells the
+//! frame clock (`frame`) the token flipped.
+//!
+//! Until a title's first `PresentX`, a fallback guesses the frame: XCL remembers which
+//! resource every RTV descriptor points to and the first render target of each command list,
+//! and after ExecuteCommandLists presents the latest back-buffer-like render target – on a
+//! call of another console-only queue method, or rate-limited after submissions.
 //!
 //! The back buffer is copied on the title's own queue (implicit promotion from
 //! COMMON/PRESENT state, which consoles require before PresentX).
@@ -37,6 +39,43 @@ static PRESENTS: AtomicU64 = AtomicU64::new(0);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+/// the title called PresentX: the fallback guessing is off
+static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
+/// the frame; S_OK always (a console present does not fail for the title).
+pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, planes: *const u8, _params: *const u8) -> i32 {
+    if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
+        return 0;
+    }
+    super::frame::mark_flipped((planes as *const u64).read_unaligned());
+    BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    if !PRESENTX.swap(true, Ordering::Relaxed) {
+        crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
+    }
+    let count = (planes.add(8) as *const u32).read_unaligned();
+    let list = (planes.add(0x10) as *const usize).read_unaligned();
+    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+        return 0;
+    }
+    let res = (list as *const usize).read_unaligned();
+    if res == 0 {
+        return 0;
+    }
+    {
+        let mut c = CANDIDATE.lock().unwrap();
+        if c.map(|(_, r)| r) != Some(res) {
+            add_ref(res);
+            if let Some((_, old)) = c.replace((queue as usize, res)) {
+                release(old);
+            }
+        } else if let Some(cur) = c.as_mut() {
+            cur.0 = queue as usize;
+        }
+    }
+    present_now(Duration::ZERO);
+    0
+}
 
 thread_local! {
     static IN_PRESENT: Cell<bool> = const { Cell::new(false) };
@@ -112,7 +151,7 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
 }
 
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || IN_PRESENT.with(|c| c.get()) {
+    if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;
     }
     let handle = {
@@ -143,7 +182,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
 
 /// StubHook for console-only queue methods (PresentX, frame events, …).
 pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
-    if !enabled() {
+    if !enabled() || PRESENTX.load(Ordering::Relaxed) {
         return;
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);

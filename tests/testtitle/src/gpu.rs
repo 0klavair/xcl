@@ -230,6 +230,86 @@ pub fn pso_capture_and_fallback() -> Result<(), String> {
     }
 }
 
+/// Console presentation as a title does it: a 60 Hz frame clock (device #78 / #79), the
+/// origin wait that hands out the frame token (#80), a cleared 640×360 back buffer handed to
+/// `PresentX` (queue #30) with that token, then the frame's statistics (#81).
+pub fn present_x_frame() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let d = dev.as_raw();
+        let set_interval: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32) -> HRESULT = std::mem::transmute(slot(d, 78));
+        let schedule: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32) -> HRESULT = std::mem::transmute(slot(d, 79));
+        let wait_event: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32, *mut u64) -> HRESULT = std::mem::transmute(slot(d, 80));
+        let statistics: unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u8) -> HRESULT = std::mem::transmute(slot(d, 81));
+        ensure!(set_interval(d, std::ptr::null_mut(), 16667, 1, 0) >= 0, "SetFrameIntervalX");
+        ensure!(schedule(d, 0, 0, std::ptr::null(), 0) >= 0, "ScheduleFrameEventX (origin)");
+        let mut token = 0u64;
+        let hr = wait_event(d, 0, 500, std::ptr::null(), 0, &mut token);
+        ensure!(hr == 0 && token != 0, "WaitFrameEventX hr={hr:#x} token={token}");
+
+        let (w, h) = (640u32, 360u32);
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut bb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut bb)
+            .map_err(e)?;
+        let bb = bb.ok_or("no back buffer")?;
+        let heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .map_err(e)?;
+        let start: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(heap.as_raw(), 9));
+        let rtv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
+        dev.CreateRenderTargetView(&bb, None, rtv);
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        list.ClearRenderTargetView(rtv, &[0.1, 0.5, 0.9, 1.0], None);
+        // consoles want the back buffer in COMMON / PRESENT for PresentX
+        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: transmute_copy(&bb),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    StateAfter: D3D12_RESOURCE_STATE_PRESENT,
+                }),
+            },
+        }]);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+
+        // plane 0: { u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }
+        let resources = [bb.as_raw()];
+        let mut plane = [0u8; 0x40];
+        plane[..8].copy_from_slice(&token.to_le_bytes());
+        plane[8..12].copy_from_slice(&1u32.to_le_bytes());
+        plane[0x10..0x18].copy_from_slice(&(resources.as_ptr() as u64).to_le_bytes());
+        let present: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const u8) -> HRESULT = std::mem::transmute(slot(queue.as_raw(), 30));
+        let hr = present(queue.as_raw(), 1, plane.as_ptr(), std::ptr::null());
+        ensure!(hr == 0, "PresentX hr={hr:#x}");
+        let (mut n, mut stats) = (1u32, [0u8; 0x40]);
+        let hr = statistics(d, token, 0, &mut n, stats.as_mut_ptr());
+        ensure!(hr == 0 && n == 1, "GetFrameStatisticsX hr={hr:#x} count={n}");
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        queue.Signal(&fence, 1).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+        ensure!(set_interval(d, std::ptr::null_mut(), 0, 0, 0) >= 0, "stopping the frame clock");
+        Ok(())
+    }
+}
+
 pub fn render_triangle() -> Result<(), String> {
     unsafe {
         let dev = device()?;

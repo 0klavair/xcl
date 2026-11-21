@@ -460,6 +460,12 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     for (slot, f) in console_slots(kind) {
         if slot < public {
             v[1 + slot] = super::guard::make_split(f, v[1 + slot]);
+        } else if slot < scanned {
+            // an internal method of the runtime there (e.g. queue #30 = PresentX): the title
+            // gets the console method, the runtime keeps its own
+            v[1 + slot] = super::guard::make_split(f, *ot.add(slot));
+        } else if slot < total {
+            v[1 + slot] = f;
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -512,6 +518,12 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (24, dev_copy_descriptors_simple_x as usize),
                 (62, dev_create_compute_pso_x as usize),
                 (76, dev_create_committed_resource_x as usize),
+                // frame pacing (SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX,
+                // GetFrameStatisticsX)
+                (78, super::frame::set_frame_interval_x as usize),
+                (79, super::frame::schedule_frame_event_x as usize),
+                (80, super::frame::wait_frame_event_x as usize),
+                (81, super::frame::frame_statistics_x as usize),
             ];
             if super::console_list::enabled() {
                 v.push((12, dev_create_command_list_x as usize));
@@ -520,6 +532,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
+        Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
         _ => vec![],
     }
 }
