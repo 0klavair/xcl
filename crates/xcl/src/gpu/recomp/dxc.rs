@@ -179,7 +179,7 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
 fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
-        let Some(dir) = candidates().into_iter().find(|dir| dir.join("dxcompiler.dll").is_file()) else {
+        let Ok(dir) = location() else {
             return "unavailable".into();
         };
         let mut h = 0xcbf2_9ce4_8422_2325u64;
