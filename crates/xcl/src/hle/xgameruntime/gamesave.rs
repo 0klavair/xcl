@@ -6,7 +6,7 @@ use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 
 use super::xasync::*;
-use crate::util::{from_cstr_ptr, E_INVALIDARG, HRESULT, S_OK};
+use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -315,11 +315,14 @@ fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> 
     Ok((out, picked.len() as u32))
 }
 
-unsafe fn names_of(names: *const *const u8, count: u32) -> Vec<String> {
-    if names.is_null() {
-        return Vec::new();
+unsafe fn names_of(names: *const *const u8, count: u32) -> Result<Vec<String>, HRESULT> {
+    if count == 0 {
+        return Ok(Vec::new());
     }
-    (0..count as usize).filter_map(|i| from_cstr_ptr(*names.add(i))).collect()
+    if names.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    (0..count as usize).map(|i| from_cstr_ptr(*names.add(i)).ok_or(E_INVALIDARG)).collect()
 }
 
 /// Turn the offsets of a copied layout into pointers.
@@ -336,7 +339,11 @@ pub unsafe extern "system" fn XGameSaveReadBlobData(c: *mut Container, names: *c
     if count.is_null() {
         return E_INVALIDARG;
     }
-    let (bytes, n) = match read_layout(&c.dir, &names_of(names, *count)) {
+    let requested = match names_of(names, *count) {
+        Ok(names) => names,
+        Err(e) => return e,
+    };
+    let (bytes, n) = match read_layout(&c.dir, &requested) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -353,7 +360,8 @@ static READ_ID: u8 = 0;
 
 pub unsafe extern "system" fn XGameSaveReadBlobDataAsync(c: *mut Container, names: *const *const u8, count: u32, b: *mut XAsyncBlock) -> HRESULT {
     let Some(c) = container(c) else { return E_INVALIDARG };
-    let (dir, list) = (c.dir.clone(), names_of(names, count));
+    let Ok(list) = names_of(names, count) else { return E_INVALIDARG };
+    let dir = c.dir.clone();
     begin_with(b, &READ_ID as *const u8 as usize, move || {
         let (mut bytes, n) = read_layout(&dir, &list)?;
         bytes.splice(0..0, n.to_le_bytes()); // count travels in front, dropped by the Result
@@ -367,6 +375,15 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     if hr < 0 {
         return hr;
     }
+    if need < std::mem::size_of::<u32>() {
+        return E_FAIL;
+    }
+    let body_size = need - std::mem::size_of::<u32>();
+    if out.is_null() || size < body_size {
+        // Do not consume the one-shot XAsync result until the caller can
+        // receive it; the documented insufficient-buffer retry must succeed.
+        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    }
     let mut tmp = vec![0u8; need];
     let hr = XAsyncGetResult(b, &READ_ID as *const u8 as *const c_void, need, tmp.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
     if hr < 0 {
@@ -374,9 +391,7 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     }
     let n = u32::from_le_bytes(tmp[..4].try_into().unwrap());
     let body = &tmp[4..];
-    if out.is_null() || size < body.len() {
-        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    }
+    debug_assert_eq!(body.len(), body_size);
     std::ptr::copy_nonoverlapping(body.as_ptr(), out as *mut u8, body.len());
     fix_up(out, n);
     if !count.is_null() {
@@ -480,6 +495,60 @@ mod tests {
     }
 
     #[test]
+    fn read_blob_names_require_a_complete_counted_array() {
+        unsafe {
+            let mut provider = std::ptr::null_mut();
+            assert_eq!(
+                XGameSaveInitializeProvider(
+                    std::ptr::null_mut(),
+                    b"olympus-read-name-validation\0".as_ptr(),
+                    false,
+                    &mut provider,
+                ),
+                S_OK
+            );
+            let _ = XGameSaveDeleteContainer(provider, b"slot\0".as_ptr());
+            let mut container = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(provider, b"slot\0".as_ptr(), &mut container), S_OK);
+            let mut update = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(container, std::ptr::null(), &mut update), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(update, b"data\0".as_ptr(), b"secret".as_ptr(), 6), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(update), S_OK);
+            XGameSaveCloseUpdate(update);
+
+            let mut count = 1u32;
+            let mut buffer = vec![0u64; 32];
+            assert_eq!(
+                XGameSaveReadBlobData(container, std::ptr::null(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                E_INVALIDARG
+            );
+            assert_eq!(count, 1, "invalid filter changed the caller's count");
+            let null_name = [std::ptr::null()];
+            assert_eq!(
+                XGameSaveReadBlobData(container, null_name.as_ptr(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                E_INVALIDARG
+            );
+
+            let mut async_block: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XGameSaveReadBlobDataAsync(container, std::ptr::null(), 1, &mut async_block), E_INVALIDARG);
+            assert_eq!(XAsyncGetStatus(&mut async_block, false), E_INVALIDARG, "invalid async filter started an operation");
+            assert_eq!(XGameSaveReadBlobDataAsync(container, null_name.as_ptr(), 1, &mut async_block), E_INVALIDARG);
+
+            // The documented empty filter remains the read-all form.
+            count = 0;
+            assert_eq!(
+                XGameSaveReadBlobData(container, std::ptr::null(), &mut count, 256, buffer.as_mut_ptr() as *mut Blob),
+                S_OK
+            );
+            assert_eq!(count, 1);
+
+            XGameSaveCloseContainer(container);
+            assert_eq!(XGameSaveDeleteContainer(provider, b"slot\0".as_ptr()), S_OK);
+            XGameSaveCloseProvider(provider);
+        }
+    }
+
+    #[test]
     fn containers_blobs_round_trip() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -517,7 +586,12 @@ mod tests {
             assert_eq!(XGameSaveReadBlobDataAsync(c, names.as_ptr(), 1, &mut blk), S_OK);
             assert_eq!(XAsyncGetStatus(&mut blk, true), S_OK);
             let mut buf2 = vec![0u64; 16];
-            let mut n2 = 0u32;
+            let mut n2 = u32::MAX;
+            assert_eq!(
+                XGameSaveReadBlobDataResult(&mut blk, 1, buf2.as_mut_ptr() as *mut Blob, &mut n2),
+                E_GS_PROVIDED_BUFFER_TOO_SMALL
+            );
+            assert_eq!(n2, u32::MAX, "failed result changed the output count");
             assert_eq!(XGameSaveReadBlobDataResult(&mut blk, 128, buf2.as_mut_ptr() as *mut Blob, &mut n2), S_OK);
             let b1 = &*(buf2.as_ptr() as *const Blob);
             assert_eq!((n2, std::slice::from_raw_parts(b1.data, 2)), (1, &b"xy"[..]));
