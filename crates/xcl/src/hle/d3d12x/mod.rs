@@ -15,6 +15,7 @@ pub mod guard;
 pub mod layout;
 pub mod null;
 pub mod present;
+pub mod pso_async;
 pub mod real;
 
 use std::ffi::c_void;

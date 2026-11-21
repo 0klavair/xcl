@@ -204,6 +204,10 @@ pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> R
             return Ok((b, true));
         }
     }
+    if CACHED_ONLY.with(|c| c.get()) {
+        MISSED.with(|m| m.set(true));
+        return Err("DXIL not compiled yet".into());
+    }
     let b = compile(src, entry, profile, &[])?;
     if std::fs::create_dir_all(dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
@@ -213,6 +217,26 @@ pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> R
         }
     }
     Ok((b, false))
+}
+
+thread_local! {
+    static CACHED_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` without compiling: a program missing from the disk cache fails at once instead
+/// (non-blocking pipeline creation). Returns `f`'s result and whether something was missing.
+pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    CACHED_ONLY.with(|c| c.set(true));
+    MISSED.with(|m| m.set(false));
+    let r = f();
+    CACHED_ONLY.with(|c| c.set(false));
+    (r, MISSED.with(|m| m.replace(false)))
+}
+
+/// Inside `cached_only`.
+pub fn in_cached_only() -> bool {
+    CACHED_ONLY.with(|c| c.get())
 }
 
 pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {

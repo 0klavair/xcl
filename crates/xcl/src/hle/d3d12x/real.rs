@@ -115,6 +115,9 @@ pub struct D3d12Stats {
     /// why console shaders could not be used (first messages)
     #[serde(default)]
     pub translation_errors: Vec<String>,
+    /// pipelines built in the background behind a stand-in: built, failed, still building
+    #[serde(default)]
+    pub background_pipelines: (usize, usize, usize),
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -257,6 +260,7 @@ pub fn stats() -> D3d12Stats {
         uma_error: UMA_ERROR.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
+        background_pipelines: super::pso_async::counts(),
     }
 }
 
@@ -1020,7 +1024,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
-        Kind::CommandList => v.push(("OMSetRenderTargets", cl_om_set_render_targets as usize)),
+        Kind::CommandList => v.extend_from_slice(&[("OMSetRenderTargets", cl_om_set_render_targets as usize), ("SetPipelineState", cl_set_pipeline_state as usize)]),
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
         Kind::Resource => v.push(("Release", res_release as usize)),
@@ -1110,6 +1114,25 @@ struct Dummy {
     cs: Vec<u8>,
 }
 
+/// Stand-in mesh shader and pixel shader (DXIL, as mesh pipelines need): one degenerate
+/// triangle (DXC wants every output written), nothing drawn.
+fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
+    static D: OnceLock<Option<(Vec<u8>, Vec<u8>)>> = OnceLock::new();
+    D.get_or_init(|| {
+        use crate::gpu::recomp::dxc::compile;
+        let ms = "struct V { float4 p : SV_Position; };\n[outputtopology(\"triangle\")]\n[numthreads(1, 1, 1)]\nvoid main(out vertices V v[1], out indices uint3 t[1]) { SetMeshOutputCounts(1, 1); v[0].p = float4(0, 0, 0, 1); t[0] = uint3(0, 0, 0); }\n";
+        let ps = "float4 main() : SV_Target { return float4(1, 0, 1, 1); }\n";
+        match (compile(ms, "main", "ms_6_5", &[]), compile(ps, "main", "ps_6_0", &[])) {
+            (Ok(m), Ok(p)) => Some((m, p)),
+            (m, p) => {
+                crate::xlog_warn!("D3D12.X: stand-in mesh shaders: {:?} {:?}", m.err(), p.err());
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
 fn compile(src: &str, target: &str) -> Vec<u8> {
     unsafe {
         let mut blob = None;
@@ -1173,7 +1196,27 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
     hr
 }
 
+thread_local! {
+    /// translation errors noted during a cached-only attempt (`attempt`)
+    static ATTEMPT_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run a translated-pipeline path without compiling (`dxc::cached_only`): (its result, whether
+/// a shader was not compiled yet). Errors it noted count only when nothing was missing.
+fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    let (r, missed) = crate::gpu::recomp::dxc::cached_only(f);
+    let notes = ATTEMPT_NOTES.with(|n| std::mem::take(&mut *n.borrow_mut()));
+    if !missed {
+        notes.into_iter().for_each(note_translation_error);
+    }
+    (r, missed)
+}
+
 fn note_translation_error(e: String) {
+    if crate::gpu::recomp::dxc::in_cached_only() {
+        ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
+        return;
+    }
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
     if g.len() < 5 {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
@@ -1200,6 +1243,7 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
+    let pso = super::pso_async::resolve(pso);
     PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
@@ -1357,10 +1401,205 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     Some(hr)
 }
 
+// ---------------------------------------------------------------------------------------
+// non-blocking pipeline creation (see `pso_async`)
+// ---------------------------------------------------------------------------------------
+
+/// A pipeline description that owns what it points to (shader blobs, input layout and its
+/// semantic names), so a worker can build the pipeline after the title's memory is gone.
+/// The root signature pointer is kept as is (the translated paths replace it).
+#[allow(dead_code)] // the vectors only keep the copies alive
+enum OwnedDesc {
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+}
+
+unsafe impl Send for OwnedDesc {}
+
+impl OwnedDesc {
+    fn ptr(&self) -> *const c_void {
+        match self {
+            OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
+            OwnedDesc::Graphics(d, ..) => &**d as *const _ as *const c_void,
+            OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
+        }
+    }
+}
+
+/// Copy a shader blob into `blobs` and point `b` at the copy.
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+    if let Some(bytes) = shader_bytes(b) {
+        blobs.push(bytes.to_vec());
+        let v = blobs.last().unwrap();
+        *b = bytecode(v);
+    } else {
+        *b = D3D12_SHADER_BYTECODE::default();
+    }
+}
+
+unsafe fn own_compute(desc: *const c_void) -> Option<OwnedDesc> {
+    let mut d: Box<D3D12_COMPUTE_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC));
+    let mut blobs = Vec::new();
+    own_shader(&mut d.CS, &mut blobs);
+    d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    Some(OwnedDesc::Compute(d, blobs))
+}
+
+/// None with stream output (not copied; such pipelines are built in the call).
+unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
+    let mut d: Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC> = Box::new(std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC));
+    if d.StreamOutput.NumEntries > 0 {
+        return None;
+    }
+    let mut blobs = Vec::new();
+    for b in [&mut d.VS, &mut d.PS, &mut d.DS, &mut d.HS, &mut d.GS] {
+        own_shader(b, &mut blobs);
+    }
+    let n = d.InputLayout.NumElements as usize;
+    let mut elems = Vec::new();
+    let mut names = Vec::new();
+    if n > 0 && !d.InputLayout.pInputElementDescs.is_null() {
+        elems = std::slice::from_raw_parts(d.InputLayout.pInputElementDescs, n).to_vec();
+        for e in &mut elems {
+            names.push(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_owned());
+            e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
+        }
+    }
+    d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: if elems.is_empty() { std::ptr::null() } else { elems.as_ptr() }, NumElements: elems.len() as u32 };
+    d.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    Some(OwnedDesc::Graphics(d, blobs, elems, names))
+}
+
+/// A pipeline state stream with its shaders copied. None when another subobject points at
+/// title memory (input layout, stream output, view instancing).
+unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return None;
+    }
+    let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= size {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+        let (psize, palign) = super::null::subobject_payload(ty)?;
+        let at = off + if palign == 8 { 8 } else { 4 };
+        let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
+        match ty {
+            1..=6 | 24 | 25 => {
+                let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
+                if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
+                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
+                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                }
+            }
+            7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
+            19 => buf[at..at + 16].fill(0),
+            _ => {}
+        }
+        off += ((at - off) + psize + 7) & !7;
+    }
+    let d = Box::new([buf.len(), buf.as_ptr() as usize]);
+    Some(OwnedDesc::Stream(d, buf, blobs))
+}
+
+/// Raw pointers a worker needs (the device lives for the process).
+#[derive(Clone, Copy)]
+struct Dev(usize, usize);
+unsafe impl Send for Dev {}
+
+/// The stand-in for a pipeline with dummy shaders (draws / computes nothing).
+unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let d = dummy();
+    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    copy.VS = bytecode(&d.vs);
+    copy.PS = bytecode(&d.ps);
+    copy.DS = D3D12_SHADER_BYTECODE::default();
+    copy.HS = D3D12_SHADER_BYTECODE::default();
+    copy.GS = D3D12_SHADER_BYTECODE::default();
+    copy.StreamOutput = std::mem::zeroed();
+    copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
+    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
+}
+
+unsafe fn standin_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    copy.CS = bytecode(&dummy().cs);
+    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
+}
+
+unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let Some((buf, _)) = fallback_stream(desc as *const u8) else { return E_INVALIDARG };
+    let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
+    finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
+}
+
+/// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
+unsafe fn go_background(
+    this: *mut c_void,
+    f: PsoFn,
+    desc: *const c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+    compute: bool,
+    owned: OwnedDesc,
+    standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
+) -> Option<HRESULT> {
+    let hr = standin(this, f, desc, riid, ppv);
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        static ONCE: AtomicU64 = AtomicU64::new(0);
+        if ONCE.fetch_add(1, Ordering::Relaxed) < 3 {
+            crate::xlog_warn!("D3D12.X: no stand-in pipeline ({hr:#x}) – building this one in the call");
+        }
+        return None;
+    }
+    let dev = Dev(this as usize, f as usize);
+    super::pso_async::submit(
+        *ppv as usize,
+        compute,
+        Box::new(move || {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
+                out as usize
+            } else {
+                0
+            }
+        }),
+    );
+    Some(hr)
+}
+
+unsafe fn build_graphics(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    let iid = pc_iid(Kind::PipelineState);
+    matches!(translated_graphics_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(hr) if hr >= 0)
+}
+
+unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    let iid = pc_iid(Kind::PipelineState);
+    matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
+}
+
+unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    let iid = pc_iid(Kind::PipelineState);
+    matches!(translated_mesh_stream(dev.0 as *mut c_void, d.ptr(), &iid, out), Some(hr) if hr >= 0)
+}
+
 unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
-    if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
+    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
+    if missed {
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
+            return hr;
+        }
+        if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
+            return hr;
+        }
+    } else if let Some(hr) = translated {
         return hr;
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
@@ -1389,7 +1628,16 @@ unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *cons
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let console = translated_compute_pso(this, f, desc, riid, ppv);
+    let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
+    if missed {
+        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
+            // a console program the worker is translating (its root signature comes with it)
+            LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+            LAST_COMPUTE_RS.with(|c| c.set(0));
+            return hr;
+        }
+        console = translated_compute_pso(this, f, desc, riid, ppv);
+    }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
         return hr;
@@ -1436,6 +1684,7 @@ static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mut
 
 /// The compute pass of a pipeline state XCL built from console MS / GS code.
 pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
+    let pso = super::pso_async::resolve(pso);
     TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
@@ -1624,6 +1873,8 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
+    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
@@ -1636,10 +1887,10 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         };
         match ty {
             1 => put(&mut buf, &d.vs),
-            2 => put(&mut buf, &d.ps),
+            2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
-            3 | 4 | 5 => put(&mut buf, &[]),
-            24 | 25 => return None, // mesh pipelines need SM6.5 stand-ins
+            3 | 4 | 5 | 24 => put(&mut buf, &[]),
+            25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
@@ -1652,7 +1903,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
 unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
+    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
+    if missed {
+        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {
+            return hr;
+        }
+        if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
+            return hr;
+        }
+    } else if let Some(hr) = translated {
         return hr;
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
@@ -1727,6 +1986,13 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     if n > 0 && !rtvs.is_null() {
         super::present::note_rt0(this as usize, *rtvs);
     }
+}
+
+/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
+unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
+    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {

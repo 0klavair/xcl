@@ -104,6 +104,8 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
     let before = real::stats();
     let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState through the backend hook");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    // built in the background behind a stand-in when its shaders were not compiled yet
+    xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize);
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shaders: {:?}", after.translation_errors);
     assert_eq!(after.fallback_pipelines, before.fallback_pipelines, "fallback shaders were used");
@@ -116,7 +118,15 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
 #[test]
 fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
-    let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)]);
+    let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT);
+    check_untextured_triangle(&dev, &pso);
+}
+
+const UNTEXTURED_LAYOUT: [(&CStr, DXGI_FORMAT, u32); 2] = [(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)];
+
+/// Draw a triangle with the retail untextured VS / PS pipeline `pso` and check every pixel
+/// against the same transform and interpolation on the CPU.
+fn check_untextured_triangle(dev: &ID3D12Device, pso: &ID3D12PipelineState) {
     // the pipeline's own root signature (static samplers from the console code)
     let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
@@ -151,7 +161,7 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
         vertices.extend_from_slice(p);
         vertices.extend_from_slice(c);
     }
-    let px = runner::draw_on(&dev, &pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("draw");
+    let px = runner::draw_on(dev, pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("draw");
 
     // expected: the same transform on the CPU → pixel-space triangle → interpolated colour
     let to_px = |p: [f32; 3]| {
@@ -183,6 +193,83 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     }
     println!("checked pixels: {inside} inside, {outside} outside; triangle {a:?} {b:?} {c:?}");
     assert!(inside > 400 && outside > 2500, "too few checked pixels: {inside} / {outside}");
+}
+
+/// Non-blocking pipeline creation with an empty DXIL cache: the call returns a stand-in at
+/// once, the real pipeline is built in the background – and it renders exactly like one built
+/// in the call; a mesh pipeline's two-pass parts are found through its stand-in once built.
+#[test]
+fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
+    use xcl::hle::d3d12x::pso_async;
+    let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
+    let cold = std::env::temp_dir().join(format!("xcl-async-pso-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cold);
+    std::env::set_var("XCL_DXIL_CACHE", &cold);
+    let built_before = pso_async::counts().0;
+    let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT); // waits for the real one
+    let raw = pso.as_raw() as usize;
+    assert_eq!(pso_async::counts().0, built_before + 1, "built in the background");
+    let real = pso_async::resolve(raw);
+    assert_ne!(real, raw, "the real pipeline replaces the stand-in");
+    assert!(real::pso_root_signature(raw).is_some(), "the stand-in resolves to the real pipeline's root signature");
+    let real_pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&(real as *mut std::ffi::c_void)) }.unwrap().clone();
+    check_untextured_triangle(&dev, &real_pso);
+    // the shaders are in the cache now: the next pipeline is built in the call
+    let again = pso_through_hook(&dev, &blobs[0], &blobs[1], &UNTEXTURED_LAYOUT);
+    assert!(!pso_async::is_pending(again.as_raw() as usize) && pso_async::resolve(again.as_raw() as usize) == again.as_raw() as usize);
+
+    // a mesh pipeline (MS + PS of one pass) the same way
+    let data = std::fs::read(std::env::var("XCL_SAMPLE_RPF").unwrap()).unwrap();
+    let recs = pack::scan(&data, 0x40);
+    let (ms, ps) = recs
+        .iter()
+        .filter(|r| r.name.starts_with("MS"))
+        .find_map(|r| {
+            let h = pass_hash(&r.name)?;
+            let pr = recs.iter().find(|p| p.name.starts_with("PS_") && pass_hash(&p.name) == Some(h))?;
+            Some((pack::inflate(&data, r)?.to_vec(), pack::inflate(&data, pr)?.to_vec()))
+        })
+        .unwrap();
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    #[repr(C, align(8))]
+    struct Sub<T> {
+        ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+        v: T,
+    }
+    #[repr(C)]
+    struct Stream {
+        rs: Sub<*mut std::ffi::c_void>,
+        ms: Sub<D3D12_SHADER_BYTECODE>,
+        ps: Sub<D3D12_SHADER_BYTECODE>,
+        rt: Sub<D3D12_RT_FORMAT_ARRAY>,
+    }
+    let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+    rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    let st = Stream {
+        rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: game_rs.as_raw() },
+        ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: code(&ms) },
+        ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: code(&ps) },
+        rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
+    };
+    let d2: ID3D12Device2 = dev.cast().unwrap();
+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: std::mem::size_of::<Stream>(), pPipelineStateSubobjectStream: &st as *const _ as *mut _ };
+    let t0 = std::time::Instant::now();
+    let mesh: ID3D12PipelineState = unsafe { d2.CreatePipelineState(&desc) }.expect("mesh stand-in");
+    let call = t0.elapsed();
+    let raw = mesh.as_raw() as usize;
+    assert!(pso_async::is_pending(raw) && real::two_pass_of(raw).is_none(), "a mesh stand-in, no compute pass yet");
+    drop(st); // the title's description is gone; the worker builds from its own copy
+    assert_ne!(pso_async::resolve_wait(raw), raw);
+    assert!(real::two_pass_of(raw).is_some(), "the two-pass parts through the stand-in");
+    println!("mesh: the call returned after {call:?}, the real pipeline was ready after {:?}", t0.elapsed());
+    std::env::remove_var("XCL_DXIL_CACHE");
+    let _ = std::fs::remove_dir_all(&cold);
 }
 
 /// Texel (x, y) of the two test textures, RGBA8.

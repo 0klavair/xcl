@@ -50,7 +50,7 @@ measurements and next steps:
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 24 064 / 24 064 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
-| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers | GPU tests drawing the game's own VS / PS pairs |
+| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | 🟡 | device, resources, heaps and pipelines are in place | draw submission and present need the game exe |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes), mip chains with mip tail, arrays and cubes → PC textures | 908 / 912 retail textures exact; GPU upload bit exact |
@@ -69,9 +69,9 @@ measurements and next steps:
 | Needs a game executable | Not done yet | Not planned |
 |---|---|---|
 | D3D12.X draw records and `PresentX` / frame pacing | – | Xbox Live, Store licensing (offline by design) |
-| root arguments → shader registers for graphics | non-blocking pipeline creation (first run compiles shaders synchronously) | decrypting XVC packages or any DRM |
-| texture creation in title memory (binding the detiler) | Opus / XMA2 audio decoding | console SDK headers / binaries in the repository |
-| the persistent-local-storage class and `XSystemGetDeviceType` slot of the thunk protocol | hull / domain / amplification shaders (none in the sample game), linear / 3D / MSAA tiled textures | |
+| root arguments → shader registers for graphics | Opus / XMA2 audio decoding | decrypting XVC packages or any DRM |
+| texture creation in title memory (binding the detiler) | hull / domain / amplification shaders (none in the sample game) | console SDK headers / binaries in the repository |
+| the persistent-local-storage class and `XSystemGetDeviceType` slot of the thunk protocol | linear / 3D / MSAA tiled textures | |
 | Bink GPU decoding, rehydrating prebuilt BVHs | performance work (GPU buffers live in system memory) | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

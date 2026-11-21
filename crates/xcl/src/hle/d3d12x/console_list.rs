@@ -686,8 +686,10 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[1] = (table_at >> 32) as u32;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
+                        // a pipeline still being built in the background is waited for
+                        let real = super::pso_async::resolve_wait((*p).pc);
                         // the pipeline's own root signature when it has static samplers
-                        let own = ((*p).rs != 0).then(|| (*p).rs as *mut c_void);
+                        let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
                             None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
@@ -697,7 +699,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
                         }
-                        let raw = (*p).pc as *mut c_void;
+                        let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         list.Dispatch(x, y, z);

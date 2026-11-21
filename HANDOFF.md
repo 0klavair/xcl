@@ -536,6 +536,26 @@ Nothing open.
   Unexplained: 6 packets per subblock with a table difference of 12·960 – TOC 0xFC is CELT FB 20 ms **stereo**, so the table
   probably counts samples × channels.
 
+## Non-blocking pipeline creation (session 5, 2026-11-21)
+- **Gap:** DXC ran in the title's `Create*PipelineState` call: 0.2 s median, seconds for big programs – thousands of
+  pipelines while a title loads meant minutes of stall on the first run (the DXIL disk cache helps only later runs).
+- **Now** (`hle/d3d12x/pso_async.rs` + `real.rs`): every translated path is first tried with `dxc::cached_only` (no
+  compiling; a miss fails at once – `attempt`, translation errors of a missed attempt are dropped). All DXIL cached →
+  built in the call as before. Otherwise the title gets a **stand-in** at once (dummy shaders, its own description:
+  `standin_graphics` / `standin_compute` / `standin_stream`; mesh stand-ins are DXIL: `dummy_mesh`, one degenerate
+  triangle) and the same `translated_*` path runs on a worker (`pso_async::submit`, one thread per core, 64 MB stacks)
+  on an **owned copy** of the description (`OwnedDesc`: shader blobs, input layout + semantic names, stream subobjects;
+  stream output / input layout in a stream / view instancing → built in the call).
+- **Binding:** `SetPipelineState` on PC command lists (new override), console list replay, `two_pass_of`,
+  `pso_root_signature` go through `pso_async::resolve` – the real pipeline once built. Graphics draws nothing until then;
+  compute is waited for at its first bind / replay (`resolve_wait`; a skipped dispatch would corrupt results).
+  `report.json → d3d12.background_pipelines` = (built, failed, still building). `XCL_ASYNC_PSO=0` turns it off.
+- Tests: `retail_pipelines_built_in_the_background_behind_a_stand_in` (empty DXIL cache: the game's VS/PS pipeline built
+  in the background renders the same triangle pixel for pixel; a mesh pipeline returns after ~0.1 s, real after ~1 s,
+  two-pass parts found through the stand-in, title's description freed before the worker ran); the game's BVH builder
+  with an empty cache (52 programs compiled in the background, compute waited for at replay) builds BLAS + TLAS.
+- Not yet: releasing a stand-in does not release its real pipeline (pipelines live until the process ends).
+
 ## Title memory above 4 GB: UMA windows (session 5, 2026-11-21)
 - **Gap:** shaders addressed one `mem` buffer with the low 32 bits of the address, and D3D12 opens a heap from an
   address only below 4 GiB (4095 MiB) – so at most 4 GB of title graphics memory, while a Series X title has ~13.5 GB.
