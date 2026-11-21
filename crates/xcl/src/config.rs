@@ -61,7 +61,7 @@ impl Config {
         if self.title_memory == "auto" {
             let m = manifest.and_then(|m| if series_s { m.lockhart_memory.clone() } else { m.anaconda_memory.clone() });
             if let Some(m) = &m {
-                from.push(format!("pamięć tytułu {m}"));
+                from.push(format!("title memory {m}"));
             }
             self.title_memory = m.unwrap_or_else(|| "standard".into()).to_ascii_lowercase();
         }
@@ -134,11 +134,11 @@ impl Default for Config {
     }
 }
 
-const HEADER: &str = "# XCL – konfiguracja tytułu. Plik tworzony automatycznie; można go edytować.\n\
-# device_type: \"anaconda\" (Series X) lub \"lockhart\" (Series S)\n\
-# mounts: prefiks ścieżki konsolowej -> folder ({game} = folder gry, tylko odczyt; {data} = dane XCL)\n\
-# aliases: wzorzec DLL -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
-# stub_returns: \"dll!Funkcja\" -> wartość zwracana przez zaślepkę (np. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
+const HEADER: &str = "# XCL – title configuration. Created automatically; you can edit it.\n\
+# device_type: \"anaconda\" (Series X) or \"lockhart\" (Series S)\n\
+# mounts: console path prefix -> folder ({game} = game folder, read-only; {data} = XCL data)\n\
+# aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
+# stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
 
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {

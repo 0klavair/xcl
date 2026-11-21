@@ -1,7 +1,7 @@
 //! Console-shaped command lists and pipeline states.
 //!
 //! D3D12.X code compiled into a title writes command records straight into the command list
-//! object (HANDOFF: "Format listy poleceń D3D12.X"): +0x18 write pointer, +0x28 / +0x30
+//! object (HANDOFF: "D3D12.X command list format"): +0x18 write pointer, +0x28 / +0x30
 //! bounds, +0x344 + 4·i root parameter headers (filled by SetComputeRootSignature), and it
 //! copies 28 bytes from +0x10 of the pipeline state object into the stream. So the title gets
 //! XCL objects with that layout; the records are turned into PC commands at `close`:
@@ -169,7 +169,7 @@ pso_forward!(pso_3 = 3, pso_4 = 4, pso_5 = 5, pso_6 = 6, pso_7 = 7, pso_8 = 8);
 fn pso_vtable() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        let mut v: Vec<usize> = (0..PSO_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12PipelineState(konsola)::#{i}"), 0).0).collect();
+        let mut v: Vec<usize> = (0..PSO_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12PipelineState(console)::#{i}"), 0).0).collect();
         let known: [usize; 9] = [pso_qi as usize, pso_addref as usize, pso_release as usize, pso_3 as usize, pso_4 as usize, pso_5 as usize, pso_6 as usize, pso_7 as usize, pso_8 as usize];
         v[..9].copy_from_slice(&known);
         Box::leak(v.into_boxed_slice()).as_ptr() as usize
@@ -310,7 +310,7 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     match close(this) {
         Ok(_) => S_OK,
         Err(e) => {
-            crate::xlog_error!("lista konsoli: Close – {e}");
+            crate::xlog_error!("console list: Close – {e}");
             crate::util::E_FAIL
         }
     }
@@ -338,7 +338,7 @@ unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32)
 }
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     if pso.is_null() || *(pso as *const usize) != pso_vtable() {
-        crate::xlog_warn!("lista konsoli: SetPipelineState z obiektem spoza XCL ({pso:?}) – pomijam");
+        crate::xlog_warn!("console list: SetPipelineState with an object not from XCL ({pso:?}) – skipping");
         return;
     }
     let words: [u32; 7] = std::ptr::read((pso as usize + 0x10) as *const [u32; 7]);
@@ -348,7 +348,7 @@ unsafe extern "system" fn cl_set_compute_root_signature(this: *mut c_void, rs: *
     let obj = this as usize;
     let n = layout_of(rs as usize).map(|l| l.params.len()).unwrap_or(0);
     if n == 0 {
-        crate::xlog_warn!("lista konsoli: SetComputeRootSignature – nieznany układ ({rs:?})");
+        crate::xlog_warn!("console list: SetComputeRootSignature – unknown layout ({rs:?})");
     }
     for i in 0..MAX_PARAMS {
         *((obj + F_HEADERS + 4 * i) as *mut u32) = header(i);
@@ -398,7 +398,7 @@ unsafe extern "system" fn cl_copy_buffer_region(this: *mut c_void, dst: usize, d
 /// rect count, rects) – amd_fidelityfx_upscaler_xbox.dll picks #54 for float targets
 unsafe fn clear_uav(this: *mut c_void, float: bool, gpu: u64, cpu: u64, res: usize, values: *const u32, rects: u32) {
     if rects != 0 {
-        crate::xlog_warn!("lista konsoli: ClearUnorderedAccessView z {rects} prostokątami – czyszczę całość");
+        crate::xlog_warn!("console list: ClearUnorderedAccessView with {rects} rectangles – clearing the whole view");
     }
     let mut w = vec![CLEAR_UAV_MARKER, float as u32];
     for v in [gpu, cpu, res as u64] {
@@ -441,7 +441,7 @@ unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usi
 fn list_vtable() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
-        let mut v: Vec<usize> = (0..LIST_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12GraphicsCommandList(konsola)::#{i}"), 0).0).collect();
+        let mut v: Vec<usize> = (0..LIST_SLOTS).map(|i| crate::stubs::make_stub_info(DLL, &format!("ID3D12GraphicsCommandList(console)::#{i}"), 0).0).collect();
         // console slots found on XboxBvhBuilder.dll (HANDOFF)
         for (slot, f) in [
             (0, cl_qi as usize),
@@ -558,17 +558,17 @@ pub struct Translation {
 pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let obj = obj as usize;
     let mut guard = LISTS.lock().unwrap();
-    let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("to nie jest lista konsoli XCL")?;
+    let st = guard.as_mut().and_then(|m| m.get_mut(&obj)).ok_or("not an XCL console list")?;
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("brak listy PC")?.clone();
+    let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("no PC list")?.clone();
     // created with the first translated pipeline (without one every dispatch is skipped)
     let rs = super::real::abi_rs_cached().and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
     let uma_va = super::real::uma_gpu_va();
-    let u = crate::gpu::uma::get().ok_or("brak UMA")?;
+    let u = crate::gpu::uma::get().ok_or("no UMA")?;
     if uma_va == 0 {
-        return Err("bufor UMA nie jest otwarty na GPU".into());
+        return Err("the UMA buffer is not open on the GPU".into());
     }
     let va = |p: usize| uma_va + (p - u.base()) as u64;
     let mut out = Translation::default();
@@ -678,7 +678,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
                 match pso {
                     Some(p) if (*p).translated => {
-                        let table_at = uma_copy(st, &table).ok_or("UMA: tablica argumentów")?;
+                        let table_at = uma_copy(st, &table).ok_or("UMA: argument table")?;
                         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
                         io[0] = table_at as u32;
                         io[1] = (table_at >> 32) as u32;
@@ -688,7 +688,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let own = ((*p).rs != 0).then(|| (*p).rs as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
                             Some(r) => list.SetComputeRootSignature(r),
-                            None => list.SetComputeRootSignature(rs.as_ref().ok_or("brak root signature ABI XCL")?),
+                            None => list.SetComputeRootSignature(rs.as_ref().ok_or("no XCL ABI root signature")?),
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
@@ -744,7 +744,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     drop(guard);
     if std::env::var_os("XCL_CONSOLE_LISTS_LOG").is_some() {
         crate::xlog_info!(
-            "lista konsoli: {} dispatchy, {} pominiętych (PSO bez tłumaczenia), {} barier, {} czyszczeń, {} kopii, {} pominiętych rekordów",
+            "console list: {} dispatches, {} skipped (PSO without a translation), {} barriers, {} clears, {} copies, {} skipped records",
             out.dispatches,
             out.skipped_dispatches,
             out.barriers,
@@ -754,7 +754,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
         );
     }
     if let Some((w, at)) = out.unknown {
-        crate::xlog_warn!("lista konsoli: nieznany rekord {w:#010x} (słowo {at}) – reszta pominięta");
+        crate::xlog_warn!("console list: unknown record {w:#010x} (word {at}) – rest skipped");
     }
     list.Close().map_err(|e| format!("Close: {e}"))?;
     Ok(out)

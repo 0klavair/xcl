@@ -337,23 +337,23 @@ pub unsafe fn install(
         SEQ.fetch_add(1, Ordering::Relaxed),
         safe
     ));
-    std::fs::write(&path, &bytes).map_err(|e| format!("zapis nośnika TLS {}: {e}", path.display()))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("writing the TLS carrier {}: {e}", path.display()))?;
     let h = LoadLibraryW(wide(&path.to_string_lossy()).as_ptr());
     if h.is_null() {
         return Err(format!(
-            "LoadLibrary nośnika TLS nie powiodło się (błąd {})",
+            "LoadLibrary of the TLS carrier failed (error {})",
             windows_sys::Win32::Foundation::GetLastError()
         ));
     }
     let index = *((h as usize + (DATA_RVA + OFF_INDEX) as usize) as *const u32);
     if index == NO_INDEX {
-        return Err("Windows nie przydzielił slotu TLS dla nośnika (katalog TLS zignorowany)".into());
+        return Err("Windows did not allocate a TLS slot for the carrier (TLS directory ignored)".into());
     }
     *index_ptr = index;
     img.index.store(index, Ordering::Release);
     let n = fill_existing_threads(&img, index);
     crate::xlog_info!(
-        "TLS: {img_name}: szablon {template_len} B, blok {size} B, indeks {index}, wątków zainicjowanych: {n}"
+        "TLS: {img_name}: template {template_len} B, block {size} B, index {index}, threads initialized: {n}"
     );
     Ok(index)
 }

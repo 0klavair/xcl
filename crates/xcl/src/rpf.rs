@@ -31,7 +31,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if !data.starts_with(pack::RPF9_MAGIC) {
-        eprintln!("xcl rpf: {} nie jest paczką RPF9", path.display());
+        eprintln!("xcl rpf: {} is not an RPF9 package", path.display());
         return 2;
     }
     let recs = pack::scan(&data, 0x40);
@@ -40,20 +40,20 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let heads: Vec<usize> = data.windows(4).enumerate().filter(|(i, w)| i % 0x800 == 0 && *w == pack::RPF9_MAGIC).map(|(i, _)| i).collect();
         let toc = |h: usize| data.get(h + 0x40..h + 0x60).map(|b| b.to_vec()).unwrap_or_default();
         let same = heads.len() > 1 && heads.iter().all(|&h| toc(h) == toc(heads[0]));
-        println!("{}: {:.1} MB, brak rekordów z jawnymi nazwami", path.display(), data.len() as f64 / 1048576.0);
-        println!("archiwa RPF9 (nagłówki co 2 KB): {}", heads.len());
+        println!("{}: {:.1} MB, no records with plain names", path.display(), data.len() as f64 / 1048576.0);
+        println!("RPF9 archives (headers every 2 KB): {}", heads.len());
         for &h in heads.iter().take(top) {
             let w = |o: usize| u32::from_le_bytes(data[h + o..h + o + 4].try_into().unwrap());
-            println!("  {h:#010x}: pola {:#x} {:#x} {:#x}", w(4), w(8), w(12));
+            println!("  {h:#010x}: fields {:#x} {:#x} {:#x}", w(4), w(8), w(12));
         }
         if same {
-            println!("TOC zaszyfrowany: wszystkie archiwa zaczynają spis od tych samych bajtów (stały klucz z gry) – bez exe nie do odczytania");
+            println!("TOC encrypted: every archive starts its table of contents with the same bytes (a fixed key from the game) – unreadable without the exe");
         }
         return 0;
     }
     let (csum, usum): (usize, usize) = recs.iter().fold((0, 0), |a, r| (a.0 + r.csize, a.1 + r.usize));
     println!(
-        "{}: {:.1} MB, {} rekordów, spakowane {:.1} MB → {:.1} MB",
+        "{}: {:.1} MB, {} records, packed {:.1} MB → {:.1} MB",
         path.display(),
         data.len() as f64 / 1048576.0,
         recs.len(),
@@ -66,7 +66,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let mut shown = 0;
     let mut extracted = 0;
     for r in &recs {
-        let ext = r.name.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_else(|| "(bez rozszerzenia)".into());
+        let ext = r.name.rsplit_once('.').map(|x| x.1.to_ascii_lowercase()).unwrap_or_else(|| "(no extension)".into());
         let e = by_ext.entry(ext).or_default();
         e.0 += 1;
         e.1 += r.usize;
@@ -89,15 +89,15 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             }
         }
     }
-    println!("rozszerzenia (rekordy, rozmiar po rozpakowaniu):");
+    println!("extensions (records, unpacked size):");
     for (k, (n, s)) in &by_ext {
         println!("  {k:<20} {n:>7} {:>10.1} MB", *s as f64 / 1048576.0);
     }
     let mut m: Vec<_> = by_magic.into_iter().collect();
     m.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("sygnatury danych (z próbki): {}", m.iter().take(12).map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", "));
+    println!("data signatures (from a sample): {}", m.iter().take(12).map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join(", "));
     if extract.is_some() {
-        println!("wypakowano {extracted} do {}", out.display());
+        println!("extracted {extracted} to {}", out.display());
     }
     0
 }

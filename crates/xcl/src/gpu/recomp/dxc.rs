@@ -64,7 +64,7 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
                 }
             }
         }
-        Err("nie znaleziono dxcompiler.dll (ustaw XCL_DXC_DIR albo zainstaluj Windows SDK)".into())
+        Err("dxcompiler.dll not found (set XCL_DXC_DIR or install the Windows SDK)".into())
     })
     .as_ref()
     .map_err(|e| e.clone())
@@ -125,7 +125,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                 };
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
-                    .unwrap_or_else(|_| Err("DXC: panika w wątku kompilacji".into()));
+                    .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
                 let _ = job.reply.send(r);
             });
         }
@@ -137,8 +137,8 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: brak wątków kompilacji".to_string())?;
-    rx.recv().map_err(|_| "DXC: wątek kompilacji zakończył się".to_string())?
+    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {

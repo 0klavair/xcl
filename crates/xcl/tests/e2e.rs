@@ -56,7 +56,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let dll = bin_dir.join("testgame_mw.dll");
     assert!(
         title.is_file() && dll.is_file(),
-        "brak {} / {} – zbuduj najpierw: cargo build --workspace",
+        "missing {} / {} – build first: cargo build --workspace",
         title.display(),
         dll.display()
     );
@@ -83,19 +83,19 @@ fn test_title_runs_and_game_folder_is_untouched() {
     println!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
 
     assert!(
-        stdout.contains("konsola: importuje kernelx.dll") && !stdout.contains("UWAGA"),
-        "launcher powinien rozpoznać tytuł konsolowy"
+        stdout.contains("console: imports kernelx.dll") && !stdout.contains("WARNING"),
+        "the launcher should recognize a console title"
     );
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
-    assert!(fails.is_empty(), "nieudane sprawdzenia w tytule testowym:\n{}", fails.join("\n"));
-    assert!(stdout.contains("xcl_testtitle: koniec, błędów: 0"), "tytuł testowy nie doszedł do końca");
-    assert!(out.status.success(), "kod wyjścia {:?}", out.status.code());
+    assert!(fails.is_empty(), "failed checks in the test title:\n{}", fails.join("\n"));
+    assert!(stdout.contains("xcl_testtitle: done, failures: 0"), "the test title did not run to the end");
+    assert!(out.status.success(), "exit code {:?}", out.status.code());
 
     // (2) the game folder is untouched
-    assert_eq!(snapshot(&game), before, "FOLDER GRY ZOSTAŁ ZMIENIONY");
+    assert_eq!(snapshot(&game), before, "GAME FOLDER WAS MODIFIED");
 
     // (2b) MicrosoftGame.config (tests/data/testgame): PLS quota and the title memory mode
-    assert!(stdout.contains("MicrosoftGame.Config: pamięć tytułu Advanced, PLS 2048 MB"), "launcher: {stdout}");
+    assert!(stdout.contains("MicrosoftGame.Config: title memory Advanced, PLS 2048 MB"), "launcher: {stdout}");
     let boot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.join("XCL.TestTitle").join("cache").join("boot.json")).unwrap()).unwrap();
     let c = &boot["config"];
     assert_eq!((c["pls_mb"].as_u64(), c["title_memory"].as_str(), c["uma_mb"].as_u64()), (Some(2048), Some("advanced"), Some(4095)));
@@ -165,7 +165,7 @@ fn test_title_runs_and_game_folder_is_untouched() {
         assert_eq!(a["buffers_silenced"], 1, "audio: {a}");
         assert_eq!(a["source_voice_errors"], 0, "audio: {a}");
     } else {
-        eprintln!("e2e: brak urządzenia audio – głosy XAudio2 niesprawdzone ({a})");
+        eprintln!("e2e: no audio device – XAudio2 voices not checked ({a})");
     }
 
     // (6) real D3D12 backend: genuine GPU objects, console shader replaced by a stand-in

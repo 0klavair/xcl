@@ -177,7 +177,7 @@ pub fn uma_gpu_va() -> u64 {
 
 unsafe fn open_uma(device: &ID3D12Device) {
     let Some(u) = crate::gpu::uma::get() else {
-        *UMA_ERROR.lock().unwrap() = "brak regionu UMA".into();
+        *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
     let r = (|| -> Result<(usize, u64), String> {
@@ -203,11 +203,11 @@ unsafe fn open_uma(device: &ID3D12Device) {
     })();
     match r {
         Ok(b) => {
-            crate::xlog_info!("D3D12.X: UMA ({} MB) otwarta jako sterta GPU, bufor pod VA {:#x}", u.size() >> 20, b.1);
+            crate::xlog_info!("D3D12.X: UMA ({} MB) opened as a GPU heap, buffer at VA {:#x}", u.size() >> 20, b.1);
             *UMA_BUFFER.lock().unwrap() = Some(b);
         }
         Err(e) => {
-            crate::xlog_warn!("D3D12.X: UMA niedostępna dla GPU: {e}");
+            crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
             *UMA_ERROR.lock().unwrap() = e;
         }
     }
@@ -273,7 +273,7 @@ pub fn init() -> Result<String, String> {
             if D3D12GetDebugInterface(&mut dbg).is_ok() {
                 if let Some(d) = dbg {
                     d.EnableDebugLayer();
-                    crate::xlog_info!("D3D12: warstwa debug włączona");
+                    crate::xlog_info!("D3D12: debug layer enabled");
                 }
             }
         }
@@ -297,9 +297,9 @@ pub fn init() -> Result<String, String> {
         if device.is_none() {
             let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
             D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| format!("D3D12CreateDevice(WARP): {e}"))?;
-            name = "WARP (renderer programowy)".into();
+            name = "WARP (software renderer)".into();
         }
-        let device = device.ok_or("brak urządzenia")?;
+        let device = device.ok_or("no device")?;
         open_uma(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
@@ -421,12 +421,12 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     }
     let hook = if kind == Kind::CommandQueue { super::present::on_queue_console_method as usize } else { 0 };
     for i in public..scanned {
-        let info = stubs::new_info(DLL, &format!("{}::#{i} (spoza PC)", iface.name), 0);
+        let info = stubs::new_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v[1 + i] = super::guard::make_guard(v[1 + i], info);
     }
     for i in scanned..total {
-        let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (spoza PC)", iface.name), 0);
+        let (addr, info) = stubs::make_stub_info(DLL, &format!("{}::#{i} (not on PC)", iface.name), 0);
         info.hook.store(hook, Ordering::Release);
         v.push(addr);
     }
@@ -454,7 +454,7 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let ext = leaked.as_ptr() as usize + 8;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
-        "D3D12.X: {} – {public} metod PC, {} slotów wewnętrznych pod strażnikiem, +{EXTRA_SLOTS} zaślepek",
+        "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs",
         iface.name,
         scanned - public
     );
@@ -545,7 +545,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         let gpu = if d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
         if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler) {
-            crate::xlog_warn!("sterta deskryptorów konsoli: brak miejsca w UMA na {} slotów", d[1]);
+            crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
         }
     }
     hr
@@ -659,7 +659,7 @@ unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, cle
         u.free(p);
         static ONCE: AtomicU64 = AtomicU64::new(0);
         if ONCE.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::xlog_warn!("bufor konsoli w UMA: CreatePlacedResource {hr:#x} – zostaje zasób osobny (shader go nie zobaczy)");
+            crate::xlog_warn!("console buffer in UMA: CreatePlacedResource {hr:#x} – keeping a separate resource (the shader will not see it)");
         }
         return None;
     }
@@ -673,9 +673,9 @@ unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, cle
             if r.Map(0, None, Some(&mut m)).is_ok() {
                 r.Unmap(0, None);
                 if m as usize != p {
-                    crate::xlog_warn!("bufor konsoli w UMA: Map zwraca {m:?}, a nie {p:#x} – zapisy CPU nie trafią pod adres konsoli");
+                    crate::xlog_warn!("console buffer in UMA: Map returns {m:?}, not {p:#x} – CPU writes will not reach the console address");
                 } else {
-                    crate::xlog_info!("bufory konsoli w UMA: Map = adres konsoli ({p:#x})");
+                    crate::xlog_info!("console buffers in UMA: Map = console address ({p:#x})");
                 }
             }
         }
@@ -707,7 +707,7 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
 
 fn note_buffer_view() {
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("widok bufora w stercie konsoli: bufor nie jest w UMA – shader dostanie pusty V# (num_records 0)");
+        crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
     }
 }
 
@@ -759,7 +759,7 @@ static MIXED_COPIES: AtomicU64 = AtomicU64::new(0);
 
 fn note_mixed_copy() {
     if MIXED_COPIES.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("CopyDescriptors (konsola): zakres spoza stert konsoli XCL – kopiowanie tylko na PC");
+        crate::xlog_warn!("CopyDescriptors (console): range outside the XCL console heaps – copying on the PC only");
     }
 }
 
@@ -911,7 +911,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
         let w = |o: usize| *((desc + o) as *const u32);
         crate::xlog_info!(
-            "CreateCommittedResource (konsola, slot 76): wymiar {} {}x{} format {} flagi {:#x}; pola konsoli za opisem PC: +52 {:#x} +56 {:#x}",
+            "CreateCommittedResource (console, slot 76): dimension {} {}x{} format {} flags {:#x}; console fields after the PC desc: +52 {:#x} +56 {:#x}",
             w(0),
             *((desc + 16) as *const u64),
             w(24),
@@ -920,7 +920,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             w(52),
             w(56)
         );
-        crate::xlog_info!("  opis (dwordy): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
+        crate::xlog_info!("  desc (dwords): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
     }
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
@@ -944,7 +944,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
-            "CreateCommittedResource (konsola): {hr:#x}; sterta typ {} cpu {} pula {}, flagi sterty {flags:#x}, stan {state:#x}",
+            "CreateCommittedResource (console): {hr:#x}; heap type {} cpu {} pool {}, heap flags {flags:#x}, state {state:#x}",
             pw(0),
             pw(4),
             pw(8)
@@ -964,7 +964,7 @@ unsafe extern "system" fn dev_create_command_list_x(this: *mut c_void, mask: usi
 
 unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *const c_void, a: usize, b: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if a != 0 || b != 0 {
-        crate::xlog_warn!("CreateComputePipelineState (konsola, slot 62): nieznane parametry {a:#x} {b:#x} pominięte");
+        crate::xlog_warn!("CreateComputePipelineState (console, slot 62): unknown parameters {a:#x} {b:#x} ignored");
     }
     let hr = dev_create_compute_pso(this, desc, riid, ppv);
     // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
@@ -1028,7 +1028,7 @@ unsafe extern "system" fn qi_override(this: *mut c_void, riid: *const GUID, ppv:
     if hr == E_NOINTERFACE && !riid.is_null() {
         let s = layout::guid_string(&*riid);
         if UNKNOWN_IIDS.lock().unwrap().insert(s.clone()) {
-            crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interfejs nieznany na PC (konsolowy?)");
+            crate::xlog_warn!("D3D12.X: QueryInterface({s}) – interface unknown on the PC (console-only?)");
         }
     }
     hr
@@ -1136,9 +1136,9 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
     let n = if ok { FALLBACK_PSO.fetch_add(1, Ordering::Relaxed) } else { FAILED_PSO.fetch_add(1, Ordering::Relaxed) };
     if n < 5 || n % 1000 == 0 {
         if ok {
-            crate::xlog_warn!("D3D12.X: {what} odrzucony przez sterownik ({hr:#x}) – użyto zastępczych shaderów (#{})", n + 1);
+            crate::xlog_warn!("D3D12.X: {what} rejected by the driver ({hr:#x}) – fallback shaders used (#{})", n + 1);
         } else {
-            crate::xlog_error!("D3D12.X: {what} odrzucony ({hr:#x}), także w wersji zastępczej (#{})", n + 1);
+            crate::xlog_error!("D3D12.X: {what} rejected ({hr:#x}), the fallback version too (#{})", n + 1);
         }
     }
 }
@@ -1160,7 +1160,7 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
 fn note_translation_error(e: String) {
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
     if g.len() < 5 {
-        crate::xlog_warn!("D3D12.X: shadery konsoli w PSO bez tłumaczenia: {e}");
+        crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
     }
     if g.len() < 20 && !g.contains(&e) {
         g.push(e);
@@ -1209,7 +1209,7 @@ unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::Sta
             Some(raw)
         }
         Err(e) => {
-            note_translation_error(format!("root signature ABI XCL z samplerami statycznymi: {e}"));
+            note_translation_error(format!("XCL ABI root signature with static samplers: {e}"));
             None
         }
     }
@@ -1234,7 +1234,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
             }
         }
         Err(e) => {
-            note_translation_error(format!("root signature ABI XCL: {e}"));
+            note_translation_error(format!("XCL ABI root signature: {e}"));
             None
         }
     }
@@ -1272,12 +1272,12 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("sterownik odrzucił obliczeniowy PSO z przetłumaczonym CS ({hr:#x})"));
+        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
-    crate::xlog_info!("D3D12.X: obliczeniowy PSO z przetłumaczonym CS konsoli ({} B DXIL)", dxil.len());
+    crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
     Some(Ok(hr))
 }
 
@@ -1292,7 +1292,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         return None;
     }
     if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
-        note_translation_error("PSO z HS/DS – jeszcze nieobsługiwane".into());
+        note_translation_error("PSO with HS/DS – not supported yet".into());
         return None;
     }
     if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
@@ -1330,13 +1330,13 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("sterownik odrzucił PSO z przetłumaczonymi shaderami ({hr:#x})"));
+        note_translation_error(format!("the driver rejected the PSO with the translated shaders ({hr:#x})"));
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: graficzny PSO z przetłumaczonych shaderów konsoli (#{})", n + 1);
+        crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{})", n + 1);
     }
     Some(hr)
 }
@@ -1362,7 +1362,7 @@ unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *cons
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    note_fallback("graficzny PSO", hr, hr2 >= 0);
+    note_fallback("graphics PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
     } else {
@@ -1388,7 +1388,7 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    note_fallback("obliczeniowy PSO", hr, hr2 >= 0);
+    note_fallback("compute PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
     } else {
@@ -1489,7 +1489,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
     if hr < 0 {
-        note_translation_error(format!("sterownik odrzucił pipeline mesh z {kind} konsoli ({hr:#x})"));
+        note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
@@ -1500,7 +1500,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut compute: *mut c_void = std::ptr::null_mut();
     let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
     if hc < 0 || compute.is_null() {
-        note_translation_error(format!("sterownik odrzucił przebieg obliczeniowy {kind} konsoli ({hc:#x})"));
+        note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
         release(*ppv);
         *ppv = std::ptr::null_mut();
@@ -1510,7 +1510,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline z {kind} konsoli w dwóch przebiegach (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
 }
@@ -1532,7 +1532,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
-        note_translation_error("pipeline mesh z AS – jeszcze nieobsługiwane".into());
+        note_translation_error("mesh pipeline with AS – not supported yet".into());
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
@@ -1644,12 +1644,12 @@ unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *co
         return hr;
     }
     let Some((buf, _)) = fallback_stream(desc as *const u8) else {
-        note_fallback("strumień PSO", hr, false);
+        note_fallback("PSO stream", hr, false);
         return hr;
     };
     let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
     let hr2 = finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv);
-    note_fallback("strumień PSO", hr, hr2 >= 0);
+    note_fallback("PSO stream", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
     } else {
@@ -1677,7 +1677,7 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
                 if hr2 >= 0 {
                     let n = FALLBACK_RS.fetch_add(1, Ordering::Relaxed);
                     if n < 5 {
-                        crate::xlog_warn!("D3D12.X: root signature odrzucona ({hr:#x}) – zastępcza pusta (#{})", n + 1);
+                        crate::xlog_warn!("D3D12.X: root signature rejected ({hr:#x}) – empty fallback (#{})", n + 1);
                     }
                     hr = hr2;
                 }

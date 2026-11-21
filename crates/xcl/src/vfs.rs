@@ -222,7 +222,7 @@ impl Vfs {
                 if self.existing_drives & (1 << bit) == 0 {
                     let mut u = self.unmapped.lock().unwrap();
                     if u.len() < 1000 && u.insert(p.clone()) {
-                        crate::xlog_warn!("[VFS] niezmapowana ścieżka konsolowa: {p}");
+                        crate::xlog_warn!("[VFS] unmapped console path: {p}");
                     }
                     return Target::Pass;
                 }
@@ -337,7 +337,7 @@ impl Vfs {
     fn record_write(&self, rel: &str) {
         let mut w = self.writes.lock().unwrap();
         if w.len() < 10_000 && w.insert(rel.to_string()) {
-            crate::xlog_info!("[VFS] zapis do pliku gry przekierowany do nakładki: {rel}");
+            crate::xlog_info!("[VFS] write to a game file redirected to the overlay: {rel}");
         }
     }
 

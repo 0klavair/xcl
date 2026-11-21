@@ -132,9 +132,9 @@ pub fn build() -> Report {
         audio: crate::hle::xaudio2::stats(),
         xgameruntime: crate::hle::xgameruntime::api::stats(),
         notes: vec![
-            "Metody D3D12.X spoza PC widać w called_stubs jako '<Interfejs>::#slot (spoza PC)'.".into(),
-            "Shadery w formacie konsolowym są zastępowane (fallback_pipelines) do czasu ukończenia recompilera RDNA2.".into(),
-            "Bezpośrednie wywołania Nt* na plikach nie przechodzą przez VFS.".into(),
+            "D3D12.X methods missing on PC show up in called_stubs as '<Interface>::#slot (not on PC)'.".into(),
+            "Console-format shaders are replaced (fallback_pipelines) until the RDNA2 recompiler is finished.".into(),
+            "Direct Nt* calls on files do not go through the VFS.".into(),
         ],
     }
 }

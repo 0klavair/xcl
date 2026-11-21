@@ -158,7 +158,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLOSE => {
-            crate::xlog_info!("okno XCL zamknięte – kończę proces gry");
+            crate::xlog_info!("XCL window closed – ending the game process");
             crate::report::write_final(None);
             crate::log::flush();
             windows::Win32::System::Threading::ExitProcess(0);
@@ -202,11 +202,11 @@ fn window_thread() {
             None,
         );
         let Ok(hwnd) = hwnd else {
-            crate::xlog_error!("nie udało się utworzyć okna XCL");
+            crate::xlog_error!("could not create the XCL window");
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("okno XCL utworzone ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -287,7 +287,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
-            crate::xlog_info!("prezentacja: swap chain {w}x{h} {:?}", fmt);
+            crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
             return true;
         }
         return false;
@@ -314,11 +314,11 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             p.w = w;
             p.h = h;
             p.fmt = fmt;
-            crate::xlog_info!("prezentacja: swap chain {w}x{h} {:?} – obraz gry pojawi się w oknie XCL", fmt);
+            crate::xlog_info!("present: swap chain {w}x{h} {:?} – the game image will appear in the XCL window", fmt);
             p.sc.is_some()
         }
         Err(e) => {
-            crate::xlog_error!("prezentacja: CreateSwapChainForHwnd: {e}");
+            crate::xlog_error!("present: CreateSwapChainForHwnd: {e}");
             false
         }
     }
@@ -383,7 +383,7 @@ unsafe fn present_now(min_interval: Duration) {
     p.last = Instant::now();
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        crate::xlog_info!("prezentacja: pierwsza klatka gry wyświetlona ({}x{})", desc.Width, desc.Height);
+        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
 }
 

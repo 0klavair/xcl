@@ -39,28 +39,28 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::Mutex
     static PACK: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
     let Some(data) = data else {
-        println!("XCL_SAMPLE_RPF nie ustawione – pomijam");
+        println!("XCL_SAMPLE_RPF not set – skipping");
         return None;
     };
     if xcl::gpu::recomp::dxc::location().is_err() {
-        println!("brak DXC – pomijam");
+        println!("no DXC – skipping");
         return None;
     }
     let recs = pack::scan(data, 0x40);
     let blobs: Vec<Vec<u8>> = names
         .iter()
         .map(|n| {
-            let r = recs.iter().find(|r| r.name == *n).unwrap_or_else(|| panic!("brak rekordu {n}"));
+            let r = recs.iter().find(|r| r.name == *n).unwrap_or_else(|| panic!("no record {n}"));
             let b = pack::inflate(data, r).unwrap();
-            assert!(xcl::gpu::xbox::is_xbox(&b), "{n}: oczekiwany kontener konsoli");
+            assert!(xcl::gpu::xbox::is_xbox(&b), "{n}: expected a console container");
             b
         })
         .collect();
     if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
-        println!("brak prawdziwego urządzenia D3D12 – pomijam");
+        println!("no real D3D12 device – skipping");
         return None;
     }
-    println!("urządzenie backendu: {}", real::stats().adapter);
+    println!("backend device: {}", real::stats().adapter);
     let raw = real::device_raw();
     Some((blobs, unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone(), serial))
 }
@@ -102,11 +102,11 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
     desc.RasterizerState.DepthClipEnable = true.into();
     desc.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
     let before = real::stats();
-    let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState przez hak backendu");
+    let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&desc) }.expect("CreateGraphicsPipelineState through the backend hook");
     unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
     let after = real::stats();
-    assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO nie powstał z przetłumaczonych shaderów: {:?}", after.translation_errors);
-    assert_eq!(after.fallback_pipelines, before.fallback_pipelines, "użyto zastępczych shaderów");
+    assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shaders: {:?}", after.translation_errors);
+    assert_eq!(after.fallback_pipelines, before.fallback_pipelines, "fallback shaders were used");
     pso
 }
 
@@ -118,7 +118,7 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
     let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)]);
     // the pipeline's own root signature (static samplers from the console code)
-    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature przetłumaczonego PSO") as *mut std::ffi::c_void;
+    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
 
     // explicit inputs: user SGPR s[8:9] → descriptor table at 0x100 with two V#s
@@ -151,7 +151,7 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
         vertices.extend_from_slice(p);
         vertices.extend_from_slice(c);
     }
-    let px = runner::draw_on(&dev, &pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("rysowanie");
+    let px = runner::draw_on(&dev, &pso, &rs, &vertices, 28, &io, &mem, SIZE, CLEAR).expect("draw");
 
     // expected: the same transform on the CPU → pixel-space triangle → interpolated colour
     let to_px = |p: [f32; 3]| {
@@ -173,16 +173,16 @@ fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
             if m > 0.02 {
                 let want: Vec<f32> = (0..4).map(|k| l1 * corners[0].1[k] + l2 * corners[1].1[k] + l3 * corners[2].1[k]).collect();
                 let ok = (0..4).all(|k| (got[k] - want[k]).abs() < 0.01);
-                assert!(ok, "piksel ({x},{y}) wewnątrz: {got:?}, oczekiwane {want:?}");
+                assert!(ok, "pixel ({x},{y}) inside: {got:?}, expected {want:?}");
                 inside += 1;
             } else if m < -0.02 {
-                assert_eq!(got, CLEAR, "piksel ({x},{y}) poza trójkątem");
+                assert_eq!(got, CLEAR, "pixel ({x},{y}) outside the triangle");
                 outside += 1;
             }
         }
     }
-    println!("sprawdzone piksele: {inside} wewnątrz, {outside} na zewnątrz; trójkąt {a:?} {b:?} {c:?}");
-    assert!(inside > 400 && outside > 2500, "za mało sprawdzonych pikseli: {inside} / {outside}");
+    println!("checked pixels: {inside} inside, {outside} outside; triangle {a:?} {b:?} {c:?}");
+    assert!(inside > 400 && outside > 2500, "too few checked pixels: {inside} / {outside}");
 }
 
 /// Texel (x, y) of the two test textures, RGBA8.
@@ -224,7 +224,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12), (c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 28)],
     );
     // the pipeline's own root signature (static samplers from the console code)
-    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature przetłumaczonego PSO") as *mut std::ffi::c_void;
+    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
 
     // console memory: texel data at the addresses the T#s name, constants, two descriptor tables
@@ -248,7 +248,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
     let mut textures = Vec::new();
     for t in [t_a, t_b] {
         let img = desc::image(&t).expect("T#");
-        assert_eq!(img.swizzle_mode, 0, "test używa liniowych tekstur");
+        assert_eq!(img.swizzle_mode, 0, "the test uses linear textures");
         let (res, srv) = desc::image_d3d12(&img).expect("format DXGI");
         assert_eq!((res.Width, res.Height, res.Format), (SIZE as u64, SIZE, DXGI_FORMAT_R8G8B8A8_UNORM));
         let at = img.address as usize;
@@ -265,7 +265,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         mem[(table + 0x20) / 4..(table + 0x20) / 4 + 8].copy_from_slice(&desc::xcl_image_words(&t, heap_index));
         mem[(table + 0x40) / 4..(table + 0x40) / 4 + 4].copy_from_slice(&vsharp(0x2000));
     }
-    assert_eq!(desc::xcl_sampler_words(&s_code, 0), s_code, "S# z kodu wskazuje sampler 0");
+    assert_eq!(desc::xcl_sampler_words(&s_code, 0), s_code, "the S# from the code points at sampler 0");
     // identity world and view-projection
     for (i, v) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0].iter().enumerate() {
         mem[0x1000 / 4 + i] = f(*v);
@@ -288,7 +288,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         runner::Draw { sgprs: user_data(0x100), scissor: [0, 0, half, SIZE as i32] },
         runner::Draw { sgprs: user_data(0x200), scissor: [half, 0, SIZE as i32, SIZE as i32] },
     ];
-    let px = runner::draw_on_multi(&dev, &pso, &rs, &vertices, 36, &draws, &mem, &textures, &[sampler], SIZE, CLEAR).expect("rysowanie");
+    let px = runner::draw_on_multi(&dev, &pso, &rs, &vertices, 36, &draws, &mem, &textures, &[sampler], SIZE, CLEAR).expect("draw");
 
     let unorm = |t: [u8; 4]| t.map(|c| c as f32 / 255.0);
     let (mut checked, mut changed) = (0, 0);
@@ -298,7 +298,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
             let a = unorm(texel_a(x, y));
             let b = unorm(texel_b(x, y));
             let want = if x < half as usize { a } else { [b[2], b[1], b[0], b[3]] };
-            assert!((0..4).all(|k| (got[k] - want[k]).abs() < 0.005), "piksel ({x},{y}): {got:?}, oczekiwane {want:?}");
+            assert!((0..4).all(|k| (got[k] - want[k]).abs() < 0.005), "pixel ({x},{y}): {got:?}, expected {want:?}");
             checked += 1;
             // right half: the second draw saw the other descriptor, not texture A
             if x >= half as usize && (0..4).any(|k| (got[k] - a[k]).abs() > 0.05) {
@@ -307,8 +307,8 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         }
     }
     let right = (SIZE * SIZE / 2) as usize;
-    println!("sprawdzone piksele: {checked}; po zmianie deskryptora różnych od tekstury A: {changed} / {right}");
-    assert!(changed > right * 9 / 10, "zmiana deskryptora między draw callami nie zmieniła wyniku: {changed} / {right}");
+    println!("checked pixels: {checked}; differing from texture A after the descriptor change: {changed} / {right}");
+    assert!(changed > right * 9 / 10, "changing the descriptor between draw calls did not change the result: {changed} / {right}");
 }
 
 /// Retail legacy GS: `VS_VoxelizeGeneric` (ES variant) + `GS_VoxelizeGeneric` translated as
@@ -322,7 +322,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
 fn retail_es_gs_voxelize_geometry_mode() {
     let Some((blobs, _dev, _serial)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
     use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
-    let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("para ES + GS");
+    let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("ES + GS pair");
     assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
     let t = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported_why);
@@ -359,16 +359,16 @@ fn retail_es_gs_voxelize_geometry_mode() {
     io[17] = es_tab;
     io[IO_GS_PRIMS] = 2;
     io[IO_GS_VERTICES] = vin;
-    let (px, r) = runner::mesh_draw(&cs, &ms, &ps, 1, rec.record_dwords(), &io, &mem, 64, [0.0; 4]).expect("rysowanie");
+    let (px, r) = runner::mesh_draw(&cs, &ms, &ps, 1, rec.record_dwords(), &io, &mem, 64, [0.0; 4]).expect("draw");
 
     let vd = rec.vert_dwords();
     let fl = |i: usize| f32::from_bits(r[i]);
-    assert_eq!((r[0], r[1]), (6, 2), "3 wierzchołki i 1 trójkąt na trójkąt wejściowy");
+    assert_eq!((r[0], r[1]), (6, 2), "3 vertices and 1 triangle per input triangle");
     let tri_at = MESH_HEADER + rec.max_vertices as usize * vd;
     let mut axes = Vec::new();
     for (t, tri) in tris.iter().enumerate() {
         let base = 3 * t;
-        assert_eq!(r[tri_at + t], (base | (base + 1) << 10 | (base + 2) << 20) as u32, "trójkąt {t}: indeksy");
+        assert_eq!(r[tri_at + t], (base | (base + 1) << 10 | (base + 2) << 20) as u32, "triangle {t}: indices");
         // true normal and the two coordinates that are not the dominant axis
         let (e1, e2) = ([0, 1, 2].map(|k| tri[1][k] - tri[0][k]), [0, 1, 2].map(|k| tri[2][k] - tri[0][k]));
         let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
@@ -380,17 +380,17 @@ fn retail_es_gs_voxelize_geometry_mode() {
             let v = MESH_HEADER + (base + i) * vd;
             let pos = [fl(v), fl(v + 1), fl(v + 2), fl(v + 3)];
             let (axis, tc1, tc3) = (r[v + 4], [fl(v + 8), fl(v + 9), fl(v + 10), fl(v + 11)], [fl(v + 12), fl(v + 13), fl(v + 14)]);
-            println!("trójkąt {t} wierzchołek {i}: pos {pos:?} oś {axis} TEXCOORD1 {tc1:?} TEXCOORD3 {tc3:?}");
+            println!("triangle {t} vertex {i}: pos {pos:?} axis {axis} TEXCOORD1 {tc1:?} TEXCOORD3 {tc3:?}");
             assert_eq!(tc1, [-1.0, -1.0, 1.0, 1.0], "TEXCOORD1");
             let dot = (tc3[0] * n[0] + tc3[1] * n[1] + tc3[2] * n[2]) / len;
             let unit = (tc3[0] * tc3[0] + tc3[1] * tc3[1] + tc3[2] * tc3[2]).sqrt();
-            assert!((unit - 1.0).abs() < 1e-3 && (dot.abs() - 1.0).abs() < 1e-3, "TEXCOORD3 = jednostkowa normalna: {tc3:?} vs {n:?}");
+            assert!((unit - 1.0).abs() < 1e-3 && (dot.abs() - 1.0).abs() < 1e-3, "TEXCOORD3 = unit normal: {tc3:?} vs {n:?}");
             assert_eq!(pos[3], 1.0, "w");
             assert!((0.0..=1.0).contains(&pos[2]), "z w [0, 1]: {pos:?}");
             if i == 0 {
                 axes.push(axis);
             } else {
-                assert_eq!(axis, axes[t], "oś jednakowa w trójkącie");
+                assert_eq!(axis, axes[t], "same axis within the triangle");
             }
             // position = the two non-dominant coordinates (any order, any sign)
             let p = tri[i];
@@ -398,20 +398,20 @@ fn retail_es_gs_voxelize_geometry_mode() {
                 .iter()
                 .any(|&(a, b)| (pos[0].abs() - p[a].abs()).abs() < 1e-5 && (pos[1].abs() - p[b].abs()).abs() < 1e-5);
             found |= ok;
-            assert!(ok, "pozycja = rzut na płaszczyznę osi dominującej: {pos:?} z {p:?} (oś {dom})");
+            assert!(ok, "position = projection onto the plane of the dominant axis: {pos:?} from {p:?} (axis {dom})");
             // exactly, as the code selects: z-dominant → (x, y), x-dominant → (z, y); depth = 0.5·d + 0.5
             let want = match dom {
                 2 => [p[0], p[1], 0.5 * p[2] + 0.5, 1.0],
                 _ => [p[2], p[1], 0.5 * p[0] + 0.5, 1.0],
             };
-            assert_eq!(pos, want, "trójkąt {t} wierzchołek {i}");
+            assert_eq!(pos, want, "triangle {t} vertex {i}");
         }
         assert!(found);
     }
-    assert_eq!(axes, vec![4, 0], "oś dominująca: z → 4, x → 0");
+    assert_eq!(axes, vec![4, 0], "dominant axis: z → 4, x → 0");
     let covered = px.iter().filter(|p| p[0] == 1.0).count();
-    println!("pokryte piksele: {covered}");
-    assert!(covered > 300, "pass-through narysował wyjście GS: {covered}");
+    println!("covered pixels: {covered}");
+    assert!(covered > 300, "pass-through drew the GS output: {covered}");
 }
 
 /// Hash of a retail record name (`MS_VS_Transform_PositionOnly_6463b8c5_Wrapped` → 6463b8c5):
@@ -470,7 +470,7 @@ fn retail_mesh_pipelines_through_the_hook() {
         let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: std::mem::size_of::<Stream>(), pPipelineStateSubobjectStream: &s as *const _ as *mut _ };
         match unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) } {
             Ok(p) if real::two_pass_of(p.as_raw() as usize).is_some() => ok += 1,
-            Ok(_) => failed.push(format!("{} + {}: PSO bez przebiegu obliczeniowego", r.name, pr.name)),
+            Ok(_) => failed.push(format!("{} + {}: PSO without a compute pass", r.name, pr.name)),
             Err(e) => {
                 failed.push(format!("{} + {}: {e}", r.name, pr.name));
                 if std::env::var_os("XCL_MS_SIGS").is_some() {
@@ -482,14 +482,14 @@ fn retail_mesh_pipelines_through_the_hook() {
         }
         println!("  {:.1} s  {} + {}", t0.elapsed().as_secs_f64(), r.name, pr.name);
     }
-    println!("pipeline'y MS + PS przez hook: {ok} / {tried}");
+    println!("MS + PS pipelines through the hook: {ok} / {tried}");
     for f in failed.iter().take(10) {
         println!("  {f}");
     }
     for e in real::stats().translation_errors.iter().take(10) {
-        println!("  błąd tłumaczenia: {}", e.lines().take(6).collect::<Vec<_>>().join(" | "));
+        println!("  translation error: {}", e.lines().take(6).collect::<Vec<_>>().join(" | "));
     }
-    assert!(tried >= 3 && ok == tried, "{} nieudanych", failed.len());
+    assert!(tried >= 3 && ok == tried, "{} failed", failed.len());
 }
 
 /// Retail legacy GS pipeline through CreateGraphicsPipelineState: VS (ES variant) + GS
@@ -512,6 +512,6 @@ fn retail_gs_pipeline_through_the_hook() {
     d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
     d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     let p: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&d) }.unwrap_or_else(|e| panic!("{e}; {:?}", real::stats().translation_errors));
-    let tp = real::two_pass_of(p.as_raw() as usize).expect("pipeline GS w dwóch przebiegach");
+    let tp = real::two_pass_of(p.as_raw() as usize).expect("GS pipeline in two passes");
     assert_eq!((tp.kind, tp.record.max_vertices), ("GS", 63));
 }

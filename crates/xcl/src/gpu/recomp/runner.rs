@@ -79,17 +79,17 @@ fn init() -> Result<Gpu, String> {
         let name = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_string();
         let mut dev: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(e)?;
-        let dev = dev.ok_or("brak urządzenia")?;
+        let dev = dev.ok_or("no device")?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
         dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
             .map_err(|x| format!("SM 6.6: {x}"))?;
         if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err(format!("{name}: brak SM 6.6"));
+            return Err(format!("{name}: no SM 6.6"));
         }
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut o1 as *mut _ as _, std::mem::size_of_val(&o1) as u32).map_err(e)?;
         if !o1.WaveOps.as_bool() || o1.WaveLaneCountMax < 64 || !o1.Int64ShaderOps.as_bool() {
-            return Err(format!("{name}: brak wave64/operacji falowych/int64 ({}..{})", o1.WaveLaneCountMin, o1.WaveLaneCountMax));
+            return Err(format!("{name}: no wave64/wave operations/int64 ({}..{})", o1.WaveLaneCountMin, o1.WaveLaneCountMax));
         }
         let queue: ID3D12CommandQueue =
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
@@ -232,7 +232,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         let mut r: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .map_err(e)?;
-        let r = r.ok_or("tekstura")?;
+        let r = r.ok_or("texture")?;
         for (k, fp) in fps.iter().enumerate() {
             let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
             let src = D3D12_TEXTURE_COPY_LOCATION {
@@ -304,7 +304,7 @@ fn buffer(dev: &ID3D12Device, size: u64, heap: D3D12_HEAP_TYPE, state: D3D12_RES
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r)
             .map_err(e)?;
     }
-    r.ok_or_else(|| "bufor".into())
+    r.ok_or_else(|| "buffer".into())
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -431,7 +431,7 @@ pub fn run_with_statics(
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU nie skończył w 10 s (usunięte urządzenie: {:?})", dev.GetDeviceRemovedReason()));
+            return Err(format!("GPU did not finish within 10 s (device removed: {:?})", dev.GetDeviceRemovedReason()));
         }
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -486,7 +486,7 @@ pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(K
 pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
     let t = super::translate(code, &super::Options::default())?;
     if !t.complete() {
-        return Err(format!("nieobsługiwane instrukcje: {:?}", t.unsupported));
+        return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
     run_with_statics(&dxil, state, mem, textures, samplers, &t.static_samplers)
@@ -497,7 +497,7 @@ pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelR
     let opt = super::Options::default();
     let t = super::translate(code, &opt)?;
     if !t.complete() {
-        return Err(format!("nieobsługiwane instrukcje: {:?}", t.unsupported));
+        return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
     run(&dxil, state, mem)
@@ -641,8 +641,8 @@ unsafe fn bind_views(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, textu
         up.Unmap(0, None);
         let mut r: Option<ID3D12Resource> = None;
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &t.res, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
-            .map_err(|x| format!("tekstura {i}: {x}"))?;
-        let r = r.ok_or("tekstura")?;
+            .map_err(|x| format!("texture {i}: {x}"))?;
+        let r = r.ok_or("texture")?;
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
@@ -783,7 +783,7 @@ pub fn draw_on_multi(
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if fence.GetCompletedValue() < 1 {
-            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
+            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
@@ -994,7 +994,7 @@ pub fn mesh_draw_split(
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
+            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
@@ -1104,7 +1104,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
+            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
@@ -1183,7 +1183,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
         if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU nie skończył w 10 s ({:?})", dev.GetDeviceRemovedReason()));
+            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;

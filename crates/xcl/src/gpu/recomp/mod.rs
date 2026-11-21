@@ -216,15 +216,15 @@ pub enum Mode {
 pub fn geometry_program(es_blob: &[u8], gs_blob: &[u8]) -> Result<(Vec<u8>, GsInterface), String> {
     use super::xbox;
     let pick = |blob: &[u8], hw: u8| -> Result<Vec<u8>, String> {
-        let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
-        let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)).ok_or_else(|| format!("brak wariantu {}", xbox::hw_stage_name(hw)))?;
-        let p = f.programs.first().ok_or("FSSM bez programu")?;
+        let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+        let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == hw)).ok_or_else(|| format!("no variant {}", xbox::hw_stage_name(hw)))?;
+        let p = f.programs.first().ok_or("FSSM without a program")?;
         Ok(f.data[p.offset..p.offset + p.len].to_vec())
     };
     let (es, gs) = (pick(es_blob, 2)?, pick(gs_blob, 3)?);
-    let psv = super::dxbc::psv(gs_blob).ok_or("GS bez PSV0")?;
+    let psv = super::dxbc::psv(gs_blob).ok_or("GS without PSV0")?;
     if psv.gs_input_primitive != 3 || psv.gs_output_topology != 5 {
-        return Err(format!("GS: wejście {} / wyjście {} – obsługiwane trójkąty → triangle strip", psv.gs_input_primitive, psv.gs_output_topology));
+        return Err(format!("GS: input {} / output {} – supported: triangles → triangle strip", psv.gs_input_primitive, psv.gs_output_topology));
     }
     let (es_inputs, es_outputs) = super::dxbc::signatures(es_blob);
     let g = GsInterface {
@@ -382,7 +382,7 @@ fn term(c: &Ctx, start: u64, end: u64) -> Term {
 /// `XCL_RECOMP_WHY`: print why a program stays on the guarded block chain.
 fn why(_at: u64, msg: &str) {
     if std::env::var_os("XCL_RECOMP_WHY").is_some() {
-        eprintln!("niestrukturalne: {msg}");
+        eprintln!("unstructured: {msg}");
     }
 }
 
@@ -447,7 +447,7 @@ fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, 
         let last = next(b) - 1;
         let latch = c.leaders[last];
         if !matches!(term(c, latch, b), Term::Cond(t) | Term::Jump(t) if t == a) {
-            return Err(format!("pętla {a:#x}..{b:#x}: koniec {:?}", term(c, latch, b)));
+            return Err(format!("loop {a:#x}..{b:#x}: end {:?}", term(c, latch, b)));
         }
         return Ok((Item::Loop { a, b, latch, entry: None }, next(b)));
     }
@@ -473,7 +473,7 @@ fn item_at(c: &Ctx, i: usize, lo: u64, hi: u64, exit: Option<u64>, nest: usize, 
         // the last block of the program: the natural end
         Term::End if end == u64::MAX || last_pc < end => Item::Block { start, end, raise: None },
         Term::End => Item::Block { start, end, raise: Some(END) },
-        other => return Err(format!("blok {start:#x}..{end:#x} w {lo:#x}..{hi:#x}: {other:?}")),
+        other => return Err(format!("block {start:#x}..{end:#x} in {lo:#x}..{hi:#x}: {other:?}")),
     };
     Ok((item, i + 1))
 }
@@ -589,7 +589,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
             _ => BTreeSet::new(),
         };
         if let Some(t) = pending.iter().find(|&&t| t > s && t < e) {
-            why(s, &format!("skok do {t:#x} wewnątrz {s:#x}..{e:#x}"));
+            why(s, &format!("branch to {t:#x} inside {s:#x}..{e:#x}"));
             return None;
         }
         let none = BTreeSet::new();
@@ -602,7 +602,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
             Item::Loop { a, latch, entry: Some(u), .. } => {
                 // the head [a, u) runs at the end of an iteration and may only fall into u
                 if structurable_to(c, a, u, None, nest + 1, None, &none)?.iter().any(|&t| t != u) {
-                    why(a, &format!("pętla obrócona {a:#x}: głowa wychodzi poza {u:#x}"));
+                    why(a, &format!("rotated loop {a:#x}: the head exits elsewhere than {u:#x}"));
                     return None;
                 }
                 let mut r = structurable_to(c, u, latch, None, nest + 1, None, &none)?;
@@ -613,7 +613,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
                 let mut r = structurable_to(c, end, t, u, nest + 1, cont, &none)?;
                 if let Some(u) = u {
                     if r.contains(&t) {
-                        why(t, &format!("skok z if na początek else {t:#x}"));
+                        why(t, &format!("branch from the if to the start of the else {t:#x}"));
                         return None;
                     }
                     r.extend(structurable_to(c, t, u, None, nest + 1, cont, &none)?);
@@ -624,7 +624,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
             Item::Block { raise, .. } => raise.into_iter().collect(),
         };
         if let Some(t) = raised.iter().find(|&&t| t < e) {
-            why(s, &format!("skok wstecz/do środka {t:#x} z {s:#x}..{e:#x}"));
+            why(s, &format!("backward/inward branch to {t:#x} from {s:#x}..{e:#x}"));
             return None;
         }
         pending.extend(raised);
@@ -869,19 +869,19 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
                 let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
                 match lane {
                     0..=105 => {
-                        out.insert("v_readlane/writelane: numer wątku z SGPR");
+                        out.insert("v_readlane/writelane: lane number from an SGPR");
                     }
                     160..=192 => {
-                        out.insert("v_readlane/writelane: wątek ≥ 32");
+                        out.insert("v_readlane/writelane: lane ≥ 32");
                     }
                     255 if d.literal.is_some_and(|l| l & 63 >= 32) => {
-                        out.insert("v_readlane/writelane: wątek ≥ 32");
+                        out.insert("v_readlane/writelane: lane ≥ 32");
                     }
                     _ => {}
                 }
             }
             "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
-                out.insert("ds_(b)permute: dowolny wątek");
+                out.insert("ds_(b)permute: arbitrary lane");
             }
             _ => {}
         }
@@ -975,7 +975,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
-        let d = rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: nie da się zdekodować ({e:?})"))?;
+        let d = rdna2::decode(&code[off..], off as u64).map_err(|e| format!("+{off:#x}: cannot decode ({e:?})"))?;
         off += d.len;
         insts.push(d);
     }
@@ -999,7 +999,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         if let Some(t) = rdna2::branch_target(d) {
             if !starts.contains(&t) {
-                return Err(format!("+{:#x}: skok do {t:#x}, który nie jest początkiem instrukcji", d.pc));
+                return Err(format!("+{:#x}: branch to {t:#x}, which is not the start of an instruction", d.pc));
             }
             leaders.insert(t);
             leaders.insert(next);

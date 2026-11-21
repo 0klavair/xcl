@@ -209,7 +209,7 @@ fn resolve_inner(key: &str, what: &ImportName, depth: u32) -> (usize, Source) {
                 }
                 return stub_for(key, what);
             }
-            Err(e) => crate::xlog_error!("nie udało się załadować {}: {e}", path.display()),
+            Err(e) => crate::xlog_error!("failed to load {}: {e}", path.display()),
         }
     }
     // Real Windows DLL
@@ -328,7 +328,7 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
             None => None,
         };
         if r.is_none() {
-            crate::xlog_warn!("GetProcAddress({name}, {what}) → NULL (brak implementacji)");
+            crate::xlog_warn!("GetProcAddress({name}, {what}) → NULL (not implemented)");
         }
         return r;
     }

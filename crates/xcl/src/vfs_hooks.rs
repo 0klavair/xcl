@@ -625,7 +625,7 @@ pub fn install() -> Result<(), String> {
         }
     }
     if errors.is_empty() {
-        crate::xlog_info!("VFS: {} hooków plikowych aktywnych", list.len());
+        crate::xlog_info!("VFS: {} file hooks active", list.len());
         Ok(())
     } else {
         Err(errors.join("; "))

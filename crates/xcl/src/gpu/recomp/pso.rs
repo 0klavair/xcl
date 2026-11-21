@@ -47,7 +47,7 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
 }
 
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(super::Translation, &'static str), String> {
-    let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
         Stage::Vertex => 4,
@@ -58,20 +58,20 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(
         .fssm
         .iter()
         .find(|f| f.stages.first().is_some_and(|s| s.hw == want))
-        .ok_or_else(|| format!("brak wariantu sprzętowego {}", xbox::hw_stage_name(want)))?;
-    let mode = interface(blob, &sh, f).ok_or("nieznany interfejs shadera")?;
+        .ok_or_else(|| format!("no hardware variant {}", xbox::hw_stage_name(want)))?;
+    let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
     let profile = match (&mode, stage) {
         (Mode::Vertex(_), Stage::Vertex) => "vs_6_6",
         (Mode::Pixel(_), Stage::Pixel) => "ps_6_6",
         (Mode::Compute(_), Stage::Compute) => "cs_6_6",
-        _ => return Err("etap shadera nie pasuje do miejsca w PSO".into()),
+        _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
-    let p = f.programs.first().ok_or("FSSM bez programu")?;
+    let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));
+        return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     Ok((t, profile))
 }
@@ -96,7 +96,7 @@ fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, p
     let t = translate(code, &Options { mode, wave64, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
-        return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));
+        return Err(format!("incomplete translation, missing: {missing:?}"));
     }
     let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
@@ -108,12 +108,12 @@ fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, p
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
-    let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
-    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("brak wariantu sprzętowego NGG")?;
-    let mode = interface(blob, &sh, f).ok_or("nieznany interfejs MS (np. linie / punkty)")?;
-    let Mode::Mesh(ms) = &mode else { return Err("kontener nie jest MS".into()) };
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
+    let Mode::Mesh(ms) = &mode else { return Err("the container is not an MS".into()) };
     let record = ms.clone();
-    let p = f.programs.first().ok_or("FSSM bez programu")?;
+    let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
     two_pass(code, mode.clone(), super::detect_wave64(code), record, ps)
 }

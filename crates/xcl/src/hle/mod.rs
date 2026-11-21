@@ -93,7 +93,7 @@ fn build(config: &Config) -> Registry {
         };
         match route {
             Some(r) => routes.push((pat.to_ascii_lowercase(), r)),
-            None => crate::xlog_warn!("aliases: nieznany cel '{target}' dla '{pat}' – pomijam"),
+            None => crate::xlog_warn!("aliases: unknown target '{target}' for '{pat}' – skipping"),
         }
     }
     let k = idx(KERNELX);

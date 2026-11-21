@@ -41,7 +41,7 @@ fn cap_memory(bytes: usize) {
         let ok = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32) != 0
             && AssignProcessToJobObject(job, GetCurrentProcess()) != 0;
         if !ok {
-            eprintln!("cap_memory: nie udało się ustawić limitu pamięci");
+            eprintln!("cap_memory: could not set the memory limit");
         }
     }
 }
@@ -243,7 +243,7 @@ fn bink2_console_dll_decodes_a_game_movie() {
             mid.chunks(4).for_each(|c| ppm.extend([c[2], c[1], c[0]]));
             std::fs::write(out, ppm).unwrap();
         }
-        println!("Bink: {w}x{h}, {frames} klatek, zmian między klatkami {changes}, kolorów w środkowej {}", colours.len());
+        println!("Bink: {w}x{h}, {frames} frames, changes between frames {changes}, colours in the middle one {}", colours.len());
         assert!(changes > frames / 4, "frames change: {changes} of {frames}");
         assert!(colours.len() > 500, "middle frame: {} colours", colours.len());
     }
@@ -382,7 +382,7 @@ fn xbox_bvh_builder_rehydrates_game_geometry() {
             t => panic!("unexpected node type {t} ({n:#x})"),
         }
     }
-    println!("Rehydrate: {} węzłów trójkątów, box32 {}, box16 {}", seen_nodes.len(), boxes[1], boxes[0]);
+    println!("Rehydrate: {} triangle nodes, box32 {}, box16 {}", seen_nodes.len(), boxes[1], boxes[0]);
     assert_eq!(seen_nodes.len(), tri_nodes, "triangle nodes = header @0x0C");
     assert!(seen_prims.values().all(|&c| c == 1), "every (geometry, primitive) exactly once");
     // every geometry's primitives 0..n are all there
@@ -394,7 +394,7 @@ fn xbox_bvh_builder_rehydrates_game_geometry() {
         assert!(ps.iter().enumerate().all(|(i, &p)| i == p), "geometry {g}: primitives 0..{} without gaps", ps.len());
     }
     let counts: Vec<usize> = per_geometry.values().map(Vec::len).collect();
-    println!("geometrie: {} z trójkątami {counts:?} (razem {}; pole nagłówka @0x04 = {prims})", counts.len(), seen_prims.len());
+    println!("geometries: {} with triangles {counts:?} (total {}; header field @0x04 = {prims})", counts.len(), seen_prims.len());
 }
 
 /// Probe: the console BVH builder constructed on XCL's D3D12.X device (real backend) – what
@@ -417,7 +417,7 @@ fn xbox_bvh_builder_on_xcl_device_probe() {
         let ctor: extern "system" fn(*mut u8, *mut std::ffi::c_void, bool) -> *mut u8 = std::mem::transmute(proc(&m, "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z"));
         let this = pages(0x10000);
         ctor(this.as_mut_ptr(), dev, false);
-        println!("XboxBvhBuilder skonstruowany");
+        println!("XboxBvhBuilder constructed");
         if std::env::var_os("XCL_PROBE_BVH_RECORD").is_none() {
             return;
         }
@@ -441,7 +441,7 @@ fn xbox_bvh_builder_on_xcl_device_probe() {
         prebuild(this.as_mut_ptr(), &inputs, std::ptr::null(), &mut sizes);
         let dest = uma.alloc(sizes[0] as usize, 256).unwrap();
         let scratch = uma.alloc(sizes[1] as usize, 256).unwrap();
-        println!("rozmiary: wynik {} B, scratch {} B; dest {dest:?}, scratch {scratch:?}", sizes[0], sizes[1]);
+        println!("sizes: result {} B, scratch {} B; dest {dest:?}, scratch {scratch:?}", sizes[0], sizes[1]);
         let desc = BuildDesc { dest: dest as u64, inputs, source: 0, scratch: scratch as u64 };
         let build: extern "system" fn(*mut u8, *mut std::ffi::c_void, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
             &m,
@@ -449,7 +449,7 @@ fn xbox_bvh_builder_on_xcl_device_probe() {
         ));
         build(this.as_mut_ptr(), list.as_raw(), &desc, 0, std::ptr::null());
         list.Close().unwrap();
-        println!("budowa BLAS nagrana na liście poleceń (niewykonana)");
+        println!("BLAS build recorded on the command list (not executed)");
     }
 }
 
@@ -554,17 +554,17 @@ fn xbox_bvh_builder_records_into_a_fake_console_list() {
         let dest = uma.alloc(13312, 256).unwrap();
         let scratch = uma.alloc(23872, 256).unwrap();
         let desc = BuildDesc { dest: dest as u64, inputs, source: 0, scratch: scratch as u64 };
-        println!("vb {vb:?} dest {dest:?} scratch {scratch:?} rekordy {records:#x} upload od {:#x}", FAKE_BUMP.load(std::sync::atomic::Ordering::Relaxed));
+        println!("vb {vb:?} dest {dest:?} scratch {scratch:?} records {records:#x} upload from {:#x}", FAKE_BUMP.load(std::sync::atomic::Ordering::Relaxed));
         let build: extern "system" fn(*mut u8, *mut u8, *const BuildDesc, u32, *const u8) = std::mem::transmute(proc(
             &m,
             "?BuildRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@PEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@IPEBUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC@@@Z",
         ));
         build(this.as_mut_ptr(), list.as_mut_ptr(), &desc, 0, std::ptr::null());
-        println!("== wywołania metod listy");
+        println!("== list method calls");
         for (slot, a) in FAKE_CALLS.lock().unwrap().iter() {
             println!("  #{slot:<4} {:x?}", &a[1..]);
         }
-        println!("== zmienione pola obiektu listy (offset: przed → po)");
+        println!("== changed fields of the list object (offset: before → after)");
         for k in (0..0x10000).step_by(8) {
             let (b, a) = (u64::from_le_bytes(snapshot[k..k + 8].try_into().unwrap()), u64::from_le_bytes(list[k..k + 8].try_into().unwrap()));
             if a != b {
@@ -582,24 +582,24 @@ fn xbox_bvh_builder_records_into_a_fake_console_list() {
             } else if windows::core::Interface::cast::<ID3D12RootSignature>(u).is_ok() {
                 "RootSignature"
             } else {
-                "inny"
+                "other"
             }
         };
         let args33: std::collections::BTreeSet<usize> = FAKE_CALLS.lock().unwrap().iter().filter(|c| c.0 == 33).map(|c| c.1[1]).collect();
         for p in &args33 {
             println!("  #33 argument {p:#x}: {}", kind(*p));
         }
-        println!("== urządzenie {dev:?}");
+        println!("== device {dev:?}");
         let mut seen = std::collections::BTreeSet::new();
         let rec64 = std::slice::from_raw_parts(records as *const u32, (end - records) / 4);
         for w in rec64.windows(2) {
             let p = (w[0] as usize) | (w[1] as usize) << 32;
             if (0x1_0000_0000..0x7FFF_0000_0000).contains(&p) && w[1] != 4 && seen.insert(p) {
                 let vt = (p as *const usize).read();
-                println!("  wskaźnik {p:#x}: vtable {vt:#x} = {} ({})", xcl::modules::describe_address(vt), if xcl::modules::describe_address(vt).contains(".dll") { "?" } else { kind(p) });
+                println!("  pointer {p:#x}: vtable {vt:#x} = {} ({})", xcl::modules::describe_address(vt), if xcl::modules::describe_address(vt).contains(".dll") { "?" } else { kind(p) });
             }
         }
-        println!("== bufor rekordów: {} B", end - records);
+        println!("== record buffer: {} B", end - records);
         let rec = std::slice::from_raw_parts(records as *const u32, (end - records) / 4);
         for (i, ch) in rec.chunks(8).enumerate().take(64) {
             println!("  {:#06x}: {:08x?}", i * 32, ch);
@@ -682,7 +682,7 @@ fn xbox_bvh_builder_builds_on_the_gpu() {
             queue.Signal(&fence, round).unwrap();
             let start = std::time::Instant::now();
             while fence.GetCompletedValue() < round {
-                assert!(start.elapsed().as_secs() < 10, "GPU nie skończył w 10 s (usunięcie urządzenia: {:?})", device.GetDeviceRemovedReason());
+                assert!(start.elapsed().as_secs() < 10, "GPU did not finish within 10 s (device removal: {:?})", device.GetDeviceRemovedReason());
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let data = std::slice::from_raw_parts(dest, sizes[0] as usize).to_vec();
@@ -702,10 +702,10 @@ fn xbox_bvh_builder_builds_on_the_gpu() {
                     .filter_map(|(i, tri)| xcl::gpu::bvh::triangle_hit(tri, o, d).map(|h| (h[0] / h[1], i as u32)))
                     .filter(|h| (0.0..100.0).contains(&h.0))
                     .min_by(|a, b| a.0.total_cmp(&b.0));
-                assert_eq!(bvh.trace(o, d, 100.0).map(|g| g.1), brute.map(|b| b.1), "runda {round}: ray {o:?} → {to:?}");
+                assert_eq!(bvh.trace(o, d, 100.0).map(|g| g.1), brute.map(|b| b.1), "round {round}: ray {o:?} → {to:?}");
                 hits += brute.is_some() as u32;
             }
-            println!("runda {round}: {n} trójkątów zbudowanych na GPU przez konsolowy builder – 500 promieni zgodnych z brute force ({hits} trafień)");
+            println!("round {round}: {n} triangles built on the GPU by the console builder – 500 rays match brute force ({hits} hits)");
             assert!(hits > 20);
         }
     }
@@ -778,7 +778,7 @@ fn xbox_bvh_builder_builds_a_tlas_on_the_gpu() {
             queue.Signal(&fence, round).unwrap();
             let start = std::time::Instant::now();
             while fence.GetCompletedValue() < round {
-                assert!(start.elapsed().as_secs() < 10, "GPU nie skończył w 10 s ({:?})", device.GetDeviceRemovedReason());
+                assert!(start.elapsed().as_secs() < 10, "GPU did not finish within 10 s ({:?})", device.GetDeviceRemovedReason());
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             (dest as u64, sizes[0] as usize)
@@ -839,7 +839,7 @@ fn xbox_bvh_builder_builds_a_tlas_on_the_gpu() {
             std::fs::write(format!("{}.tlas", out.to_string_lossy()), &data).unwrap();
         }
         let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
-        println!("TLAS: {tsize} B, nagłówek {:x?}", (0..16).map(|k| word(4 * k)).collect::<Vec<_>>());
+        println!("TLAS: {tsize} B, header {:x?}", (0..16).map(|k| word(4 * k)).collect::<Vec<_>>());
         let top = xcl::gpu::bvh::Bvh { root: word(0x30), data: data.clone() };
         let lookup = |a: u64| blases.iter().find(|b| b.0 == a).map(|b| b.1.as_slice());
         let mut hits = 0;
@@ -863,7 +863,7 @@ fn xbox_bvh_builder_builds_a_tlas_on_the_gpu() {
             assert_eq!(got.map(|g| (g.1, g.2)), brute.map(|b| (b.1, b.2)), "ray {o:?} → {to:?}");
             hits += brute.is_some() as u32;
         }
-        println!("TLAS zbudowany na GPU przez konsolowy builder: 800 promieni zgodnych z brute force ({hits} trafień)");
+        println!("TLAS built on the GPU by the console builder: 800 rays match brute force ({hits} hits)");
         assert!(hits > 30);
     }
 }
@@ -919,7 +919,7 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         let create: extern "C" fn(*mut usize, *mut FfxHeader, *const u8) -> u32 = std::mem::transmute(proc(&m, "ffxCreateContext"));
         let mut ctx = 0usize;
         let rc = create(&mut ctx, &mut desc.header, std::ptr::null());
-        println!("ffxCreateContext: kod {rc:#x}, kontekst {ctx:#x}");
+        println!("ffxCreateContext: code {rc:#x}, context {ctx:#x}");
         if rc != 0 || std::env::var_os("XCL_PROBE_FSR_DISPATCH").is_none() {
             return;
         }
@@ -979,7 +979,7 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         put(&mut d, 412, &[0.1f32.to_bits(), 1000f32.to_bits(), 1.0f32.to_bits(), 1f32.to_bits()]);
         let dispatch: extern "C" fn(*mut usize, *const u32) -> u32 = std::mem::transmute(proc(&m, "ffxDispatch"));
         let rc = dispatch(&mut ctx, d.as_ptr());
-        println!("ffxDispatch: kod {rc:#x}");
+        println!("ffxDispatch: code {rc:#x}");
         assert_eq!(rc, 0);
         // descriptor tables in the stream: 32-bit addresses of slots in XCL's console heaps;
         // the 2D images there must be the inputs (formats 71 / 22 / 29) in the XCL ABI form
@@ -997,7 +997,7 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
             for k in 0..24 {
                 if let Some(d) = console_heap::words_at(w.wrapping_add(32 * k)) {
                     if d[3] >> 28 == 9 {
-                        assert_eq!(d[0] % 2, 0, "słowo 0 = indeks SRV w stercie PC (parzysty)");
+                        assert_eq!(d[0] % 2, 0, "word 0 = SRV index in the PC heap (even)");
                         formats.insert((d[1] >> 20) & 0x1FF);
                     } else if d[3] & 0xFFF == 0xFAC && d[3] >> 30 == 0 {
                         // V#: base address in UMA, num_records set
@@ -1011,19 +1011,19 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
             }
         }
         println!(
-            "strumień FSR: {} słów, {tables} wskaźników tabel, formaty obrazów 2D w tabelach: {formats:?}, V# w tabelach: {buffers} (w UMA: {buffers_in_uma}), bufory konsoli w UMA: {}",
+            "FSR stream: {} words, {tables} table pointers, 2D image formats in the tables: {formats:?}, V#s in the tables: {buffers} (in UMA: {buffers_in_uma}), console buffers in UMA: {}",
             words.len(),
             xcl::hle::d3d12x::real::console_buffers()
         );
-        assert!(xcl::hle::d3d12x::real::console_buffers() > 0, "bufory FSR w UMA");
-        assert_eq!(buffers, buffers_in_uma, "każdy V# w tabelach wskazuje bufor w UMA");
+        assert!(xcl::hle::d3d12x::real::console_buffers() > 0, "FSR buffers in UMA");
+        assert_eq!(buffers, buffers_in_uma, "every V# in the tables points at a buffer in UMA");
         assert!(tables > 0);
         for f in [71, 22, 29] {
-            assert!(formats.contains(&f), "format {f} (wejście FSR) w tabelach");
+            assert!(formats.contains(&f), "format {f} (FSR input) in the tables");
         }
         let t = console_list::close(console).unwrap();
-        println!("lista konsoli → PC: {t:?}");
-        assert!(t.unknown.is_none(), "wszystkie rekordy FSR rozpoznane");
-        assert!(t.clears > 0 && t.copies > 0 && t.skipped == 0, "czyszczenia UAV i kopie przełożone na PC");
+        println!("console list → PC: {t:?}");
+        assert!(t.unknown.is_none(), "all FSR records recognised");
+        assert!(t.clears > 0 && t.copies > 0 && t.skipped == 0, "UAV clears and copies carried over to the PC");
     }
 }

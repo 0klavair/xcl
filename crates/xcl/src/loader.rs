@@ -62,7 +62,7 @@ pub fn map_image(path: &Path) -> Result<Arc<MappedModule>, String> {
 }
 
 fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String> {
-    let file = std::fs::read(path).map_err(|e| format!("odczyt {}: {e}", path.display()))?;
+    let file = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pe = Pe::parse(&file, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = crate::util::dll_key(&path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     let size = pe.size_of_image as usize;
@@ -74,13 +74,13 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     if base == 0 {
         if !pe.has_relocs() {
             return Err(format!(
-                "{name}: preferowany adres {:#x} zajęty, a obraz nie ma relokacji",
+                "{name}: preferred address {:#x} is taken and the image has no relocations",
                 pe.image_base
             ));
         }
         base = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
         if base == 0 {
-            return Err(format!("{name}: VirtualAlloc({size:#x}) nie powiodło się"));
+            return Err(format!("{name}: VirtualAlloc({size:#x}) failed"));
         }
     }
     let delta = base as i64 - pe.image_base as i64;
@@ -100,7 +100,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             }
             let src = s.raw_ptr as usize;
             if src + raw > file.len() || s.va as usize + raw > size {
-                return fail(format!("{name}: sekcja {} poza plikiem/obrazem", s.name));
+                return fail(format!("{name}: section {} outside the file/image", s.name));
             }
             std::ptr::copy_nonoverlapping(file.as_ptr().add(src), (base + s.va as usize) as *mut u8, raw);
         }
@@ -110,7 +110,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     if delta != 0 {
         let relocs = match pe.relocations() {
             Ok(r) => r,
-            Err(e) => return fail(format!("{name}: relokacje: {e}")),
+            Err(e) => return fail(format!("{name}: relocations: {e}")),
         };
         for r in relocs {
             let p = base + r.rva as usize;
@@ -124,7 +124,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
                         let v = (p as *mut u32).read_unaligned();
                         (p as *mut u32).write_unaligned((v as i64 + delta) as u32);
                     }
-                    k => crate::xlog_warn!("{name}: nieobsługiwany typ relokacji {k} @ {:#x}", r.rva),
+                    k => crate::xlog_warn!("{name}: unsupported relocation type {k} @ {:#x}", r.rva),
                 }
             }
         }
@@ -152,15 +152,15 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         modules::set_main(module.clone());
     }
     crate::xlog_info!(
-        "załadowano {name} @ {base:#x} (rozmiar {size:#x}, preferowany {:#x}{})",
+        "loaded {name} @ {base:#x} (size {size:#x}, preferred {:#x}{})",
         pe.image_base,
-        if delta != 0 { ", relokowany" } else { "" }
+        if delta != 0 { ", relocated" } else { "" }
     );
 
     // 4. imports (normal + delay-load, resolved eagerly)
     let mut all = match pe.imports() {
         Ok(v) => v,
-        Err(e) => return fail(format!("{name}: tablica importów: {e}")),
+        Err(e) => return fail(format!("{name}: import table: {e}")),
     };
     match pe.delay_imports() {
         Ok(v) => all.extend(v),
@@ -242,7 +242,7 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
             let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
             crate::xlog_info!("DllMain({}, PROCESS_ATTACH)", m.name);
             if f(m.base as *mut c_void, 1, std::ptr::null_mut()) == 0 {
-                return Err(format!("DllMain({}) zwrócił FALSE", m.name));
+                return Err(format!("DllMain({}) returned FALSE", m.name));
             }
         }
     }
@@ -277,7 +277,7 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     }
     let m = map_image(path)?;
     if !m.is_dll {
-        crate::xlog_warn!("{key} nie jest DLL, a jest ładowany jako biblioteka");
+        crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
     }
     init_dll(&m)?;
     Ok(m)
@@ -323,7 +323,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     let stack = (m.stack_reserve as usize).max(1 << 20);
     let args = Box::into_raw(Box::new(EntryArgs { entry: m.base + m.entry_rva as usize }));
     crate::xlog_info!(
-        "start {}: punkt wejścia {} , stos {:#x}",
+        "start {}: entry point {} , stack {:#x}",
         m.name,
         modules::describe_address(m.base + m.entry_rva as usize),
         stack
@@ -339,7 +339,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
             std::ptr::null_mut(),
         );
         if h.is_null() {
-            crate::xlog_error!("CreateThread dla wątku gry nie powiodło się");
+            crate::xlog_error!("CreateThread for the game thread failed");
             return 0xC000_0001;
         }
         let mut code = 0u32;

@@ -149,7 +149,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         let mut master: *mut c_void = std::ptr::null_mut();
         let hr = method::<CreateMasteringVoice>(eng, 7)(eng, &mut master, 2, 48_000, 0x4, device.as_ptr(), std::ptr::null(), 6);
         if hr < 0 {
-            println!("  (brak urządzenia audio: CreateMasteringVoice → {:#x}; pomijam głosy)", hr as u32);
+            println!("  (no audio device: CreateMasteringVoice → {:#x}; skipping voices)", hr as u32);
             release(eng);
             return Ok(());
         }
@@ -176,7 +176,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         method::<GetVoiceDetails>(xv, 0)(xv, &mut det);
         let (ch, rate) = (det.channels, det.rate);
         if (ch, rate) != (1, 48_000) {
-            return Err(format!("XMA2 voice: {ch} kan., {rate} Hz"));
+            return Err(format!("XMA2 voice: {ch} ch., {rate} Hz"));
         }
         let packet = vec![0x5au8; 2048];
         let xb = Buffer {
@@ -232,7 +232,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         }
         let ends = BUFFER_END.load(Ordering::SeqCst);
         if ends != XMA_CONTEXT + PCM_CONTEXT || STREAM_END.load(Ordering::SeqCst) < 2 {
-            return Err(format!("callbacki: OnBufferEnd suma kontekstów {ends:#x}, OnStreamEnd {}", STREAM_END.load(Ordering::SeqCst)));
+            return Err(format!("callbacks: OnBufferEnd context sum {ends:#x}, OnStreamEnd {}", STREAM_END.load(Ordering::SeqCst)));
         }
         if VOICE_ERRORS.load(Ordering::SeqCst) != 0 {
             return Err("OnVoiceError".into());
@@ -243,7 +243,7 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if !(70..=2000).contains(&ms) {
             return Err(format!("XMA2 buffer ended after {ms} ms (expected ≈100)"));
         }
-        println!("  (bufor XMA2 skończył się po {ms} ms)");
+        println!("  (XMA2 buffer ended after {ms} ms)");
         for v in [xv, pv, master] {
             method::<Destroy>(v, 18)(v);
         }

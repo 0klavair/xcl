@@ -105,7 +105,7 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
             }
         }
         return Err(format!(
-            "MicrosoftGame.config wskazuje {}, ale takiego pliku nie ma w {}",
+            "MicrosoftGame.config names {}, but there is no such file in {}",
             cfg_exes.join(", "),
             root.display()
         ));
@@ -117,12 +117,12 @@ fn pick_exe(root: &Path) -> Result<PathBuf, String> {
     match candidates.len() {
         1 => Ok(candidates.into_iter().next().unwrap()),
         0 => Err(format!(
-            "w {} nie ma pliku .exe gry{}",
+            "no game .exe file in {}{}",
             root.display(),
-            if skipped_self { " (jest tylko xcl.exe – czyli sam XCL; nie kopiuj go do folderu gry)" } else { "" }
+            if skipped_self { " (only xcl.exe – that is XCL itself; do not copy it into the game folder)" } else { "" }
         )),
         _ => Err(format!(
-            "kilka plików .exe ({}) – wskaż exe gry bezpośrednio albo ustaw 'exe' w xcl.toml",
+            "several .exe files ({}) – point to the game exe directly or set 'exe' in xcl.toml",
             candidates.iter().map(rel).collect::<Vec<_>>().join(", ")
         )),
     }
@@ -144,9 +144,9 @@ pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), Strin
         (target.clone(), pick_exe(&target)?)
     } else {
         if is_xcl_copy(&target) {
-            return Err(format!("{} to sam XCL, nie gra – podaj exe albo folder gry", target.display()));
+            return Err(format!("{} is XCL itself, not a game – give the game exe or folder", target.display()));
         }
-        (target.parent().ok_or("brak folderu nadrzędnego")?.to_path_buf(), target.clone())
+        (target.parent().ok_or("no parent folder")?.to_path_buf(), target.clone())
     };
     let (_, identity) = read_game_config(&root);
     let title = sanitize(&identity.unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
@@ -194,7 +194,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("xcl: błąd w xcl.toml: {e}");
+            eprintln!("xcl: error in xcl.toml: {e}");
             return 2;
         }
     };
@@ -206,23 +206,23 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let boot = Boot { title: title.clone(), exe_path: exe.clone(), game_root: root.clone(), data_dir: data_dir.clone(), config };
     let boot_path = data_dir.join("cache").join("boot.json");
     if let Err(e) = std::fs::write(&boot_path, serde_json::to_string_pretty(&boot).unwrap()) {
-        eprintln!("xcl: zapis {}: {e}", boot_path.display());
+        eprintln!("xcl: writing {}: {e}", boot_path.display());
         return 2;
     }
     let _ = std::fs::remove_file(boot.report_path());
 
-    println!("XCL {} – uruchamiam '{title}'", env!("CARGO_PKG_VERSION"));
+    println!("XCL {} – starting '{title}'", env!("CARGO_PKG_VERSION"));
     println!("  exe:   {}", exe.display());
-    println!("  dane:  {}", data_dir.display());
+    println!("  data:  {}", data_dir.display());
     if !from_manifest.is_empty() {
         println!("  MicrosoftGame.Config: {}", from_manifest.join(", "));
     }
     match crate::inspect::console_imports(&exe) {
         Some(c) if c.is_empty() => println!(
-            "  UWAGA: ten plik nie importuje żadnej biblioteki konsoli (kernelx / xgameruntime / d3d12_xs) –\n         to raczej zwykły program Windows, a nie gra z Xbox Series."
+            "  WARNING: this file imports no console library (kernelx / xgameruntime / d3d12_xs) –\n           it is most likely a regular Windows program, not an Xbox Series game."
         ),
-        Some(c) => println!("  konsola: importuje {}", c.join(", ")),
-        None => println!("  UWAGA: to nie jest poprawny plik PE x64 (zaszyfrowany? z paczki XVC?)"),
+        Some(c) => println!("  console: imports {}", c.join(", ")),
+        None => println!("  WARNING: this is not a valid x64 PE file (encrypted? from an XVC package?)"),
     }
 
     let mut cmdline = quote(&exe.to_string_lossy());
@@ -233,7 +233,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let code = match spawn_host(&cmdline, &root, &boot_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("xcl: nie udało się uruchomić procesu gry: {e}");
+            eprintln!("xcl: failed to start the game process: {e}");
             return 2;
         }
     };
@@ -269,7 +269,7 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
         );
         std::env::remove_var("XCL_HOST");
         if ok == 0 {
-            return Err(format!("CreateProcessW: błąd {}", GetLastError()));
+            return Err(format!("CreateProcessW: error {}", GetLastError()));
         }
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut code = 0u32;
@@ -288,32 +288,32 @@ fn summarize(boot: &Boot, code: u32) {
         let _ = std::fs::write(&path, serde_json::to_string_pretty(r).unwrap_or_default());
     }
     println!();
-    println!("Gra zakończyła się kodem {code:#x} ({code})");
+    println!("Game exited with code {code:#x} ({code})");
     let Some(r) = report else {
-        println!("Brak raportu – zobacz log: {}", boot.logs_dir().join("xcl.log").display());
+        println!("No report – see the log: {}", boot.logs_dir().join("xcl.log").display());
         return;
     };
     if let Some(c) = &r.crash {
         println!("CRASH: {c}");
     }
     let total: usize = r.imports_by_source.values().sum();
-    println!("Importy: {total} ({})", r.imports_by_source.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", "));
+    println!("Imports: {total} ({})", r.imports_by_source.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", "));
     if !r.called_stubs.is_empty() {
-        println!("Wywołane niezaimplementowane funkcje ({}):", r.called_stubs.len());
+        println!("Unimplemented functions called ({}):", r.called_stubs.len());
         for s in r.called_stubs.iter().take(15) {
-            println!("  {:>8}×  {}!{}   (pierwsze wywołanie: {})", s.calls, s.dll, s.function, s.first_caller);
+            println!("  {:>8}×  {}!{}   (first call: {})", s.calls, s.dll, s.function, s.first_caller);
         }
     }
     if !r.vfs.unmapped_paths.is_empty() {
-        println!("Niezmapowane ścieżki konsolowe: {}", r.vfs.unmapped_paths.len());
+        println!("Unmapped console paths: {}", r.vfs.unmapped_paths.len());
         for p in r.vfs.unmapped_paths.iter().take(5) {
             println!("  {p}");
         }
     }
     if !r.vfs.redirected_writes.is_empty() {
-        println!("Zapisy do plików gry przekierowane do nakładki: {}", r.vfs.redirected_writes.len());
+        println!("Writes to game files redirected to the overlay: {}", r.vfs.redirected_writes.len());
     }
-    println!("Raport: {}", path.display());
+    println!("Report: {}", path.display());
     println!("Log:    {}", boot.logs_dir().join("xcl.log").display());
 }
 
@@ -359,8 +359,8 @@ mod tests {
         std::fs::copy(&me, d.0.join("xcl.exe")).unwrap();
         std::fs::copy(&me, d.0.join("renamed_copy.exe")).unwrap(); // byte-identical copy of XCL
         let e = resolve_target(&d.0).unwrap_err();
-        assert!(e.contains("xcl.exe") && e.contains("sam XCL"), "{e}");
-        assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("sam XCL"));
+        assert!(e.contains("xcl.exe") && e.contains("XCL itself"), "{e}");
+        assert!(resolve_target(&d.0.join("xcl.exe")).unwrap_err().contains("XCL itself"));
         // a real game exe next to it wins
         std::fs::write(d.0.join("game.exe"), b"MZ not really a game").unwrap();
         let (_, exe, _) = resolve_target(&d.0).unwrap();

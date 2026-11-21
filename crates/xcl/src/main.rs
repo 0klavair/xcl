@@ -18,22 +18,22 @@ unsafe extern "system" fn xcl_tls_callback(_h: *mut c_void, reason: u32, _r: *mu
 static XCL_TLS_CALLBACK: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = xcl_tls_callback;
 
 const HELP: &str = "\
-XCL – warstwa zgodności Xbox Series X|S → Windows
+XCL – Xbox Series X|S → Windows compatibility layer
 
-Użycie:
-  xcl run <folder gry | plik.exe> [-- argumenty gry]
-      Uruchamia grę. Folder gry jest tylko czytany; zapisy, zapisy gry i logi trafiają do
-      %LOCALAPPDATA%\\XCL\\<tytuł>\\ (lub %XCL_DATA_ROOT%\\<tytuł>\\).
-  xcl inspect <plik.exe|plik.dll> [--json]
-      Analiza bez uruchamiania: importy i co XCL dla nich ma (HLE / Windows / zaślepka).
-  xcl disasm <plik> [--offset N] [--length N] [--all] [--hex] [--fssm PLIK]
-      Dezasembler kodu GPU konsoli (RDNA2) – np. dla shaderów zapisanych w <dane>\\shaders\\.
-      Kontenery konsolowe (XDAT/XBCH/FSSM) są rozpakowywane; --fssm zapisuje rozpakowany FSSM.
-  xcl shaders <plik | folder | paczka.rpf> [--top N] [--json] [--recomp] [--compile N]
-      Statystyki korpusu shaderów: formaty, etapy, histogram instrukcji RDNA2 (priorytety
-      dla recompilera). Paczki RPF9 są skanowane w poszukiwaniu rekordów shaderów.
-      --recomp: tłumaczy wszystkie programy RDNA2 → HLSL i pokazuje, czego brakuje;
-      --compile N: dodatkowo kompiluje N pełnych tłumaczeń przez DXC.
+Usage:
+  xcl run <game folder | file.exe> [-- game arguments]
+      Runs the game. The game folder is only read; writes, game saves and logs go to
+      %LOCALAPPDATA%\\XCL\\<title>\\ (or %XCL_DATA_ROOT%\\<title>\\).
+  xcl inspect <file.exe|file.dll> [--json]
+      Analysis without running: imports and what XCL has for them (HLE / Windows / stub).
+  xcl disasm <file> [--offset N] [--length N] [--all] [--hex] [--fssm FILE]
+      Disassembler for console GPU code (RDNA2) – e.g. for shaders saved in <data>\\shaders\\.
+      Console containers (XDAT/XBCH/FSSM) are unpacked; --fssm saves the unpacked FSSM.
+  xcl shaders <file | folder | package.rpf> [--top N] [--json] [--recomp] [--compile N]
+      Shader corpus statistics: formats, stages, RDNA2 instruction histogram (priorities
+      for the recompiler). RPF9 packages are scanned for shader records.
+      --recomp: translates every RDNA2 program → HLSL and shows what is missing;
+      --compile N: additionally compiles N complete translations with DXC.
   xcl --version
 ";
 

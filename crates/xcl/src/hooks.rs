@@ -17,14 +17,14 @@ pub unsafe fn hook(module: &str, func: &str, detour: usize, orig: &AtomicUsize) 
         h = LoadLibraryW(wide(module).as_ptr());
     }
     if h.is_null() {
-        return Err(format!("hook {module}!{func}: brak modułu"));
+        return Err(format!("hook {module}!{func}: module not found"));
     }
     let cname = std::ffi::CString::new(func).unwrap();
-    let target = GetProcAddress(h, cname.as_ptr() as *const u8).ok_or_else(|| format!("hook: brak {module}!{func}"))?;
+    let target = GetProcAddress(h, cname.as_ptr() as *const u8).ok_or_else(|| format!("hook: {module}!{func} not found"))?;
     let d = RawDetour::new(target as *const (), detour as *const ()).map_err(|e| format!("hook {module}!{func}: {e}"))?;
     orig.store(d.trampoline() as *const () as usize, Ordering::Release);
     d.enable().map_err(|e| format!("hook {module}!{func}: {e}"))?;
     Box::leak(Box::new(d));
-    crate::xlog_debug!("hook {module}!{func} aktywny");
+    crate::xlog_debug!("hook {module}!{func} active");
     Ok(())
 }

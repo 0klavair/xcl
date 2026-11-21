@@ -46,7 +46,7 @@ pub fn record_call(info: &StubInfo, caller: usize) {
     if n == 0 {
         info.first_caller.store(caller, Ordering::Relaxed);
         crate::xlog_warn!(
-            "[STUB] {}!{} wywołane po raz pierwszy z {} → zwracam {:#x}",
+            "[STUB] {}!{} first called from {} → returning {:#x}",
             info.dll,
             info.name,
             crate::modules::describe_address(caller),

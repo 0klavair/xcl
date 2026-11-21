@@ -187,7 +187,7 @@ fn vtable(kind: Kind) -> *const usize {
 fn new_obj(kind: Kind) -> *mut NullObj {
     let n = CREATED.fetch_add(1, Ordering::Relaxed);
     if n < 64 || n % 10_000 == 0 {
-        crate::xlog_debug!("D3D12.X null: nowy {} (#{n})", kind.iface());
+        crate::xlog_debug!("D3D12.X null: new {} (#{n})", kind.iface());
     }
     Box::into_raw(Box::new(NullObj {
         vtbl: vtable(kind),
@@ -355,7 +355,7 @@ pub unsafe fn capture_stream_desc(desc: *const u8) {
     while off + 8 <= size {
         let ty = *((base + off) as *const u32);
         let Some((psize, palign)) = subobject_payload(ty) else {
-            crate::xlog_debug!("[SHADER] strumień PSO: nieznany podobiekt typu {ty} – przerywam analizę");
+            crate::xlog_debug!("[SHADER] PSO stream: unknown subobject type {ty} – stopping the parse");
             break;
         };
         let poff = if palign == 8 { 8 } else { 4 };
@@ -677,7 +677,7 @@ static ANNOUNCED: AtomicU32 = AtomicU32::new(0);
 
 unsafe fn create_device(ppv: *mut *mut c_void) -> HRESULT {
     if ANNOUNCED.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("D3D12.X: tworzę URZĄDZENIE ZASTĘPCZE (null device) – grafika nie jest renderowana w etapie M1");
+        crate::xlog_warn!("D3D12.X: creating a FALLBACK DEVICE (null device) – graphics are not rendered in milestone M1");
     }
     if ppv.is_null() {
         return S_FALSE;

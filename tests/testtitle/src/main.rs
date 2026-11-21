@@ -441,6 +441,6 @@ fn main() {
     check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);
 
     let failures = FAILURES.load(Ordering::SeqCst);
-    println!("xcl_testtitle: koniec, błędów: {failures}");
+    println!("xcl_testtitle: done, failures: {failures}");
     std::process::exit(failures as i32);
 }

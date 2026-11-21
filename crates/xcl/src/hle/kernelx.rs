@@ -86,7 +86,7 @@ pub fn sanitize_alloc_type(t: u32) -> u32 {
     let s = t & STD_ALLOC_MASK;
     let dropped = t & !STD_ALLOC_MASK;
     if dropped != 0 && WARNED_FLAGS.fetch_or(dropped, Ordering::Relaxed) & dropped != dropped {
-        crate::xlog_debug!("VirtualAlloc: pomijam konsolowe flagi alokacji {dropped:#x}");
+        crate::xlog_debug!("VirtualAlloc: dropping console allocation flags {dropped:#x}");
     }
     if s == 0 {
         0x1000 | 0x2000
@@ -361,7 +361,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         return 0;
     };
     let Some(block) = u.alloc(n * PHYS_PAGE, PHYS_PAGE) else {
-        crate::xlog_warn!("AllocateTitlePhysicalPages({n}): brak miejsca w UMA");
+        crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
@@ -411,7 +411,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     }
     static WARNED: AtomicU32 = AtomicU32::new(0);
     if WARNED.fetch_add(1, Ordering::Relaxed) < 5 {
-        crate::xlog_warn!("MapTitlePhysicalPages({va:?}, {n} stron, ciągłe: {consecutive}) – mapowanie pod wybrany adres / rozproszonych stron jeszcze nieobsługiwane");
+        crate::xlog_warn!("MapTitlePhysicalPages({va:?}, {n} pages, consecutive: {consecutive}) – mapping at a chosen address / of scattered pages not supported yet");
     }
     fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
     std::ptr::null_mut()

@@ -262,7 +262,7 @@ pub unsafe extern "system" fn XPackageMount(id: *const u8, out: *mut *mut c_void
     }
     let id = crate::util::from_cstr_ptr(id).unwrap_or_default();
     if !id.is_empty() && !id.eq_ignore_ascii_case(&package_identifier()) {
-        crate::xlog_warn!("XPackageMount({id}) – nieznany pakiet (DLC?)");
+        crate::xlog_warn!("XPackageMount({id}) – unknown package (DLC?)");
         return E_NOT_FOUND;
     }
     *out = Box::into_raw(Box::new(Mount { path: game_root() })) as *mut c_void;
@@ -392,7 +392,7 @@ unsafe fn valid_user(h: *mut c_void) -> bool {
 }
 
 pub unsafe extern "system" fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT {
-    crate::xlog_info!("XUserAddAsync(options={options:#x}) → lokalny użytkownik offline '{}'", crate::state::config().gamertag);
+    crate::xlog_info!("XUserAddAsync(options={options:#x}) → local offline user '{}'", crate::state::config().gamertag);
     begin_with(b, &USER_ADD_IDENTITY as *const u8 as usize, || {
         USER.refs.fetch_add(1, Ordering::AcqRel);
         Ok((user_ptr() as usize).to_le_bytes().to_vec())
@@ -535,7 +535,7 @@ pub unsafe extern "system" fn XUserUnregisterForChangeEvent(_token: Registration
 // ---------------------------------------------------------------------------------------
 
 pub unsafe extern "system" fn XStoreCreateContext(_user: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    crate::xlog_warn!("XStoreCreateContext → niedostępne (tryb offline, XCL nie udaje licencji)");
+    crate::xlog_warn!("XStoreCreateContext → unavailable (offline mode, XCL does not fake licenses)");
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }

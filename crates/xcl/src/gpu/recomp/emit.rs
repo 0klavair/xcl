@@ -277,7 +277,7 @@ impl Em {
         *self.unsupported_why.entry(format!("{m}: {why}")).or_default() += 1;
         *self.unsupported.entry(m).or_default() += 1;
         let txt = rdna2::format(d);
-        self.line(&format!("/* NIEOBSŁUGIWANE ({why}): {txt} */"));
+        self.line(&format!("/* UNSUPPORTED ({why}): {txt} */"));
     }
 
     // ---------------------------------------------------------------- registers
@@ -520,7 +520,7 @@ impl Em {
             "ENC_MIMG" => self.mimg(d, &name),
             "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH" => self.flat(d, &name),
             e if e.starts_with("ENC_VOP") || e.starts_with("VOP") => self.valu(d, &name),
-            _ => Err("kodowanie"),
+            _ => Err("encoding"),
         };
         if let Err(why) = r {
             self.unsupported(d, why);
@@ -599,7 +599,7 @@ impl Em {
                     "s_cbranch_execz" => Flow::Cond(execz(self), t),
                     "s_cbranch_execnz" => Flow::Cond(format!("!({})", execz(self)), t),
                     _ => {
-                        self.unsupported(d, "skok warunkowy");
+                        self.unsupported(d, "conditional branch");
                         Flow::Next
                     }
                 }
@@ -620,7 +620,7 @@ impl Em {
             let k_s = simm() as i16 as i32 as u32;
             let k_u = simm() as u32;
             let sd = Self::field(d, "SDST");
-            let cur = self.code32(sd, None, false).ok_or("rejestr")?;
+            let cur = self.code32(sd, None, false).ok_or("register")?;
             let dst = Dst::S(sd);
             match name {
                 "s_movk_i32" => self.write32(&dst, &hex(k_s)),
@@ -633,7 +633,7 @@ impl Em {
                 }
                 "s_mulk_i32" => self.write32(&dst, &format!("(uint)((int){cur} * {})", k_s as i32)),
                 _ if name.starts_with("s_cmpk_") => {
-                    let (op, signed) = cmp_op(&name[7..]).ok_or("porównanie")?;
+                    let (op, signed) = cmp_op(&name[7..]).ok_or("comparison")?;
                     let (a, b) = if signed { (format!("(int){cur}"), format!("{}", k_s as i32)) } else { (cur.clone(), format!("{k_u}u")) };
                     self.line(&format!("scc = (uint)({a} {op} {b});"));
                 }
@@ -656,7 +656,7 @@ impl Em {
             }
             let (a, b) = (self.read(d, ins[0], false).ok_or("op")?, self.read(d, ins[1], false).ok_or("op")?);
             if let Some(rest) = name.strip_prefix("s_cmp_") {
-                let (op, signed) = cmp_op(rest).ok_or("porównanie")?;
+                let (op, signed) = cmp_op(rest).ok_or("comparison")?;
                 let (a, b) = if signed { (format!("(int){a}"), format!("(int){b}")) } else { (a, b) };
                 self.line(&format!("scc = (uint)({a} {op} {b});"));
                 return Ok(());
@@ -711,11 +711,11 @@ impl Em {
             // already in their VGPRs (kernel mode) – other indirect jumps are not supported
             let (sd, s0) = (Self::field(d, "SDST"), Self::field(d, "SSRC0"));
             if name == "s_swappc_b64" && sd == s0 {
-                self.line("/* wywołanie fetch shadera – atrybuty wejściowe są już w VGPR */");
+                self.line("/* fetch shader call – the input attributes are already in VGPRs */");
                 *self.ignored.entry("s_swappc_b64 (fetch shader)".into()).or_default() += 1;
                 return Ok(());
             }
-            return Err("skok pośredni");
+            return Err("indirect branch");
         }
         if name == "s_getpc_b64" {
             // the code region is addressed from 0 in this model
@@ -1134,7 +1134,7 @@ impl Em {
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
                 let Some(e) = params.get(k) else {
-                    self.line("/* param bez elementu OSG1 (atrapa) */");
+                    self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 };
                 let n = out_comps(e);
@@ -1149,7 +1149,7 @@ impl Em {
             }
             (Mode::Pixel(ps), 0..=7) => {
                 let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) else {
-                    self.line("/* eksport do nieopisanego SV_Target */");
+                    self.line("/* export to an undeclared SV_Target */");
                     if done {
                         self.ps_done = true;
                         self.line(&format!("if ({act}) xcl_live = true;"));
@@ -1188,7 +1188,7 @@ impl Em {
             (Mode::Mesh(ms), 32..=63) => {
                 let k = (tgt - 32) as usize;
                 if k >= ranked(&ms.outputs, true).len() {
-                    self.line("/* param bez elementu OSG1 (atrapa) */");
+                    self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
                 for c in 0..4 {
@@ -1199,7 +1199,7 @@ impl Em {
             }
             (Mode::Mesh(_), 20) => st.push(format!("res.Store(xcl_prm * 4u, {});", srcs[0])),
             (Mode::Mesh(_), 9) => {}
-            _ => return Err("cel eksportu"),
+            _ => return Err("export target"),
         }
         if !st.is_empty() {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
@@ -1224,17 +1224,17 @@ impl Em {
 
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
-        let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolacja poza PS") };
+        let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
         let n_attrs = ranked(&ps.inputs, false).len() as u64;
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
         if attr >= n_attrs {
-            return Err("atrybut poza ISG1");
+            return Err("attribute outside ISG1");
         }
         let src = format!("xi.a{attr}[{chan}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
-                self.line("/* pierwsza połowa interpolacji – wartość daje p2 */");
+                self.line("/* first half of the interpolation – p2 produces the value */");
             }
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
@@ -1254,7 +1254,7 @@ impl Em {
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("if ({act}) {v} = {e};"));
             }
-            _ => return Err("interpolacja"),
+            _ => return Err("interpolation"),
         }
         Ok(())
     }
@@ -1567,7 +1567,7 @@ impl Em {
 
         if base == "get_lod" {
             if !ps {
-                return Err("image_get_lod poza PS");
+                return Err("image_get_lod outside PS");
             }
             let coords: Vec<String> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let (ty, coord) = match dim {
@@ -1989,7 +1989,7 @@ impl Em {
         let value = match &rd_idx {
             Some(idx) => {
                 if src_code < 256 {
-                    return Err("movrels: źródło nie jest VGPR");
+                    return Err("movrels: the source is not a VGPR");
                 }
                 let base = src_code - 256;
                 let mut cases = String::new();
@@ -2282,7 +2282,7 @@ impl Em {
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
             let s0 = f("SRC0");
             if s0 < 256 {
-                return Err("v_swap_b32: SRC0 nie jest VGPR");
+                return Err("v_swap_b32: SRC0 is not a VGPR");
             }
             let (x, y) = (self.vreg(f("VDST")), self.vreg(s0 - 256));
             let (t, act) = (self.t(), self.act());
@@ -2293,7 +2293,7 @@ impl Em {
             return Err("VOP3P");
         }
         if d.variant != Variant::Plain && ext_encoding(d).is_none() {
-            return Err("SDWA/DPP w tym kodowaniu");
+            return Err("SDWA/DPP in this encoding");
         }
         self.dpp_enable = None;
         if name.contains("f64") || name.contains("_i64") || name.contains("_u64") || name.contains("_b64") {
@@ -2506,7 +2506,7 @@ impl Em {
             "v_mbcnt_lo_u32_b32" => format!("countbits({a} & lanemask_lt_lo()) + {b}"),
             "v_mbcnt_hi_u32_b32" => format!("countbits({a} & lanemask_lt_hi()) + {b}"),
             "v_cndmask_b32" => {
-                let (l, h) = u.get(2).ok_or("maska")?.split_once('|').ok_or("maska")?;
+                let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
                 let bit = self.lane_of(l, h);
                 format!("select({bit}, {b}, {a})")
             }
@@ -2576,7 +2576,7 @@ impl Em {
                 return Ok(());
             }
             "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
-                let (l, h) = u.get(2).ok_or("maska")?.split_once('|').ok_or("maska")?;
+                let (l, h) = u.get(2).ok_or("mask")?.split_once('|').ok_or("mask")?;
                 let cin = format!("(uint)({})", self.lane_of(l, h));
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b.clone(), a.clone()) } else { (a.clone(), b.clone()) };
                 let t = self.t();
@@ -2675,7 +2675,7 @@ impl Em {
                     _ => return Err("VOPC int"),
                 }
             }
-            _ => return Err("VOPC typ"),
+            _ => return Err("VOPC type"),
         };
         self.vopc_write(d, cmpx, outs, &cond)
     }
@@ -2963,7 +2963,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     let (and, or, xor) = (pat & 0x1F, (pat >> 5) & 0x1F, (pat >> 10) & 0x1F);
                     format!("(lane_id & 0x20u) | ((((lane_id & 0x1Fu) & {and}u) | {or}u) ^ {xor}u)")
                 } else {
-                    return Err("ds_swizzle: tryb FFT/rotacji");
+                    return Err("ds_swizzle: FFT/rotate mode");
                 };
                 self.line(&format!("uint {t} = rla({a}, {src});"));
                 let dst = Dst::V(f("VDST"));
@@ -2981,7 +2981,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             _ => {}
         }
         if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
-            return Err("LDS poza compute");
+            return Err("LDS outside compute");
         }
         // geometry mode: where each GS lane puts its output vertices (lowest LDS address written)
         let gs_phase = match &self.opt.mode {

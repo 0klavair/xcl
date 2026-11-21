@@ -235,7 +235,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
     if !readable(ptr, len) {
         st.stats.rejected_pointers += 1;
         if st.stats.rejected_pointers <= 5 {
-            crate::xlog_warn!("[SHADER] {stage}: niepoprawny wskaźnik/rozmiar ({ptr:#x}, {len}) – inny układ struktury na konsoli?");
+            crate::xlog_warn!("[SHADER] {stage}: invalid pointer/size ({ptr:#x}, {len}) – different struct layout on the console?");
         }
         return;
     }
@@ -257,14 +257,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
     let base = dir.join(format!("{h:016x}_{stage}"));
     let _ = std::fs::write(base.with_extension("bin"), &blob);
     let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
-    crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, części [{}]", blob.len(), kind.label(), names.join(","));
+    crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
     if kind == Kind::XboxNative {
         capture_xbox(&blob, &base, h);
     } else if matches!(kind, Kind::ContainerUnknown | Kind::Rdna2Raw | Kind::Unknown) {
         let listing = rdna2_listing(&blob);
         if !listing.is_empty() {
             let _ = std::fs::write(base.with_extension("rdna2.txt"), listing);
-            crate::xlog_info!("[SHADER] {h:016x}: znaleziono kod RDNA2 – dezasemblacja w {}", base.with_extension("rdna2.txt").display());
+            crate::xlog_info!("[SHADER] {h:016x}: RDNA2 code found – disassembly in {}", base.with_extension("rdna2.txt").display());
         }
     }
 }
@@ -291,13 +291,13 @@ fn capture_xbox(blob: &[u8], base: &std::path::Path, h: u64) {
     recompile(blob, &sh, base);
     let stages: Vec<String> = sh.fssm.iter().map(|f| f.stage_label()).collect();
     crate::xlog_info!(
-        "[SHADER] {h:016x}: kontener konsolowy {} SM {}.{}, FSSM [{}], {} instrukcji RDNA2{}",
+        "[SHADER] {h:016x}: console container {} SM {}.{}, FSSM [{}], {} RDNA2 instructions{}",
         sh.stage,
         sh.shader_model.0,
         sh.shader_model.1,
         stages.join(", "),
         insts.instructions,
-        if failed { " – UWAGA: niepełny parse (xcl disasm)" } else { "" }
+        if failed { " – WARNING: incomplete parse (xcl disasm)" } else { "" }
     );
 }
 
@@ -323,7 +323,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
             let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
             if let Some(Err(e)) = &built {
-                crate::xlog_warn!("[SHADER] DXC odrzucił tłumaczenie {}: {}", base.display(), e.lines().next().unwrap_or(""));
+                crate::xlog_warn!("[SHADER] DXC rejected the translation {}: {}", base.display(), e.lines().next().unwrap_or(""));
             }
             if let Some(st) = STATE.lock().unwrap().as_mut() {
                 let s = &mut st.stats;

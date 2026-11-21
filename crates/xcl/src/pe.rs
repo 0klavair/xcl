@@ -41,10 +41,10 @@ pub enum PeError {
 impl fmt::Display for PeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PeError::Truncated(w) => write!(f, "plik obcięty/uszkodzony ({w})"),
-            PeError::BadMagic(w) => write!(f, "niepoprawny podpis {w} (to nie jest plik PE)"),
-            PeError::NotX64(m) => write!(f, "architektura 0x{m:04x} nie jest x64 (0x8664)"),
-            PeError::BadRva(r) => write!(f, "RVA 0x{r:x} poza obrazem"),
+            PeError::Truncated(w) => write!(f, "file truncated/corrupt ({w})"),
+            PeError::BadMagic(w) => write!(f, "invalid signature {w} (not a PE file)"),
+            PeError::NotX64(m) => write!(f, "architecture 0x{m:04x} is not x64 (0x8664)"),
+            PeError::BadRva(r) => write!(f, "RVA 0x{r:x} outside the image"),
         }
     }
 }

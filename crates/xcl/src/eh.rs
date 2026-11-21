@@ -22,7 +22,7 @@ pub fn register_function_table(base: usize, rva: u32, size: u32) -> bool {
         RtlAddFunctionTable((base + rva as usize) as *const IMAGE_RUNTIME_FUNCTION_ENTRY, count, base as u64)
     };
     if !ok {
-        crate::xlog_warn!("RtlAddFunctionTable({base:#x}) nie powiodło się");
+        crate::xlog_warn!("RtlAddFunctionTable({base:#x}) failed");
     }
     ok
 }
@@ -59,12 +59,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         let mut extra = String::new();
         if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
             let op = match rec.ExceptionInformation[0] {
-                0 => "odczyt",
-                1 => "zapis",
-                8 => "wykonanie",
+                0 => "read",
+                1 => "write",
+                8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} adresu {:#x})", rec.ExceptionInformation[1]);
+            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
@@ -77,7 +77,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             )
         };
         let msg = format!(
-            "nieobsłużony wyjątek {:#010x} w {}{extra}{regs}",
+            "unhandled exception {:#010x} in {}{extra}{regs}",
             rec.ExceptionCode as u32,
             modules::describe_address(addr)
         );

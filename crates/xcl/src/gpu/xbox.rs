@@ -194,27 +194,27 @@ pub fn parse(blob: &[u8]) -> Option<XboxShader> {
         ..Default::default()
     };
     if x != 0x18 {
-        sh.notes.push(format!("XDAT pod +{x:#x} w części DXIL (oczekiwano +0x18)"));
+        sh.notes.push(format!("XDAT at +{x:#x} in the DXIL part (expected +0x18)"));
     }
     match xdat_entries(d, x) {
         Some(e) => sh.entries = e.into_iter().map(|(id, o, s)| XdatEntry { id, offset: dxil.offset + o, size: s }).collect(),
-        None => sh.notes.push("nie udało się odczytać tabeli XDAT".into()),
+        None => sh.notes.push("could not read the XDAT table".into()),
     }
     for e in &sh.entries {
         let data = &blob[e.offset..e.offset + e.size];
         if data.starts_with(b"XBCH") {
             if e.id != XDAT_XBCH {
-                sh.notes.push(format!("XBCH we wpisie o nieoczekiwanym id {:#x}", e.id));
+                sh.notes.push(format!("XBCH in an entry with unexpected id {:#x}", e.id));
             }
             sh.fssm.push(parse_xbch(data, e.offset));
         } else if e.id == XDAT_HASH && e.size == 16 {
             sh.hash = Some(data.try_into().unwrap());
         } else if e.id == XDAT_XBCH {
-            sh.notes.push(format!("wpis {:#x} bez nagłówka XBCH", e.id));
+            sh.notes.push(format!("entry {:#x} without an XBCH header", e.id));
         }
     }
     if sh.fssm.is_empty() {
-        sh.notes.push("brak FSSM (kodu natywnego) w kontenerze".into());
+        sh.notes.push("no FSSM (native code) in the container".into());
     }
     Some(sh)
 }
@@ -258,7 +258,7 @@ fn parse_xbch(x: &[u8], blob_offset: usize) -> Fssm {
         (8..x.len().min(64)).find(|&o| x[o] == 0x78 && is_zlib_header(&x[o..]))
     };
     let Some(start) = start else {
-        f.error = Some("XBCH: nie znaleziono strumienia zlib".into());
+        f.error = Some("XBCH: zlib stream not found".into());
         return f;
     };
     let end = if csize > 0 && start + csize <= x.len() { start + csize } else { x.len() };
@@ -267,12 +267,12 @@ fn parse_xbch(x: &[u8], blob_offset: usize) -> Fssm {
     match miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&x[start..end], limit) {
         Ok(data) => {
             if rsize != 0 && data.len() != rsize {
-                f.error = Some(format!("XBCH: rozpakowano {} B, nagłówek podaje {rsize} B", data.len()));
+                f.error = Some(format!("XBCH: decompressed {} B, the header says {rsize} B", data.len()));
             }
             f.data = data;
             analyze_fssm(&mut f);
         }
-        Err(e) => f.error = Some(format!("XBCH: błąd zlib ({:?})", e.status)),
+        Err(e) => f.error = Some(format!("XBCH: zlib error ({:?})", e.status)),
     }
     f
 }
@@ -294,7 +294,7 @@ fn analyze_fssm(f: &mut Fssm) {
             }
         }
     } else {
-        f.error.get_or_insert_with(|| "brak nagłówka FSSM".into());
+        f.error.get_or_insert_with(|| "no FSSM header".into());
     }
     let code_start = f.code.map(|c| c.0).unwrap_or(d.len());
     if magic_ok {
@@ -537,7 +537,7 @@ pub fn listing(sh: &XboxShader) -> String {
         blocks.sort_by_key(|b| b.1.offset);
         for (is_data, p) in blocks {
             if is_data {
-                out.push_str(&format!("; FSSM #{i}: dane w kodzie +{:#x} (FSSM +{:#x}), {} B\n", p.offset - co, p.offset, p.len));
+                out.push_str(&format!("; FSSM #{i}: data in the code +{:#x} (FSSM +{:#x}), {} B\n", p.offset - co, p.offset, p.len));
                 for (k, w) in f.data[p.offset..p.offset + p.len].chunks_exact(4).enumerate() {
                     let w = u32::from_le_bytes(w.try_into().unwrap());
                     // show a float only where the bits look like one (|x| ≈ 1e-10 … 1e10)
@@ -548,7 +548,7 @@ pub fn listing(sh: &XboxShader) -> String {
                 continue;
             }
             out.push_str(&format!(
-                "; FSSM #{i} [{}]: program +{:#x} w kodzie (FSSM +{:#x}), {} B\n",
+                "; FSSM #{i} [{}]: program +{:#x} in the code (FSSM +{:#x}), {} B\n",
                 f.stage_label(),
                 p.offset - co,
                 p.offset,

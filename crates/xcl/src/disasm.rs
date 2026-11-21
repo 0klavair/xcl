@@ -32,15 +32,15 @@ fn hexdump(data: &[u8], base: usize) {
 fn xdat_label(id: u32) -> &'static str {
     match id {
         xbox::XDAT_HASH => "hash",
-        xbox::XDAT_XBCH => "XBCH → FSSM (kod natywny)",
-        xbox::XDAT_NESTED_HEADER => "zagnieżdżony nagłówek DXIL (NOBC)",
+        xbox::XDAT_XBCH => "XBCH → FSSM (native code)",
+        xbox::XDAT_NESTED_HEADER => "nested DXIL header (NOBC)",
         _ => "?",
     }
 }
 
 fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
     println!(
-        "kontener konsolowy: etap {} (DXIL), SM {}.{}, XDAT @ +{:#x}",
+        "console container: stage {} (DXIL), SM {}.{}, XDAT @ +{:#x}",
         sh.stage, sh.shader_model.0, sh.shader_model.1, sh.xdat_offset
     );
     for e in &sh.entries {
@@ -50,7 +50,7 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
         println!("  hash: {}", h.iter().map(|b| format!("{b:02x}")).collect::<String>());
     }
     for n in &sh.notes {
-        println!("  UWAGA: {n}");
+        println!("  NOTE: {n}");
     }
     for (i, f) in sh.fssm.iter().enumerate() {
         println!(
@@ -62,34 +62,34 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
             f.version
         );
         if let Some(e) = &f.error {
-            println!("  UWAGA: {e}");
+            println!("  WARNING: {e}");
         }
         for s in &f.stages {
-            println!("  etap sprzętowy: {} – deskryptor @ +{:#x}", s.label(), s.offset);
+            println!("  hardware stage: {} – descriptor @ +{:#x}", s.label(), s.offset);
         }
         match f.code {
             Some((o, l)) => println!(
-                "  kod: +{o:#x}, {l} B ({}), programów: {}",
-                if f.code_from_header { "wskaźnik z nagłówka +0xC0" } else { "znaleziony skanowaniem" },
+                "  code: +{o:#x}, {l} B ({}), programs: {}",
+                if f.code_from_header { "pointer from header +0xC0" } else { "found by scanning" },
                 f.programs.len()
             ),
-            None => println!("  kod: nie znaleziono"),
+            None => println!("  code: not found"),
         }
         let limit = if full_hex { usize::MAX } else { 0x140 };
-        println!("  nagłówek – niezerowe qwordy (bez wypełniacza 0xDEADBEEF){}:", if full_hex { "" } else { ", do +0x140; --hex: całość" });
+        println!("  header – non-zero qwords (without the 0xDEADBEEF filler){}:", if full_hex { "" } else { ", up to +0x140; --hex: all" });
         for (o, q) in xbox::header_qwords(f, limit) {
             println!("    +{o:#05x}: {q:016x}");
         }
         if full_hex {
             if let Some((o, l)) = f.code {
-                println!("  dane za kodem (+{:#x}):", o + l);
+                println!("  data after the code (+{:#x}):", o + l);
                 hexdump(&f.data[o + l..], o + l);
             }
         }
         if let Some(out) = fssm_out {
             let name = if i == 0 { out.to_string() } else { format!("{out}.{i}") };
             match std::fs::write(&name, &f.data) {
-                Ok(()) => println!("  zapisano FSSM do {name}"),
+                Ok(()) => println!("  saved FSSM to {name}"),
                 Err(e) => eprintln!("xcl disasm: {name}: {e}"),
             }
         }
@@ -106,11 +106,11 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     };
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| parse_num(v));
     let all = args.iter().any(|a| a == "--all");
-    println!("{} – {} B, dekoder: {}", path.display(), data.len(), crate::gpu::RDNA2_ARCH);
+    println!("{} – {} B, decoder: {}", path.display(), data.len(), crate::gpu::RDNA2_ARCH);
 
     if let Some(off) = opt("--offset") {
         if off >= data.len() {
-            eprintln!("xcl disasm: offset {off:#x} poza plikiem");
+            eprintln!("xcl disasm: offset {off:#x} is past the end of the file");
             return 2;
         }
         let len = opt("--length").unwrap_or(data.len() - off).min(data.len() - off);
@@ -121,7 +121,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let (kind, parts) = shader::classify(&data);
     println!("format: {}", kind.label());
     if !parts.is_empty() {
-        println!("części kontenera:");
+        println!("container parts:");
         for p in &parts {
             println!("  {}  +{:#x}  {} B", p.fourcc, p.offset, p.size);
         }
@@ -134,9 +134,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     let listing = shader::rdna2_listing(&data);
     if listing.is_empty() {
-        println!("nie znaleziono programów RDNA2 (zakończonych s_endpgm); użyj --offset N, aby wymusić dekodowanie");
+        println!("no RDNA2 programs found (ending in s_endpgm); use --offset N to force decoding");
         if matches!(kind, shader::Kind::Dxil | shader::Kind::Dxbc) {
-            println!("(to shader w formacie PC – nie wymaga rekompilacji)");
+            println!("(this is a PC-format shader – no recompilation needed)");
         }
     } else {
         print!("{listing}");

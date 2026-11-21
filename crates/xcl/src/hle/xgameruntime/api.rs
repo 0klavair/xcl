@@ -70,7 +70,7 @@ const XSTORE: Guid = g(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
 pub const XASYNC: Guid = g(0x073b7dcb_1fcf_4030_94be_e3c9eb623428);
 
 /// classes that reach Xbox Live / the Store or take XCL's user handles: not available
-const REFUSED: [(Guid, &str); 2] = [(XSTORE, "XStore"), (XUSER_DEVICE, "XUser (urządzenia)")];
+const REFUSED: [(Guid, &str); 2] = [(XSTORE, "XStore"), (XUSER_DEVICE, "XUser (devices)")];
 
 /// names of the other classes, for the log
 fn family(c: &Guid) -> &'static str {
@@ -79,7 +79,7 @@ fn family(c: &Guid) -> &'static str {
         0x37e56907 => "XNetworking",
         0x95fd18d2 => "XGameInvite",
         0x8836fe87 => "XGameRuntimeFeature",
-        0x0a2192aa => "(tylko konsola – na PC zaślepki)",
+        0x0a2192aa => "(console only – stubs on PC)",
         _ => "?",
     }
 }
@@ -112,12 +112,12 @@ fn pc() -> Option<&'static Pc> {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
         let h = LoadLibraryExW(crate::util::wide("xgameruntime.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if h.is_null() {
-            crate::xlog_warn!("XGameRuntime: brak System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync i reszta API spoza XCL niedostępne");
+            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync and the other APIs XCL does not implement are unavailable");
             return None;
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);
         let query = f("QueryApiImpl")?;
-        crate::xlog_info!("XGameRuntime: API spoza XCL z systemowego xgameruntime.dll");
+        crate::xlog_info!("XGameRuntime: APIs XCL does not implement come from the system xgameruntime.dll");
         Some(Pc {
             query: std::mem::transmute::<usize, QueryFn>(query),
             init_ex2: f("InitializeApiImplEx2").map(|p| std::mem::transmute::<usize, InitEx2>(p)),
@@ -146,7 +146,7 @@ unsafe fn start_pc_async() {
 // ---------------------------------------------------------------------------------------
 
 pub unsafe extern "system" fn InitializeApiImplEx2(gdk: u64, os: u64, flags: u64, options: *mut c_void) -> HRESULT {
-    crate::xlog_info!("XGameRuntime: InitializeApiImplEx2({gdk:#x}, {os:#x}, flagi {flags:#x}) – tytuł przez thunki GDK");
+    crate::xlog_info!("XGameRuntime: InitializeApiImplEx2({gdk:#x}, {os:#x}, flags {flags:#x}) – title goes through the GDK thunks");
     pc_init(gdk, os, flags, options);
     S_OK
 }
@@ -163,13 +163,13 @@ unsafe fn pc_init(gdk: u64, os: u64, flags: u64, options: *mut c_void) {
         hr = p.init.map(|f| f(gdk >> 32, gdk & 0xFFFF_FFFF)).unwrap_or(-1);
     }
     if hr < 0 {
-        crate::xlog_warn!("XGameRuntime PC: inicjalizacja → {:#x}", hr as u32);
+        crate::xlog_warn!("XGameRuntime PC: initialization → {:#x}", hr as u32);
     }
     start_pc_async();
 }
 
 pub unsafe extern "system" fn InitializeApiImplEx(gdk: u64, os: u64, flags: u64) -> HRESULT {
-    crate::xlog_info!("XGameRuntime: InitializeApiImplEx({gdk:#x}, {os:#x}, flagi {flags:#x})");
+    crate::xlog_info!("XGameRuntime: InitializeApiImplEx({gdk:#x}, {os:#x}, flags {flags:#x})");
     pc_init(gdk, os, flags, std::ptr::null_mut());
     S_OK
 }
@@ -197,7 +197,7 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
     *out = std::ptr::null_mut();
     let (c, i) = (*clsid, *iid);
     if let Some((_, name)) = REFUSED.iter().find(|r| r.0 == c) {
-        note(c, i, format!("{name}: niedostępne (offline)"));
+        note(c, i, format!("{name}: unavailable (offline)"));
         return REGDB_E_CLASSNOTREG;
     }
     if let Some(o) = own(&c, &i) {
@@ -215,7 +215,7 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
             S_OK
         }
         None => {
-            note(c, i, format!("{}: brak", family(&c)));
+            note(c, i, format!("{}: missing", family(&c)));
             REGDB_E_CLASSNOTREG
         }
     }
@@ -282,7 +282,7 @@ unsafe fn unknown_slot(this: *const Obj, slot: usize) -> usize {
         *n == 1
     };
     if first {
-        crate::xlog_warn!("XGameRuntime: {key} – nieobsługiwane (E_NOTIMPL)");
+        crate::xlog_warn!("XGameRuntime: {key} – not supported (E_NOTIMPL)");
     }
     if f.zero.contains(&slot) {
         0
@@ -547,14 +547,14 @@ pub unsafe extern "system" fn XGameGetXboxTitleId(out: *mut u32) -> HRESULT {
     let t = &crate::state::config().title_id;
     *out = u32::from_str_radix(t.trim_start_matches("0x"), 16).unwrap_or(0);
     if *out == 0 {
-        crate::xlog_warn!("XGameGetXboxTitleId: brak TitleId w MicrosoftGame.Config / xcl.toml → 0");
+        crate::xlog_warn!("XGameGetXboxTitleId: no TitleId in MicrosoftGame.Config / xcl.toml → 0");
     }
     S_OK
 }
 
 unsafe extern "system" fn XLaunchNewGame(exe: *const u8, args: *const u8, _user: *mut c_void) {
     crate::xlog_warn!(
-        "XLaunchNewGame({}, {}) – pomijam (XCL uruchamia jeden tytuł)",
+        "XLaunchNewGame({}, {}) – ignored (XCL runs a single title)",
         crate::util::from_cstr_ptr(exe).unwrap_or_default(),
         crate::util::from_cstr_ptr(args).unwrap_or_default()
     );
@@ -581,7 +581,7 @@ fn note(c: Guid, i: Guid, what: String) {
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiStats {
-    /// "clsid/iid" → who answered (XCL, PC, niedostępne, brak)
+    /// "clsid/iid" → who answered (XCL, PC, unavailable, missing)
     pub apis: BTreeMap<String, String>,
     /// XCL objects' slots the title called that XCL does not implement: "Iface#slot" → calls
     pub unimplemented: BTreeMap<String, u64>,
@@ -624,14 +624,14 @@ mod tests {
     fn thunk_protocol_with_xcl_objects_on_pc_queues() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if pc().is_none() {
-            println!("brak systemowego xgameruntime.dll – pomijam");
+            println!("no system xgameruntime.dll – skipping");
             return;
         }
         unsafe {
             assert_eq!(InitializeApiImplEx2(0x6336_0000_2712, 0x65f4_0000_1edd, 2, std::ptr::null_mut()), S_OK);
             assert_eq!(query(XSTORE, XSTORE).0, REGDB_E_CLASSNOTREG);
             let (hr, xa) = query(XASYNC, XASYNC);
-            assert!(hr >= 0 && !xa.is_null(), "XAsync z PC: {hr:#x}");
+            assert!(hr >= 0 && !xa.is_null(), "XAsync from PC: {hr:#x}");
             let get_status: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, bool) -> HRESULT = slot(xa, 3);
 
             // XUserAddAsync / Result through the vtable, completed on the PC process queue
@@ -696,7 +696,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             super::super::xasync::use_pc(0);
-            assert!(DONE.load(Ordering::SeqCst) >= 1, "wywołanie zwrotne XAsync");
+            assert!(DONE.load(Ordering::SeqCst) >= 1, "XAsync completion callback");
         }
     }
 }

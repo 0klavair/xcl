@@ -58,10 +58,10 @@ pub fn console_imports(path: &Path) -> Option<Vec<String>> {
 fn status(s: &Source) -> String {
     match s {
         Source::Hle(m) => format!("HLE ({m})"),
-        Source::HleOther(m) => format!("HLE ({m}, inny moduł)"),
+        Source::HleOther(m) => format!("HLE ({m}, other module)"),
         Source::System(d) => format!("Windows ({d})"),
-        Source::GameDll(d) => format!("DLL gry ({d})"),
-        Source::Stub => "ZAŚLEPKA".into(),
+        Source::GameDll(d) => format!("game DLL ({d})"),
+        Source::Stub => "STUB".into(),
     }
 }
 
@@ -69,7 +69,7 @@ pub fn run(path: &Path, json: bool) -> i32 {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("xcl inspect: nie można odczytać {}: {e}", path.display());
+            eprintln!("xcl inspect: cannot read {}: {e}", path.display());
             return 2;
         }
     };
@@ -77,7 +77,7 @@ pub fn run(path: &Path, json: bool) -> i32 {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
-                "xcl inspect: {}: {e}\n(Jeśli to plik z paczki XVC/MSIXVC – XCL działa tylko na już rozpakowanych plikach.)",
+                "xcl inspect: {}: {e}\n(If this is a file from an XVC/MSIXVC package – XCL only works on already unpacked files.)",
                 path.display()
             );
             return 3;
@@ -115,23 +115,23 @@ pub fn run(path: &Path, json: bool) -> i32 {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
         return 0;
     }
-    println!("Plik:          {}", out.file);
-    println!("Typ:           {} x64, podsystem {}", if out.is_dll { "DLL" } else { "EXE" }, out.subsystem);
-    println!("ImageBase:     {}  (rozmiar {}, wejście +{})", out.image_base, out.size_of_image, out.entry_rva);
-    println!("Relokacje:     {}", if out.has_relocations { "tak" } else { "NIE (obraz musi trafić pod ImageBase)" });
-    println!("Statyczny TLS: {}", tls.map(|n| format!("{n} B (obsługiwany przez nośnik TLS)")).unwrap_or_else(|| "brak".into()));
-    println!("Wyjątki:       {} wpisów .pdata", out.exception_entries);
-    println!("Stos:          {}", out.stack_reserve);
+    println!("File:          {}", out.file);
+    println!("Type:          {} x64, subsystem {}", if out.is_dll { "DLL" } else { "EXE" }, out.subsystem);
+    println!("ImageBase:     {}  (size {}, entry +{})", out.image_base, out.size_of_image, out.entry_rva);
+    println!("Relocations:   {}", if out.has_relocations { "yes" } else { "NO (the image must be mapped at ImageBase)" });
+    println!("Static TLS:    {}", tls.map(|n| format!("{n} B (handled by the TLS carrier)")).unwrap_or_else(|| "none".into()));
+    println!("Exceptions:    {} .pdata entries", out.exception_entries);
+    println!("Stack:         {}", out.stack_reserve);
     match console_imports(path) {
-        Some(c) if !c.is_empty() => println!("Gra z konsoli: tak (importuje {})", c.join(", ")),
-        _ => println!("Gra z konsoli: NIE – brak importów kernelx / xgameruntime / d3d12_xs (zwykły program Windows?)"),
+        Some(c) if !c.is_empty() => println!("Console game:  yes (imports {})", c.join(", ")),
+        _ => println!("Console game:  NO – no kernelx / xgameruntime / d3d12_xs imports (a regular Windows program?)"),
     }
     let mut per_dll: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     for e in &out.imports {
         per_dll.entry(format!("{}{}", e.dll, if e.delay { " (delay-load)" } else { "" })).or_default().push(e);
     }
-    let total_stub = out.imports.iter().filter(|e| e.status == "ZAŚLEPKA").count();
-    println!("\nImporty: {} funkcji z {} DLL, z czego {} bez implementacji (zaślepki):", out.imports.len(), per_dll.len(), total_stub);
+    let total_stub = out.imports.iter().filter(|e| e.status == "STUB").count();
+    println!("\nImports: {} functions from {} DLLs, {} of them unimplemented (stubs):", out.imports.len(), per_dll.len(), total_stub);
     for (dll, entries) in &per_dll {
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for e in entries {
@@ -139,16 +139,16 @@ pub fn run(path: &Path, json: bool) -> i32 {
                 "HLE"
             } else if e.status.starts_with("Windows") {
                 "Windows"
-            } else if e.status.starts_with("DLL gry") {
-                "DLL gry"
+            } else if e.status.starts_with("game DLL") {
+                "game DLL"
             } else {
-                "zaślepki"
+                "stubs"
             };
             *counts.entry(k).or_default() += 1;
         }
         let c: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
         println!("  {dll}: {}", c.join(", "));
-        for e in entries.iter().filter(|e| e.status == "ZAŚLEPKA") {
+        for e in entries.iter().filter(|e| e.status == "STUB") {
             println!("      - {}", e.function);
         }
     }

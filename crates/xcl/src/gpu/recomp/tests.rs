@@ -10,7 +10,7 @@ fn gpu_ready() -> bool {
     match (runner::adapter(), super::dxc::location()) {
         (Ok(_), Ok(_)) => true,
         (a, d) => {
-            println!("GPU/DXC niedostępne – pomijam ({:?} / {:?})", a.err(), d.err());
+            println!("GPU/DXC unavailable – skipping ({:?} / {:?})", a.err(), d.err());
             false
         }
     }
@@ -168,7 +168,7 @@ fn gpu_scalar_loop_and_scc() {
     let mut st = KernelState::default();
     st.sgpr[20] = (8 << 16) | 8;
     let r = runner::run_code(&code, &st, &[]).unwrap();
-    assert_eq!(r.sgpr[0], 55, "pętla");
+    assert_eq!(r.sgpr[0], 55, "loop");
     assert!(r.vgpr.iter().all(|v| v[1] == 55));
     assert_eq!(r.sgpr[2], 1, "s_add_u32 wraps");
     assert_eq!(r.sgpr[3], 1, "s_addc_u32 uses the carry");
@@ -273,14 +273,14 @@ fn gpu_memory_and_exports() {
 #[test]
 fn gpu_retail_vs_blit_gen_amb_cube() {
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else {
-        println!("XCL_SAMPLE_RPF nie ustawione – pomijam");
+        println!("XCL_SAMPLE_RPF not set – skipping");
         return;
     };
     if !gpu_ready() {
         return;
     }
     let data = std::fs::read(&path).unwrap();
-    let rec = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name == "VS_BlitGenAmbCube_0cfdb358_Wrapped").expect("rekord");
+    let rec = crate::gpu::pack::scan(&data, 0x40).into_iter().find(|r| r.name == "VS_BlitGenAmbCube_0cfdb358_Wrapped").expect("record");
     let blob = crate::gpu::pack::inflate(&data, &rec).unwrap();
     let sh = crate::gpu::xbox::parse(&blob).unwrap();
     let fs = &sh.fssm[0];
@@ -529,7 +529,7 @@ fn gpu_graphics_vs_ps_draw() {
         for x in 0..16 {
             let want = if x >= 8 { [0.4, 0.6, 0.4, 1.0] } else { clear };
             let got = px[y * 16 + x];
-            assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "piksel ({x},{y}) = {got:?}, oczekiwano {want:?}");
+            assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "pixel ({x},{y}) = {got:?}, expected {want:?}");
         }
     }
 }
@@ -1183,11 +1183,11 @@ fn retail_ps_gallery() {
         let bytes: Vec<u8> = rgb.iter().map(|x| (x.powf(1.0 / 2.2) * 255.0).round() as u8).collect();
         let file = format!("{:02}_{}.png", kept.len(), rec.name.split('_').take(4).collect::<Vec<_>>().join("_"));
         write_png(&dir.join(&file), size, size, &bytes);
-        println!("{file}: {} instrukcji, wariancja {var:.3}", t.instructions);
+        println!("{file}: {} instructions, variance {var:.3}", t.instructions);
         kept.push(format!("{file}\t{}\t{}", rec.name, t.instructions));
     }
     std::fs::write(dir.join("index.txt"), kept.join("\n")).unwrap();
-    println!("spróbowano {tried}, zapisano {} w {:.0} s", kept.len(), t0.elapsed().as_secs_f64());
+    println!("tried {tried}, saved {} in {:.0} s", kept.len(), t0.elapsed().as_secs_f64());
 }
 
 #[test]
@@ -1312,7 +1312,7 @@ fn gpu_tsharp_to_d3d12_resources() {
         [0, fmt << 20 | (w1 & 3) << 30, (w1 >> 2) | h1 << 14, 4 | 5 << 3 | 6 << 6 | 7 << 9 | (mips - 1) << 16 | ty << 28, depth - 1, (mips - 1) << 4, 0, 0]
     };
     for (name, words) in [
-        ("2D RGBA8 9 mipów", t(56, 256, 256, 1, 9, 9)),
+        ("2D RGBA8 9 mips", t(56, 256, 256, 1, 9, 9)),
         ("2D BC7 sRGB", t(182, 128, 64, 1, 9, 1)),
         ("cube RGBA16F", t(71, 64, 64, 6, 11, 7)),
         ("3D R11G11B10", t(36, 32, 32, 16, 10, 1)),
@@ -1637,10 +1637,10 @@ fn compute_abi_survey() {
         let v_in = vr.iter().all(|&v| v <= tid as u64);
         vgpr_ok += v_in as usize;
         if !(s_in && v_in && psv == Some(nt)) {
-            println!("{}: rsrc2 {rsrc2:#x} user {user} tgid {tg:?} tid {tid} threads {nt:?} psv {psv:?} SGPR czytane {sr:?} VGPR {vr:?}", r.name);
+            println!("{}: rsrc2 {rsrc2:#x} user {user} tgid {tg:?} tid {tid} threads {nt:?} psv {psv:?} SGPRs read {sr:?} VGPR {vr:?}", r.name);
         }
     }
-    println!("CS: {n}, numthreads = PSV0: {threads_ok}, SGPR w user+system: {sgpr_ok}, VGPR w ID wątku: {vgpr_ok}");
+    println!("CS: {n}, numthreads = PSV0: {threads_ok}, SGPRs within user+system: {sgpr_ok}, VGPRs within the thread ID: {vgpr_ok}");
 }
 
 /// Compute mode with the console dispatch ABI: numthreads 16×8 (two wave64 waves per group),
@@ -2168,7 +2168,7 @@ fn blob_dxc_cost() {
     let r = super::dxc::compile(&h, "main", profile, &extra);
     println!("HLSL {} KB, DXC {args}: {:.1} s → {}", h.len() / 1024, t0.elapsed().as_secs_f32(), match r {
         Ok(b) => format!("DXIL {} KB", b.len() / 1024),
-        Err(e) => format!("błąd: {}", e.chars().take(200).collect::<String>()),
+        Err(e) => format!("error: {}", e.chars().take(200).collect::<String>()),
     });
 }
 
@@ -2210,7 +2210,7 @@ fn retail_translation_survey() {
     let all = crate::gpu::pack::scan(&data, 0x40);
     let records: Vec<_> = match seed {
         Some(sd) => {
-            println!("losowa próbka: ziarno {sd}");
+            println!("random sample: seed {sd}");
             all.into_iter().enumerate().filter(|(i, _)| mix(sd ^ (*i as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)) % every as u64 == 0).map(|(_, r)| r).collect()
         }
         None => all.into_iter().step_by(every).collect(),
@@ -2262,14 +2262,14 @@ fn retail_translation_survey() {
                     let hw = f.stages.first().map_or(0, |s| s.hw);
                     let stage = format!("{} ({})", sh.stage, crate::gpu::xbox::hw_stage_name(hw));
                     let res = std::panic::catch_unwind(|| -> Result<(super::Translation, &'static str), String> {
-                        let mode = super::interface(&blob, &sh, f).ok_or("brak interfejsu")?;
+                        let mode = super::interface(&blob, &sh, f).ok_or("no interface")?;
                         let profile = match &mode {
                             Mode::Vertex(_) => "vs_6_6",
                             Mode::Pixel(_) => "ps_6_6",
                             // MS (NGG) and GS run as compute shaders feeding a pass-through mesh shader
                             Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Kernel => "cs_6_6",
                         };
-                        let p = f.programs.first().ok_or("FSSM bez programu")?;
+                        let p = f.programs.first().ok_or("FSSM without a program")?;
                         let code = &f.data[p.offset..p.offset + p.len];
                         Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?, profile))
                     });
@@ -2327,7 +2327,7 @@ fn retail_translation_survey() {
                             }
                         }
                         Ok(Err(m)) => error(&mut a, m),
-                        Err(_) => error(&mut a, "panika tłumacza".into()),
+                        Err(_) => error(&mut a, "translator panic".into()),
                     }
                 }
             });
@@ -2336,25 +2336,25 @@ fn retail_translation_survey() {
     let _ = std::panic::take_hook();
     let a = acc.into_inner().unwrap();
     let (all, done): (usize, usize) = a.stages.values().fold((0, 0), |s, v| (s.0 + v.0, s.1 + v.1));
-    println!("rekordów: {} (co {every}.), wariantów FSSM: {all}, przetłumaczonych w całości: {done} ({:.1}%), instrukcji: {}, czas {:.1} s", records.len(), 100.0 * done as f64 / all.max(1) as f64, a.instructions, t0.elapsed().as_secs_f64());
-    println!("z blokami pc (nie w pełni strukturalne): {} / {all}", a.hybrid);
+    println!("records: {} (1 in {every}), FSSM variants: {all}, fully translated: {done} ({:.1}%), instructions: {}, time {:.1} s", records.len(), 100.0 * done as f64 / all.max(1) as f64, a.instructions, t0.elapsed().as_secs_f64());
+    println!("with pc blocks (not fully structured): {} / {all}", a.hybrid);
     let mut hn = a.hybrid_names;
     hn.sort();
-    println!("  najmniejsze: {:?}", hn.iter().take(6).collect::<Vec<_>>());
+    println!("  smallest: {:?}", hn.iter().take(6).collect::<Vec<_>>());
     for (st, (n, ok)) in &a.stages {
         println!("  {st:<14} {ok:>6} / {n:<6} ({:.1}%)", 100.0 * *ok as f64 / (*n).max(1) as f64);
     }
     let mut missing: Vec<_> = a.missing.into_iter().collect();
     missing.sort_by(|x, y| y.1.cmp(&x.1));
-    println!("brakujące instrukcje (w ilu wariantach):");
+    println!("missing instructions (in how many variants):");
     for (k, n) in missing.iter().take(40) {
         println!("  {n:>6}  {k}");
     }
     let mut errors: Vec<_> = a.errors.into_iter().collect();
     errors.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
-    println!("błędy:");
+    println!("errors:");
     for (k, (n, ex)) in errors.iter().take(20) {
-        println!("  {n:>6}  {k}   (np. {ex})");
+        println!("  {n:>6}  {k}   (e.g. {ex})");
     }
     if with_dxc {
         let mut t = a.dxc_times;
@@ -2362,7 +2362,7 @@ fn retail_translation_survey() {
         let q = |f: f64| t.get(((t.len() as f64 * f) as usize).min(t.len().saturating_sub(1))).map_or(0.0, |x| x.0);
         let failed: usize = a.dxc_errors.values().map(|v| v.0).sum();
         println!(
-            "DXC strukturalne: {} wariantów, {:.0} s (średnio {:.2} s); z blokami pc: {} wariantów, {:.0} s (średnio {:.2} s)",
+            "DXC structured: {} variants, {:.0} s (mean {:.2} s); with pc blocks: {} variants, {:.0} s (mean {:.2} s)",
             a.dxc_structured.1,
             a.dxc_structured.0,
             a.dxc_structured.0 / a.dxc_structured.1.max(1) as f64,
@@ -2370,14 +2370,14 @@ fn retail_translation_survey() {
             a.dxc_hybrid.0,
             a.dxc_hybrid.0 / a.dxc_hybrid.1.max(1) as f64
         );
-        println!("DXC: {} skompilowanych, {failed} błędów; czas mediana {:.2} s, p90 {:.2} s, max {:.1} s ({}), suma {:.0} s", t.len(), q(0.5), q(0.9), t.last().map_or(0.0, |x| x.0), t.last().map_or("", |x| x.1.as_str()), t.iter().map(|x| x.0).sum::<f64>());
+        println!("DXC: {} compiled, {failed} errors; time median {:.2} s, p90 {:.2} s, max {:.1} s ({}), total {:.0} s", t.len(), q(0.5), q(0.9), t.last().map_or(0.0, |x| x.0), t.last().map_or("", |x| x.1.as_str()), t.iter().map(|x| x.0).sum::<f64>());
         for (secs, name) in t.iter().rev().take(10) {
             println!("  {secs:>6.2} s  {name}");
         }
         let mut errs: Vec<_> = a.dxc_errors.into_iter().collect();
         errs.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
         for (k, (n, ex)) in errs.iter().take(20) {
-            println!("  {n:>6}  {k}   (np. {ex})");
+            println!("  {n:>6}  {k}   (e.g. {ex})");
         }
     }
 }
@@ -2422,7 +2422,7 @@ fn retail_shader_cost() {
             let h = &owned;
             if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
                 let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.hlsl", r.name)), h);
-                eprintln!("HLSL zapisany: {} ({} KB)", r.name, h.len() / 1024);
+                eprintln!("HLSL written: {} ({} KB)", r.name, h.len() / 1024);
             }
             let t0 = std::time::Instant::now();
             let r2 = super::dxc::compile(h, "main", profile, &extra);
@@ -2431,7 +2431,7 @@ fn retail_shader_cost() {
                 let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.failed.hlsl", r.name)), h);
             }
             println!(
-                "{} [{profile}] instrukcji {}, HLSL {} KB, linii {}, pc-dispatch {}, if {}, for(;;) {}, select {} → DXC {:.2} s, {}",
+                "{} [{profile}] instructions {}, HLSL {} KB, lines {}, pc-dispatch {}, if {}, for(;;) {}, select {} → DXC {:.2} s, {}",
                 r.name,
                 t.instructions,
                 h.len() / 1024,
@@ -2492,10 +2492,10 @@ fn isa_coverage() {
     }
     let _ = std::panic::take_hook();
     let (ok, all) = per_enc.values().fold((0, 0), |s, v| (s.0 + v.0, s.1 + v.1));
-    println!("instrukcje RDNA2 (spec + konsola): {all}, tłumaczone: {ok} ({:.1}%)", 100.0 * ok as f64 / all.max(1) as f64);
+    println!("RDNA2 instructions (spec + console): {all}, translated: {ok} ({:.1}%)", 100.0 * ok as f64 / all.max(1) as f64);
     for (enc, (ok, all, missing)) in &per_enc {
         let m: Vec<String> = missing.iter().map(|n| n.to_lowercase()).collect();
         let full = std::env::var_os("XCL_ISA_FULL").is_some();
-        println!("  {enc:<12} {ok:>4} / {all:<4} brak: {}", if m.len() > 14 && !full { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
+        println!("  {enc:<12} {ok:>4} / {all:<4} missing: {}", if m.len() > 14 && !full { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
     }
 }

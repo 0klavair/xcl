@@ -37,12 +37,12 @@ pub struct Placement {
 
 pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
     if matches!(t.ty, ImageType::D3 | ImageType::D2Msaa | ImageType::D2MsaaArray) {
-        return Err(format!("tekstura {:?} – jeszcze nie (tylko 1D/2D, tablice, cube)", t.ty));
+        return Err(format!("texture {:?} – not yet (only 1D/2D, arrays, cube)", t.ty));
     }
     if t.swizzle_mode == 0 {
-        return Err("tekstura liniowa (SW_MODE 0) – jeszcze nie".into());
+        return Err("linear texture (SW_MODE 0) – not yet".into());
     }
-    let chain = tiling::image_chain(t, cfg).ok_or_else(|| format!("SW_MODE {} / format {} bez wzorca kafelkowania", t.swizzle_mode, t.format))?;
+    let chain = tiling::image_chain(t, cfg).ok_or_else(|| format!("SW_MODE {} / format {} without a tiling pattern", t.swizzle_mode, t.format))?;
     let slices = match t.ty {
         ImageType::D1Array | ImageType::D2Array | ImageType::Cube => t.depth.max(1) as usize,
         _ => 1,
@@ -56,7 +56,7 @@ pub fn placement(t: &Image, cfg: PipeConfig) -> Result<Placement, String> {
 pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subresource>, String> {
     let p = placement(t, cfg)?;
     if mem.len() < p.bytes {
-        return Err(format!("{} B pamięci, a tekstura zajmuje {} B", mem.len(), p.bytes));
+        return Err(format!("{} B of memory, but the texture takes {} B", mem.len(), p.bytes));
     }
     let e = 1usize << p.chain.layout.elem_log2;
     let mut out = Vec::with_capacity(p.slices * p.chain.levels.len());
@@ -72,10 +72,10 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
 /// The console memory a T#'s texture occupies, when it lies in the unified memory (UMA).
 pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<&'static [u8], String> {
     let p = placement(t, cfg)?;
-    let u = super::uma::get().ok_or("brak UMA")?;
+    let u = super::uma::get().ok_or("no UMA")?;
     let (a, n) = (p.start as usize, p.bytes);
     if !u.contains(a) || !u.contains(a + n - 1) {
-        return Err(format!("tekstura {a:#x}+{n:#x} poza UMA"));
+        return Err(format!("texture {a:#x}+{n:#x} outside UMA"));
     }
     // SAFETY: inside the UMA reservation, which lives for the whole process
     Ok(unsafe { std::slice::from_raw_parts(a as *const u8, n) })
@@ -89,11 +89,11 @@ fn err(x: windows::core::Error) -> String {
 /// texture's contents: `mem` from `Placement::start` on.
 pub unsafe fn create(dev: &ID3D12Device, queue: &ID3D12CommandQueue, t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<ID3D12Resource, String> {
     let subs = subresources(t, mem, cfg)?;
-    let (rd, _) = desc::image_d3d12(t).ok_or_else(|| format!("format {} bez odpowiednika DXGI", t.format))?;
+    let (rd, _) = desc::image_d3d12(t).ok_or_else(|| format!("format {} without a DXGI equivalent", t.format))?;
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
         .map_err(|x| format!("CreateCommittedResource: {x}"))?;
-    let r = r.ok_or("CreateCommittedResource bez zasobu")?;
+    let r = r.ok_or("CreateCommittedResource without a resource")?;
     upload(dev, queue, &r, &subs, D3D12_RESOURCE_STATE_COPY_DEST, SHADER_READ)?;
     Ok(r)
 }
@@ -152,7 +152,7 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
     let _ = windows::Win32::Foundation::CloseHandle(ev);
     if fence.GetCompletedValue() < 1 {
-        return Err(format!("GPU nie skończył kopiowania tekstury w 10 s ({:?})", dev.GetDeviceRemovedReason()));
+        return Err(format!("GPU did not finish the texture copy within 10 s ({:?})", dev.GetDeviceRemovedReason()));
     }
     Ok(())
 }
@@ -170,8 +170,8 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
     };
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
-        .map_err(|x| format!("bufor wysyłania tekstury: {x}"))?;
-    r.ok_or_else(|| "bufor wysyłania tekstury".into())
+        .map_err(|x| format!("texture upload buffer: {x}"))?;
+    r.ok_or_else(|| "texture upload buffer".into())
 }
 
 fn transition(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn gpu_console_textures_upload_every_mip_and_slice() {
         let Some((dev, queue)) = device() else {
-            println!("brak urządzenia D3D12 – pomijam");
+            println!("no D3D12 device – skipping");
             return;
         };
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
@@ -315,7 +315,7 @@ mod tests {
                 let res = create(&dev, &queue, &t, &mem, CONSOLE_PIPES).unwrap();
                 let got = read_back(&dev, &queue, &res, &want);
                 for (k, (g, w)) in got.iter().zip(&want).enumerate() {
-                    assert!(g == w, "format {} subzasób {k} ({} wierszy × {} B) różni się", t.format, w.rows, w.row_bytes);
+                    assert!(g == w, "format {} subresource {k} ({} rows × {} B) differs", t.format, w.rows, w.row_bytes);
                 }
             }
         }
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn retail_ttpf_textures_detile_with_their_mip_chains() {
         let Ok(path) = std::env::var("XCL_SAMPLE_TTPF") else {
-            println!("XCL_SAMPLE_TTPF nie ustawione – pomijam");
+            println!("XCL_SAMPLE_TTPF not set – skipping");
             return;
         };
         let a = Ttpf::open(&path);
@@ -419,11 +419,11 @@ mod tests {
             }
         }
         let n = tail_levels.max(1) as f64;
-        println!("TTPF: rozmiar z modelu łańcucha mipów pasuje dla {fit} z {sized} tekstur");
-        println!("TTPF: tekstury z mipami (R8/RGBA8/RGBA16): {close} z {checked} – każdy mip bliski poprzedniego pomniejszonego (< 8/255), {unreadable} w nieczytelnych blokach; odstające: {worst:?}");
-        println!("TTPF: {tail_levels} poziomów w mip tail – błąd {:.2}/255, przy złym miejscu w bloku {:.2}/255", tail_err / n, wrong_err / n);
-        assert!(fit * 100 >= sized * 99, "model łańcucha mipów: {fit} / {sized}");
-        assert!(checked >= 5 && close * 100 >= checked * 90, "mipy: {close} / {checked}");
+        println!("TTPF: the mip chain model size matches for {fit} of {sized} textures");
+        println!("TTPF: textures with mips (R8/RGBA8/RGBA16): {close} of {checked} – every mip close to the previous one downscaled (< 8/255), {unreadable} in unreadable blocks; outliers: {worst:?}");
+        println!("TTPF: {tail_levels} levels in the mip tail – error {:.2}/255, at the wrong place in the block {:.2}/255", tail_err / n, wrong_err / n);
+        assert!(fit * 100 >= sized * 99, "mip chain model: {fit} / {sized}");
+        assert!(checked >= 5 && close * 100 >= checked * 90, "mips: {close} / {checked}");
         assert!(tail_levels >= 5 && wrong_err > 3.0 * tail_err, "mip tail: {tail_err} vs {wrong_err}");
     }
 

@@ -12,7 +12,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("xcl host: nie można odczytać {}: {e}", boot_path.display());
+            eprintln!("xcl host: cannot read {}: {e}", boot_path.display());
             return 0x7C1_0001;
         }
     };
@@ -21,9 +21,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
         crate::log::Level::parse(&boot.config.log_level),
         boot.config.log_to_stderr,
     );
-    crate::xlog_info!("XCL {} – host dla '{}'", env!("CARGO_PKG_VERSION"), boot.title);
-    crate::xlog_info!("gra: {} (folder tylko do odczytu: {})", boot.exe_path.display(), boot.game_root.display());
-    crate::xlog_info!("dane XCL: {}", boot.data_dir.display());
+    crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
+    crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
+    crate::xlog_info!("XCL data: {}", boot.data_dir.display());
 
     if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
@@ -45,10 +45,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {
-        crate::xlog_error!("VFS: nie wszystkie hooki zainstalowane: {e}");
+        crate::xlog_error!("VFS: not all hooks installed: {e}");
     }
     if let Err(e) = crate::eh::install_pc_hook() {
-        crate::xlog_error!("hook RtlPcToFileHeader: {e} – wyjątki C++ w grze mogą nie działać");
+        crate::xlog_error!("hook RtlPcToFileHeader: {e} – C++ exceptions in the game may not work");
     }
     crate::eh::install_crash_handler();
     HOST_MODE.store(true, Ordering::Release);
@@ -56,14 +56,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
     let main = match crate::loader::load_main(&boot.exe_path) {
         Ok(m) => m,
         Err(e) => {
-            crate::xlog_error!("ładowanie gry nie powiodło się: {e}");
+            crate::xlog_error!("loading the game failed: {e}");
             crate::report::write_final(Some(format!("loader: {e}")));
             return 0x7C1_0002;
         }
     };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
-    crate::xlog_info!("punkt wejścia gry zakończył się kodem {code}");
+    crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();
     code as i32

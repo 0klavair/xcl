@@ -64,7 +64,7 @@ for i, (a, t) in enumerate(ins):
                 break
     sites.append((a, L, bound, length, header, slot))
 
-print(f'{len(sites)} miejsc zapisu rekordów')
+print(f'{len(sites)} record write sites')
 kinds = collections.Counter((h, ln, s, b) for _, _, b, ln, h, s in sites)
 for (h, ln, s, b), n in kinds.most_common():
-    print(f'  {n:3}× nagłówek {h:18} długość {ln} B  granica +0x{b}  zastępczo slot {s}')
+    print(f'  {n:3}× header {h:18} length {ln} B  bound +0x{b}  fallback slot {s}')

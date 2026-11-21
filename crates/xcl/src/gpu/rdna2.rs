@@ -358,11 +358,11 @@ pub fn register_scale(field: &str) -> u64 {
 /// Assemble one instruction (spec name such as "V_ADD_F32", encoding name such as
 /// "ENC_VOP2" or "VOP3_SDST_ENC"), setting the given fields; for tests and tools.
 pub fn encode(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32>) -> Result<Vec<u8>, String> {
-    let ei = ENCODINGS.iter().position(|e| e.name == enc).ok_or_else(|| format!("nieznane kodowanie {enc}"))?;
+    let ei = ENCODINGS.iter().position(|e| e.name == enc).ok_or_else(|| format!("unknown encoding {enc}"))?;
     let e = &ENCODINGS[ei];
     let inst = all_instructions()
         .find(|i| i.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("nieznana instrukcja {name}"))?;
+        .ok_or_else(|| format!("unknown instruction {name}"))?;
     // SDWA / DPP layouts describe the words of the base VOP1/VOP2/VOPC encoding
     let base = ["VOP1", "VOP2", "VOPC"]
         .iter()
@@ -373,7 +373,7 @@ pub fn encode(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32
         .encs
         .iter()
         .find(|x| x.encoding as usize == base)
-        .ok_or_else(|| format!("{name} nie ma kodowania {enc}"))?;
+        .ok_or_else(|| format!("{name} has no encoding {enc}"))?;
     let mut words = vec![0u32; (e.bits as usize / 32).max(1)];
     let fixed = e.fixed_value & e.fixed_mask;
     for b in 0..64u32 {
@@ -401,7 +401,7 @@ pub fn encode(name: &str, enc: &str, fields: &[(&str, u64)], literal: Option<u32
         put(&mut words, f, ie.opcode as u64);
     }
     for &(n, v) in fields {
-        let f = e.field(n).ok_or_else(|| format!("{enc} nie ma pola {n}"))?;
+        let f = e.field(n).ok_or_else(|| format!("{enc} has no field {n}"))?;
         put(&mut words, f, v);
     }
     let mut out: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

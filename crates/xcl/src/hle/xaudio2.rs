@@ -179,7 +179,7 @@ fn note_dropped(what: &str, flags: u32, allowed: u32) {
     let key = format!("{what}:{extra:#x}");
     let mut d = DROPPED.lock().unwrap();
     if !d.contains(&key) {
-        crate::xlog_info!("XAudio2: {what} – pomijam flagi konsoli {extra:#x}");
+        crate::xlog_info!("XAudio2: {what} – dropping console flags {extra:#x}");
         d.push(key);
     }
 }
@@ -304,7 +304,7 @@ unsafe fn patch(obj: *mut c_void, slot: usize, hook: usize) {
     }
     let mut old = 0u32;
     if VirtualProtect(p as *const c_void, 8, PAGE_READWRITE, &mut old) == 0 {
-        crate::xlog_error!("XAudio2: nie można odblokować vtable {vt:p} (slot {slot})");
+        crate::xlog_error!("XAudio2: cannot make vtable {vt:p} writable (slot {slot})");
         return;
     }
     g.push((vt as usize, slot, cur));
@@ -342,7 +342,7 @@ unsafe fn create_engine(pp: *mut *mut c_void, flags: u32, processor: u32) -> HRE
     note_dropped("XAudio2Create", flags, ENGINE_FLAGS);
     let _ = processor; // console core masks mean nothing here
     let Some((with_version, plain)) = system_create() else {
-        crate::xlog_error!("XAudio2: brak systemowego xaudio2_9.dll");
+        crate::xlog_error!("XAudio2: no system xaudio2_9.dll");
         ENGINE_ERRORS.fetch_add(1, Ordering::Relaxed);
         return E_FAIL;
     };
@@ -353,14 +353,14 @@ unsafe fn create_engine(pp: *mut *mut c_void, flags: u32, processor: u32) -> HRE
         _ => E_FAIL,
     };
     if hr < 0 || (*pp).is_null() {
-        crate::xlog_error!("XAudio2: utworzenie silnika nie powiodło się ({:#x})", hr as u32);
+        crate::xlog_error!("XAudio2: creating the engine failed ({:#x})", hr as u32);
         ENGINE_ERRORS.fetch_add(1, Ordering::Relaxed);
         return if hr < 0 { hr } else { E_FAIL };
     }
     patch(*pp, ENGINE_CREATE_SOURCE_VOICE, create_source_voice as usize);
     patch(*pp, ENGINE_CREATE_MASTERING_VOICE, create_mastering_voice as usize);
     ENGINES.fetch_add(1, Ordering::Relaxed);
-    crate::xlog_info!("XAudio2: silnik utworzony (systemowe XAudio2 2.9, flagi {clean:#x})");
+    crate::xlog_info!("XAudio2: engine created (system XAudio2 2.9, flags {clean:#x})");
     S_OK
 }
 
@@ -404,7 +404,7 @@ unsafe extern "system" fn create_source_voice(
             let mut u = UNSUPPORTED.lock().unwrap();
             if !u.contains(&key) {
                 crate::xlog_warn!(
-                    "XAudio2: format {key} nieobsługiwany przez Windows ({:#x}) → głos PCM16 ({} kan., {} Hz) grający ciszę",
+                    "XAudio2: format {key} not supported by Windows ({:#x}) → PCM16 voice ({} ch., {} Hz) playing silence",
                     hr as u32,
                     i.channels,
                     i.rate
@@ -417,7 +417,7 @@ unsafe extern "system" fn create_source_voice(
     }
     if hr < 0 || (*pp).is_null() {
         SOURCE_ERRORS.fetch_add(1, Ordering::Relaxed);
-        crate::xlog_warn!("XAudio2: CreateSourceVoice (format {tag:#x}) nie powiodło się ({:#x})", hr as u32);
+        crate::xlog_warn!("XAudio2: CreateSourceVoice (format {tag:#x}) failed ({:#x})", hr as u32);
         return hr;
     }
     let voice = *pp;
@@ -429,7 +429,7 @@ unsafe extern "system" fn create_source_voice(
         SILENT_VOICES.fetch_add(1, Ordering::Relaxed);
         if is_xma(tag) && XMA_VOICES.fetch_add(1, Ordering::Relaxed) == 0 {
             crate::xlog_warn!(
-                "XAudio2: głos XMA{} ({} kan., {} Hz) → PCM16; brak dekodera XMA – bufory grają ciszę o tej samej długości",
+                "XAudio2: XMA{} voice ({} ch., {} Hz) → PCM16; no XMA decoder – buffers play silence of the same length",
                 if tag == WAVE_FORMAT_XMA2 { "2" } else { "" },
                 i.channels,
                 i.rate
@@ -453,20 +453,20 @@ unsafe extern "system" fn create_mastering_voice(
     let orig: CreateMasteringVoiceFn = std::mem::transmute(orig);
     note_dropped("CreateMasteringVoice", flags, MASTERING_FLAGS);
     if !device.is_null() {
-        crate::xlog_info!("XAudio2: CreateMasteringVoice – identyfikator urządzenia konsoli pominięty (domyślne urządzenie)");
+        crate::xlog_info!("XAudio2: CreateMasteringVoice – console device id ignored (default device)");
     }
     let flags = flags & MASTERING_FLAGS;
     let mut hr = orig(this, pp, channels, rate, flags, std::ptr::null(), chain, category);
     if hr == CO_E_NOTINITIALIZED {
         // the console needs no COM for audio; Windows' device enumeration does
         let ci = windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_MULTITHREADED as u32);
-        crate::xlog_info!("XAudio2: COM nie był zainicjowany na wątku tytułu – CoInitializeEx(MTA) → {:#x}", ci as u32);
+        crate::xlog_info!("XAudio2: COM was not initialized on the title thread – CoInitializeEx(MTA) → {:#x}", ci as u32);
         hr = orig(this, pp, channels, rate, flags, std::ptr::null(), chain, category);
     }
     if hr < 0 {
         MASTERING_RETRIES.fetch_add(1, Ordering::Relaxed);
         crate::xlog_warn!(
-            "XAudio2: CreateMasteringVoice({channels} kan., {rate} Hz, kategoria {category}) → {:#x}; ponawiam z domyślnymi",
+            "XAudio2: CreateMasteringVoice({channels} ch., {rate} Hz, category {category}) → {:#x}; retrying with defaults",
             hr as u32
         );
         hr = orig(this, pp, 0, 0, flags, std::ptr::null(), chain, AUDIO_CATEGORY_GAME_EFFECTS);
@@ -476,7 +476,7 @@ unsafe extern "system" fn create_mastering_voice(
     }
     if hr < 0 {
         MASTERING_ERRORS.fetch_add(1, Ordering::Relaxed);
-        crate::xlog_error!("XAudio2: CreateMasteringVoice nie powiodło się ({:#x}) – brak urządzenia audio?", hr as u32);
+        crate::xlog_error!("XAudio2: CreateMasteringVoice failed ({:#x}) – no audio device?", hr as u32);
     } else {
         MASTERING.fetch_add(1, Ordering::Relaxed);
     }

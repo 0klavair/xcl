@@ -131,8 +131,8 @@ pub fn get() -> Option<&'static Uma> {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
             let u = Uma::new(mb << 20);
             match &u {
-                Some(u) => crate::xlog_info!("UMA: {} MB pamięci graficznej pod {:#x} (dostępna dla GPU bez kopiowania)", u.size >> 20, u.base),
-                None => crate::xlog_warn!("UMA: nie udało się zarezerwować {mb} MB pod adresem wyrównanym do 4 GiB – zwykłe alokacje"),
+                Some(u) => crate::xlog_info!("UMA: {} MB of graphics memory at {:#x} (GPU-accessible without copies)", u.size >> 20, u.base),
+                None => crate::xlog_warn!("UMA: could not reserve {mb} MB at a 4 GiB-aligned address – plain allocations"),
             }
             u
         })

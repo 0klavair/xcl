@@ -50,7 +50,7 @@ pub fn backend() -> Backend {
     *B.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
-            crate::xlog_info!("D3D12.X: backend 'null' (z konfiguracji)");
+            crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
         match real::init() {
@@ -59,7 +59,7 @@ pub fn backend() -> Backend {
                 Backend::Real
             }
             Err(e) => {
-                crate::xlog_warn!("D3D12.X: nie udało się utworzyć urządzenia D3D12 ({e}) – przełączam na urządzenie zastępcze");
+                crate::xlog_warn!("D3D12.X: could not create a D3D12 device ({e}) – switching to the fallback device");
                 Backend::Null
             }
         }
@@ -121,7 +121,7 @@ pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_v
     if !d.is_null() && *(d as *const u8).add(40).cast::<u32>() & !PC_FLAGS != 0 {
         std::ptr::copy_nonoverlapping(d as *const u8, copy.as_mut_ptr(), 48);
         let f = copy.as_mut_ptr().add(40).cast::<u32>();
-        crate::xlog_info!("D3D12SerializeVersionedRootSignature: flagi konsoli {:#x} pominięte", *f & !PC_FLAGS);
+        crate::xlog_info!("D3D12SerializeVersionedRootSignature: console flags {:#x} dropped", *f & !PC_FLAGS);
         *f &= PC_FLAGS;
         d = copy.as_ptr() as *const c_void;
     }
@@ -135,7 +135,7 @@ pub unsafe extern "system" fn D3D12SerializeVersionedRootSignature(d: *const c_v
         let w = |o: usize| *(d as *const u8).add(o).cast::<u32>();
         let text = blob_text(*e);
         crate::xlog_warn!(
-            "D3D12SerializeVersionedRootSignature: {hr:#x} (wersja {}, parametrów {}, samplerów {}, flagi {:#x}): {text}",
+            "D3D12SerializeVersionedRootSignature: {hr:#x} (version {}, parameters {}, samplers {}, flags {:#x}): {text}",
             w(0),
             w(8),
             w(24),
