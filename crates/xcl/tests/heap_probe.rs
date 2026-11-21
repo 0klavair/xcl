@@ -88,7 +88,7 @@ fn heaps_over_partly_committed_sections() {
             for i in 0..mb / 4 {
                 *(view as *mut u32).add(i) = i as u32 ^ 0xA5A5_0000;
             }
-            let heap: windows::core::Result<ID3D12Heap> = dev3.OpenExistingHeapFromFileMapping(HANDLE(h as *mut c_void));
+            let heap: windows::core::Result<ID3D12Heap> = dev3.OpenExistingHeapFromFileMapping(HANDLE(h));
             let heap = match heap {
                 Ok(hp) => hp,
                 Err(e) => {
@@ -180,7 +180,7 @@ fn heaps_over_sections_in_a_placeholder() {
             for i in 0..chunk / 4 {
                 *(at as *mut u32).add(i) = (k as u32) << 28 | i as u32;
             }
-            let heap: ID3D12Heap = match dev3.OpenExistingHeapFromFileMapping(HANDLE(h as *mut c_void)) {
+            let heap: ID3D12Heap = match dev3.OpenExistingHeapFromFileMapping(HANDLE(h)) {
                 Ok(hp) => hp,
                 Err(e) => {
                     println!("chunk {k}: OpenExistingHeapFromFileMapping: {e}");
