@@ -117,7 +117,9 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
 fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
     let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
     let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)]);
-    let rs = real::abi_root_signature().expect("root signature ABI XCL");
+    // the pipeline's own root signature (static samplers from the console code)
+    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature przetłumaczonego PSO") as *mut std::ffi::c_void;
+    let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
 
     // explicit inputs: user SGPR s[8:9] → descriptor table at 0x100 with two V#s
     let mut io = vec![0u32; 128];
@@ -221,7 +223,9 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
         &blobs[1],
         &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12), (c"TEXCOORD", DXGI_FORMAT_R32G32_FLOAT, 28)],
     );
-    let rs = real::abi_root_signature().expect("root signature ABI XCL");
+    // the pipeline's own root signature (static samplers from the console code)
+    let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature przetłumaczonego PSO") as *mut std::ffi::c_void;
+    let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
 
     // console memory: texel data at the addresses the T#s name, constants, two descriptor tables
     let (addr_a, addr_b) = (0x1_0000u64, 0x2_0000u64);

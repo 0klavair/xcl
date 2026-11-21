@@ -138,6 +138,8 @@ pub fn abi_rs_cached() -> Option<*mut c_void> {
 thread_local! {
     /// the last compute pipeline created on this thread runs a translated console shader
     static LAST_COMPUTE_TRANSLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// … with this root signature (static samplers; 0 = the plain ABI one)
+    static LAST_COMPUTE_RS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Root signature of the pipelines built from translated console shaders (bind it, then the
@@ -967,7 +969,7 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
     let hr = dev_create_compute_pso(this, desc, riid, ppv);
     // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
     if hr >= 0 && super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
-        *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()));
+        *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()), LAST_COMPUTE_RS.with(|c| c.replace(0)));
     }
     hr
 }
@@ -1170,6 +1172,49 @@ unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
     (p != 0 && n > 0 && crate::gpu::shader::readable(p, n)).then(|| std::slice::from_raw_parts(p as *const u8, n))
 }
 
+/// Root signature of every pipeline built from translated console shaders (static samplers
+/// make it per pipeline): the draw binds it instead of the title's.
+static PSO_RS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
+    if !pso.is_null() {
+        PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
+    }
+}
+
+/// The root signature a translated pipeline state was created with.
+pub fn pso_root_signature(pso: usize) -> Option<usize> {
+    PSO_RS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+/// ABI root signatures with static samplers, by sampler set (owned here, never released).
+static ABI_RS_SAMPLERS: Mutex<Option<HashMap<Vec<u32>, usize>>> = Mutex::new(None);
+
+/// The XCL ABI root signature with a pipeline's static samplers (the plain one without).
+unsafe fn abi_rs_for(this: *mut c_void, samplers: &[crate::gpu::recomp::pso::StaticSampler]) -> Option<*mut c_void> {
+    if samplers.is_empty() {
+        return abi_rs_raw(this);
+    }
+    let key: Vec<u32> = samplers.iter().flat_map(|(w, c)| w.iter().copied().chain([*c as u32])).collect();
+    let mut g = ABI_RS_SAMPLERS.lock().unwrap();
+    let map = g.get_or_insert_with(HashMap::new);
+    if let Some(&rs) = map.get(&key) {
+        return Some(rs as *mut c_void);
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    match crate::gpu::recomp::pso::abi_root_signature_with(dev, true, samplers) {
+        Ok(rs) => {
+            let raw = rs.into_raw();
+            map.insert(key, raw as usize);
+            Some(raw)
+        }
+        Err(e) => {
+            note_translation_error(format!("root signature ABI XCL z samplerami statycznymi: {e}"));
+            None
+        }
+    }
+}
+
 /// XCL ABI root signature, created once on the backend device.
 unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
     let cur = ABI_RS.load(Ordering::Acquire);
@@ -1211,14 +1256,16 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
-    let dxil = match console_to_dxil(cs, Stage::Compute) {
+    let compiled = match console_to_dxil(cs, Stage::Compute, 0) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
             return Some(Err(()));
         }
     };
-    let Some(rs) = abi_rs_raw(this) else { return Some(Err(())) };
+    let dxil = compiled.dxil;
+    let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+    LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
@@ -1229,6 +1276,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
     crate::xlog_info!("D3D12.X: obliczeniowy PSO z przetłumaczonym CS konsoli ({} B DXIL)", dxil.len());
     Some(Ok(hr))
 }
@@ -1251,16 +1299,21 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
-    let vs_dxil = match console_to_dxil(vs, Stage::Vertex) {
+    let vs_c = match console_to_dxil(vs, Stage::Vertex, 0) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("VS: {e}"));
             return None;
         }
     };
+    let mut samplers = vs_c.samplers;
+    let vs_dxil = vs_c.dxil;
     let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil(p, Stage::Pixel) {
-            Ok(b) => Some(b),
+        Some(p) if is_console(p) => match console_to_dxil(p, Stage::Pixel, samplers.len() as u32) {
+            Ok(b) => {
+                samplers.extend(b.samplers);
+                Some(b.dxil)
+            }
             Err(e) => {
                 note_translation_error(format!("PS: {e}"));
                 return None;
@@ -1269,7 +1322,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         Some(p) => Some(p.to_vec()),
         None => None,
     };
-    let rs = abi_rs_raw(this)?;
+    let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.VS = bytecode(&vs_dxil);
@@ -1281,6 +1334,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    note_pso_rs(*ppv, rs);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: graficzny PSO z przetłumaczonych shaderów konsoli (#{})", n + 1);
     }
@@ -1350,8 +1404,11 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
 /// mesh pipeline state (pass-through MS + PS); the draw first runs `compute` (the console
 /// program, one record per thread group into `res`), then the mesh pipeline over the records.
 pub struct TwoPassPso {
-    /// compute pipeline state (XCL ABI root signature), owned here
+    /// compute pipeline state, owned here, and its root signature (static samplers)
     pub compute: usize,
+    pub compute_rs: usize,
+    /// root signature of the mesh pipeline (the title's PSO; its PS's static samplers)
+    pub mesh_rs: usize,
     pub record: crate::gpu::recomp::MsInterface,
     /// DispatchMesh groups per record (see `pso::TwoPass`)
     pub mesh_groups_per_record: u32,
@@ -1413,19 +1470,21 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
-fn two_pass_ps(ps: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+/// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
+fn two_pass_ps(ps: Option<&[u8]>) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
     use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
     match ps {
-        Some(p) if is_console(p) => console_to_dxil(p, Stage::Pixel).map(Some).map_err(|e| format!("PS: {e}")),
-        Some(p) => Ok(Some(p.to_vec())),
-        None => Ok(None),
+        Some(p) if is_console(p) => console_to_dxil(p, Stage::Pixel, 0).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
+        Some(p) => Ok((Some(p.to_vec()), Vec::new())),
+        None => Ok((None, Vec::new())),
     }
 }
 
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let rs = ABI_RS.load(Ordering::Acquire) as *mut c_void;
+#[allow(clippy::too_many_arguments)]
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
     let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
@@ -1447,7 +1506,8 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         *ppv = std::ptr::null_mut();
         return E_INVALIDARG;
     }
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    note_pso_rs(*ppv, mesh_rs);
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline z {kind} konsoli w dwóch przebiegach (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -1476,7 +1536,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, ps) = match (console_mesh(ms, ps), two_pass_ps(ps)) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps), two_pass_ps(ps)) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -1487,7 +1547,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             return Some(E_INVALIDARG);
         }
     };
-    let Some(rs) = abi_rs_raw(this) else { return Some(E_INVALIDARG) };
+    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
@@ -1502,13 +1562,13 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, "MS", riid, ppv))
+    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let (tp, ps) = match (crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS)), two_pass_ps(shader_bytes(&d.PS))) {
+    let (tp, (ps, ps_samplers)) = match (crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS)), two_pass_ps(shader_bytes(&d.PS))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("VS+GS: {e}"));
@@ -1519,7 +1579,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
             return E_INVALIDARG;
         }
     };
-    let Some(rs) = abi_rs_raw(this) else { return E_INVALIDARG };
+    let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
     out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
@@ -1536,7 +1596,7 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
-    finish_two_pass(this, &out, tp, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
 }
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.

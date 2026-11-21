@@ -128,6 +128,8 @@ struct ConsolePso {
     _pad2: u32,
     pc: usize,
     translated: bool,
+    /// root signature of the translated pipeline (static samplers; 0 = the plain ABI one)
+    rs: usize,
 }
 
 fn pc_vtable_call(obj: usize, slot: usize) -> usize {
@@ -175,7 +177,7 @@ fn pso_vtable() -> usize {
 }
 
 /// Wrap a PC pipeline state (its reference moves into the wrapper) for console code.
-pub unsafe fn wrap_pso(pc: *mut c_void, translated: bool) -> *mut c_void {
+pub unsafe fn wrap_pso(pc: *mut c_void, translated: bool, rs: usize) -> *mut c_void {
     let p = Box::into_raw(Box::new(ConsolePso {
         vtable: pso_vtable() as *const usize,
         refs: AtomicU32::new(1),
@@ -186,6 +188,7 @@ pub unsafe fn wrap_pso(pc: *mut c_void, translated: bool) -> *mut c_void {
         _pad2: 0,
         pc: pc as usize,
         translated,
+        rs,
     }));
     (*p).packet[2] = p as usize as u32;
     (*p).packet[3] = (p as usize >> 32) as u32;
@@ -681,7 +684,12 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[1] = (table_at >> 32) as u32;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
-                        list.SetComputeRootSignature(rs.as_ref().ok_or("brak root signature ABI XCL")?);
+                        // the pipeline's own root signature when it has static samplers
+                        let own = ((*p).rs != 0).then(|| (*p).rs as *mut c_void);
+                        match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
+                            Some(r) => list.SetComputeRootSignature(r),
+                            None => list.SetComputeRootSignature(rs.as_ref().ok_or("brak root signature ABI XCL")?),
+                        }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
                         list.SetComputeRootUnorderedAccessView(2, uma_va);

@@ -536,6 +536,19 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## Samplery statyczne (sesja 5, 2026-11-21)
+- **Luka:** tłumacz brał indeks samplera PC zawsze z S# słowo 3 [11:0], a S# zbudowany ze stałych w kodzie (statyczne
+  samplery root signature konsoli) ma tam co innego → zły sampler / odczyt poza stertą. W PS_PedTextured_Eight_Fire 66
+  z 89 próbkowań; test e2e działał tylko dlatego, że w jego S# te bity były 0.
+- **Teraz:** przebieg `constant_samplers` (mod.rs) – S# z `s_mov_b32/s_movk_i32/s_mov_b64` stałych w tym samym bloku
+  przed MIMG → sampler statyczny `xcl_ss{k} : register(s{k}, space1)` (`Translation::static_samplers`,
+  `Options::static_sampler_base` – PS po VS); `pso::abi_root_signature_with` + `static_sampler_desc` (z
+  `desc::sampler_d3d12`; tylko 3 kolory ramki); root signature w cache po zestawie (`abi_rs_for`), **rejestr PSO →
+  root signature** (`real::pso_root_signature`) – rysowanie musi wiązać tę zamiast tytułowej; ConsolePso / TwoPassPso
+  (`compute_rs`, `mesh_rs`) też. S# z tablic deskryptorów (sterty konsoli) – bez zmian (indeks ze słowa 3).
+- Test GPU `gpu_static_samplers_from_constants_in_code` (punktowy 2,0 vs liniowy 1,5 na granicy teksli); PS z gry:
+  6 samplerów statycznych, 61 użyć; testy PSO przechodzą (PS_Rage_Textured – aniso 4× z kodu); losowy 1% DXC: 0 błędów.
+
 ## MicrosoftGame.Config (sesja 5, 2026-11-21)
 - Z manifestu gry (od użytkownika; reszta pliku bez znaczenia dla XCL): `PersistentLocalStorage/SizeMB` = 2048,
   `VirtualMachine/SMTEnabled` = true, `XboxAnacondaTitleMemory` / `XboxLockhartTitleMemory` = Advanced.

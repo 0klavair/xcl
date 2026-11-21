@@ -35,6 +35,10 @@ pub(super) struct Em {
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
     uses_scratch: bool,
+    /// MIMG instruction address → its sampler's S# when the code builds it from constants
+    pub static_ss: BTreeMap<u64, [u32; 4]>,
+    /// the static samplers sampled with: (S#, comparison), in register order
+    pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
     pub max_vgpr: u64,
 }
@@ -236,6 +240,8 @@ impl Em {
             ps_done: false,
             uses_lds: false,
             uses_scratch: false,
+            static_ss: BTreeMap::new(),
+            static_used: Vec::new(),
             max_vgpr: 0,
         }
     }
@@ -948,6 +954,21 @@ impl Em {
         Ok(())
     }
 
+    /// The sampler of the MIMG instruction at `pc`: a static sampler when its S# is constant
+    /// (register `static_sampler_base + i`, space 1), else the sampler heap entry S# word 3
+    /// [11:0] names (XCL shader ABI).
+    fn sampler_ref(&mut self, pc: u64, comparison: bool, s3: &str) -> String {
+        let Some(&w) = self.static_ss.get(&pc) else { return format!("SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)]") };
+        let i = match self.static_used.iter().position(|&x| x == (w, comparison)) {
+            Some(i) => i,
+            None => {
+                self.static_used.push((w, comparison));
+                self.static_used.len() - 1
+            }
+        };
+        format!("xcl_ss{}", self.opt.static_sampler_base as usize + i)
+    }
+
     /// MUBUF / MTBUF: raw loads and stores, typed (format) loads.
     fn mubuf(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         if name.starts_with("buffer_atomic_") {
@@ -1476,7 +1497,8 @@ impl Em {
             }
             let samp = if has_c { "SamplerComparisonState" } else { "SamplerState" };
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
-            self.line(&format!("{samp} {t}_S = SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)];"));
+            let sampler = self.sampler_ref(d.pc, has_c, &s3);
+            self.line(&format!("{samp} {t}_S = {sampler};"));
             if let Some(o) = &offset {
                 let level = match (&lod, has_lz || base.starts_with("gather4"), ps && grads.is_none() && !has_c) {
                     (_, true, _) => "0u".to_string(),
@@ -1559,7 +1581,8 @@ impl Em {
             };
             let s3 = self.sreg(ssamp + 3);
             self.line(&format!("{ty} {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];"));
-            self.line(&format!("SamplerState {t}_S = SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0xFFFu)];"));
+            let sampler = self.sampler_ref(d.pc, false, &s3);
+            self.line(&format!("SamplerState {t}_S = {sampler};"));
             self.line(&format!(
                 "uint4 {t}_r = asuint(float4({t}_T.CalculateLevelOfDetail({t}_S, {coord}), {t}_T.CalculateLevelOfDetailUnclamped({t}_S, {coord}), 0.0f, 0.0f));"
             ));
@@ -3110,6 +3133,11 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
             h.push_str("globallycoherent RWByteAddressBuffer mem : register(u2);\n");
         } else {
             h.push_str("RWByteAddressBuffer mem : register(u2);\n");
+        }
+        for (i, (_, cmp)) in self.static_used.iter().enumerate() {
+            let k = self.opt.static_sampler_base as usize + i;
+            let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
+            let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         h.push_str(PRELUDE);
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();

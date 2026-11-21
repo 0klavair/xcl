@@ -306,11 +306,14 @@ pub struct Options {
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
     /// two independent halves – the wave-size independent form VS/PS always get (tests)
     pub hw_wave: u32,
+    /// first register (space 1) of the program's static samplers (another stage of the same
+    /// pipeline may come first)
+    pub static_sampler_base: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0 }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0 }
     }
 }
 
@@ -326,6 +329,10 @@ pub struct Translation {
     pub ignored: BTreeMap<String, usize>,
     pub instructions: usize,
     pub blocks: usize,
+    /// static samplers the program samples with (S# built from constants in its code – the
+    /// console root signature's static samplers): (S#, comparison), register
+    /// `static_sampler_base + i` in space 1
+    pub static_samplers: Vec<([u32; 4], bool)>,
 }
 
 impl Translation {
@@ -909,6 +916,61 @@ pub fn detect_wave64(code: &[u8]) -> bool {
     !(w32 > 0 && w64 == 0)
 }
 
+/// Value of a scalar constant source operand (inline constant or literal), if it is one.
+fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
+    Some(match code {
+        128..=192 => (code - 128) as u32,
+        193..=208 => (-((code - 192) as i32)) as u32,
+        240..=247 => [0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][(code - 240) as usize].to_bits(),
+        248 => 0x3E22_F983, // 1 / (2π)
+        255 => d.literal?,
+        _ => return None,
+    })
+}
+
+/// S# built from constants in the code – how the console compiler places the static
+/// samplers of a root signature: for each MIMG instruction whose four sampler SGPRs were all
+/// set by s_mov / s_movk with constants earlier in its block, those words.
+fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64, [u32; 4]> {
+    let mut known: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    let mut out = BTreeMap::new();
+    for d in insts {
+        if leaders.contains(&d.pc) {
+            known.clear();
+        }
+        let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
+        if d.enc.name == "ENC_MIMG" {
+            if let Some(s) = f("SSAMP").map(|v| v * rdna2::register_scale("SSAMP")) {
+                if let (Some(a), Some(b), Some(c), Some(e)) = (known.get(&s), known.get(&(s + 1)), known.get(&(s + 2)), known.get(&(s + 3))) {
+                    out.insert(d.pc, [*a, *b, *c, *e]);
+                }
+            }
+        }
+        let set: Vec<(u64, u32)> = match d.inst.name {
+            "S_MOV_B32" => f("SDST").zip(f("SSRC0").and_then(|c| scalar_constant(d, c))).map(|(r, v)| vec![(r, v)]).unwrap_or_default(),
+            "S_MOVK_I32" => f("SDST").zip(f("SIMM16")).map(|(r, v)| vec![(r, v as u16 as i16 as i32 as u32)]).unwrap_or_default(),
+            // 64-bit moves of inline integers (sign-extended): S# words that are 0 / -1
+            "S_MOV_B64" => match (f("SDST"), f("SSRC0")) {
+                (Some(r), Some(c @ 128..=208)) => {
+                    let v = scalar_constant(d, c).unwrap() as i32 as i64;
+                    vec![(r, v as u32), (r + 1, (v >> 32) as u32)]
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        for w in rdna2::sgpr_uses(d).1 {
+            known.remove(&w);
+        }
+        for (r, v) in set {
+            if r < 106 {
+                known.insert(r, v);
+            }
+        }
+    }
+    out
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
@@ -947,6 +1009,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
     }
     let mut em = emit::Em::new(opt.clone());
+    em.static_ss = constant_samplers(&insts, &leaders);
     em.max_vgpr = insts
         .iter()
         .flat_map(|d| {
@@ -1023,5 +1086,6 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         body.push_str(&code);
     }
     let hlsl = em.finish(&body);
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks })
+    let static_samplers = em.static_used.clone();
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
 }

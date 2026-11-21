@@ -627,6 +627,65 @@ fn gpu_images_sample_load_store_atomic() {
     assert_eq!(u32::from_le_bytes(r.textures[2][..4].try_into().unwrap()), 64, "image_atomic_inc (64 lanes, limit 100)");
 }
 
+/// Static samplers: the program builds two S# from constants (point / linear, clamp) – as
+/// the console compiler places a root signature's static samplers – and samples the same
+/// texel boundary with each; they become static samplers of the root signature.
+#[test]
+fn gpu_static_samplers_from_constants_in_code() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let clamp = 2 | 2 << 3 | 2 << 6;
+    let point = [clamp, 0x00FF_F000u32, 0, 0];
+    let linear = [clamp, 0x00FF_F000, 1 << 20 | 1 << 22, 0];
+    let mov = |r: u64, v: u32| -> (&'static str, &'static str, Vec<(&'static str, u64)>, Option<u32>) {
+        if v == 0 {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 128)], None)
+        } else {
+            ("S_MOV_B32", "ENC_SOP1", vec![("SDST", r), ("SSRC0", 255)], Some(v))
+        }
+    };
+    let mut list = Vec::new();
+    for k in 0..4 {
+        list.push(mov(24 + k as u64, point[k]));
+        list.push(mov(28 + k as u64, linear[k]));
+    }
+    // T# tex0 in s[16:23] (SRSRC = 4); S# point s[24:27] (SSAMP = 6), linear s[28:31] (7)
+    list.push(("IMAGE_SAMPLE_LZ", "ENC_MIMG", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)], None));
+    list.push(("IMAGE_SAMPLE_LZ", "ENC_MIMG", vec![("VDATA", 20), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 7), ("DMASK", 0xF), ("DIM", 1)], None));
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert_eq!(t.static_samplers, vec![(point, false), (linear, false)], "two static samplers from the code");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookups left");
+
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    for r in st.vgpr.iter_mut() {
+        r[0] = f(0.5); // the boundary between texel columns 1 and 2
+        r[1] = f(0.125); // row 0
+    }
+    // 4x4 RGBA32F, texel (x, y) = (x, y, x + 4y, 1)
+    let mut t0 = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            for v in [x as f32, y as f32, (x + 4 * y) as f32, 1.0] {
+                t0.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let tex = vec![TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 4, depth: 1, texel_bytes: 16, data: t0, uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!([fl(10), fl(11), fl(12), fl(13)], [2.0, 0.0, 2.0, 1.0], "lane {l}: static point sampler");
+        assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l}: static linear sampler");
+    }
+}
+
 #[test]
 fn gpu_images_a16_d16() {
     if !gpu_ready() {
@@ -1651,7 +1710,7 @@ fn gpu_wave32_program_in_wave64_hardware() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 1)], None),
         ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 193), ("SRC1", 128)], None),
     ]);
-    let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64 }).unwrap();
+    let t = translate(&p, &Options { mode: Mode::Kernel, wave64: false, hw_wave: 64, ..Default::default() }).unwrap();
     assert!(t.hlsl.contains("[WaveSize(64)]") && t.hlsl.contains("xcl_half"), "{}", t.hlsl);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
     let mut st = KernelState::default();

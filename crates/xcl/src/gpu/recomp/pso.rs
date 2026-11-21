@@ -23,15 +23,30 @@ pub fn is_console(blob: &[u8]) -> bool {
     xbox::is_xbox(blob)
 }
 
-/// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached).
+/// A static sampler of a translated program: (S#, comparison) – see `Translation`.
+pub type StaticSampler = ([u32; 4], bool);
+
+/// A console shader as PC DXIL and the static samplers it needs in its root signature.
+pub struct Compiled {
+    pub dxil: Vec<u8>,
+    pub samplers: Vec<StaticSampler>,
+}
+
+/// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached); its static
+/// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
-pub fn console_to_dxil(blob: &[u8], stage: Stage) -> Result<Vec<u8>, String> {
-    let (hlsl, profile) = console_to_hlsl(blob, stage)?;
-    dxc::compile_cached(&hlsl, "main", profile).map(|(b, _)| b)
+pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<Compiled, String> {
+    let (t, profile) = console_translation(blob, stage, sampler_base)?;
+    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    Ok(Compiled { dxil, samplers: t.static_samplers })
 }
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
+    console_translation(blob, stage, 0).map(|(t, p)| (t.hlsl, p))
+}
+
+fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(super::Translation, &'static str), String> {
     let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
@@ -53,12 +68,12 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
     };
     let p = f.programs.first().ok_or("FSSM bez programu")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));
     }
-    Ok((t.hlsl, profile))
+    Ok((t, profile))
 }
 
 /// A console geometry stage as XCL runs it, in two passes: the console program as a compute
@@ -73,6 +88,8 @@ pub struct TwoPass {
     /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
     /// output limit and goes out in runs of triangles)
     pub mesh_groups_per_record: u32,
+    /// static samplers of the compute pass
+    pub samplers: Vec<StaticSampler>,
 }
 
 fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
@@ -85,7 +102,7 @@ fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, p
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
     let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record })
+    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
@@ -110,6 +127,38 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>) -> Result<TwoPa
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
 pub fn abi_root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignature, String> {
+    abi_root_signature_with(dev, graphics, &[])
+}
+
+/// A static sampler (register `k`, space 1) from its S#; static samplers have only three
+/// border colours (others: transparent black).
+pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STATIC_SAMPLER_DESC {
+    let d = crate::gpu::desc::sampler_d3d12(w, *comparison);
+    let border = match d.BorderColor {
+        [0.0, 0.0, 0.0, 1.0] => D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK,
+        [1.0, 1.0, 1.0, 1.0] => D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        _ => D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+    };
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: d.Filter,
+        AddressU: d.AddressU,
+        AddressV: d.AddressV,
+        AddressW: d.AddressW,
+        MipLODBias: d.MipLODBias,
+        MaxAnisotropy: d.MaxAnisotropy,
+        ComparisonFunc: d.ComparisonFunc,
+        BorderColor: border,
+        MinLOD: d.MinLOD,
+        MaxLOD: d.MaxLOD,
+        ShaderRegister: k,
+        RegisterSpace: 1,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// The ABI root signature with the pipeline's static samplers (registers 0.., space 1).
+pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
+    let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
         let params: Vec<D3D12_ROOT_PARAMETER1> = (0..3)
             .map(|i| D3D12_ROOT_PARAMETER1 {
@@ -127,7 +176,13 @@ pub fn abi_root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12Ro
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 { NumParameters: 3, pParameters: params.as_ptr(), NumStaticSamplers: 0, pStaticSamplers: std::ptr::null(), Flags: flags },
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 3,
+                    pParameters: params.as_ptr(),
+                    NumStaticSamplers: statics.len() as u32,
+                    pStaticSamplers: if statics.is_empty() { std::ptr::null() } else { statics.as_ptr() },
+                    Flags: flags,
+                },
             },
         };
         let mut blob: Option<ID3DBlob> = None;

@@ -336,8 +336,21 @@ pub fn run(dxil: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult
 
 /// `run` with test textures (SRV at heap index 2·i, UAV at 2·i + 1) and samplers.
 pub fn run_with(dxil: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
+    run_with_statics(dxil, state, mem, textures, samplers, &[])
+}
+
+/// `run_with` for a kernel with static samplers (`Translation::static_samplers`).
+pub fn run_with_statics(
+    dxil: &[u8],
+    state: &KernelState,
+    mem: &[u32],
+    textures: &[TestTexture],
+    samplers: &[TestSampler],
+    statics: &[super::pso::StaticSampler],
+) -> Result<KernelResult, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let rs: ID3D12RootSignature = if statics.is_empty() { gpu.rs.clone() } else { super::pso::abi_root_signature_with(&gpu.dev, false, statics)? };
     let mut io: Vec<u32> = state.sgpr.clone();
     io.resize(KERNEL_SGPRS, 0);
     io[KERNEL_SCC_SLOT] = state.scc;
@@ -351,7 +364,7 @@ pub fn run_with(dxil: &[u8], state: &KernelState, mem: &[u32], textures: &[TestT
         let dev = &gpu.dev;
         let pso: ID3D12PipelineState = dev
             .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: transmute_copy(&gpu.rs),
+                pRootSignature: transmute_copy(&rs),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
                 ..Default::default()
             })
@@ -382,7 +395,7 @@ pub fn run_with(dxil: &[u8], state: &KernelState, mem: &[u32], textures: &[TestT
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let bound = bind_resources(dev, &list, textures, samplers)?;
-        list.SetComputeRootSignature(&gpu.rs);
+        list.SetComputeRootSignature(&rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
@@ -476,7 +489,7 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
         return Err(format!("nieobsługiwane instrukcje: {:?}", t.unsupported));
     }
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl))?;
-    run_with(&dxil, state, mem, textures, samplers)
+    run_with_statics(&dxil, state, mem, textures, samplers, &t.static_samplers)
 }
 
 /// Translate + compile + run RDNA2 code as a kernel.
