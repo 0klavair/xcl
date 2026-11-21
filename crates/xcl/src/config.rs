@@ -105,6 +105,8 @@ impl Default for Config {
         let mut mounts = BTreeMap::new();
         mounts.insert("GAME:".into(), "{game}".into());
         mounts.insert("G:".into(), "{game}".into());
+        // the package drive of the XDK days, still used by GDK titles (XDefiant: d:\hunter\...)
+        mounts.insert("D:".into(), "{game}".into());
         mounts.insert("T:".into(), "{data}\\temp".into());
         Config {
             device_type: "anaconda".into(),
@@ -144,7 +146,14 @@ const HEADER: &str = "# XCL – title configuration. Created automatically; you 
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(s) => {
+                let mut c: Config = toml::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+                // default mounts added since the file was written
+                for (k, v) in Config::default().mounts {
+                    c.mounts.entry(k).or_insert(v);
+                }
+                Ok(c)
+            }
             Err(_) => {
                 let c = Config::default();
                 let body = toml::to_string_pretty(&c).map_err(|e| e.to_string())?;

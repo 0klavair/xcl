@@ -33,6 +33,7 @@ const PC_RESET: usize = 10;
 const PC_DRAW_INDEXED: usize = 13;
 const PC_DISPATCH: usize = 14;
 const PC_COPY_BUFFER_REGION: usize = 15;
+const PC_COPY_TEXTURE_REGION: usize = 16;
 const PC_COPY_RESOURCE: usize = 17;
 const PC_RESOURCE_BARRIER: usize = 26;
 const PC_IA_SET_INDEX_BUFFER: usize = 43;
@@ -430,7 +431,49 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
     if let Some(m) = OCCLUSION.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, pso)
+    // the PC runtime writes its own vtable into a copy list again on Reset: keep XCL's
+    let ext = *(this as *const usize);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, pso);
+    if *(this as *const usize) != ext {
+        *(this as *mut usize) = ext;
+    }
+    hr
+}
+
+/// A D3D12_TEXTURE_COPY_LOCATION for the log.
+unsafe fn location(l: *const D3D12_TEXTURE_COPY_LOCATION) -> String {
+    if l.is_null() {
+        return "null".into();
+    }
+    let l = &*l;
+    let res = transmute_copy::<_, usize>(&l.pResource);
+    if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+        let p = l.Anonymous.PlacedFootprint;
+        let f = p.Footprint;
+        format!("buffer {res:#x} +{:#x} format {} {}x{}x{} pitch {}", p.Offset, f.Format.0, f.Width, f.Height, f.Depth, f.RowPitch)
+    } else {
+        let d = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc());
+        format!("texture {res:#x} subresource {} ({:?})", l.Anonymous.SubresourceIndex, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0)))
+    }
+}
+
+/// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
+pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
+    if hr < 0 {
+        let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
+        crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
+    }
+    hr
+}
+
+/// DMA list #12 CopyTextureRegion(dst, x, y, z, src, box) (PC #16)
+pub(super) unsafe extern "system" fn dma_copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("D3D12.X: DMA CopyTextureRegion to {} at ({x}, {y}, {z}) from {}{}", location(dst), location(src), if bx.is_null() { String::new() } else { format!(" box {:?}", { let b = *bx; (b.left, b.top, b.front, b.right, b.bottom, b.back) }) });
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, dst, x, y, z, src, bx)
 }
 
 /// command list #28 BeginQuery(heap, type, index) (PC #52)

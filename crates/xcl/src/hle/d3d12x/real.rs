@@ -45,6 +45,9 @@ pub enum Kind {
     CommandQueue,
     CommandAllocator,
     CommandList,
+    /// the console's DMA (copy) list, ID3D12XboxDmaCommandList: a PC list with the console's
+    /// shorter vtable (`console_remap`)
+    DmaList,
     Fence,
     DescriptorHeap,
     Resource,
@@ -63,7 +66,7 @@ impl Kind {
             Kind::Device => "ID3D12Device",
             Kind::CommandQueue => "ID3D12CommandQueue",
             Kind::CommandAllocator => "ID3D12CommandAllocator",
-            Kind::CommandList => "ID3D12GraphicsCommandList",
+            Kind::CommandList | Kind::DmaList => "ID3D12GraphicsCommandList",
             Kind::Fence => "ID3D12Fence",
             Kind::DescriptorHeap => "ID3D12DescriptorHeap",
             Kind::Resource => "ID3D12Resource",
@@ -310,7 +313,8 @@ pub fn init() -> Result<String, String> {
     }
     unsafe {
         let cfg = crate::state::config();
-        if cfg.d3d12_debug {
+        let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
+        if debug {
             let mut dbg: Option<ID3D12Debug> = None;
             if D3D12GetDebugInterface(&mut dbg).is_ok() {
                 if let Some(d) = dbg {
@@ -342,6 +346,13 @@ pub fn init() -> Result<String, String> {
             name = "WARP (software renderer)".into();
         }
         let device = device.ok_or("no device")?;
+        if debug {
+            // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
+            if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
+                let mut cookie = 0u32;
+                let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
+            }
+        }
         open_uma(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
@@ -349,6 +360,16 @@ pub fn init() -> Result<String, String> {
         *ADAPTER.lock().unwrap() = name.clone();
         Ok(name)
     }
+}
+
+/// A debug layer message: errors and warnings into the log (the first 200).
+unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 || N.fetch_add(1, Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
+    crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0);
 }
 
 type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
@@ -366,6 +387,10 @@ pub unsafe fn create_device(riid: *const c_void, ppv: *mut *mut c_void) -> HRESU
         let qi: QiFn = std::mem::transmute(*vt(dev));
         let hr = qi(dev, riid as *const GUID, ppv);
         if hr >= 0 {
+            crate::xlog_info!("D3D12.X: device {:p} for the title", *ppv);
+            if std::env::var_os("XCL_WATCH_DEVICE").is_some() {
+                crate::eh::watch_writes(*ppv as usize);
+            }
             return hr;
         }
     }
@@ -381,6 +406,7 @@ pub unsafe fn create_device(riid: *const c_void, ppv: *mut *mut c_void) -> HRESU
 
 struct Class {
     orig: usize,
+    kind: Kind,
     ext: usize,
     iface: &'static Iface,
     public: usize,
@@ -412,8 +438,23 @@ fn module_of(addr: usize) -> usize {
     h as usize
 }
 
+/// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
+pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
+    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+}
+
 fn is_ext(v: usize) -> bool {
     EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
+}
+
+/// An adopted object gets the extended vtable of another kind (a DMA list: created as a PC
+/// list, it needs the console's DMA layout).
+pub(super) unsafe fn readopt(obj: *mut c_void, kind: Kind) {
+    if obj.is_null() || !is_ext(vt(obj) as usize) {
+        return adopt(obj, kind);
+    }
+    let orig = *vt(obj).sub(1);
+    *(obj as *mut usize) = class_for(obj, orig, kind);
 }
 
 /// Give a genuine D3D12 object the extended vtable for `kind`.
@@ -430,7 +471,7 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
-    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig) {
+    if let Some(c) = CLASSES.lock().unwrap().iter().find(|c| c.orig == orig && c.kind == kind) {
         return c.ext;
     }
     let ot = orig as *const usize;
@@ -522,11 +563,12 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
     let ext = leaked.as_ptr() as usize + 8;
     EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(ext);
     crate::xlog_info!(
-        "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs",
+        "D3D12.X: {} – {public} PC methods, {} internal slots under the guard, +{EXTRA_SLOTS} stubs ({kind:?}, PC vtable {})",
         iface.name,
-        scanned - public
+        scanned - public,
+        crate::modules::describe_address(orig)
     );
-    CLASSES.lock().unwrap().push(Class { orig, ext, iface, public, scanned });
+    CLASSES.lock().unwrap().push(Class { orig, kind, ext, iface, public, scanned });
     ext
 }
 
@@ -540,6 +582,10 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
 fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
     match kind {
         Kind::CommandList => (28..=31).map(|x| (x, x + 24)).chain((32..=55).map(|x| (x, x - 4))).chain((104..=109).map(|x| (x, x - 44))).chain([(124, 77), (125, 78)]).collect(),
+        // the DMA list: Close / Reset, then the copy methods (XDefiant calls #12 with
+        // CopyTextureRegion's arguments): 11–14 = PC 15–18 (CopyBufferRegion, CopyTextureRegion,
+        // CopyResource, CopyTiles); what follows is not known yet (`console_extensions`)
+        Kind::DmaList => (11..=14).map(|x| (x, x + 4)).collect(),
         _ => Vec::new(),
     }
 }
@@ -553,6 +599,7 @@ fn console_extensions(kind: Kind) -> Option<usize> {
     match kind {
         Kind::Device => Some(44),
         Kind::CommandList => Some(60),
+        Kind::DmaList => Some(15),
         _ => None,
     }
 }
@@ -583,6 +630,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
             vec![
                 (0, dev_qi_x as usize),
                 (8, x::create_command_queue_x as usize),
+                (25, x::get_resource_allocation_info_x as usize),
+                // CreateCommittedResource at its PC index too (XDefiant): console code uses the
+                // buffer's GPU address as a CPU pointer – it goes into unified memory
+                (27, dev_create_committed_resource_x as usize),
                 (9, x::create_command_allocator_x as usize),
                 (10, x::create_graphics_pso_pc as usize),
                 (12, x::create_command_list_pc as usize),
@@ -623,6 +674,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
+        Kind::DmaList => vec![(9, super::list_x::dma_close_x as usize), (10, super::list_x::reset_x as usize), (12, super::list_x::dma_copy_texture_region_x as usize)],
         Kind::CommandList => {
             use super::list_x as l;
             vec![
@@ -789,6 +841,44 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
 
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
 /// what the recompiled shaders read through `mem`. None: not placed (fall back to committed).
+/// A committed texture of console code: on the console its memory is unified memory too –
+/// titles write it through its GPU address (XDefiant clears one with memset). It gets UMA
+/// memory of the console's size (XG; the PC's where XG has no model) and is created as a
+/// texture at that address (`device_x::create_placed_resource_x`: kept in step with the
+/// memory where XG lays it out); GetGPUVirtualAddress returns the address.
+unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let u = crate::gpu::uma::get()?;
+    if ppv.is_null() || !crate::gpu::shader::readable(desc, 0x38) {
+        return None;
+    }
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    if !(2..=4).contains(&u32::from_le_bytes(x[0..4].try_into().unwrap())) {
+        return None;
+    }
+    let (size, align) = match crate::hle::xg::Texture::new(&x) {
+        Ok(t) if t.size() > 0 => (t.size(), t.alignment()),
+        _ => {
+            type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
+            let pc: F = std::mem::transmute(orig_fn(this, 25));
+            let mut r = [0u64; 2];
+            pc(this, &mut r, 0, 1, &super::device_x::pc_resource_desc(&x));
+            (r[0], r[1])
+        }
+    };
+    if size == 0 || size == u64::MAX {
+        return None;
+    }
+    let align = (align as usize).max(0x1_0000);
+    let p = u.alloc((size as usize).div_ceil(align) * align, align)? as usize;
+    let hr = super::device_x::create_placed_resource_x(this, p as u64, desc as *const u8, state as u32, clear as *const c_void, riid, ppv);
+    if hr < 0 || (*ppv).is_null() {
+        u.free(p);
+        return None;
+    }
+    UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, size as usize, true));
+    Some(hr)
+}
+
 unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
     if UMA_HEAPS.lock().unwrap().is_empty() || ppv.is_null() {
@@ -1125,6 +1215,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
     let mut pc_desc = [0u8; 56];
+    let console_desc = desc;
     let mut desc = desc;
     if desc != 0 {
         std::ptr::copy_nonoverlapping(desc as *const u8, pc_desc.as_mut_ptr(), 56);
@@ -1137,6 +1228,9 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     }
     if desc != 0 {
         if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
+            return hr;
+        }
+        if let Some(hr) = place_console_texture(this, console_desc, state, clear, riid, ppv) {
             return hr;
         }
     }
@@ -1179,6 +1273,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     match kind {
         Kind::Device => v.extend_from_slice(&[
             ("CreateCommandQueue", dev_create_command_queue as usize),
+            ("CheckFeatureSupport", dev_check_feature_support as usize),
             ("CreateCommandAllocator", dev_create_command_allocator as usize),
             ("CreateGraphicsPipelineState", dev_create_graphics_pso as usize),
             ("CreateComputePipelineState", dev_create_compute_pso as usize),
@@ -1204,7 +1299,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
-        Kind::CommandList => v.extend_from_slice(&[("OMSetRenderTargets", cl_om_set_render_targets as usize), ("SetPipelineState", cl_set_pipeline_state as usize)]),
+        Kind::CommandList => v.extend_from_slice(&[("OMSetRenderTargets", cl_om_set_render_targets as usize), ("SetPipelineState", cl_set_pipeline_state as usize), ("Close", cl_close as usize)]),
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
         Kind::Resource => v.push(("Release", res_release as usize)),
@@ -1254,6 +1349,76 @@ macro_rules! as_usize {
     ($x:ident) => {
         usize
     };
+}
+
+/// Close: a failure is logged with what was recorded (titles stop on it; the PC runtime
+/// refuses some calls only here)
+unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
+    let hr = f(this) as HRESULT;
+    if hr < 0 {
+        let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
+        crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
+    }
+    hr
+}
+
+/// The PC size of a CheckFeatureSupport structure.
+fn pc_feature_size(feature: i32) -> Option<usize> {
+    use std::mem::size_of;
+    Some(match D3D12_FEATURE(feature) {
+        D3D12_FEATURE_D3D12_OPTIONS => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(),
+        D3D12_FEATURE_ARCHITECTURE => size_of::<D3D12_FEATURE_DATA_ARCHITECTURE>(),
+        D3D12_FEATURE_FEATURE_LEVELS => size_of::<D3D12_FEATURE_DATA_FEATURE_LEVELS>(),
+        D3D12_FEATURE_FORMAT_SUPPORT => size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>(),
+        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS => size_of::<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS>(),
+        D3D12_FEATURE_FORMAT_INFO => size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>(),
+        D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT => size_of::<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT>(),
+        D3D12_FEATURE_SHADER_MODEL => size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>(),
+        D3D12_FEATURE_D3D12_OPTIONS1 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(),
+        D3D12_FEATURE_ROOT_SIGNATURE => size_of::<D3D12_FEATURE_DATA_ROOT_SIGNATURE>(),
+        D3D12_FEATURE_ARCHITECTURE1 => size_of::<D3D12_FEATURE_DATA_ARCHITECTURE1>(),
+        D3D12_FEATURE_D3D12_OPTIONS2 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS2>(),
+        D3D12_FEATURE_SHADER_CACHE => size_of::<D3D12_FEATURE_DATA_SHADER_CACHE>(),
+        D3D12_FEATURE_D3D12_OPTIONS3 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS3>(),
+        D3D12_FEATURE_EXISTING_HEAPS => size_of::<D3D12_FEATURE_DATA_EXISTING_HEAPS>(),
+        D3D12_FEATURE_D3D12_OPTIONS4 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS4>(),
+        D3D12_FEATURE_D3D12_OPTIONS5 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>(),
+        D3D12_FEATURE_D3D12_OPTIONS6 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>(),
+        D3D12_FEATURE_D3D12_OPTIONS7 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>(),
+        D3D12_FEATURE_D3D12_OPTIONS8 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS8>(),
+        D3D12_FEATURE_D3D12_OPTIONS9 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS9>(),
+        D3D12_FEATURE_D3D12_OPTIONS10 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS10>(),
+        D3D12_FEATURE_D3D12_OPTIONS11 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS11>(),
+        D3D12_FEATURE_D3D12_OPTIONS12 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>(),
+        D3D12_FEATURE_D3D12_OPTIONS13 => size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS13>(),
+        _ => return None,
+    })
+}
+
+/// CheckFeatureSupport(feature, data, size): console structures can be larger than the PC's
+/// (XDefiant: D3D12_OPTIONS with 0x40 bytes, 0x3C on the PC – and the title stops on the
+/// error). A size the PC refuses is retried with the PC's, the console's extra bytes zero.
+unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
+    let hr = f(this, feature, data, size);
+    let Some(pc) = pc_feature_size(feature).filter(|&pc| hr < 0 && !data.is_null() && pc != size as usize) else { return hr };
+    let n = pc.min(size as usize);
+    let mut tmp = vec![0u8; pc];
+    std::ptr::copy_nonoverlapping(data, tmp.as_mut_ptr(), n); // input fields (format, sample count …)
+    let hr2 = f(this, feature, tmp.as_mut_ptr(), pc as u32);
+    if hr2 >= 0 {
+        std::ptr::write_bytes(data, 0, size as usize);
+        std::ptr::copy_nonoverlapping(tmp.as_ptr(), data, n);
+    }
+    static SEEN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if !seen.contains(&feature) {
+        seen.push(feature);
+        crate::xlog_info!("D3D12.X: CheckFeatureSupport({feature}) with the console's {size} bytes, the PC's {pc} → {:#x}", hr2 as u32);
+    }
+    hr2
 }
 
 /// Device creation methods ending in (REFIID riid, void** ppv).

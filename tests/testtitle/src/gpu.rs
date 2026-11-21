@@ -408,7 +408,10 @@ pub fn console_device_methods() -> Result<(), String> {
         let hr = list_x(d, [DMA, 0, 1, 0].as_ptr(), alloc.as_raw(), std::ptr::null_mut(), &IID_DMA_LIST, &mut raw);
         ensure!(hr >= 0 && !raw.is_null(), "CreateCommandListX (DMA) hr={hr:#x}");
         let list = ID3D12GraphicsCommandList::from_raw(raw);
-        list.CopyBufferRegion(&dst, 0, &src, 0, n as u64);
+        // the DMA list's own vtable: Close #9, Reset #10, CopyBufferRegion #11 (then
+        // CopyTextureRegion #12, CopyResource #13, CopyTiles #14)
+        type CopyBuffer = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+        std::mem::transmute::<usize, CopyBuffer>(slot(raw, 11))(raw, dst.as_raw(), 0, src.as_raw(), 0, n as u64);
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;

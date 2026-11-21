@@ -78,11 +78,18 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let dma = !riid.is_null() && guid_bytes(&*riid) == guid_bytes(&IID_XBOX_DMA_COMMAND_LIST);
     let riid = if dma { &IID_GRAPHICS_COMMAND_LIST as *const GUID } else { riid };
     let (node, ty) = (if node == 0 { 0 } else { 1 }, pc_list_type(ty) as usize);
-    if super::console_list::enabled() {
+    let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
         real::dev_create_command_list(this, node, ty, alloc, pso, riid, ppv)
+    };
+    if dma && hr >= 0 && !ppv.is_null() {
+        real::readopt(*ppv, real::Kind::DmaList);
+        if std::env::var_os("XCL_WATCH_DMA").is_some() {
+            crate::eh::watch_writes(*ppv as usize);
+        }
     }
+    hr
 }
 
 /// device #12 CreateCommandList(node mask, type, allocator, initial pipeline, riid, list):
@@ -377,6 +384,40 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     d
 }
 
+/// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
+/// returned through a hidden pointer. Called the C way – (return buffer, device, …), XDefiant –
+/// or the C++ way – (device, return buffer, …): whichever argument is the device is `this`.
+/// Textures get the console's size (XG: what the title then places them in); buffers and
+/// what XG does not model the PC's.
+pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38]) -> *mut [u64; 2] {
+    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
+    let pc: F = std::mem::transmute(real::orig_fn(this, 25));
+    let (mut size, mut align) = (0u64, 0u64);
+    for k in 0..n as usize {
+        let x = if descs.is_null() { [0u8; 0x38] } else { descs.add(k).read_unaligned() };
+        let (s, a) = match crate::hle::xg::Texture::new(&x).ok().filter(|_| u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32) {
+            Some(t) => (t.size(), t.alignment()),
+            None => {
+                let d = pc_resource_desc(&x);
+                let mut r = [0u64; 2];
+                pc(this, &mut r, mask, 1, &d);
+                (r[0], r[1])
+            }
+        };
+        if s == u64::MAX || a == 0 {
+            size = u64::MAX;
+            break;
+        }
+        size = size.div_ceil(a) * a + s;
+        align = align.max(a);
+    }
+    if !ret.is_null() {
+        *ret = [size, align];
+    }
+    ret
+}
+
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
 /// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
@@ -400,7 +441,14 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => return hr,
-            Err(e) if once(&M, 4) => crate::xlog_warn!("D3D12.X: CreatePlacedResourceX texture at {va:#x}: not kept in step with the memory ({e})"),
+            Err(e) if once(&M, 4) => {
+                let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+                crate::xlog_warn!(
+                    "D3D12.X: CreatePlacedResourceX texture at {va:#x} (dimension {} {}x{}x{}, {} mips, format {}, {} samples, layout {:#x}, flags {:#x}): not kept in step with the memory ({e})",
+                    u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u16::from_le_bytes(x[0x1C..0x1E].try_into().unwrap()),
+                    u16::from_le_bytes(x[0x1E..0x20].try_into().unwrap()), u(0x20), u(0x24), u(0x2C), u(0x30)
+                )
+            }
             Err(_) => {}
         }
     }

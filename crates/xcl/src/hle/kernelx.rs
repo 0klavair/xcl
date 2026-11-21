@@ -22,6 +22,12 @@ use crate::util::{dll_key, from_ansi_ptr, from_wide_ptr, write_ansi_out, write_w
 type HANDLE = *mut c_void;
 type BOOL = i32;
 
+/// The title's own unhandled-exception filter goes behind XCL's (`eh`): XCL's crash report
+/// first, then the title's handler (its crash reporter) as on the console.
+pub unsafe extern "system" fn SetUnhandledExceptionFilter(f: usize) -> usize {
+    crate::eh::set_title_filter(f)
+}
+
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
         // registry: the console mode the GDK thunks read (XSystemGetDeviceType)
@@ -60,6 +66,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         RegisterAppConstrainedChangeNotification,
         UnregisterAppConstrainedChangeNotification,
         // threads / system
+        SetUnhandledExceptionFilter,
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,

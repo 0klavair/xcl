@@ -117,6 +117,9 @@ enum Compare {
     SignOfZero,
     /// floats, relative error 2e-5 (the console's transcendental and division code)
     Float,
+    /// half floats, relative error 2e-3: the console computes them in fp16, a PC driver may
+    /// keep fp32 (D3D12 allows the higher precision)
+    Half,
 }
 use Compare::*;
 
@@ -210,6 +213,51 @@ const KERNELS: &[(&str, &str, Compare)] = &[
          out_u(o + 4u, (uint)min(a, b)); out_u(o + 5u, (uint)(max(a, b) >> 32));",
         Exact,
     ),
+    (
+        "local arrays indexed per lane",
+        "uint arr[32]; uint a = in_u(tid.x);
+         for (uint i = 0u; i < 32u; i++) arr[i] = in_u(tid.x * 3u + i) ^ i;
+         uint s = 0u;
+         for (uint j = 0u; j < 32u; j++) { s = s * 3u + arr[(j * 7u + a) & 31u]; arr[(a >> j) & 31u] += j; }
+         out_u(tid.x * 8u, s);
+         out_u(tid.x * 8u + 1u, arr[a & 31u]);",
+        Exact,
+    ),
+    (
+        "switch and nested loops",
+        "uint a = in_u(tid.x), r = 0u;
+         for (uint i = 0u; i < (a & 7u); i++) {
+             for (uint j = 0u; j < 8u; j++) {
+                 switch ((a >> (i + j)) & 3u) {
+                     case 0u: r += j; break;
+                     case 1u: r ^= i << j; break;
+                     case 2u: r = (r & 1u) ? r + 7u : r * 5u + 1u; break;
+                     default: r = (r >> 1) | (r << 31); break;
+                 }
+                 if ((r & 0xFu) == 9u) break;
+             }
+         }
+         out_u(tid.x * 8u, r);",
+        Exact,
+    ),
+    (
+        "16-bit floats",
+        "float16_t h = (float16_t)in_f(tid.x), k = (float16_t)in_f(tid.x + 256u);
+         uint o = tid.x * 8u;
+         out_f(o, (float)(h * k + (float16_t)1.0));
+         out_f(o + 1u, (float)max(h, k));
+         out_f(o + 2u, (float)(h - k * (float16_t)0.5));",
+        Half,
+    ),
+    (
+        "16-bit integers",
+        "uint16_t u = (uint16_t)in_u(tid.x), v = (uint16_t)(in_u(tid.x) >> 16);
+         uint o = tid.x * 8u;
+         out_u(o, (uint)(uint16_t)(u * v + (uint16_t)3u));
+         out_u(o + 1u, (uint)(uint16_t)(u >> (v & (uint16_t)15u)));
+         out_u(o + 2u, (uint)(int)(int16_t)((int16_t)u / (int16_t)((v & (uint16_t)0x7Fu) | (uint16_t)1u)));",
+        Exact,
+    ),
 ];
 
 /// The inputs: 1024 integers (varied bit patterns), 1024 floats (-10 … 10 and a few special
@@ -274,7 +322,11 @@ fn console_compiled_kernels_match_the_pc_compile() {
         return;
     }
     let mut failed = Vec::new();
-    for &(name, body, how) in KERNELS {
+    let only = std::env::var("XCL_KERNEL").ok().and_then(|k| k.parse::<usize>().ok());
+    for (k, &(name, body, how)) in KERNELS.iter().enumerate() {
+        if only.is_some_and(|o| o != k) {
+            continue;
+        }
         match run_both(&c, body) {
             Err(e) => failed.push(format!("{name}: {e}")),
             Ok((console, pc)) => {
@@ -287,9 +339,10 @@ fn console_compiled_kernels_match_the_pc_compile() {
                     _ if a == b => true,
                     Exact => false,
                     SignOfZero => zero(a) == zero(b),
-                    Float => {
+                    Float | Half => {
+                        let tolerance = if how == Half { 2e-3 } else { 2e-5 };
                         let (x, y) = (f32::from_bits(a), f32::from_bits(b));
-                        (x.is_nan() && y.is_nan()) || (x - y).abs() <= 2e-5 * y.abs().max(1.0)
+                        (x.is_nan() && y.is_nan()) || (x - y).abs() <= tolerance * y.abs().max(1.0)
                     }
                 };
                 let bad: Vec<usize> = (0..pc.len()).filter(|&i| !same(console[i], pc[i])).collect();
@@ -315,7 +368,7 @@ fn print_a_console_compile() {
     let Some(c) = console_compiler() else { return };
     let which = std::env::var("XCL_KERNEL").ok().and_then(|k| k.parse::<usize>().ok()).unwrap_or(0);
     let src = kernel(KERNELS[which].1);
-    let blob = console_compile(&c, &src, &["-E", "main", "-T", "cs_6_6", "-D", "XCL_CONSOLE=1"]).unwrap_or_else(|e| panic!("{e}"));
+    let blob = console_compile(&c, &src, &["-E", "main", "-T", "cs_6_6", "-enable-16bit-types", "-D", "XCL_CONSOLE=1"]).unwrap_or_else(|e| panic!("{e}"));
     println!("{}: {} bytes, parts {:?}", KERNELS[which].0, blob.len(), parts(&blob));
     match xcl::gpu::xbox::parse(&blob) {
         Some(sh) => {

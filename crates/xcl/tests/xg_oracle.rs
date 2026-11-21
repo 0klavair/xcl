@@ -603,3 +603,17 @@ fn print_volumes_lines_and_samples() {
         }
     }
 }
+
+#[test]
+#[ignore]
+fn print_line_modes() {
+    let Some(m) = console() else { return };
+    let create = proc(m, "XGCreateTextureComputer");
+    for f in [28u32, 71, 2, 61] {
+        let ok: Vec<String> = [0u32, 1, 2].into_iter().chain(0x100..0x120).filter(|&lay| unsafe { layout(create, &desc(2, 256, 1, 1, 1, f, lay, 0)).0 } >= 0).map(|l| format!("{l:#x}")).collect();
+        let uav: Vec<String> = [0u32, 1, 2].into_iter().filter(|&lay| unsafe { layout(create, &desc(2, 256, 1, 1, 1, f, lay, 4)).0 } >= 0).map(|l| format!("{l:#x}")).collect();
+        let rt = unsafe { layout(create, &desc(2, 256, 1, 1, 1, f, 0, 1)).0 };
+        let h2 = unsafe { layout(create, &desc(2, 256, 2, 1, 1, f, 0, 0)).0 };
+        println!("fmt {f}: layouts {ok:?}, UAV {uav:?}, RT hr {rt:#x}, height 2 hr {h2:#x}");
+    }
+}

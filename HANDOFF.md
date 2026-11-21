@@ -1052,6 +1052,39 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   (the decoder uses the names from the gfx10.3 spec).
 - Some names in the pack are truncated (names > 255 characters do not fit in the record's length byte) – RPF9 scanner cosmetics.
 
+## XDefiant (Ubisoft.XDefiant-Game, `rogue_scarlett_rtx.exe`) – first runs (2026-11-21)
+The user's dump (Mount folder, game data in `hunter\`, read through `d:\hunter\`). Each step below was a stop
+of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c760` then `mov [0], …`):
+- **D: mount**: the package drive of the XDK days; default mounts now have `D:` = `{game}`, and default mounts
+  added later are merged into existing `xcl.toml` files.
+- **Crash reports**: the title sets its own unhandled-exception filter; kernelx `SetUnhandledExceptionFilter` keeps
+  it behind XCL's (report first, then the title's). The record has all registers, the module of each register's
+  vtable (which object it points at) and return addresses into loaded modules on the stack.
+- **CheckFeatureSupport(D3D12_OPTIONS)** with the console's 0x40 bytes (PC 0x3C → E_INVALIDARG): retried with the PC
+  size, the extra bytes zero (`dev_check_feature_support`, a size table from the PC structures).
+- **Device #25 GetResourceAllocationInfo called the C way**: (return buffer, device, mask, count, descs) – the PC
+  runtime took the device as the return buffer and wrote SizeInBytes = −1 over its vtable. `get_resource_allocation_info_x`
+  takes whichever argument is an adopted object as `this`; textures get XG's size.
+- **The DMA list's vtable** (ID3D12XboxDmaCommandList, created through device #73 with type 0x10): Close #9, Reset #10,
+  then CopyBufferRegion #11, CopyTextureRegion #12 (XDefiant: 8×8 BGRA mips from an upload buffer), CopyResource #13,
+  CopyTiles #14; later slots unknown (logged stubs). Its own `Kind::DmaList` class.
+- **D3D12Core writes its vtable into a copy list again on Reset**: XCL's adoption was lost after the first Reset;
+  `reset_x` puts XCL's back.
+- **Device #27 CreateCommittedResource from console code**: buffers go to unified memory (as #76); textures get UMA
+  memory of the console size and become title-memory textures (`place_console_texture`), their GetGPUVirtualAddress
+  is that address – XDefiant clears a 32 MB texture with memset through it.
+- **Where it stops now**: D3D12.X code compiled into the title writes graphics records into the command list object
+  (+0x18 write pointer, +0x30 end; e.g. 0xC000B600 + topology from `IASetPrimitiveTopology`). A PC list has other
+  data there (write to 0x100000000). `XCL_CONSOLE_LISTS=1` (compute records only) gets less far: its lists are not
+  DMA lists. Next: console-shaped graphics lists – the record formats from the title's inline writers, as done for
+  compute in `console_list`.
+- Diagnostics added: `XCL_WATCH_DEVICE=1` / `XCL_WATCH_DMA=1` put a hardware write watchpoint (debug registers, all
+  threads) on the title's device / first DMA list and log each writer with its callers (`eh::watch_writes`);
+  `XCL_D3D12_DEBUG=1` turns on the debug layer and copies its messages into the log (needs the Windows "Graphics
+  Tools" feature – not installed on the user's PC); `XCL_D3D12_TRACE=1` (existing) logs console calls by slot.
+- Also seen: 1D and 3D 1×1 default textures (XG: E_NOTIMPL for 1D / 3D – not mirrored), console-only list IIDs
+  55050859-…-98cf-645b51dc4874 / c3827890-… (the title takes a null), D3D12ConfigureVirtualMemoryX (stub).
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
