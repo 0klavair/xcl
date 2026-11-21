@@ -560,6 +560,21 @@ pub fn render_triangle() -> Result<(), String> {
         )
         .map_err(e)?;
         let rb = rb.ok_or("no readback buffer")?;
+        // occlusion queries: 2 around one draw, 0 around two draws with 1 nested inside it
+        let mut queries: Option<ID3D12QueryHeap> = None;
+        dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION, Count: 3, NodeMask: 0 }, &mut queries).map_err(e)?;
+        let queries = queries.ok_or("no query heap")?;
+        let mut results: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC { Width: 24, ..buf_desc },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut results,
+        )
+        .map_err(e)?;
+        let results = results.ok_or("no query results buffer")?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
@@ -587,6 +602,23 @@ pub fn render_triangle() -> Result<(), String> {
         xslot::<DrawIndexedX>(&list, 81)(list.as_raw(), ib as u64 + 16, DXGI_FORMAT_R16_UINT, 3, 0);
         list.RSSetViewports(&[half(0, h / 2)]);
         list.DrawIndexedInstanced(3, 1, 3, 0, 0);
+        // the base triangle again over the whole target (same pixels), counted by occlusion
+        // queries at the console slots BeginQuery #28 / EndQuery #29 / ResolveQueryData #30
+        type Query = unsafe extern "system" fn(*mut c_void, *mut c_void, D3D12_QUERY_TYPE, u32);
+        type Resolve = unsafe extern "system" fn(*mut c_void, *mut c_void, D3D12_QUERY_TYPE, u32, u32, *mut c_void, u64);
+        let (begin, end) = (xslot::<Query>(&list, 28), xslot::<Query>(&list, 29));
+        let (l, q, occ) = (list.as_raw(), queries.as_raw(), D3D12_QUERY_TYPE_OCCLUSION);
+        list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+        begin(l, q, occ, 2);
+        list.DrawInstanced(3, 1, 0, 0);
+        end(l, q, occ, 2);
+        begin(l, q, occ, 0);
+        list.DrawInstanced(3, 1, 0, 0);
+        begin(l, q, occ, 1);
+        list.DrawInstanced(3, 1, 0, 0);
+        end(l, q, occ, 1);
+        end(l, q, occ, 0);
+        xslot::<Resolve>(&list, 30)(l, q, occ, 0, 3, results.as_raw(), 0);
         let barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -630,6 +662,11 @@ pub fn render_triangle() -> Result<(), String> {
         let (top_right, bottom_left) = (px(48, 16), px(16, 48));
         rb.Unmap(0, None);
         crate::XMemFree(ib as *mut c_void, graphics);
+        let mut r = std::ptr::null_mut();
+        results.Map(0, None, Some(&mut r)).map_err(e)?;
+        let counts = std::slice::from_raw_parts(r as *const u64, 3).to_vec();
+        results.Unmap(0, None);
+        ensure!(counts[2] > 0 && counts[0] == 2 * counts[2] && counts[1] > 0, "occlusion queries (outer, inner, single) = {counts:?}: expected 2 × single and a visible inner one");
         ensure!(top_right == [0, 255, 0, 255], "top-right quadrant {top_right:?} (expected green: DrawIndexedX)");
         ensure!(bottom_left == [0, 255, 0, 255], "bottom-left quadrant {bottom_left:?} (expected green: the title's index buffer, bound again)");
         ensure!(center == [0, 255, 0, 255], "centre pixel {center:?} (expected green triangle)");

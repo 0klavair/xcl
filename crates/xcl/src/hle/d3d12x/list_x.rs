@@ -8,6 +8,10 @@
 //! Write32BitValueBottomOfShaderX #90. A title call of any other extension (waits on memory,
 //! GDS, KickoffX, depth bias, hints…) is logged and does nothing (`real::class_for`).
 //!
+//! Occlusion queries may nest on the console; the PC allows one active per list. One begun
+//! while another is active is not sent to the PC: the outer one counts on (its result is
+//! exact – the inner range lies in it), the inner one resolves as visible.
+//!
 //! Console GPU addresses in unified memory are the title's own addresses; memory operations
 //! go to that window's buffer (`real::uma_window_buffer`), which is in COMMON between them.
 //! An index buffer at such an address is given to the PC as the window buffer's GPU address.
@@ -25,12 +29,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::real;
 
 const PC_GET_TYPE: usize = 8;
+const PC_RESET: usize = 10;
 const PC_DRAW_INDEXED: usize = 13;
 const PC_DISPATCH: usize = 14;
 const PC_COPY_BUFFER_REGION: usize = 15;
 const PC_COPY_RESOURCE: usize = 17;
 const PC_RESOURCE_BARRIER: usize = 26;
 const PC_IA_SET_INDEX_BUFFER: usize = 43;
+const PC_BEGIN_QUERY: usize = 52;
 const PC_END_QUERY: usize = 53;
 const PC_RESOLVE_QUERY_DATA: usize = 54;
 const PC_SET_PREDICATION: usize = 55;
@@ -371,8 +377,139 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     set_index_buffer(this, bound.as_ref());
 }
 
+/// a query: (heap, index)
+type Query = (usize, u32);
+
+/// One list's occlusion queries: the active one and those begun while it was (not sent to
+/// the PC).
+#[derive(Default)]
+struct Occlusion {
+    active: Option<Query>,
+    inner: Vec<Query>,
+}
+
+impl Occlusion {
+    /// Whether the PC begins `q`.
+    fn begin(&mut self, q: Query) -> bool {
+        if self.active.is_none() {
+            self.active = Some(q);
+            return true;
+        }
+        self.inner.push(q);
+        false
+    }
+
+    /// Whether the PC ends `q` (not: an inner one).
+    fn end(&mut self, q: Query) -> bool {
+        if self.active == Some(q) {
+            self.active = None;
+            return true;
+        }
+        match self.inner.iter().position(|e| *e == q) {
+            Some(i) => {
+                self.inner.swap_remove(i);
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+static OCCLUSION: Mutex<Option<HashMap<usize, Occlusion>>> = Mutex::new(None);
+/// inner queries since ended, and the result they resolve to
+static VISIBLE: Mutex<Option<HashMap<Query, u64>>> = Mutex::new(None);
+/// what an inner OCCLUSION query reports (BINARY_OCCLUSION: 1)
+const VISIBLE_SAMPLES: u64 = 0x1_0000;
+
+fn is_occlusion(ty: D3D12_QUERY_TYPE) -> bool {
+    ty == D3D12_QUERY_TYPE_OCCLUSION || ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION
+}
+
+type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32);
+
+/// command list #10 Reset(allocator, initial pipeline): no query is active after it
+pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    if let Some(m) = OCCLUSION.lock().unwrap().as_mut() {
+        m.remove(&(this as usize));
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, pso)
+}
+
+/// command list #28 BeginQuery(heap, type, index) (PC #52)
+pub(super) unsafe extern "system" fn begin_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if is_occlusion(ty) {
+        let forward = OCCLUSION.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().begin((heap, index));
+        if !forward {
+            if once(&N, 1) {
+                crate::xlog_info!("D3D12.X: nested occlusion query – the outer one counts on, the inner one reports visible");
+            }
+            return;
+        }
+        if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
+            m.remove(&(heap, index));
+        }
+    }
+    pc::<QueryFn>(this, PC_BEGIN_QUERY)(this, heap, ty, index);
+}
+
+/// command list #29 EndQuery(heap, type, index) (PC #53)
+pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, index: u32) {
+    if is_occlusion(ty) {
+        let forward = OCCLUSION.lock().unwrap().get_or_insert_with(HashMap::new).entry(this as usize).or_default().end((heap, index));
+        if !forward {
+            let v = if ty == D3D12_QUERY_TYPE_BINARY_OCCLUSION { 1 } else { VISIBLE_SAMPLES };
+            VISIBLE.lock().unwrap().get_or_insert_with(HashMap::new).insert((heap, index), v);
+            return;
+        }
+    }
+    pc::<QueryFn>(this, PC_END_QUERY)(this, heap, ty, index);
+}
+
+/// command list #30 ResolveQueryData(heap, type, first, count, destination, offset) (PC #54):
+/// inner occlusion queries are written over the resolved data (after it, in COPY_DEST as
+/// ResolveQueryData wants the destination)
+pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
+    type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
+    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, offset);
+    if !is_occlusion(ty) {
+        return;
+    }
+    let visible: Vec<(u32, u64)> = match VISIBLE.lock().unwrap().as_ref() {
+        Some(m) if !m.is_empty() => (first..first.saturating_add(count)).filter_map(|i| m.get(&(heap, i)).map(|&v| (i, v))).collect(),
+        _ => return,
+    };
+    let dest = dest as *mut c_void;
+    let Some(res) = ID3D12Resource::from_raw_borrowed(&dest).filter(|_| !visible.is_empty()) else { return };
+    let at = res.GetGPUVirtualAddress() + offset;
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = visible
+        .iter()
+        .flat_map(|&(i, v)| {
+            let a = at + 8 * (i - first) as u64;
+            [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: a, Value: v as u32 }, D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: a + 4, Value: (v >> 32) as u32 }]
+        })
+        .collect();
+    let modes = vec![D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; params.len()];
+    type W = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
+    pc::<W>(this, PC_WRITE_BUFFER_IMMEDIATE)(this, params.len() as u32, params.as_ptr(), modes.as_ptr());
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nested_occlusion_queries_leave_the_outer_one_on_the_pc() {
+        let mut o = super::Occlusion::default();
+        assert!(o.begin((1, 0)));
+        assert!(!o.begin((1, 1)), "inner: not begun on the PC");
+        assert!(!o.end((1, 1)), "inner: not ended on the PC");
+        assert!(o.end((1, 0)));
+        // overlapping, not nested: A, B, end A, C, end B, end C
+        assert!(o.begin((1, 2)) && !o.begin((1, 3)) && o.end((1, 2)));
+        assert!(o.begin((1, 4)) && !o.end((1, 3)) && o.end((1, 4)));
+        assert!(o.active.is_none() && o.inner.is_empty());
+        assert!(o.end((1, 9)), "a query not begun here: the PC's call");
+    }
+
     #[test]
     fn fill_patterns_repeat_the_value() {
         assert_eq!(super::pattern(&0x1122_3344u32.to_le_bytes())[..8], [0x44, 0x33, 0x22, 0x11, 0x44, 0x33, 0x22, 0x11]);

@@ -625,6 +625,10 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::CommandList => {
             use super::list_x as l;
             vec![
+                (10, l::reset_x as usize),
+                (28, l::begin_query_x as usize),
+                (29, l::end_query_x as usize),
+                (30, l::resolve_query_data_x as usize),
                 (47, l::ia_set_index_buffer_x as usize),
                 (60, l::copy_memory_x as usize),
                 (61, l::fill32_x as usize),

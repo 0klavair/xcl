@@ -586,9 +586,13 @@ Console GPU addresses in unified memory are the title's own: memory operations g
   `{ u64 va; u32 op }`; **#68** depth bounds.
 - Not modelled (logged, no-op): Wait32 / 64BitValueX #71 / #72, GDS #76 / #77, KickoffX #93 (TomBox splits the list
   and submits the first part), depth bias X #94 (needs pipelines with dynamic depth bias), hints (HiStencil, MSAA,
-  compression, limits, prefetch). Occlusion queries that nest (the console allows it) are not un-nested yet.
-- The test title writes / fills / copies its own graphics memory through #60–#89, takes a GPU timestamp, and draws
-  through DrawIndexedX and #47 with indices in its memory.
+  compression, limits, prefetch).
+- **Nested occlusion queries** (#28 / #29 / #30; the console allows them, the PC one active per list): one begun while
+  another is active is not sent to the PC – the outer one counts on (exact: the inner range lies in it), the inner one
+  resolves as visible (0x10000 samples, binary 1; written over the resolved data, MARKER_OUT). TomBox ends the outer
+  one early instead – its count can then be 0 and the object culled. List Reset (#10) forgets the active queries.
+- The test title writes / fills / copies its own graphics memory through #60–#89, takes a GPU timestamp, draws
+  through DrawIndexedX and #47 with indices in its memory, and nests occlusion queries (outer = 2 × a single draw's).
 
 ## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
 - **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
