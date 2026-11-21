@@ -31,6 +31,16 @@ extern "system" {
     fn DStorageGetFactory(riid: *const windows::core::GUID, factory: *mut *mut c_void) -> HRESULT;
 }
 
+// Media Foundation: standard exports fall back to Windows' mfplat.dll, while
+// MFResetDXGIDeviceManagerX routes to XCL's HLE export.
+#[link(name = "mfplat", kind = "raw-dylib")]
+extern "system" {
+    fn MFStartup(version: u32, flags: u32) -> HRESULT;
+    fn MFShutdown() -> HRESULT;
+    fn MFCreateDXGIDeviceManager(reset_token: *mut u32, manager: *mut *mut c_void) -> HRESULT;
+    fn MFResetDXGIDeviceManagerX(manager: *mut c_void, device: *mut c_void, reset_token: u32) -> HRESULT;
+}
+
 #[link(name = "d3dcompiler_47", kind = "raw-dylib")]
 extern "system" {
     fn D3DCompile(
@@ -945,5 +955,58 @@ pub fn render_triangle() -> Result<(), String> {
         ensure!(quadrant == [0, 255, 255, 255], "top-left quadrant {quadrant:?} (expected cyan: the derived pipeline writes green only)");
         ensure!(corner == [0, 0, 255, 255], "corner pixel {corner:?} (expected blue clear colour)");
         Ok(())
+    }
+}
+
+/// Media Foundation `MFResetDXGIDeviceManagerX` with the console `d3d12_xs` device.
+pub fn mfplat_reset_dxgi_device_manager() -> Result<(), String> {
+    const MF_VERSION: u32 = 0x0002_0070;
+    const MFSTARTUP_LITE: u32 = 1;
+    const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
+
+    type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+    type CloseHandleFn = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+    type OpenHandleFn = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    type TestDeviceFn = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+
+    unsafe {
+        let hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+        ensure!(hr >= 0, "MFStartup hr={hr:#x}");
+
+        let dev = device()?;
+        let mut token: u32 = 0;
+        let mut mgr: *mut c_void = std::ptr::null_mut();
+        let hr = MFCreateDXGIDeviceManager(&mut token, &mut mgr);
+        if hr < 0 || mgr.is_null() {
+            let _ = MFShutdown();
+            return Err(format!("MFCreateDXGIDeviceManager hr={hr:#x}"));
+        }
+
+        let vtbl = *(mgr as *const *const usize);
+        let release: ReleaseFn = transmute_copy(&*vtbl.add(2));
+        let close_handle: CloseHandleFn = transmute_copy(&*vtbl.add(3));
+        let open_handle: OpenHandleFn = transmute_copy(&*vtbl.add(6));
+        let test_device: TestDeviceFn = transmute_copy(&*vtbl.add(8));
+
+        let res = (|| -> Result<(), String> {
+            let hr_bad = MFResetDXGIDeviceManagerX(mgr, dev.as_raw(), token.wrapping_add(1));
+            ensure!(hr_bad == E_INVALIDARG, "bad token expected E_INVALIDARG, got {hr_bad:#x}");
+
+            let hr_ok = MFResetDXGIDeviceManagerX(mgr, dev.as_raw(), token);
+            ensure!(hr_ok == 0, "MFResetDXGIDeviceManagerX hr={hr_ok:#x}");
+
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            let hr_open = open_handle(mgr, &mut handle);
+            ensure!(hr_open >= 0 && !handle.is_null(), "OpenDeviceHandle hr={hr_open:#x}");
+
+            let hr_test = test_device(mgr, handle);
+            let _ = close_handle(mgr, handle);
+            ensure!(hr_test >= 0, "TestDevice hr={hr_test:#x}");
+            Ok(())
+        })();
+
+        release(mgr);
+        let _ = MFShutdown();
+        res
     }
 }

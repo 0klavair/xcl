@@ -15,6 +15,7 @@ pub mod d3d12x;
 pub mod dstorage;
 pub mod dxcompiler;
 pub mod kernelx;
+pub mod mfplat;
 pub mod opus;
 pub mod xaudio2;
 pub mod xg;
@@ -74,6 +75,7 @@ pub const KERNELX: &str = "kernelx.dll";
 pub const XGAMERUNTIME: &str = "xgameruntime.dll";
 pub const D3D12X: &str = "d3d12_xs.dll";
 pub const XAUDIO2: &str = "xaudio2_9.dll";
+pub const MFPLAT: &str = "mfplat.dll";
 pub const DXCOMPILER: &str = "dxcompiler_xs.dll";
 /// the console's texture layout library (`xg`)
 pub const XG: &str = "xg_xs.dll";
@@ -88,6 +90,7 @@ fn build(config: &Config) -> Registry {
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),
+        HleModule::new(MFPLAT, mfplat::exports(), &["mfplat.dll"]),
         HleModule::new(DXCOMPILER, dxcompiler::exports(), &[]),
         HleModule::new(MINUSERX, Vec::new(), &["user32.dll"]),
         HleModule::new(XCRDAPI, dstorage::exports(), &[]),
@@ -139,6 +142,8 @@ fn build(config: &Config) -> Registry {
     for p in ["xaudio2_9.dll", "xaudio2_9redist.dll"] {
         routes.push((p.into(), Route::Hle(a)));
     }
+    let mf = idx(MFPLAT);
+    routes.push((MFPLAT.into(), Route::Hle(mf)));
     let u = idx(MINUSERX);
     routes.push((MINUSERX.into(), Route::Hle(u)));
     let s = idx(XCRDAPI);
@@ -201,8 +206,10 @@ mod tests {
         assert_eq!(name("xgameruntime.dll"), Some(XGAMERUNTIME));
         assert_eq!(name("d3d12_xs.dll"), Some(D3D12X));
         assert_eq!(name("xaudio2_9.dll"), Some(XAUDIO2));
+        assert_eq!(name("mfplat.dll"), Some(MFPLAT));
         assert!(r.hle_for("kernel32.dll").unwrap().aliases_are_system());
         assert!(!r.hle_for("xaudio2_9.dll").unwrap().aliases_are_system());
+        assert!(!r.hle_for("mfplat.dll").unwrap().aliases_are_system());
         assert_eq!(name("ucrtbase.dll"), None);
         assert_eq!(name("api-ms-win-crt-runtime-l1-1-0.dll"), None);
     }
