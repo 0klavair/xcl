@@ -135,24 +135,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     }
     let recs = pack::scan(&data, 0x40);
     if recs.is_empty() {
-        // no inline records: list the (nested) RPF9 headers and say whether the TOC is readable
-        let heads: Vec<usize> = data.windows(4).enumerate().filter(|(i, w)| i % 0x800 == 0 && *w == pack::RPF9_MAGIC).map(|(i, _)| i).collect();
-        let toc = |h: usize| data.get(h + 0x40..h + 0x60).map(|b| b.to_vec()).unwrap_or_default();
-        let same = heads.len() > 1 && heads.iter().all(|&h| toc(h) == toc(heads[0]));
         println!("{}: {:.1} MB, no records with plain names", path.display(), data.len() as f64 / 1048576.0);
-        println!("RPF9 archives (headers every 2 KB): {}", heads.len());
-        for &h in heads.iter().take(top) {
-            let fields = h.checked_add(4).and_then(|start| h.checked_add(16).and_then(|end| data.get(start..end)));
-            if let Some(fields) = fields {
-                let w = |o: usize| u32::from_le_bytes(fields[o..o + 4].try_into().unwrap());
-                println!("  {h:#010x}: fields {:#x} {:#x} {:#x}", w(0), w(4), w(8));
-            } else {
-                println!("  {h:#010x}: truncated header");
-            }
-        }
-        if same {
-            println!("TOC encrypted: every archive starts its table of contents with the same bytes (a fixed key from the game) – unreadable without the exe");
-        }
+        crate::rpf_probe::summarize(&data, top);
         return 0;
     }
     let (csum, usum): (usize, usize) = recs.iter().fold((0, 0), |a, r| (a.0 + r.csize, a.1 + r.usize));

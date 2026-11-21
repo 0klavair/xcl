@@ -1,4 +1,4 @@
-//! Bounded-memory structural probing for large RPF9 archives.
+//! Bounded-memory structural probing for RPF9 archives.
 
 use std::io::{self, Read};
 use std::path::Path;
@@ -34,7 +34,7 @@ struct Probe {
 /// and a capped number of summaries. This intentionally does not interpret,
 /// decrypt, or extract the table of contents.
 fn inspect(reader: &mut impl Read, len: u64, top: usize) -> io::Result<Probe> {
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buffer = vec![0u8; len.min(CHUNK_SIZE as u64) as usize];
     let mut base = 0u64;
     let mut headers = 0u64;
     let mut root_magic = false;
@@ -149,6 +149,18 @@ pub(crate) fn run(path: &Path, top: usize) -> i32 {
         path.display(),
         len as f64 / 1048576.0
     );
+    print_summary(&probe, top);
+    0
+}
+
+/// Report headers from archive data already read by the full scan.
+pub(crate) fn summarize(mut data: &[u8], top: usize) {
+    let len = data.len() as u64;
+    let probe = inspect(&mut data, len, top).expect("reading from a slice cannot fail");
+    print_summary(&probe, top);
+}
+
+fn print_summary(probe: &Probe, top: usize) {
     println!("RPF9 archives (headers every 2 KB): {}", probe.headers);
     for header in &probe.shown {
         if let Some(fields) = header.fields {
@@ -175,7 +187,6 @@ pub(crate) fn run(path: &Path, top: usize) -> i32 {
         ),
         TocEvidence::Unknown => println!("TOC encryption: unknown (insufficient complete header evidence)"),
     }
-    0
 }
 
 #[cfg(test)]
