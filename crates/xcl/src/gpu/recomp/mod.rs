@@ -53,6 +53,7 @@
 
 pub mod dxc;
 pub(crate) mod emit;
+pub mod mesh_wave;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
@@ -960,6 +961,13 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         if matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B64" | "S_BITCMP1_B64") {
             out.insert("scalar condition from a whole-wave mask");
         }
+    }
+    let report = mesh_wave::analyze(code);
+    if !report.mask_scc_branches.is_empty() {
+        out.insert("branch on a half-local scalar condition");
+    }
+    if report.undecoded_at.is_some() {
+        out.insert("incomplete geometry program decode");
     }
     out
 }
