@@ -21,6 +21,20 @@ pub struct MaskBranch {
     pub mask: BranchMask,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidBranchTargetReason {
+    Misaligned,
+    OutsideProgram,
+    NotInstructionStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidBranchTarget {
+    pub pc: u64,
+    pub target: u64,
+    pub reason: InvalidBranchTargetReason,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LaneReadKind {
     ReadFirst,
@@ -53,6 +67,7 @@ pub struct MeshWaveReport {
     pub instructions: usize,
     pub decoded_bytes: usize,
     pub undecoded_at: Option<u64>,
+    pub invalid_branch_targets: Vec<InvalidBranchTarget>,
     pub whole_mask_branches: Vec<MaskBranch>,
     pub mask_scc_branches: Vec<u64>,
     pub saveexec: Vec<u64>,
@@ -65,6 +80,22 @@ pub struct MeshWaveReport {
     pub exports: Vec<u64>,
     pub backedges: Vec<(u64, u64)>,
     pub loop_headers: BTreeSet<u64>,
+}
+
+fn invalid_branch_target_reason(
+    target: u64,
+    decoded_bytes: usize,
+    pcs: &BTreeMap<u64, usize>,
+) -> Option<InvalidBranchTargetReason> {
+    if target & 3 != 0 {
+        Some(InvalidBranchTargetReason::Misaligned)
+    } else if target >= decoded_bytes as u64 {
+        Some(InvalidBranchTargetReason::OutsideProgram)
+    } else if !pcs.contains_key(&target) {
+        Some(InvalidBranchTargetReason::NotInstructionStart)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -195,6 +226,21 @@ pub fn analyze(code: &[u8]) -> MeshWaveReport {
         .enumerate()
         .map(|(index, d)| (d.pc, index))
         .collect();
+    // Inspect every decoded direct branch, including unreachable instructions.
+    // A malformed target must not disappear merely because it cannot become a
+    // CFG successor.
+    let invalid_branch_targets = decoded
+        .iter()
+        .filter_map(|instruction| {
+            let target = rdna2::branch_target(instruction)?;
+            let reason = invalid_branch_target_reason(target, offset, &pcs)?;
+            Some(InvalidBranchTarget {
+                pc: instruction.pc,
+                target,
+                reason,
+            })
+        })
+        .collect();
 
     // Forward may-analysis over the real CFG. A definite overwrite kills old
     // taint on each path; a join retains taint from any predecessor.
@@ -225,6 +271,7 @@ pub fn analyze(code: &[u8]) -> MeshWaveReport {
         instructions: decoded.len(),
         decoded_bytes: offset,
         undecoded_at,
+        invalid_branch_targets,
         ..Default::default()
     };
     let mut last_vgpr_writer: BTreeMap<u64, &'static str> = BTreeMap::new();
@@ -346,6 +393,91 @@ mod tests {
         let report = analyze(&code);
         assert_eq!(report.backedges, vec![(4, 0)]);
         assert_eq!(report.loop_headers, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn accepts_forward_and_backward_instruction_targets() {
+        let mut code = one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]);
+        code.extend(one("S_NOP", "ENC_SOPP", &[("SIMM16", 0)]));
+        code.extend(one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xfffd)]));
+        let report = analyze(&code);
+        assert!(report.invalid_branch_targets.is_empty());
+        assert_eq!(report.backedges, vec![(8, 0)]);
+        assert_eq!(report.loop_headers, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn rejects_target_into_literal_word() {
+        let mut code = one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]);
+        code.extend(
+            encode(
+                "V_MOV_B32",
+                "ENC_VOP1",
+                &[("VDST", 0), ("SRC0", 255)],
+                Some(0x1234_5678),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            analyze(&code).invalid_branch_targets,
+            vec![InvalidBranchTarget {
+                pc: 0,
+                target: 8,
+                reason: InvalidBranchTargetReason::NotInstructionStart,
+            }]
+        );
+        assert!(crate::gpu::recomp::geometry_wave32_hazards(&code)
+            .contains("invalid geometry branch target"));
+    }
+
+    #[test]
+    fn classifies_misaligned_and_outside_targets() {
+        let pcs = BTreeMap::from([(0, 0), (4, 1)]);
+        assert_eq!(
+            invalid_branch_target_reason(2, 8, &pcs),
+            Some(InvalidBranchTargetReason::Misaligned)
+        );
+
+        let mut code = one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xfffe)]);
+        code.extend(one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]));
+        let report = analyze(&code);
+        assert_eq!(report.invalid_branch_targets.len(), 2);
+        assert!(report
+            .invalid_branch_targets
+            .iter()
+            .all(|target| target.reason == InvalidBranchTargetReason::OutsideProgram));
+        assert_eq!(report.invalid_branch_targets[0].pc, 0);
+        assert_eq!(
+            report.invalid_branch_targets[0],
+            InvalidBranchTarget {
+                pc: 0,
+                target: u64::MAX - 3,
+                reason: InvalidBranchTargetReason::OutsideProgram,
+            }
+        );
+        assert_eq!(
+            report.invalid_branch_targets[1],
+            InvalidBranchTarget {
+                pc: 4,
+                target: 12,
+                reason: InvalidBranchTargetReason::OutsideProgram,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_invalid_branch_even_when_it_is_unreachable() {
+        let mut code = one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)]);
+        code.extend(one("S_ENDPGM", "ENC_SOPP", &[]));
+        code.extend(one("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]));
+        assert_eq!(
+            analyze(&code).invalid_branch_targets,
+            vec![InvalidBranchTarget {
+                pc: 8,
+                target: 16,
+                reason: InvalidBranchTargetReason::OutsideProgram,
+            }]
+        );
     }
 
     #[test]

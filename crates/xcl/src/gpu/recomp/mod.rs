@@ -969,6 +969,9 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     if report.undecoded_at.is_some() {
         out.insert("incomplete geometry program decode");
     }
+    if !report.invalid_branch_targets.is_empty() {
+        out.insert("invalid geometry branch target");
+    }
     out
 }
 
