@@ -179,6 +179,24 @@ pub fn valid_image_shape(t: &Image) -> bool {
     if matches!(t.ty, ImageType::D1Array | ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube | ImageType::D3) && t.depth > u16::MAX as u32 {
         return false;
     }
+    let within_d3d12_limits = match t.ty {
+        ImageType::D1 => t.width <= D3D12_REQ_TEXTURE1D_U_DIMENSION,
+        ImageType::D1Array => t.width <= D3D12_REQ_TEXTURE1D_U_DIMENSION && t.depth <= D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION,
+        ImageType::D2 | ImageType::D2Msaa => t.width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && t.height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+        ImageType::D2Array | ImageType::D2MsaaArray | ImageType::Cube => {
+            t.width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+                && t.height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION
+                && t.depth <= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION
+        }
+        ImageType::D3 => {
+            t.width <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+                && t.height <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+                && t.depth <= D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION
+        }
+    };
+    if !within_d3d12_limits {
+        return false;
+    }
     if matches!(t.ty, ImageType::D2Msaa | ImageType::D2MsaaArray) {
         return true;
     }
@@ -477,6 +495,75 @@ mod tests {
             t.ty = ty;
             assert!(valid_image_shape(&t), "{ty:?}");
             assert_eq!(image_d3d12(&t).unwrap().0.DepthOrArraySize, 1, "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn resource_dimensions_respect_d3d12_texture_limits() {
+        let mut t = image(&tsharp()).unwrap();
+        t.base_level = 0;
+        t.last_level = 0;
+        t.max_mip = 0;
+
+        t.ty = ImageType::D1;
+        t.width = D3D12_REQ_TEXTURE1D_U_DIMENSION;
+        assert!(image_d3d12(&t).is_some());
+        t.width += 1;
+        assert!(image_d3d12(&t).is_none());
+
+        t.ty = ImageType::D2;
+        for axis in 0..2 {
+            t.width = 1;
+            t.height = 1;
+            if axis == 0 {
+                t.width = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+            } else {
+                t.height = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+            }
+            assert!(image_d3d12(&t).is_some(), "2D axis {axis} at the limit");
+            if axis == 0 {
+                t.width += 1;
+            } else {
+                t.height += 1;
+            }
+            assert!(image_d3d12(&t).is_none(), "2D axis {axis} over the limit");
+        }
+
+        for ty in [ImageType::D1Array, ImageType::D2Array, ImageType::D2MsaaArray] {
+            t.width = 1;
+            t.height = 1;
+            t.ty = ty;
+            t.depth = D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION;
+            assert!(image_d3d12(&t).is_some(), "{ty:?} at the array limit");
+            t.depth += 1;
+            assert!(image_d3d12(&t).is_none(), "{ty:?} over the array limit");
+        }
+
+        t.ty = ImageType::Cube;
+        t.base_array = 0;
+        t.depth = 2046; // largest whole number of faces within the 2048-slice limit
+        assert!(image_d3d12(&t).is_some());
+        t.depth = 2052;
+        assert!(image_d3d12(&t).is_none());
+
+        t.ty = ImageType::D3;
+        t.depth = 1;
+        for axis in 0..3 {
+            t.width = 1;
+            t.height = 1;
+            t.depth = 1;
+            match axis {
+                0 => t.width = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                1 => t.height = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+                _ => t.depth = D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION,
+            }
+            assert!(image_d3d12(&t).is_some(), "3D axis {axis} at the limit");
+            match axis {
+                0 => t.width += 1,
+                1 => t.height += 1,
+                _ => t.depth += 1,
+            }
+            assert!(image_d3d12(&t).is_none(), "3D axis {axis} over the limit");
         }
     }
 
