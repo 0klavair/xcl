@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -183,30 +182,24 @@ fn toolchain_identity() -> &'static str {
             return "unavailable".into();
         };
         let mut h = 0xcbf2_9ce4_8422_2325u64;
-        let mut buffer = [0u8; 64 * 1024];
         for name in ["dxcompiler.dll", "dxil.dll"] {
             for byte in name.bytes().chain([0]) {
                 h ^= byte as u64;
                 h = h.wrapping_mul(0x100_0000_01b3);
             }
-            let Ok(mut file) = std::fs::File::open(dir.join(name)) else {
+            let Ok(metadata) = std::fs::metadata(dir.join(name)) else {
                 h ^= 0xff;
                 h = h.wrapping_mul(0x100_0000_01b3);
                 continue;
             };
-            loop {
-                let Ok(read) = file.read(&mut buffer) else {
-                    h ^= 0xfe;
-                    h = h.wrapping_mul(0x100_0000_01b3);
-                    break;
-                };
-                if read == 0 {
-                    break;
-                }
-                for &byte in &buffer[..read] {
-                    h ^= byte as u64;
-                    h = h.wrapping_mul(0x100_0000_01b3);
-                }
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            for byte in metadata.len().to_le_bytes().into_iter().chain(modified.to_le_bytes()) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
             }
         }
         format!("{h:016x}")
