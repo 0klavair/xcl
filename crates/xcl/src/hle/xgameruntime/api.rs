@@ -447,7 +447,7 @@ fn classes() -> Vec<Class> {
             },
             // telemetry: offline, accepted and dropped
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
-            // dialogs without a user handle go to the PC runtime (message, error, text entry)
+            // dialogs and text entry without a user handle go to the PC runtime
             Class {
                 name: "XGameUi",
                 clsid: XGAMEUI,
@@ -460,6 +460,14 @@ fn classes() -> Vec<Class> {
                     "XGameUiShowTextEntryAsync",
                     "XGameUiShowTextEntryResultSize",
                     "XGameUiShowTextEntryResult",
+                    // the in-game text entry: options and text in, a PC handle out and back
+                    "XGameUiTextEntryOpen",
+                    "XGameUiTextEntryClose",
+                    "XGameUiTextEntryGetState",
+                    "XGameUiTextEntryGetExtents",
+                    "XGameUiTextEntryUpdatePositionHint",
+                    "XGameUiTextEntryUpdateVisibility",
+                    "XGameUiSetNotificationPositionHint",
                 ],
             },
     ]
@@ -523,6 +531,9 @@ fn xuser() -> Vec<(&'static str, usize)> {
         ("XUserIsSignOutPresent", no as usize),
         ("XUserSignOutAsync", sign_out_async as usize),
         ("XUserSignOutResult", empty_result as usize),
+        ("XUserGetGamerPictureAsync", gamer_picture_async as usize),
+        ("XUserGetGamerPictureResultSize", XAsyncGetResultSize as usize),
+        ("XUserGetGamerPictureResult", gamer_picture_result as usize),
     ]);
     v
 }
@@ -535,6 +546,7 @@ fn xuser_devices() -> Vec<(&'static str, usize)> {
         ("XUserRegisterForDefaultAudioEndpointUtf16Changed", register_token4 as usize),
         ("XUserUnregisterForDefaultAudioEndpointUtf16Changed", yes as usize),
         ("XUserFindForDevice", user_not_found as usize),
+        ("XUserGetDefaultAudioEndpointUtf16", default_audio_endpoint as usize),
     ]
 }
 
@@ -721,6 +733,105 @@ unsafe extern "system" fn display_deferral(out: *mut usize) -> HRESULT {
     }
     *out = 1;
     S_OK
+}
+
+static PICTURE_ID: u8 = 0;
+
+/// XUserGetGamerPictureAsync(user, size, async): a plain picture (PNG) of the requested size
+/// (XUserGamerPictureSize: 64, 208, 424, 1080 pixels) – there is no profile offline.
+unsafe extern "system" fn gamer_picture_async(user: *mut c_void, size: u32, b: *mut XAsyncBlock) -> HRESULT {
+    let side = match size {
+        0 => 64,
+        1 => 208,
+        2 => 424,
+        3 => 1080,
+        _ => return E_INVALIDARG,
+    };
+    if !super::valid_user(user) {
+        return E_INVALIDARG;
+    }
+    begin_with(b, &PICTURE_ID as *const u8 as usize, move || Ok(png_square(side, [0x5A, 0x6E, 0x82])))
+}
+
+unsafe extern "system" fn gamer_picture_result(b: *mut XAsyncBlock, size: usize, buf: *mut c_void, used: *mut usize) -> HRESULT {
+    XAsyncGetResult(b, &PICTURE_ID as *const u8 as *const c_void, size, buf, used)
+}
+
+/// A `side` × `side` RGB PNG of one colour.
+fn png_square(side: usize, rgb: [u8; 3]) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &b in data {
+            c ^= b as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut chunk = |ty: &[u8; 4], data: &[u8]| {
+        let mut c = ty.to_vec();
+        c.extend_from_slice(data);
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(&c);
+        out.extend_from_slice(&crc32(&c).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(side as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, deflate, no filter method / interlace
+    chunk(b"IHDR", &ihdr);
+    let mut rows = Vec::with_capacity(side * (1 + 3 * side));
+    for _ in 0..side {
+        rows.push(0); // filter: none
+        for _ in 0..side {
+            rows.extend_from_slice(&rgb);
+        }
+    }
+    chunk(b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&rows, 6));
+    chunk(b"IEND", &[]);
+    out
+}
+
+/// XUserGetDefaultAudioEndpointUtf16(user, kind, count, id, used): Windows' default
+/// communications device (kind 0 render, 1 capture) – what a PC title gets for its user.
+unsafe extern "system" fn default_audio_endpoint(_user: u64, kind: u32, count: usize, id: *mut u16, used: *mut usize) -> HRESULT {
+    if kind > 1 {
+        return E_INVALIDARG;
+    }
+    // on a thread of its own: the title's thread keeps its COM apartment as it is
+    let Some(s) = std::thread::spawn(move || unsafe { endpoint_id(kind) }).join().ok().flatten() else {
+        return crate::util::E_NOT_FOUND;
+    };
+    let w: Vec<u16> = s.encode_utf16().chain([0]).collect();
+    if !used.is_null() {
+        *used = w.len();
+    }
+    if id.is_null() || count < w.len() {
+        return crate::util::E_NOT_SUFFICIENT_BUFFER;
+    }
+    std::ptr::copy_nonoverlapping(w.as_ptr(), id, w.len());
+    S_OK
+}
+
+/// The id of the default communications endpoint (0 render, 1 capture), None without one.
+unsafe fn endpoint_id(kind: u32) -> Option<String> {
+    use windows::Win32::Media::Audio::{eCapture, eCommunications, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED};
+    let init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+    let id = (|| {
+        let e: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let d = e.GetDefaultAudioEndpoint(if kind == 0 { eRender } else { eCapture }, eCommunications).ok()?;
+        let p = d.GetId().ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s
+    })();
+    if init {
+        CoUninitialize();
+    }
+    id
 }
 
 /// XPackageInstallChunks(id, count, selectors, interval, suppress, queue, monitor): installed
@@ -1044,6 +1155,58 @@ mod tests {
         assert!(returns_bool("XUserIsStoreUser") && returns_bool("XPackageUnregisterPackageInstalled") && !returns_bool("XUserGetState"));
     }
 
+    /// The offline gamer picture is a valid PNG: chunk CRCs, size, pixels.
+    #[test]
+    fn gamer_picture_is_a_png() {
+        let p = png_square(5, [1, 2, 3]);
+        assert_eq!(&p[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let (mut at, mut chunks) = (8, Vec::new());
+        while at < p.len() {
+            let n = u32::from_be_bytes(p[at..at + 4].try_into().unwrap()) as usize;
+            let body = &p[at + 4..at + 8 + n];
+            let crc = u32::from_be_bytes(p[at + 8 + n..at + 12 + n].try_into().unwrap());
+            // CRC-32 (zlib's): the same check the chunk carries
+            let mut c = !0u32;
+            for &b in body {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            assert_eq!(!c, crc);
+            chunks.push((body[..4].to_vec(), body[4..].to_vec()));
+            at += 12 + n;
+        }
+        let names: Vec<&[u8]> = chunks.iter().map(|c| c.0.as_slice()).collect();
+        assert_eq!(names, [&b"IHDR"[..], b"IDAT", b"IEND"]);
+        assert_eq!(&chunks[0].1, &[0, 0, 0, 5, 0, 0, 0, 5, 8, 2, 0, 0, 0]);
+        let rows = miniz_oxide::inflate::decompress_to_vec_zlib(&chunks[1].1).unwrap();
+        assert_eq!(rows.len(), 5 * 16);
+        assert!(rows.chunks(16).all(|r| r[0] == 0 && r[1..].chunks(3).all(|px| px == [1, 2, 3])));
+        // the CRC of IEND is the well-known one
+        assert_eq!(&p[p.len() - 4..], &[0xAE, 0x42, 0x60, 0x82]);
+    }
+
+    /// The default communications endpoint: Windows' (or not found without an audio device);
+    /// a short buffer gets the size it needs.
+    #[test]
+    fn default_audio_endpoint_is_windows_default() {
+        unsafe {
+            let mut used = 0usize;
+            let hr = default_audio_endpoint(0, 0, 0, std::ptr::null_mut(), &mut used);
+            if hr == crate::util::E_NOT_FOUND {
+                println!("no audio endpoint – skipping");
+                return;
+            }
+            assert_eq!(hr, crate::util::E_NOT_SUFFICIENT_BUFFER);
+            let mut w = vec![0u16; used];
+            assert_eq!(default_audio_endpoint(0, 0, w.len(), w.as_mut_ptr(), &mut used), S_OK);
+            let id = String::from_utf16_lossy(&w[..used - 1]);
+            assert!(id.starts_with("{0.0.0."), "a render endpoint id: {id}");
+            assert_eq!(default_audio_endpoint(0, 2, 0, std::ptr::null_mut(), &mut used), E_INVALIDARG);
+        }
+    }
+
     /// The thunk protocol end to end on the PC runtime: XUser and XGameSave are XCL's objects,
     /// their async calls complete on the PC runtime's task queues; XStore is refused; XAsync
     /// comes from the PC runtime.
@@ -1079,6 +1242,23 @@ mod tests {
             let mut used = 0usize;
             assert_eq!(gamertag(gt, user, 0, 64, buf.as_mut_ptr(), &mut used), S_OK);
             assert!(used > 1);
+            // gamer picture (slots 16-18): an async PNG of the requested size
+            let (_, pu) = query(XUSER, XUSER);
+            let pic: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut XAsyncBlock) -> HRESULT = slot(pu, 16);
+            let pic_size: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(pu, 17);
+            let pic_result: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, usize, *mut u8, *mut usize) -> HRESULT = slot(pu, 18);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(pic(pu, user, 1, &mut b), S_OK);
+            assert_eq!(get_status(xa, &mut b, true), S_OK);
+            let mut n = 0usize;
+            assert_eq!(pic_size(pu, &mut b, &mut n), S_OK);
+            let mut png = vec![0u8; n];
+            assert_eq!(pic_result(pu, &mut b, n, png.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!((used, &png[..8], u32::from_be_bytes(png[16..20].try_into().unwrap())), (n, &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A][..], 208));
+            // the in-game text entry goes to the PC runtime (its handles stay there)
+            let (_, ui) = query(XGAMEUI, g(0xeaf669df_5542_4590_99a3_8dc061f837cc));
+            let open = slot_in_table("XGameUiTextEntryOpen").2;
+            assert_eq!(*(*(ui as *const *const usize)).add(open), FORWARDS[open] as usize, "TextEntryOpen is forwarded");
             // an unimplemented slot answers E_NOTIMPL and is reported
             let token: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(u, 23);
             assert_eq!(token(u), E_NOTIMPL);

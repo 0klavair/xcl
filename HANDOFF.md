@@ -561,6 +561,18 @@ Nothing open.
   analytics (family "Windows.Xbox", OS 10.0.25398, Series X / S); runtime features (true); XDisplay (XLaunchUri refused,
   timeout deferral); XGameEvent (offline: accepted, dropped). Refused: XStore, XAppBroadcast, XAppCapture.
 - Tests: `vtables_follow_the_gdk_table`, `console_mode_registry_value`, PLS in `thunk_protocol_with_xcl_objects_on_pc_queues`.
+- **Who answers the 396 functions** (counted on the GDK table): XCL 122 (+7 dialogs and 7 text-entry / notification
+  calls forwarded to the PC runtime), the PC runtime's whole classes 111 (XAsync / XTaskQueue / XThread, XGameStreaming,
+  XNetworking, speech, invites / activation / protocols, XError, closed captions), refused 109 (XStore, XAppBroadcast /
+  XAppCapture), not implemented in XCL classes 40 – Xbox Live and account UI (token and signature, player picker,
+  profile card, achievements, invites, web authentication, state share, UI response setters), XUserFindControllerFor-
+  UserWithUi, and three without public signatures (XGameUiShowManageSpace*, XPackageGetIdentifier) plus
+  XPackageUninstallUWPInstance / XPersistentLocalStorageMountForPackage.
+- Added: XUserGetGamerPicture* (a plain PNG of the requested size: 64 / 208 / 424 / 1080 px), XUserGetDefaultAudio-
+  EndpointUtf16 (Windows' default communications endpoint, looked up on a thread of its own), XGameUiTextEntry* and
+  XGameUiSetNotificationPositionHint to the PC runtime (no XCL handles; the PC accepted the title's GDK version, so its
+  vtable has these slots). Tests: `gamer_picture_is_a_png`, `default_audio_endpoint_is_windows_default`, the picture and
+  the forwarded slot in `thunk_protocol_with_xcl_objects_on_pc_queues`.
 
 ## Non-blocking pipeline creation (session 5, 2026-11-21)
 - **Gap:** DXC ran in the title's `Create*PipelineState` call: 0.2 s median, seconds for big programs – thousands of
