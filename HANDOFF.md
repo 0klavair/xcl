@@ -518,6 +518,21 @@ unknown records), the result read with `bvh::Bvh::trace` = brute force on 500 ra
 ## In progress (unfinished)
 Nothing open.
 
+## Contributions merged (session 5, 2026-11-21, PRs #5, #6, #8, part of #7)
+- **#5** more RDNA2 instructions (scalar movrel / bitcmp / bfe64, d16 typed buffers, f64 ceil / fract / rndne / frexp /
+  sqrt / rsq / class, v_swaprel, pknorm f16…) with tests. Fixed on the GPU (RX 9070), where its GPU tests had not run:
+  `ceil_d` without f64 negation, `sqrt_d` (HLSL's sqrt is f32: f32 root + two f64 Newton steps), the swaprel test's VGPR
+  range. Relative moves keep the existing rule: their targets lie within the program's VGPRs.
+- **#8** DXIL cache: single flight per shader (threads and processes – named mutex `XclDxilCache-…`), container
+  validation of cached blobs, atomic writes; RPF scanning / extraction hardened. The cached-only check comes before the
+  locks (non-blocking pipeline creation must not wait for a compile in flight). Its XAudio2 part was dropped (PR #3
+  decodes Opus; its frame table was wrong for SILK / hybrid).
+- **#6** T# validation (mip range, cube faces, array depth), 1D height ignored, UMA span and subresource-count checks,
+  physical-page mapping inside one allocation. Its own linear layout was not taken (not addrlib's): linear stays
+  `tiling::Layout` mode 0.
+- **#7** only the persistent-local-storage accounting (used bytes measured). Its task-queue / XAsync handle registries
+  (2.8 k lines against forged handles) were not taken.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
