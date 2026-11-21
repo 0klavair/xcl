@@ -1124,9 +1124,13 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if !is_console(vs) {
         return None;
     }
-    if shader_bytes(&d.GS).is_some() || shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
-        note_translation_error("PSO z GS/HS/DS – jeszcze nieobsługiwane".into());
+    if shader_bytes(&d.HS).is_some() || shader_bytes(&d.DS).is_some() {
+        note_translation_error("PSO z HS/DS – jeszcze nieobsługiwane".into());
         return None;
+    }
+    if let Some(gs) = shader_bytes(&d.GS).filter(|g| is_console(g)) {
+        let _ = f;
+        return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
     let vs_dxil = match console_to_dxil(vs, Stage::Vertex) {
         Ok(b) => b,
@@ -1219,6 +1223,203 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// console geometry stages in two passes (MS / NGG, legacy GS): see `pso::TwoPass`
+// ---------------------------------------------------------------------------------------
+
+/// What XCL keeps for a mesh pipeline built from console MS / GS code: the title holds the
+/// mesh pipeline state (pass-through MS + PS); the draw first runs `compute` (the console
+/// program, one record per thread group into `res`), then the mesh pipeline over the records.
+pub struct TwoPassPso {
+    /// compute pipeline state (XCL ABI root signature), owned here
+    pub compute: usize,
+    pub record: crate::gpu::recomp::MsInterface,
+    /// DispatchMesh groups per record (see `pso::TwoPass`)
+    pub mesh_groups_per_record: u32,
+    /// "MS" or "GS"
+    pub kind: &'static str,
+}
+
+static TWO_PASS: Mutex<Option<HashMap<usize, std::sync::Arc<TwoPassPso>>>> = Mutex::new(None);
+
+/// The compute pass of a pipeline state XCL built from console MS / GS code.
+pub fn two_pass_of(pso: usize) -> Option<std::sync::Arc<TwoPassPso>> {
+    TWO_PASS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+pub fn two_pass_count() -> usize {
+    TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+}
+
+/// A pipeline state stream being written: subobjects aligned as D3D12 expects
+/// (type, payload at 4 or 8, size rounded to 8).
+#[derive(Default)]
+struct StreamOut(Vec<u8>);
+
+impl StreamOut {
+    fn raw(&mut self, ty: u32, payload: &[u8], align8: bool) {
+        let at = self.0.len();
+        self.0.extend_from_slice(&ty.to_le_bytes());
+        self.0.resize(at + if align8 { 8 } else { 4 }, 0);
+        self.0.extend_from_slice(payload);
+        let end = (self.0.len() + 7) & !7;
+        self.0.resize(end, 0);
+    }
+    fn put<T>(&mut self, ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, v: &T) {
+        let b = unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) };
+        self.raw(ty.0 as u32, b, std::mem::align_of::<T>() == 8);
+    }
+    fn shader(&mut self, ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, code: &[u8]) {
+        self.put(ty, &D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr() as *const c_void, BytecodeLength: code.len() });
+    }
+}
+
+/// The subobjects of a stream: (type, payload).
+fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+        let (psize, palign) = super::null::subobject_payload(ty)?;
+        let poff = if palign == 8 { 8 } else { 4 };
+        out.push((ty, buf.get(off + poff..off + poff + psize)?));
+        off += (poff + psize + 7) & !7;
+    }
+    Some(out)
+}
+
+unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
+    let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
+    shader_bytes(&b)
+}
+
+/// The console PS of a two-pass pipeline (a PC PS passes as it is).
+fn two_pass_ps(ps: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    match ps {
+        Some(p) if is_console(p) => console_to_dxil(p, Stage::Pixel).map(Some).map_err(|e| format!("PS: {e}")),
+        Some(p) => Ok(Some(p.to_vec())),
+        None => Ok(None),
+    }
+}
+
+/// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
+/// the title gets the mesh pipeline state.
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let rs = ABI_RS.load(Ordering::Acquire) as *mut c_void;
+    let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+    let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
+    if hr < 0 {
+        note_translation_error(format!("sterownik odrzucił pipeline mesh z {kind} konsoli ({hr:#x})"));
+        return E_INVALIDARG;
+    }
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    cdesc.CS = bytecode(&tp.cs);
+    let iid = pc_iid(Kind::PipelineState);
+    let mut compute: *mut c_void = std::ptr::null_mut();
+    let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+    if hc < 0 || compute.is_null() {
+        note_translation_error(format!("sterownik odrzucił przebieg obliczeniowy {kind} konsoli ({hc:#x})"));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
+        release(*ppv);
+        *ppv = std::ptr::null_mut();
+        return E_INVALIDARG;
+    }
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n % 1000 == 0 {
+        crate::xlog_info!("D3D12.X: pipeline z {kind} konsoli w dwóch przebiegach (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+    }
+    hr
+}
+
+/// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
+/// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
+unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    use crate::gpu::recomp::pso::{console_mesh, is_console};
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return None;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return None;
+    }
+    let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
+    let ms = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1))?;
+    if !is_console(ms) {
+        return None;
+    }
+    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
+        note_translation_error("pipeline mesh z AS – jeszcze nieobsługiwane".into());
+        return Some(E_INVALIDARG);
+    }
+    let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+    let (tp, ps) = match (console_mesh(ms, ps), two_pass_ps(ps)) {
+        (Ok(tp), Ok(ps)) => (tp, ps),
+        (Err(e), _) => {
+            note_translation_error(format!("MS: {e}"));
+            return Some(E_INVALIDARG);
+        }
+        (_, Err(e)) => {
+            note_translation_error(e);
+            return Some(E_INVALIDARG);
+        }
+    };
+    let Some(rs) = abi_rs_raw(this) else { return Some(E_INVALIDARG) };
+    // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if let Some(p) = &ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+    }
+    for (ty, payload) in &subs {
+        let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
+        if !skip {
+            let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+            out.raw(*ty, payload, palign == 8);
+        }
+    }
+    Some(finish_two_pass(this, &out, tp, "MS", riid, ppv))
+}
+
+/// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
+/// with the description's state.
+unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let (tp, ps) = match (crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS)), two_pass_ps(shader_bytes(&d.PS))) {
+        (Ok(tp), Ok(ps)) => (tp, ps),
+        (Err(e), _) => {
+            note_translation_error(format!("VS+GS: {e}"));
+            return E_INVALIDARG;
+        }
+        (_, Err(e)) => {
+            note_translation_error(e);
+            return E_INVALIDARG;
+        }
+    };
+    let Some(rs) = abi_rs_raw(this) else { return E_INVALIDARG };
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+    if let Some(p) = &ps {
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+    }
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
+    rt.RTFormats = d.RTVFormats;
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
+    finish_two_pass(this, &out, tp, "GS", riid, ppv)
+}
+
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     let size = *(desc as *const usize);
@@ -1256,6 +1457,9 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
 unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
+        return hr;
+    }
     let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
         return hr;

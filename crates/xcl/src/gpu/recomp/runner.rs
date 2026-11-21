@@ -831,6 +831,23 @@ pub fn mesh_draw(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    mesh_draw_split(cs, ms, ps, groups, 1, record_dwords, sgprs, mem, size, clear)
+}
+
+/// `mesh_draw` with `split` mesh groups per record (`emit::passthrough_split`).
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_draw_split(
+    cs: &[u8],
+    ms: &[u8],
+    ps: &[u8],
+    groups: u32,
+    split: u32,
+    record_dwords: usize,
+    sgprs: &[u32],
+    mem: &[u32],
+    size: u32,
+    clear: [f32; 4],
+) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     unsafe {
@@ -946,7 +963,7 @@ pub fn mesh_draw(
         list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: size as f32, Height: size as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
         list.RSSetScissorRects(&[windows::Win32::Foundation::RECT { left: 0, top: 0, right: size as i32, bottom: size as i32 }]);
         let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(e)?;
-        list6.DispatchMesh(groups, 1, 1);
+        list6.DispatchMesh(groups * split, 1, 1);
         list.ResourceBarrier(&[
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
             transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),

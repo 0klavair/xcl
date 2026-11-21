@@ -61,6 +61,53 @@ pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static st
     Ok((t.hlsl, profile))
 }
 
+/// A console geometry stage as XCL runs it, in two passes: the console program as a compute
+/// shader writes one record per thread group (vertices + primitives, `record`) into `res`,
+/// then a pass-through mesh shader rasterises the records with the pixel shader.
+pub struct TwoPass {
+    /// compute pass (cs_6_6 DXIL)
+    pub cs: Vec<u8>,
+    /// pass-through mesh shader (ms_6_6 DXIL)
+    pub ms: Vec<u8>,
+    pub record: super::MsInterface,
+    /// mesh groups of the pass-through per record (> 1: the record is over D3D12's mesh
+    /// output limit and goes out in runs of triangles)
+    pub mesh_groups_per_record: u32,
+}
+
+fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let t = translate(code, &Options { mode, wave64, ..Default::default() })?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("niepełne tłumaczenie, brakuje: {missing:?}"));
+    }
+    let cs = dxc::compile_cached(&t.hlsl, "main", "cs_6_6")?.0;
+    let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+    let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+    let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+    Ok(TwoPass { cs, ms, record, mesh_groups_per_record })
+}
+
+/// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
+/// the pixel shader `ps` (its container: console or PC) reads.
+pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let sh = xbox::parse(blob).ok_or("to nie jest kontener shadera konsoli")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("brak wariantu sprzętowego NGG")?;
+    let mode = interface(blob, &sh, f).ok_or("nieznany interfejs MS (np. linie / punkty)")?;
+    let Mode::Mesh(ms) = &mode else { return Err("kontener nie jest MS".into()) };
+    let record = ms.clone();
+    let p = f.programs.first().ok_or("FSSM bez programu")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    two_pass(code, mode.clone(), super::detect_wave64(code), record, ps)
+}
+
+/// A legacy GS pipeline: the ES variant of the console VS + the GS as one program.
+pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let (code, g) = super::geometry_program(vs, gs)?;
+    let record = g.record();
+    two_pass(&code, Mode::Geometry(g), true, record, ps)
+}
+
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
 pub fn abi_root_signature(dev: &ID3D12Device, graphics: bool) -> Result<ID3D12RootSignature, String> {
     unsafe {

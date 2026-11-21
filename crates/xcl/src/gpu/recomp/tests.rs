@@ -966,6 +966,19 @@ fn gpu_mesh_mode_two_passes() {
     assert_eq!((at(3, 29)[0], at(3, 29)[3]), (0.0, 1.0), "group 0 triangle (left)");
     assert_eq!((at(19, 29)[0], at(19, 29)[3]), (1.0, 1.0), "group 1 triangle (right)");
     assert_eq!(at(29, 3), [-1.0; 4], "outside both triangles");
+
+    // the same records through a pass-through for a pixel shader with 16 inputs: over the
+    // mesh output limit (17 · 16 B · 128 vertices), so 4 mesh groups per record, each a run
+    // of triangles with their own vertex copies; inputs the program does not write read 0
+    let ins: Vec<crate::gpu::dxbc::SigElement> = (0..16).map(|k| crate::gpu::dxbc::SigElement { index: k, register: k + 1, ..sig("TEXCOORD", 0, 0) }).collect();
+    let split = super::emit::passthrough_split(&ms, super::emit::passthrough_elements(&ms, Some(&ins)));
+    assert_eq!(split, 4);
+    let pass16 = super::emit::mesh_passthrough_for(&ms, Some(&ins));
+    let msb16 = dxc::compile(&pass16, "main", "ms_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{pass16}"));
+    let fields: String = (0..16).map(|k| format!(" float4 t{k} : TEXCOORD{k};")).collect();
+    let ps16 = dxc::compile(&format!("struct V {{ float4 pos : SV_Position;{fields} }};\nfloat4 main(V v) : SV_Target0 {{ return v.t0 + v.t15; }}\n"), "main", "ps_6_6", &[]).unwrap();
+    let (px16, _) = runner::mesh_draw_split(&cs, &msb16, &ps16, 2, split, ms.record_dwords(), &sg, &mem, 32, [-1.0; 4]).unwrap();
+    assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).

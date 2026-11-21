@@ -536,6 +536,32 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## Pipeline'y MS (NGG) i GS w tworzeniu PSO (sesja 5, 2026-11-21)
+- 9 282 MS + 195 GS z `shaders.rpf` (~40% paczki) dostawały dotąd shadery zastępcze (`real.rs` obsługiwał tylko VS+PS
+  i CS). Teraz:
+  - **`CreatePipelineState` ze strumieniem z MS konsoli** (`translated_mesh_stream`) i **`CreateGraphicsPipelineState` z VS +
+    GS konsoli** (`translated_gs_pso`) → `pso::console_mesh` / `pso::console_geometry` → **`pso::TwoPass`**: przebieg
+    obliczeniowy (program konsoli, rekord na grupę w `res`) + przejściowy mesh shader z przetłumaczonym PS. Tytuł dostaje
+    PSO mesh (stan ze strumienia / opisu: blend, rasteryzer, głębia, formaty; RS = ABI XCL); obliczeniowy PSO i układ
+    rekordu leżą w `real::two_pass_of(pso)` (`TwoPassPso`: compute, record, mesh_groups_per_record, kind).
+    Kod konsoli nigdy nie trafia do sterownika (nieudane tłumaczenie → E_INVALIDARG). AS – jeszcze nie (brak w paczce).
+  - **Przejściowy MS pod konkretny PS** (`emit::mesh_passthrough_for`): wyjścia = dokładnie wejścia przetłumaczonego PS
+    (te same elementy, kolejność i typy `{typ}4` → identyczne upakowanie sygnatur, D3D12 je łączy); wartości ze slotu
+    rekordu o tej samej semantyce, brakujące = 0 – **w parach MS+PS z jednego efektu sygnatury się NIE zgadzają** (PS
+    czyta np. TEXCOORD20, którego MS nie pisze, i odwrotnie; na konsoli sterownik łączy atrybuty po indeksie). Odległości
+    obcinania zostają. Bez `SV_CullPrimitive` (złe trójkąty są zdegenerowane).
+  - **Limit D3D12: 32 KB wyjścia na grupę mesh** – duże PS (17 atrybutów × 16 B × 128 wierzchołków) go przekraczają →
+    **tryb dzielony** (`emit::passthrough_split`): rekord idzie w N grupach mesh, każda z odcinkiem trójkątów i własnymi
+    kopiami 3 wierzchołków; przy rysowaniu `DispatchMesh(grupy · mesh_groups_per_record)`.
+  - Testy: `retail_mesh_pipelines_through_the_hook` (pary MS+PS o tym samym skrócie przebiegu w nazwie, próbka
+    `XCL_MS_EVERY`, domyślnie co 1500.; co 700. = 14/14), `retail_gs_pipeline_through_the_hook`, `gpu_mesh_mode_two_passes`
+    (tryb dzielony = te same piksele). Testy `gpu_pso_e2e` serializowane przez `setup` (wspólne liczniki PSO).
+  - **Uwaga:** regresje `gpu_pso_e2e` bez `XCL_SAMPLE_RPF` kończą się w 0,00 s (pomijane) – zawsze z próbką.
+- **Do zrobienia z exe: rysowanie.** Przy DispatchMesh (MS) / Draw* (GS) z takim PSO: najpierw `compute` z RS ABI (io =
+  SGPR z argumentów root, `res` = bufor rekordów grupy · `record.record_dwords()` dwordów, `mem` = UMA), bariera UAV,
+  potem PSO mesh z `DispatchMesh(grupy · mesh_groups_per_record)`; dla GS jeszcze pobranie wierzchołków ES do `mem`
+  (IO_GS_PRIMS / IO_GS_VERTICES jak w `retail_es_gs_voxelize_geometry_mode`). Rekordy rysowania D3D12.X – z exe.
+
 ## Przegląd tłumacza na całej paczce (sesja 5, 2026-11-21)
 - Test `retail_translation_survey` (ignorowany; `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N`, `XCL_SURVEY_DXC=1`):
   - **tłumaczenie: 24 064 / 24 064 wariantów FSSM w całości** (PS 12 101, MS/NGG 9 282, VS 2 236, GS 195, ES 195,

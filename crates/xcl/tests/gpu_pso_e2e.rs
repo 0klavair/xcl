@@ -32,7 +32,10 @@ fn f(x: f32) -> u32 {
 
 /// Console shader containers by record name (as a title passes them in
 /// D3D12_SHADER_BYTECODE) and the backend device. None: no sample pack / DXC / GPU.
-fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device)> {
+/// `setup` holds `SERIAL` for the test: they share the backend device and its global PSO
+/// counters.
+fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::MutexGuard<'static, ()>)> {
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     static PACK: OnceLock<Option<Vec<u8>>> = OnceLock::new();
     let data = PACK.get_or_init(|| std::env::var("XCL_SAMPLE_RPF").ok().and_then(|p| std::fs::read(p).ok())).as_ref();
     let Some(data) = data else {
@@ -59,7 +62,7 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device)> {
     }
     println!("urządzenie backendu: {}", real::stats().adapter);
     let raw = real::device_raw();
-    Some((blobs, unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone()))
+    Some((blobs, unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone(), serial))
 }
 
 /// CreateGraphicsPipelineState through the backend hook with the title's own (empty)
@@ -112,8 +115,7 @@ fn pso_through_hook(dev: &ID3D12Device, vs: &[u8], ps: &[u8], layout: &[(&CStr, 
 /// SV_Target0 through f16): one triangle, interpolated colours checked pixel by pixel.
 #[test]
 fn retail_vs_ps_through_the_pso_hook_render_and_read_back() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((blobs, dev)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
+    let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpv_f020b20e_Wrapped", "PS_Rage_Untextured_14f8529b_Wrapped"]) else { return };
     let pso = pso_through_hook(&dev, &blobs[0], &blobs[1], &[(c"POSITION", DXGI_FORMAT_R32G32B32_FLOAT, 0), (c"COLOR", DXGI_FORMAT_R32G32B32A32_FLOAT, 12)]);
     let rs = real::abi_root_signature().expect("root signature ABI XCL");
 
@@ -212,8 +214,7 @@ fn console_tsharp(address: u64, dst_sel: [u32; 4]) -> [u32; 8] {
 /// texture B with BGRA swizzle). Checked texel by texel, then that the change took effect.
 #[test]
 fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((blobs, dev)) = setup(&["VS_Rage_TransformPosCpvTex_1702efec_Wrapped", "PS_Rage_Textured_1702efec_Wrapped"]) else { return };
+    let Some((blobs, dev, _serial)) = setup(&["VS_Rage_TransformPosCpvTex_1702efec_Wrapped", "PS_Rage_Textured_1702efec_Wrapped"]) else { return };
     let pso = pso_through_hook(
         &dev,
         &blobs[0],
@@ -315,7 +316,7 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
 /// coordinates (w = 1, z in [0, 1]), and pixels covered.
 #[test]
 fn retail_es_gs_voxelize_geometry_mode() {
-    let Some((blobs, _dev)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    let Some((blobs, _dev, _serial)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
     use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
     let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("para ES + GS");
     assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
@@ -407,4 +408,106 @@ fn retail_es_gs_voxelize_geometry_mode() {
     let covered = px.iter().filter(|p| p[0] == 1.0).count();
     println!("pokryte piksele: {covered}");
     assert!(covered > 300, "pass-through narysował wyjście GS: {covered}");
+}
+
+/// Hash of a retail record name (`MS_VS_Transform_PositionOnly_6463b8c5_Wrapped` → 6463b8c5):
+/// shaders of one effect pass share it.
+fn pass_hash(name: &str) -> Option<&str> {
+    let mut it = name.rsplit('_');
+    it.next()?;
+    it.next().filter(|h| h.len() == 8 && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Retail mesh pipelines through the CreatePipelineState hook: MS (NGG) + a PS of the same
+/// effect pass become a two-pass pipeline (compute pass + pass-through MS with the translated
+/// PS; D3D12 checks the MS → PS linkage). A sample of the pack (every `XCL_MS_EVERY`-th MS).
+#[test]
+fn retail_mesh_pipelines_through_the_hook() {
+    let Some((_, dev, _serial)) = setup(&[]) else { return };
+    let data = std::fs::read(std::env::var("XCL_SAMPLE_RPF").unwrap()).unwrap();
+    let recs = pack::scan(&data, 0x40);
+    let every: usize = std::env::var("XCL_MS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    #[repr(C, align(8))]
+    struct Sub<T> {
+        ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+        v: T,
+    }
+    #[repr(C)]
+    struct Stream {
+        rs: Sub<*mut std::ffi::c_void>,
+        ms: Sub<D3D12_SHADER_BYTECODE>,
+        ps: Sub<D3D12_SHADER_BYTECODE>,
+        rt: Sub<D3D12_RT_FORMAT_ARRAY>,
+    }
+    let (mut tried, mut ok) = (0, 0);
+    let mut failed = Vec::new();
+    for r in recs.iter().filter(|r| r.name.starts_with("MS")).step_by(every) {
+        let Some(h) = pass_hash(&r.name) else { continue };
+        let Some(pr) = recs.iter().find(|p| p.name.starts_with("PS_") && pass_hash(&p.name) == Some(h)) else { continue };
+        let (ms, ps) = (pack::inflate(&data, r).unwrap(), pack::inflate(&data, pr).unwrap());
+        let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+        let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
+        rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let s = Stream {
+            rs: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, v: game_rs.as_raw() },
+            ms: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, v: code(&ms) },
+            ps: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, v: code(&ps) },
+            rt: Sub { ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, v: rt },
+        };
+        let d2: ID3D12Device2 = dev.cast().unwrap();
+        tried += 1;
+        let t0 = std::time::Instant::now();
+        let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: std::mem::size_of::<Stream>(), pPipelineStateSubobjectStream: &s as *const _ as *mut _ };
+        match unsafe { d2.CreatePipelineState::<ID3D12PipelineState>(&desc) } {
+            Ok(p) if real::two_pass_of(p.as_raw() as usize).is_some() => ok += 1,
+            Ok(_) => failed.push(format!("{} + {}: PSO bez przebiegu obliczeniowego", r.name, pr.name)),
+            Err(e) => {
+                failed.push(format!("{} + {}: {e}", r.name, pr.name));
+                if std::env::var_os("XCL_MS_SIGS").is_some() {
+                    let sig = |v: &[xcl::gpu::dxbc::SigElement]| v.iter().map(|e| format!("{}{}(sv{} t{} r{} m{:x})", e.name, e.index, e.system_value, e.component_type, e.register, e.mask)).collect::<Vec<_>>().join(" ");
+                    println!("    MS wyj.: {}
+    PS wej.: {}", sig(&xcl::gpu::dxbc::signatures(&ms).1), sig(&xcl::gpu::dxbc::signatures(&ps).0));
+                }
+            }
+        }
+        println!("  {:.1} s  {} + {}", t0.elapsed().as_secs_f64(), r.name, pr.name);
+    }
+    println!("pipeline'y MS + PS przez hook: {ok} / {tried}");
+    for f in failed.iter().take(10) {
+        println!("  {f}");
+    }
+    for e in real::stats().translation_errors.iter().take(10) {
+        println!("  błąd tłumaczenia: {}", e.lines().take(6).collect::<Vec<_>>().join(" | "));
+    }
+    assert!(tried >= 3 && ok == tried, "{} nieudanych", failed.len());
+}
+
+/// Retail legacy GS pipeline through CreateGraphicsPipelineState: VS (ES variant) + GS
+/// become a two-pass pipeline (no PS: depth-only voxelisation pass is fine too).
+#[test]
+fn retail_gs_pipeline_through_the_hook() {
+    let Some((blobs, dev, _serial)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+    let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        VS: code(&blobs[0]),
+        GS: code(&blobs[1]),
+        SampleMask: u32::MAX,
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    let p: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&d) }.unwrap_or_else(|e| panic!("{e}; {:?}", real::stats().translation_errors));
+    let tp = real::two_pass_of(p.as_raw() as usize).expect("pipeline GS w dwóch przebiegach");
+    assert_eq!((tp.kind, tp.record.max_vertices), ("GS", 63));
 }
