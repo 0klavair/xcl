@@ -176,7 +176,9 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     if b.is_null() {
         return E_INVALIDARG;
     }
-    let Some(q) = taskqueue::queue_from((*b).queue) else { return E_INVALIDARG };
+    let Some(q) = taskqueue::queue_from((*b).queue) else {
+        return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
+    };
     taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize });
     S_OK
 }
@@ -323,7 +325,11 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
         cv: Condvar::new(),
     });
     set_state(b, Some(s));
-    XAsyncSchedule(b, 0)
+    let hr = XAsyncSchedule(b, 0);
+    if hr < 0 {
+        XAsyncComplete(b, hr, 0);
+    }
+    hr
 }
 
 // ---------------------------------------------------------------------------------------
