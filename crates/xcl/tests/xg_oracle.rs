@@ -221,8 +221,8 @@ fn texel_offsets_and_the_console_pipe_configuration() {
                 .filter(|cfg| {
                     let t = xcl::hle::xg::Texture::with_pipes(&d, **cfg).unwrap();
                     let mut good = true;
-                    for i in 0..t.chain.levels.len() {
-                        let l = t.chain.levels[i];
+                    for i in 0..t.texels().unwrap().chain.levels.len() {
+                        let l = t.texels().unwrap().chain.levels[i];
                         for k in 0..24 {
                             let (x, y, s) = match k {
                                 0 => (0, 0, 0),
@@ -291,8 +291,8 @@ fn print_xor_64kb_parts() {
             let off: Offset = unsafe { std::mem::transmute(*(*(c as *const *const usize)).add(6)) };
             let t = xcl::hle::xg::Texture::with_pipes(&d, cfg).unwrap();
             let mut bad = std::collections::BTreeMap::<String, (usize, String)>::new();
-            for i in 0..t.chain.levels.len() {
-                let l = t.chain.levels[i];
+            for i in 0..t.texels().unwrap().chain.levels.len() {
+                let l = t.texels().unwrap().chain.levels[i];
                 for s in 0..2usize {
                     for y in (0..l.height).step_by(7) {
                         for x in (0..l.width).step_by(5) {
@@ -382,11 +382,11 @@ fn subresource_copies_match_the_console_library() {
         let t = xcl::hle::xg::Texture::new(&d).unwrap();
         let size = t.size() as usize;
         let (mut a, mut b) = (vec![0u8; size], vec![0u8; size]);
-        let mips = t.chain.levels.len();
+        let mips = t.texels().unwrap().chain.levels.len();
         for s in 0..array as usize {
             for i in 0..mips {
-                let l = t.chain.levels[i];
-                let row = l.width * t.bpe as usize;
+                let l = t.texels().unwrap().chain.levels[i];
+                let row = l.width * t.texels().unwrap().bpe as usize;
                 let pitch = row + 16;
                 let lin: Vec<u8> = (0..pitch * l.height)
                     .map(|_| {
@@ -440,5 +440,166 @@ fn print_odd_offsets() {
             }
         }
     }
-    println!("{n} texels of mip 0 differ; pitch {} block {}x{}", t.chain.levels[0].pitch, t.chain.layout.block_w, t.chain.layout.block_h);
+    println!("{n} texels of mip 0 differ; pitch {} block {}x{}", t.texels().unwrap().chain.levels[0].pitch, t.texels().unwrap().chain.layout.block_w, t.texels().unwrap().chain.layout.block_h);
+}
+
+#[test]
+#[ignore]
+fn print_planes() {
+    let Some(m) = console() else { return };
+    let create = proc(m, "XGCreateTextureComputer");
+    for (name, d) in [
+        ("rgba8 1x1 RT+DS optimal", desc(3, 1, 1, 1, 1, 28, 0, 3)),
+        ("rgba8 256x256 RT+DS optimal", desc(3, 256, 256, 1, 1, 28, 0, 3)),
+        ("d32 256x256 RT+DS optimal", desc(3, 256, 256, 1, 1, 40, 0, 3)),
+        ("d24s8 256x256 RT+DS optimal", desc(3, 256, 256, 1, 1, 45, 0, 3)),
+        ("bc1 256x256 RT+DS optimal", desc(3, 256, 256, 1, 1, 71, 0, 3)),
+        ("bc1 256x256 DS optimal", desc(3, 256, 256, 1, 1, 71, 0, 2)),
+        ("rgba8 256x256 DS 0x119", desc(3, 256, 256, 1, 1, 28, 0x119, 2)),
+        ("rgba8 256x256 DS 0x118", desc(3, 256, 256, 1, 1, 28, 0x118, 2)),
+        ("rgba8 256x256 DS optimal", desc(3, 256, 256, 1, 1, 28, 0, 2)),
+        ("rgba8 1x1 DS optimal", desc(3, 1, 1, 1, 0, 28, 0, 2)),
+        ("bc1 256x256 RT optimal", desc(3, 256, 256, 1, 1, 71, 0, 1)),
+        ("d24s8 256x256 RT optimal", desc(3, 256, 256, 1, 1, 45, 0, 1)),
+        ("d32s8 256x256 DS optimal", desc(3, 256, 256, 1, 1, 20, 0, 2)),
+        ("r32f 256x256 DS optimal", desc(3, 256, 256, 1, 1, 41, 0, 2)),
+        ("rgba8 256x256 RT optimal", desc(3, 256, 256, 1, 1, 28, 0, 1)),
+        ("rgba8 1000x333 RT optimal", desc(3, 1000, 333, 1, 1, 28, 0, 1)),
+        ("rgba8 256x256 RT 0x119", desc(3, 256, 256, 1, 1, 28, 0x119, 1)),
+        ("rgba8 256x256 RT optimal 3 mips", desc(3, 256, 256, 1, 3, 28, 0, 1)),
+        ("rgba8 256x256 RT optimal array 4", desc(3, 256, 256, 4, 1, 28, 0, 1)),
+        ("d32 256x256 depth", desc(3, 256, 256, 1, 1, 40, 0, 2)),
+        ("d32 1000x333 depth", desc(3, 1000, 333, 1, 1, 40, 0, 2)),
+        ("d24s8 256x256 depth", desc(3, 256, 256, 1, 1, 45, 0, 2)),
+        ("d16 256x256 depth", desc(3, 256, 256, 1, 1, 55, 0, 2)),
+        ("d24s8 256x256 no flags", desc(3, 256, 256, 1, 1, 45, 0x109, 0)),
+    ] {
+        let (hr, l) = unsafe { layout(create, &d) };
+        let q = |o: usize| u64::from_le_bytes(l[o..o + 8].try_into().unwrap());
+        let w = |o: usize| u32::from_le_bytes(l[o..o + 4].try_into().unwrap());
+        println!("{name}: hr {hr:#x} size {:#x} align {:#x} mips {} planes {}", q(0), q(8), w(0x10), w(0x14));
+        for p in 0..w(0x14).min(4) as usize {
+            let b = 0x18 + p * 0x6C8;
+            let head: Vec<String> = (0..0x38).step_by(4).map(|k| format!("{:x}", w(b + k))).collect();
+            println!("  plane {p}: {}", head.join(" "));
+            let r = b + 0x38;
+            let row: Vec<String> = (0..0x70).step_by(4).map(|k| format!("{:x}", w(r + k))).collect();
+            println!("    mip0: {}", row.join(" "));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn print_htile_sizes() {
+    let Some(m) = console() else { return };
+    let create = proc(m, "XGCreateTextureComputer");
+    for &(w, h) in &[(64u64, 64u32), (128, 128), (256, 256), (512, 512), (1024, 1024), (2048, 2048), (4096, 4096), (8192, 8192), (1920, 1080), (3840, 2160), (1000, 333), (16384, 16), (16, 16384)] {
+        for &(array, mips) in &[(1u16, 1u16), (6, 1), (1, 3)] {
+            for f in [40u32, 45] {
+                let (hr, l) = unsafe { layout(create, &desc(3, w, h, array, mips, f, 0, 2)) };
+                let q = |o: usize| u64::from_le_bytes(l[o..o + 8].try_into().unwrap());
+                let wd = |o: usize| u32::from_le_bytes(l[o..o + 4].try_into().unwrap());
+                let planes: Vec<String> = (0..wd(0x14).min(4) as usize).map(|p| { let b = 0x18 + p * 0x6C8; format!("u{} size {:#x} off {:#x} al {:#x}", wd(b), q(b + 8), q(b + 0x18), q(b + 0x20)) }).collect();
+                println!("fmt {f} {w}x{h} a{array} m{mips}: hr {hr:#x} total {:#x} | {}", q(0), planes.join(" | "));
+            }
+        }
+    }
+}
+
+/// Render targets (CMASK), depth buffers (HTILE, depth, stencil) and the depth + stencil
+/// formats against the console library.
+#[test]
+fn render_target_and_depth_layouts_match() {
+    let Some(m) = console() else { return };
+    let theirs = proc(m, "XGCreateTextureComputer");
+    let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
+    let mut bad = std::collections::BTreeMap::<String, (usize, String)>::new();
+    let (mut cases, mut same) = (0, 0);
+    for f in [28u32, 71, 40, 55, 45, 20, 41, 39, 44] {
+        for (w, h) in [(1u64, 1u32), (100, 60), (256, 256), (1920, 1080)] {
+            for mips in [1u16, 3] {
+                for array in [1u16, 6] {
+                    for (lay, flags) in [(0u32, 1u32), (0, 2), (0x118, 2), (0x119, 2), (0x119, 1), (0x111, 1), (2, 1), (2, 2), (0, 5), (0x109, 2), (0, 3), (0, 4), (0, 0)] {
+                        let d = desc(3, w, h, array, mips, f, lay, flags);
+                        let (hc, lc) = unsafe { layout(theirs, &d) };
+                        let (ho, lo) = unsafe { layout(ours, &d) };
+                        cases += 1;
+                        let k = if (hc < 0) != (ho < 0) {
+                            Some((format!("HRESULT {hc:#x} vs ours {ho:#x}"), String::new()))
+                        } else if hc >= 0 {
+                            (0..0x1B40).step_by(4).find(|&o| lc[o..o + 4] != lo[o..o + 4]).map(|o| {
+                                let v = |l: &[u8]| u32::from_le_bytes(l[o..o + 4].try_into().unwrap());
+                                (field(o), format!(": console {:#x}, ours {:#x}", v(&lc), v(&lo)))
+                            })
+                        } else {
+                            None
+                        };
+                        match k {
+                            None => same += 1,
+                            Some((name, val)) => {
+                                let e = bad.entry(name).or_default();
+                                e.0 += 1;
+                                if e.1.is_empty() {
+                                    e.1 = format!("fmt {f} {w}x{h} mips {mips} array {array} layout {lay:#x} flags {flags:#x}{val}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{cases} render target / depth cases: {same} the same");
+    for (k, (n, ex)) in &bad {
+        println!("  {k}: {n}× – e.g. {ex}");
+    }
+    assert!(bad.is_empty());
+}
+
+#[test]
+#[ignore]
+fn print_volumes_lines_and_samples() {
+    let Some(m) = console() else { return };
+    let create = proc(m, "XGCreateTextureComputer");
+    let samples = |mut d: [u8; 0x38], n: u32| {
+        d[0x24..0x28].copy_from_slice(&n.to_le_bytes());
+        d
+    };
+    for (name, d) in [
+        ("3D rgba8 64x64x16 optimal", desc(4, 64, 64, 16, 1, 28, 0, 0)),
+        ("3D rgba8 64x64x16 0x109", desc(4, 64, 64, 16, 1, 28, 0x109, 0)),
+        ("3D rgba8 64x64x16 0x119", desc(4, 64, 64, 16, 1, 28, 0x119, 0)),
+        ("3D rgba8 64x64x16 0x11A", desc(4, 64, 64, 16, 1, 28, 0x11A, 0)),
+        ("3D rgba8 64x64x16 0x115", desc(4, 64, 64, 16, 1, 28, 0x115, 0)),
+        ("3D rgba8 64x64x16 0x116", desc(4, 64, 64, 16, 1, 28, 0x116, 0)),
+        ("3D rgba8 64x64x16 linear", desc(4, 64, 64, 16, 1, 28, 1, 0)),
+        ("3D rgba8 64x64x16 4 mips", desc(4, 64, 64, 16, 4, 28, 0, 0)),
+        ("3D r8 32x32x32 optimal", desc(4, 32, 32, 32, 1, 61, 0, 0)),
+        ("3D rgba8 64x64x16 UAV", desc(4, 64, 64, 16, 1, 28, 0, 4)),
+        ("1D rgba8 256 optimal", desc(2, 256, 1, 1, 1, 28, 0, 0)),
+        ("1D rgba8 256 0x119", desc(2, 256, 1, 1, 1, 28, 0x119, 0)),
+        ("1D rgba8 256 linear", desc(2, 256, 1, 1, 1, 28, 1, 0)),
+        ("1D rgba8 256 array 4 9 mips", desc(2, 256, 1, 4, 0, 28, 0, 0)),
+        ("2D rgba8 256x256 4x RT", samples(desc(3, 256, 256, 1, 1, 28, 0, 1), 4)),
+        ("2D rgba8 256x256 4x", samples(desc(3, 256, 256, 1, 1, 28, 0, 0), 4)),
+        ("2D d32 256x256 4x DS", samples(desc(3, 256, 256, 1, 1, 40, 0, 2), 4)),
+        ("2D rgba8 256x256 2x RT", samples(desc(3, 256, 256, 1, 1, 28, 0, 1), 2)),
+        ("2D rgba8 256x256 8x RT", samples(desc(3, 256, 256, 1, 1, 28, 0, 1), 8)),
+    ] {
+        let (hr, l) = unsafe { layout(create, &d) };
+        let q = |o: usize| u64::from_le_bytes(l[o..o + 8].try_into().unwrap());
+        let w = |o: usize| u32::from_le_bytes(l[o..o + 4].try_into().unwrap());
+        println!("{name}: hr {hr:#x} size {:#x} align {:#x} mips {} planes {} dim {}", q(0), q(8), w(0x10), w(0x14), w(0x1B38));
+        for p in 0..w(0x14).min(4) as usize {
+            let b = 0x18 + p * 0x6C8;
+            let head: Vec<String> = (0..0x38).step_by(4).map(|k| format!("{:x}", w(b + k))).collect();
+            println!("  plane {p}: {}", head.join(" "));
+            for i in 0..w(0x10).min(4) as usize {
+                let r = b + 0x38 + i * 0x70;
+                let row: Vec<String> = (0..0x70).step_by(4).map(|k| format!("{:x}", w(r + k))).collect();
+                println!("    mip{i}: {}", row.join(" "));
+            }
+        }
+    }
 }

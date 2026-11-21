@@ -5,8 +5,9 @@
 //! bounds, +0x344 + 4·i root parameter headers (filled by SetComputeRootSignature), and it
 //! copies 28 bytes from +0x10 of the pipeline state object into the stream. So the title gets
 //! XCL objects with that layout; the records are turned into PC commands at `close`:
-//! each Dispatch gets the root arguments packed into a table in unified memory (user SGPRs
-//! s[0:1] point at it, as on the console) and runs the translated pipeline on XCL's shader ABI.
+//! each Dispatch gets the root arguments as the console passes them (`user_data`: the ones
+//! that fit in user SGPRs s4…s15, the rest in a table in unified memory that s[0:1] points at)
+//! and runs the translated pipeline on XCL's shader ABI.
 //!
 //! Compute only, and opt-in (`XCL_CONSOLE_LISTS=1`) until the graphics records are known.
 
@@ -64,11 +65,17 @@ pub enum Param {
     Table { at: u32 },
 }
 
+/// Where a root signature's arguments go: all of them packed in order (`at`, `size` bytes);
+/// the first `inline` bytes of that are passed in user SGPRs from s4, the rest is the table.
 #[derive(Debug, Default)]
 pub struct Layout {
     pub params: Vec<Param>,
     pub size: u32,
+    pub inline: u32,
 }
+
+/// User SGPRs the console's compiler gives root arguments: s4…s15 (s0…s3 are the driver's).
+const INLINE_SGPRS: u32 = 12;
 
 /// Layout from a serialized root signature: a DXBC container with RTS0 or a bare RTS0.
 pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
@@ -82,6 +89,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
     let mut l = Layout::default();
+    // the parameters go into user SGPRs in order while each fits whole; from the first one
+    // that does not, the rest go to the table (packed from its start) – as the console's
+    // compiler expects them (HANDOFF: root argument binding)
+    let mut spilled = false;
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -89,14 +100,32 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             2..=4 => Param::Descriptor { at: l.size },
             _ => Param::Table { at: l.size },
         };
-        l.size += match p {
+        let bytes = match p {
             Param::Constants { count, .. } => 4 * count,
             Param::Table { .. } => 4,
             Param::Descriptor { .. } => 8,
         };
+        spilled |= l.inline + bytes > 4 * INLINE_SGPRS;
+        if !spilled {
+            l.inline += bytes;
+        }
+        l.size += bytes;
         l.params.push(p);
     }
     Some(l)
+}
+
+/// The user SGPRs of a dispatch: s[0:1] = `table_at` (where the bytes of `args` past the
+/// inline part are), from s4 the inline part of `args` (all arguments packed by `l`).
+pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
+    let mut s = vec![table_at as u32, (table_at >> 32) as u32, 0, 0];
+    let inline = &args[..(l.inline as usize).min(args.len())];
+    s.extend(inline.chunks(4).map(|c| {
+        let mut w = [0u8; 4];
+        w[..c.len()].copy_from_slice(c);
+        u32::from_le_bytes(w)
+    }));
+    s
 }
 
 static LAYOUTS: Mutex<Option<HashMap<usize, Arc<Layout>>>> = Mutex::new(None);
@@ -680,10 +709,13 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
                 match pso {
                     Some(p) if (*p).translated => {
-                        let table_at = uma_copy(st, &table).ok_or("UMA: argument table")?;
-                        let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
-                        io[0] = table_at as u32;
-                        io[1] = (table_at >> 32) as u32;
+                        let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
+                        let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
+                        let mut io = match layout.as_ref() {
+                            Some(l) => user_data(l, &table, table_at as u64),
+                            None => vec![table_at as u32, (table_at >> 32) as u32],
+                        };
+                        io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // a pipeline still being built in the background is waited for
@@ -785,5 +817,38 @@ mod tests {
         let l = layout_from_blob(&bytes).unwrap();
         assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76 }, Param::Descriptor { at: 84 }, Param::Descriptor { at: 92 }]);
         assert_eq!(l.size, 100);
+        assert_eq!(l.inline, 0, "19 constants do not fit in user SGPRs: everything in the table");
+    }
+
+    /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)
+    fn rts0(params: &[(u32, u32)]) -> Vec<u8> {
+        let n = params.len() as u32;
+        let mut r = vec![2u32, n, 24, 0, 0, 0];
+        let pay = 24 + 12 * n;
+        for (k, &(ty, _)) in params.iter().enumerate() {
+            r.extend([ty, 0, pay + 12 * k as u32]);
+        }
+        for &(_, count) in params {
+            r.extend([0, 0, count]);
+        }
+        r.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// What the console's compiler does (its output on these root signatures): parameters in
+    /// user SGPRs s4… while each fits whole, the rest in the table from its start.
+    #[test]
+    fn arguments_that_fit_go_in_user_sgprs() {
+        let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline;
+        assert_eq!(inline(&[(4, 0)]), 8);
+        assert_eq!(inline(&[(1, 2), (4, 0)]), 16);
+        assert_eq!(inline(&[(0, 0)]), 4);
+        assert_eq!(inline(&[(4, 0); 6]), 48);
+        assert_eq!(inline(&[(1, 10), (4, 0)]), 48);
+        assert_eq!(inline(&[(1, 11), (4, 0)]), 44, "the UAV goes to the table");
+        assert_eq!(inline(&[(4, 0), (1, 11)]), 8, "the constants go to the table, whole");
+        assert_eq!(inline(&[(1, 20), (4, 0)]), 0, "once one goes to the table, the rest follow");
+        let l = layout_from_blob(&rts0(&[(1, 1), (4, 0), (1, 11)])).unwrap();
+        let args: Vec<u8> = [7u32, 0x1000, 4].iter().flat_map(|w| w.to_le_bytes()).chain([0u8; 44]).collect();
+        assert_eq!(user_data(&l, &args, 0x4_0000_0100), vec![0x100, 4, 0, 0, 7, 0x1000, 4]);
     }
 }

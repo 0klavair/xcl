@@ -823,7 +823,7 @@ impl Em {
             "s_add_i32" => (format!("{a} + {b}"), Some(format!("((({a} ^ {t}) & ({b} ^ {t})) >> 31) != 0u"))),
             "s_sub_i32" => (format!("{a} - {b}"), Some(format!("((({a} ^ {b}) & ({a} ^ {t})) >> 31) != 0u"))),
             "s_mul_i32" => (format!("(uint)((int){a} * (int){b})"), None),
-            "s_mul_hi_u32" => (format!("(uint)(((uint64_t){a} * (uint64_t){b}) >> 32)"), None),
+            "s_mul_hi_u32" => (format!("mul_hi_u32({a}, {b})"), None),
             "s_mul_hi_i32" => (format!("(uint)(((int64_t)(int){a} * (int64_t)(int){b}) >> 32)"), None),
             "s_lshl_b32" => (format!("{a} << ({b} & 31u)"), Some(format!("{t} != 0u"))),
             "s_lshr_b32" => (format!("{a} >> ({b} & 31u)"), Some(format!("{t} != 0u"))),
@@ -2687,7 +2687,7 @@ impl Em {
             "v_sub_nc_u32" => format!("{a} - {b}"),
             "v_subrev_nc_u32" => format!("{b} - {a}"),
             "v_mul_lo_u32" => format!("{a} * {b}"),
-            "v_mul_hi_u32" => format!("(uint)(((uint64_t){a} * (uint64_t){b}) >> 32)"),
+            "v_mul_hi_u32" => format!("mul_hi_u32({a}, {b})"),
             "v_mul_hi_i32" => format!("(uint)(((int64_t)(int){a} * (int64_t)(int){b}) >> 32)"),
             "v_mul_u32_u24" => format!("({a} & 0xFFFFFFu) * ({b} & 0xFFFFFFu)"),
             "v_mul_hi_u32_u24" => format!("(uint)(((uint64_t)({a} & 0xFFFFFFu) * (uint64_t)({b} & 0xFFFFFFu)) >> 32)"),
@@ -4359,6 +4359,15 @@ uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, selec
 
 const PRELUDE: &str = r#"
 static uint lane_id;
+// the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
+// `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
+// umul.with.overflow, which DXIL does not allow (validation fails)
+uint mul_hi_u32(uint a, uint b) {
+    uint al = a & 0xFFFFu, ah = a >> 16, bl = b & 0xFFFFu, bh = b >> 16;
+    uint lh = al * bh, hl = ah * bl;
+    uint mid = ((al * bl) >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    return ah * bh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+}
 // wave32 program in a 64-lane hardware wave: each half is its own wave (xcl_half = 0 / 1)
 static bool xcl_w32 = false;
 static uint xcl_half = 0u;

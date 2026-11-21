@@ -57,6 +57,10 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
+    if tex.planes.len() != 1 || tex.texels().is_none() {
+        return Err("a render target / depth buffer".into());
+    }
     let bytes = tex.size() as usize;
     let e = Entry { device: device as usize, va, tex: Arc::new(tex), state };
     if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) || crate::hle::kernelx::in_graphics_reservation(va) {
@@ -159,6 +163,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+    let Some(tex) = tex.texels() else { return Vec::new() };
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());

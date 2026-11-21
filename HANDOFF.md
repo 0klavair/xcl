@@ -363,6 +363,28 @@ amd_fidelityfx_loader_xbox / amd_fidelityfx_upscaler_xbox, XboxBvhBuilder. The g
   Descriptor tables – not seen yet (the builder does not use them). Group ids after the user SGPRs (s4 = TGID.x with 4 user SGPRs).
 - For XCL: on a dispatch with a translated PSO – assemble this array in UMA from the remembered root arguments, s0/s1 = its address
   in `io`, the rest as in Compute mode.
+- **Corrected with the console's own compiler** (`tests/console_shaders.rs`, `print_root_argument_placement`): s0…s3 are
+  the driver's; the parameters go into user SGPRs **s4…s15 in order while each fits whole** (descriptor 2, constant 1 each,
+  descriptor table 1 = 32-bit address of its first descriptor, high half 0); from the first one that does not fit, it and
+  all after it go to the table at s[0:1], packed from offset 0 (19 / 20 constants first → everything in the table, as
+  in the builder). E.g. 11 constants + UAV: constants s4…s14, UAV at table +0; UAV + 11 constants: UAV s[4:5],
+  constants at table +0. Group ids follow the user SGPRs. `console_list::Layout::inline` / `user_data` do this for
+  console-list dispatches.
+
+### Console shader compiler as a test generator (`tests/console_shaders.rs`, `XCL_SAMPLE_DXC`)
+- The console's `dxcompiler_xs.dll` loads on the PC with plain LoadLibrary (only API-set imports); its back end
+  `xbsc_xs.dll` (and `newbe_xs.dll`) is loaded by name at Compile, so the test loads them first from the same directory.
+  Its output is a full console container (DXIL + XDAT → XBCH → FSSM with the RDNA2 code, RTS0). Nothing of it goes into
+  the repo; the test runs only with `XCL_SAMPLE_DXC` set.
+- `console_compiled_kernels_match_the_pc_compile`: HLSL kernels (integers, conversions, float math, per-lane loops and
+  branches, groupshared + barriers, atomics, 64-bit integers) through the console compiler → XCL's translation → PC GPU,
+  next to the PC compile of the same source: the same memory. Found and fixed: the root argument placement above, and
+  `v_mul_hi_u32` / `s_mul_hi_u32` as `(uint64)a * b >> 32` – DXC turns it (compared with 0 in the console's division
+  code) into umul.with.overflow and DXIL validation fails; now from 16-bit parts (`mul_hi_u32` in the prelude).
+- The console compiler multiplies by constants with `v_mul_legacy_f32` where the HLSL allows it (DXIL fast math, no
+  signed zeros): -0 × c = +0 on the console, -0 on the PC – the conversions kernel compares up to the sign of zero.
+- Not yet: three kernels (local arrays indexed per lane, switch in nested loops, 16-bit types) made the run hang –
+  removed from the list until it is known which step (console compile, translation, DXC or the GPU) hangs.
 
 ### D3D12.X: the command list is partly "compiled into" the title's code (probe `XCL_PROBE_BVH_RECORD=1`)
 - Recording `BuildRaytracingAccelerationStructure` on a list from the XCL device: the builder calls **console list method #148**
@@ -643,7 +665,15 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
     of 0x8000 / 0x8000 for the 64KB Z/S/D/R_X modes); it follows the reported device type.
   - Modes the library takes for 2D: 1 2 5 6 9 10 17 18 21 22 25 26 27, 24 (and VAR 28) for ≤ 8-byte non-BC elements,
     VAR 31; `Layout` 0 / 2 = its choice (64KB_D for 2, 4KB_S, UAVs 4KB_S_X up to 64 KB else 64KB_R_X). Not modelled
-    (E_NOTIMPL): render targets / depth (CMASK / HTILE planes), planar depth-stencil formats, MSAA, 1D / 3D, VAR modes.
+    (E_NOTIMPL): MSAA, 1D / 3D, VAR modes.
+  - **Planes** (`xg::Texture::planes`, checked by `render_target_and_depth_layouts_match`, 1 872 descs): usage 1 color,
+    2 CMASK, 4 HTILE, 5 / 6 depth / stencil of a depth-stencil format, 7 / 8 the same in a depth buffer. A render target
+    of one level gets a CMASK after its texels (align 0x2000, size = pixels padded to 1024 × 1024 / 128 per slice; not
+    for layout 2 or the _T modes); a depth buffer (DS flag, one level) is HTILE first (align 64 KB, same padding / 16),
+    then depth, then stencil (1-byte elements), all in mode 24; RT + DS of a color or D32 format is a render target in
+    mode 24 (CMASK, no HTILE). Left empty (size 0, offset 0): the texels of a one-level BCn RT / DS and the depth of a
+    DS in a color format – with DS the whole resource then reports size 0. D32_S8X24 picks its optimal mode by 64 bits a
+    pixel. Title textures that have metadata planes are not mirrored (`title_textures`: GPU-owned).
 - **Textures in title memory** (`d3d12x/title_textures.rs`): CreatePlacedResourceX of a texture gets a PC texture kept in
   step with the title's memory – every mip and slice detiled with the XG layout (`hle::xg`) and uploaded at creation;
   unified memory is reserved with MEM_WRITE_WATCH (OpenExistingHeapFromAddress takes it), and before each
