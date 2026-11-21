@@ -242,6 +242,14 @@ fn atomic_inc_dec_x2_encoding_families() {
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
     assert_eq!(t.hlsl.matches("InterlockedCompareExchange64").count(), 6, "{}", t.hlsl);
     assert!(t.hlsl.contains(") ? (uint64_t)0 :") && t.hlsl.contains("== (uint64_t)0 ||"), "{}", t.hlsl);
+    // memory above 4 GiB: every access of the CAS loop (its first read too) goes through the
+    // window accessors
+    let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert!(!w.hlsl.contains("mem.Load<") && w.hlsl.matches("= xcl_mLoad2(").count() >= 6, "{}", w.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", w.hlsl));
+    }
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }

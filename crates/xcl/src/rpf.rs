@@ -1,4 +1,4 @@
-//! `xcl rpf <paczka> [--top N] [--find FRAGMENT] [--extract FRAGMENT --out FOLDER]`:
+//! `xcl rpf <package> [--top N] [--find FRAGMENT] [--extract FRAGMENT --out FOLDER]`:
 //! lists the records of an RPF9 package (name, sizes, signature of the unpacked data) and
 //! extracts the matching ones. Same record scan as the shader pack (`gpu::pack`).
 
