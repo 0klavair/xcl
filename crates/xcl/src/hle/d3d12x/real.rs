@@ -354,6 +354,7 @@ pub fn init() -> Result<String, String> {
             }
         }
         open_uma(&device);
+        super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -717,6 +718,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (68, l::set_depth_bounds_x as usize),
                 (69, l::write32_bottom_x as usize),
                 (70, l::write64_bottom_x as usize),
+                (71, l::wait32_x as usize),
+                (72, l::wait64_x as usize),
                 (78, l::dispatch_x as usize),
                 (81, l::draw_indexed_x as usize),
                 (84, l::copy_resource_flags_x as usize),
@@ -724,6 +727,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (88, l::write32_top_x as usize),
                 (89, l::write64_top_x as usize),
                 (90, l::write32_bottom_of_shader_x as usize),
+                (93, l::kickoff_x as usize),
+                (94, l::set_depth_bias_x as usize),
             ]
         }
         _ => vec![],
@@ -1418,9 +1423,18 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
-        Kind::CommandList => v.extend_from_slice(&[("OMSetRenderTargets", cl_om_set_render_targets as usize), ("SetPipelineState", cl_set_pipeline_state as usize), ("Close", cl_close as usize)]),
-        Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
-        Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
+        Kind::CommandList => v.extend_from_slice(&[
+            ("Release", cl_release as usize),
+            ("Close", cl_close as usize),
+            ("ClearState", cl_clear_state as usize),
+            ("DrawInstanced", cl_draw_instanced as usize),
+            ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
+            ("SetPipelineState", cl_set_pipeline_state as usize),
+            ("OMSetRenderTargets", cl_om_set_render_targets as usize),
+            ("ExecuteIndirect", cl_execute_indirect as usize),
+        ]),
+        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[("Release", res_release as usize), ("Map", res_map as usize), ("Unmap", res_unmap as usize)]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
@@ -2356,6 +2370,9 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
+    if d.Flags.0 != 0 {
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
+    }
     finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
 }
 
@@ -2493,6 +2510,71 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    super::list_x::on_set_pipeline_state(this, pso as usize);
+}
+
+unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
+    f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
+    super::list_x::on_clear_state(this, pso as usize);
+}
+
+unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
+    super::list_x::prepare_draw(this);
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
+    f(this, vcount, icount, sv, si);
+}
+
+unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
+    super::list_x::prepare_draw(this);
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
+    f(this, icount, inst, si, bv, sinst);
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn cl_execute_indirect(
+    this: *mut c_void,
+    sig: *mut c_void,
+    max_count: u32,
+    arg_buf: *mut c_void,
+    arg_off: u64,
+    cnt_buf: *mut c_void,
+    cnt_off: u64,
+) {
+    super::list_x::prepare_draw(this);
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
+    f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
+}
+
+unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::list_x::on_release(this as usize);
+    }
+    n
+}
+
+unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::list_x::on_queue_release(this as usize);
+    }
+    n
+}
+
+unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::list_x::on_allocator_release(this as usize);
+    }
+    n
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
@@ -2511,18 +2593,19 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh();
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void>;
-    let lists = if n > 0 && !lists.is_null() {
-        mapped = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l)).collect();
-        mapped.as_ptr()
-    } else {
-        lists
-    };
-    f(this, n, lists);
-    if n > 0 && !lists.is_null() {
-        super::present::note_execute(this, std::slice::from_raw_parts(lists, n as usize));
+    if n == 0 || lists.is_null() {
+        f(this, n, lists);
+        stop_if_device_removed();
+        return;
     }
+    // console-shaped lists run as the PC lists they were translated into
+    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
+        .iter()
+        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
+        .collect();
+    super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::list_x::execute_with_waits(&mapped, |chunk| f(this, chunk.len() as u32, chunk.as_ptr()));
+    super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
 

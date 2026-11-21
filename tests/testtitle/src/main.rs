@@ -591,7 +591,8 @@ fn main() {
     check("D3D12.X: triangle rendered on the real GPU and read back (console + derived pipeline)", gpu::render_triangle);
     check("D3D12.X: frame clock + PresentX of the title's back buffer", gpu::present_x_frame);
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
-    check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy)", gpu::console_list_methods);
+    check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy, KickoffX, Wait32/64)", gpu::console_list_methods);
+    check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);
     check("D3D12.X: a texture in title memory (XG layout, #44) follows CPU writes", gpu::title_texture);
     check("D3D12.X: a texture in a streaming pool gets its texels once pages are mapped in", gpu::streamed_texture);
