@@ -546,6 +546,27 @@ Nic otwartego.
     cache (`dxc::compile_cached`, klucz = HLSL) albo wcześniejsze zapełnienie cache z `shaders.rpf`.
   - MS (NGG) i GS/ES kompilować jako **cs_6_6** (działają jako compute + przejściowy mesh shader; profil ms/gs →
     „WaveSize only allowed on compute”).
+- **Optymalizacja czasu DXC (sesja 5, druga runda)** – porównanie tej samej próbki (co 100. rekord, 241 wariantów) kod
+  stary / nowy jeden po drugim: suma **228 → 152 s (−33%)**, mediana 0,29 → 0,22 s, p90 2,76 → 2,29 s, max 9,3 → 5,9 s;
+  najwolniejszy PS (PS_PedTextured_Eight_Fire, 8 600 instrukcji) ~6,5 → 3,4 s, MS (MSNC_VS_PedTransformSkinAlpha) 3,8 → 1,7 s.
+  Pomiary czasów między różnymi chwilami skaczą o ±20% (stan maszyny) – porównywać tylko obok siebie.
+  - `dxc.exe -ftime-report` (SDK) pokazał: przy -O0 DXC i tak liczy ~4 s (to nie optymalizator), przy -O3 najdroższy
+    był **Jump Threading** (25%) na pętli `pc`, a w shaderach MS **rozwijanie pętli** z funkcji pomocniczych.
+  - **Struktura:** skoki naprzód wychodzące z bloku (break z pętli, skok za złączenie exec, s_endpgm w środku – discard
+    w PS) jako **flagi `xcl_skip_<cel>`**; pętle wchodzone w środku (`s_branch` tuż przed głową, też przez `s_nop`) w formie
+    obróconej; if/else tylko gdy żaden oczekujący cel nie wpada do środka (inaczej zwykły if / flaga); analiza i emisja
+    idą tą samą funkcją `item_at`, analiza z pamięcią (`memo`). Głębokość if/pętli ≤ 24 (`MAX_NEST`; łańcuchy discard
+    w PS dawały setki zagnieżdżeń). Shadery z blokami `pc`: 102 → 23 / 241 (pozostały wzorzec: wyjście z pętli
+    umieszczone w jej środku i skok wstecz do niego).
+  - **Pomocniki HLSL bez pętli i rozgałęzień** (HLSL 2021 zamienia skalarne `?:`, `&&`, `||`, `if` na skoki):
+    `fmt_comp`/`fmt_bytes`/`bits_at`/`uf_small` (dekodowanie formatów buforów – w MS po 140 razy), `mul_legacy`
+    (1 200 razy w PS), `ballot`, `first_lane`, `cvt_u32/i32`, `bfe_*`, `sbfe_*`, `ffbh_i`, `alignbit`, `img_cls`,
+    `dst_sel`, `f16_rtz`. Uwaga: `unorm`/`snorm` to słowa kluczowe HLSL (nie nazywać tak zmiennych).
+  - **DXC na własnych wątkach** (`dxc.rs`: pula, wątek na rdzeń, stos 64 MB, własny kompilator): przebiegi LLVM DXC
+    rekurencyjnie przepełniały 2 MB stosu na dużych PS (PS_TexturedLit_8); wątki gry mogą mieć mały stos.
+  - Nieudane (bez zysku, w szumie): liczenie `lanebit(exec)` raz przy zmianie exec, usunięcie komentarzy z HLSL.
+  - Pomocniki: `retail_shader_cost` (`XCL_NAMES=a,b`, `XCL_DXC_ARGS`, `XCL_HLSL_OUT`, limit 8 GB) i w przeglądzie
+    `XCL_SURVEY_TRACE`, podział czasu strukturalne / z `pc`, 10 najwolniejszych, najmniejsze niestrukturalne.
 - Gra **nie używa FSPX/ACCC**: wszystkie 23 869 shaderów w `shaders.rpf` to XDAT/XBCH/FSSM – FSPX to tylko własne
   pipeline'y FSR4 (dla gry bez znaczenia, ewentualnie test).
 

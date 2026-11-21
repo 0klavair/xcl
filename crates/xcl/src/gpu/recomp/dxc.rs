@@ -96,8 +96,52 @@ fn compiler() -> Result<IDxcCompiler3, String> {
     })
 }
 
+/// Stack of the thread DXC runs on: its LLVM passes recurse along long dependency chains of
+/// big translated programs (2 MB overflowed on a 7 000-instruction retail PS); the caller may
+/// be a game thread with a small stack. Reserved, committed only as used.
+const DXC_STACK: usize = 64 << 20;
+
+struct Job {
+    src: String,
+    entry: String,
+    profile: String,
+    extra: Vec<String>,
+    reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+}
+
+/// DXC workers (one per core, each with its own compiler and a `DXC_STACK` stack), started
+/// on first use; callers wait for their job.
+fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
+    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for k in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
+                let job = match rx.lock().unwrap().recv() {
+                    Ok(j) => j,
+                    Err(_) => return,
+                };
+                let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                    .unwrap_or_else(|_| Err("DXC: panika w wątku kompilacji".into()));
+                let _ = job.reply.send(r);
+            });
+        }
+        std::sync::Mutex::new(tx)
+    })
+}
+
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let (reply, rx) = std::sync::mpsc::channel();
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
+    pool().lock().unwrap().send(job).map_err(|_| "DXC: brak wątków kompilacji".to_string())?;
+    rx.recv().map_err(|_| "DXC: wątek kompilacji zakończył się".to_string())?
+}
+
+fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
     // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /

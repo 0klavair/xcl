@@ -2002,6 +2002,11 @@ fn retail_translation_survey() {
         instructions: usize,
         // DXC: seconds per variant, failures "stage: first line" → (count, example)
         dxc_times: Vec<(f64, String)>,
+        // DXC seconds / variants: fully structured, with `pc` guards
+        dxc_structured: (f64, usize),
+        dxc_hybrid: (f64, usize),
+        hybrid: usize,
+        hybrid_names: Vec<(usize, String)>,
         dxc_errors: BTreeMap<String, (usize, String)>,
     }
     let with_dxc = std::env::var_os("XCL_SURVEY_DXC").is_some() && super::dxc::location().is_ok();
@@ -2045,8 +2050,12 @@ fn retail_translation_survey() {
                         Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() })?, profile))
                     });
                     // DXC outside the lock
+                    let guarded = matches!(&res, Ok(Ok((t, _))) if t.hlsl.contains("pc =="));
                     let dxc = match (&res, with_dxc) {
                         (Ok(Ok((t, profile))), true) => {
+                            if std::env::var_os("XCL_SURVEY_TRACE").is_some() {
+                                eprintln!("dxc start {} ({} KB)", r.name, t.hlsl.len() / 1024);
+                            }
                             let t1 = std::time::Instant::now();
                             let r = super::dxc::compile(&t.hlsl, "main", profile, &[]);
                             Some((t1.elapsed().as_secs_f64(), r.err().map(|e| e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or("")).to_string())))
@@ -2060,8 +2069,15 @@ fn retail_translation_survey() {
                         let x = a.errors.entry(format!("{stage}: {msg}")).or_insert((0, r.name.clone()));
                         x.0 += 1;
                     };
+                    a.hybrid += guarded as usize;
+                    if let (true, Ok(Ok((t, _)))) = (guarded, &res) {
+                        a.hybrid_names.push((t.instructions, r.name.clone()));
+                    }
                     if let Some((secs, err)) = dxc {
                         a.dxc_times.push((secs, r.name.clone()));
+                        let b = if guarded { &mut a.dxc_hybrid } else { &mut a.dxc_structured };
+                        b.0 += secs;
+                        b.1 += 1;
                         if let Some(e) = err {
                             // drop the file:line:col prefix so equal errors group
                             let e = e.split("error:").nth(1).unwrap_or(&e).trim().to_string();
@@ -2090,6 +2106,10 @@ fn retail_translation_survey() {
     let a = acc.into_inner().unwrap();
     let (all, done): (usize, usize) = a.stages.values().fold((0, 0), |s, v| (s.0 + v.0, s.1 + v.1));
     println!("rekordów: {} (co {every}.), wariantów FSSM: {all}, przetłumaczonych w całości: {done} ({:.1}%), instrukcji: {}, czas {:.1} s", records.len(), 100.0 * done as f64 / all.max(1) as f64, a.instructions, t0.elapsed().as_secs_f64());
+    println!("z blokami pc (nie w pełni strukturalne): {} / {all}", a.hybrid);
+    let mut hn = a.hybrid_names;
+    hn.sort();
+    println!("  najmniejsze: {:?}", hn.iter().take(6).collect::<Vec<_>>());
     for (st, (n, ok)) in &a.stages {
         println!("  {st:<14} {ok:>6} / {n:<6} ({:.1}%)", 100.0 * *ok as f64 / (*n).max(1) as f64);
     }
@@ -2110,11 +2130,88 @@ fn retail_translation_survey() {
         t.sort_by(|x, y| x.0.total_cmp(&y.0));
         let q = |f: f64| t.get(((t.len() as f64 * f) as usize).min(t.len().saturating_sub(1))).map_or(0.0, |x| x.0);
         let failed: usize = a.dxc_errors.values().map(|v| v.0).sum();
+        println!(
+            "DXC strukturalne: {} wariantów, {:.0} s (średnio {:.2} s); z blokami pc: {} wariantów, {:.0} s (średnio {:.2} s)",
+            a.dxc_structured.1,
+            a.dxc_structured.0,
+            a.dxc_structured.0 / a.dxc_structured.1.max(1) as f64,
+            a.dxc_hybrid.1,
+            a.dxc_hybrid.0,
+            a.dxc_hybrid.0 / a.dxc_hybrid.1.max(1) as f64
+        );
         println!("DXC: {} skompilowanych, {failed} błędów; czas mediana {:.2} s, p90 {:.2} s, max {:.1} s ({}), suma {:.0} s", t.len(), q(0.5), q(0.9), t.last().map_or(0.0, |x| x.0), t.last().map_or("", |x| x.1.as_str()), t.iter().map(|x| x.0).sum::<f64>());
+        for (secs, name) in t.iter().rev().take(10) {
+            println!("  {secs:>6.2} s  {name}");
+        }
         let mut errs: Vec<_> = a.dxc_errors.into_iter().collect();
         errs.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
         for (k, (n, ex)) in errs.iter().take(20) {
             println!("  {n:>6}  {k}   (np. {ex})");
+        }
+    }
+}
+
+/// Shape of the HLSL and DXC cost of named retail shaders (reverse engineering of compile
+/// times): `XCL_SAMPLE_RPF`, `XCL_NAMES=a,b` (substring of the record name), `XCL_DXC_ARGS`,
+/// `XCL_HLSL_OUT=<folder>` (writes the HLSL). The process is capped at 8 GB.
+#[test]
+#[ignore]
+fn retail_shader_cost() {
+    let (Ok(path), Ok(names)) = (std::env::var("XCL_SAMPLE_RPF"), std::env::var("XCL_NAMES")) else { return };
+    unsafe {
+        use windows_sys::Win32::System::JobObjects::*;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit = 8 << 30;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+        AssignProcessToJobObject(job, GetCurrentProcess());
+    }
+    let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+    let extra: Vec<&str> = args.split_whitespace().collect();
+    let data = std::fs::read(path).unwrap();
+    for r in crate::gpu::pack::scan(&data, 0x40) {
+        if !names.split(',').any(|n| !n.is_empty() && r.name.contains(n)) {
+            continue;
+        }
+        let Some(blob) = crate::gpu::pack::inflate(&data, &r) else { continue };
+        let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            let Some(mode) = super::interface(&blob, &sh, f) else { continue };
+            let profile = match &mode {
+                Mode::Vertex(_) => "vs_6_6",
+                Mode::Pixel(_) => "ps_6_6",
+                _ => "cs_6_6",
+            };
+            let p = f.programs[0];
+            let code = &f.data[p.offset..p.offset + p.len];
+            let t = super::translate(code, &Options { mode, wave64: super::detect_wave64(code), ..Default::default() }).unwrap();
+            let owned = t.hlsl.clone();
+            let h = &owned;
+            if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.hlsl", r.name)), h);
+                eprintln!("HLSL zapisany: {} ({} KB)", r.name, h.len() / 1024);
+            }
+            let t0 = std::time::Instant::now();
+            let r2 = super::dxc::compile(h, "main", profile, &extra);
+            let secs = t0.elapsed().as_secs_f64();
+            println!(
+                "{} [{profile}] instrukcji {}, HLSL {} KB, linii {}, pc-dispatch {}, if {}, for(;;) {}, select {} → DXC {:.2} s, {}",
+                r.name,
+                t.instructions,
+                h.len() / 1024,
+                h.lines().count(),
+                h.matches("pc ==").count(),
+                h.matches("if (").count(),
+                h.matches("for (;;)").count(),
+                h.matches("select(").count(),
+                secs,
+                r2.as_ref().map(|b| format!("DXIL {} KB", b.len() / 1024)).unwrap_or_else(|e| e.lines().next().unwrap_or("").to_string())
+            );
+            if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.hlsl", r.name)), h);
+            }
         }
     }
 }

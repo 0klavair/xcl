@@ -3295,37 +3295,37 @@ uint4 ld_raw(uint a) {
     if (s == 0u) return uint4(w0, w1, w2, w3);
     return uint4((w0 >> s) | (w1 << (32u - s)), (w1 >> s) | (w2 << (32u - s)), (w2 >> s) | (w3 << (32u - s)), (w3 >> s) | (w4 << (32u - s)));
 }
+// format helpers: no loops, no branches (inlined at every buffer access; `?:` and `if`
+// on scalars become control flow in HLSL 2021, which DXC is slow to clean up)
 uint bits_at(uint4 r, uint off, uint w) {
     uint i = off >> 5; uint s = off & 31u;
-    uint lo = r[i]; uint hi = (i < 3u) ? r[i + 1u] : 0u;
-    uint v = (s == 0u) ? lo : ((lo >> s) | (hi << (32u - s)));
-    return w >= 32u ? v : (v & ((1u << w) - 1u));
+    uint lo = r[i]; uint hi = select(i < 3u, r[min(i + 1u, 3u)], 0u);
+    uint v = select(s == 0u, lo, (lo >> s) | (hi << ((32u - s) & 31u)));
+    return select(w >= 32u, v, v & ((1u << (w & 31u)) - 1u));
 }
 float uf_small(uint v, uint mb) {
     uint e = v >> mb; uint m = v & ((1u << mb) - 1u); float fm = (float)m / (float)(1u << mb);
-    if (e == 31u) return m != 0u ? asfloat(0x7FC00000u) : asfloat(0x7F800000u);
-    if (e == 0u) return fm * exp2(-14.0f);
-    return exp2((float)e - 15.0f) * (1.0f + fm);
+    float special = select(m != 0u, asfloat(0x7FC00000u), asfloat(0x7F800000u));
+    return select(e == 31u, special, select(e == 0u, fm * exp2(-14.0f), exp2((float)e - 15.0f) * (1.0f + fm)));
 }
-uint fmt_bytes(uint info) { uint n = 0u; [unroll] for (uint k = 0u; k < 4u; k++) n += (info >> (8u + 6u * k)) & 63u; return n / 8u; }
+uint fmt_bytes(uint info) { return (((info >> 8) & 63u) + ((info >> 14) & 63u) + ((info >> 20) & 63u) + ((info >> 26) & 63u)) / 8u; }
 uint fmt_comp(uint4 r, uint info, uint c) {
     uint n = info & 7u; uint ty = (info >> 3) & 7u;
-    bool isint = ty == 4u || ty == 5u;
-    if (c >= n) return c == 3u ? (isint ? 1u : 0x3F800000u) : 0u;
-    uint off = 0u; [unroll] for (uint k = 0u; k < 3u; k++) if (k < c) off += (info >> (8u + 6u * k)) & 63u;
-    uint w = (info >> (8u + 6u * c)) & 63u;
+    bool isint = or(ty == 4u, ty == 5u);
+    uint off = select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
+    uint w = (info >> ((8u + 6u * c) & 31u)) & 63u;
     uint v = bits_at(r, off, w);
-    int sv = w >= 32u ? (int)v : (((int)(v << (32u - w))) >> (32u - w));
-    float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
-    float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
+    uint sh = (32u - w) & 31u;
+    int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
+    float maxu = select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u));
+    float maxs = select(w >= 32u, 2147483647.0f, (float)((1u << ((w - 1u) & 31u)) - 1u));
+    float fv = (float)v; float fsv = (float)sv;
     // exact endpoints (the hardware conversion is exact; DXC divides approximately)
-    if (ty == 0u) return asuint(v == 0u ? 0.0f : ((float)v >= maxu ? 1.0f : (float)v / maxu));
-    if (ty == 1u) return asuint(sv == 0 ? 0.0f : ((float)sv >= maxs ? 1.0f : max((float)sv / maxs, -1.0f)));
-    if (ty == 2u) return asuint((float)v);
-    if (ty == 3u) return asuint((float)sv);
-    if (ty == 4u) return v;
-    if (ty == 5u) return (uint)sv;
-    return w == 32u ? v : (w == 16u ? asuint(f16tof32(v)) : asuint(uf_small(v, w == 11u ? 6u : 5u)));
+    uint f_un = asuint(select(v == 0u, 0.0f, select(fv >= maxu, 1.0f, fv / maxu)));
+    uint f_sn = asuint(select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f))));
+    uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
+    uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
+    return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
 // image_bvh(64)_intersect_ray: node = id (low 3 bits: type), at base + (id & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
@@ -3375,7 +3375,7 @@ uint4 bvh_intersect(uint node, uint base, float tmax, float3 o, float3 d, float3
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
-uint img_cls(uint fmt) { uint ty = fmt <= 77u ? ((FMT_INFO[fmt] >> 3) & 7u) : 6u; return ty == 4u ? 1u : (ty == 5u ? 2u : 0u); }
+uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;
@@ -3407,7 +3407,7 @@ void st_bytes(uint a, uint4 r, uint n) {
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
-uint dst_sel(uint4 c, uint sel, bool isint) { return sel == 0u ? 0u : (sel == 1u ? (isint ? 1u : 0x3F800000u) : c[(sel - 4u) & 3u]); }
+uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
 "#;
 
 const PRELUDE: &str = r#"
@@ -3416,7 +3416,7 @@ static uint lane_id;
 static bool xcl_w32 = false;
 static uint xcl_half = 0u;
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
-uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return xcl_w32 ? uint2(xcl_half != 0u ? m.y : m.x, 0u) : m.xy; }
+uint2 ballot(bool b) { uint4 m = WaveActiveBallot(b); return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y)); }
 uint rla(uint v, uint l) { return WaveReadLaneAt(v, l + 32u * xcl_half); }
 bool lanebit_at(uint lo, uint hi, uint l) { return ((select(l < 32u, lo, hi) >> (l & 31u)) & 1u) != 0u; }
 uint sdwa_sel(uint x, uint sel, bool sext) {
@@ -3447,26 +3447,26 @@ float3 cube_dir(float s, float t, float face) {
     if (f == 4u) return float3(u, -v, 1.0f);
     return float3(-u, -v, -1.0f);
 }
-uint first_lane(uint lo, uint hi) { return lo != 0u ? firstbitlow(lo) : (hi != 0u ? 32u + firstbitlow(hi) : 0u); }
+uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
 uint wqm(uint m) { uint q = m | (m >> 1); q = q | (q >> 2); q &= 0x11111111u; return q * 15u; }
-float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
+float mul_legacy(float a, float b) { return select(or(a == 0.0f, b == 0.0f), 0.0f, a * b); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
 float fract_f(float x) { return min(x - floor(x), asfloat(0x3F7FFFFFu)); }
-uint cvt_u32(float f) { return (isnan(f) || f <= 0.0f) ? 0u : (f >= 4294967296.0f ? 0xFFFFFFFFu : (uint)f); }
-int cvt_i32(float f) { return isnan(f) ? 0 : (f <= -2147483648.0f ? (int)0x80000000u : (f >= 2147483648.0f ? 0x7FFFFFFF : (int)f)); }
+uint cvt_u32(float f) { return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 4294967296.0f, 0xFFFFFFFFu, (uint)f)); }
+int cvt_i32(float f) { return select(isnan(f), 0, select(f <= -2147483648.0f, (int)0x80000000u, select(f >= 2147483648.0f, 0x7FFFFFFF, (int)f))); }
 int i24(uint v) { return ((int)(v << 8)) >> 8; }
-uint bfe_u(uint v, uint o, uint w) { o &= 31u; w &= 31u; return w == 0u ? 0u : ((v >> o) & (0xFFFFFFFFu >> (32u - w))); }
-int bfe_i(uint v, uint o, uint w) { o &= 31u; w &= 31u; if (w == 0u) return 0; uint s = 32u - w; return ((int)((v >> o) << s)) >> s; }
-uint sbfe_u(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; return w == 0u ? 0u : (w >= 32u ? (v >> o) : ((v >> o) & (0xFFFFFFFFu >> (32u - w)))); }
-int sbfe_i(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; if (w == 0u) return 0; if (w >= 32u) return ((int)v) >> o; uint s = 32u - w; return ((int)((v >> o) << s)) >> s; }
-uint ffbh_i(uint v) { uint x = ((int)v < 0) ? ~v : v; return x == 0u ? 0xFFFFFFFFu : 31u - firstbithigh(x); }
-uint alignbit(uint s0, uint s1, uint s) { s &= 31u; return s == 0u ? s1 : ((s1 >> s) | (s0 << (32u - s))); }
+uint bfe_u(uint v, uint o, uint w) { o &= 31u; w &= 31u; return select(w == 0u, 0u, (v >> o) & (0xFFFFFFFFu >> ((32u - w) & 31u))); }
+int bfe_i(uint v, uint o, uint w) { o &= 31u; w &= 31u; uint s = (32u - w) & 31u; return select(w == 0u, 0, ((int)((v >> o) << s)) >> s); }
+uint sbfe_u(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; return select(w == 0u, 0u, select(w >= 32u, v >> o, (v >> o) & (0xFFFFFFFFu >> ((32u - w) & 31u)))); }
+int sbfe_i(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; uint s = (32u - w) & 31u; return select(w == 0u, 0, select(w >= 32u, ((int)v) >> o, ((int)((v >> o) << s)) >> s)); }
+uint ffbh_i(uint v) { uint x = select((int)v < 0, ~v, v); return select(x == 0u, 0xFFFFFFFFu, 31u - firstbithigh(x)); }
+uint alignbit(uint s0, uint s1, uint s) { s &= 31u; return select(s == 0u, s1, (s1 >> s) | (s0 << ((32u - s) & 31u))); }
 uint perm_b32(uint s0, uint s1, uint sel) {
     uint r = 0u;
     [unroll] for (uint i = 0u; i < 4u; i++) {
@@ -3478,7 +3478,7 @@ uint perm_b32(uint s0, uint s1, uint sel) {
     }
     return r;
 }
-uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; if (!isnan(f) && (h & 0x7FFFu) != 0u && abs(f16tof32(h)) > abs(f)) h -= 1u; return h; }
+uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
 double floor_d(double x) { double t = (double)(int64_t)x; return t > x ? t - 1.0 : t; }
