@@ -1,7 +1,7 @@
 //! XAudio2 the way a console title uses it: engine with console-only flags, mastering
-//! voice with a console device id, an XMA2 voice (no decoder on PC – XCL plays silence of
-//! the same length) and a plain PCM voice. Buffer callbacks must come back with the
-//! title's contexts and the stream must end on time.
+//! voice with a console device id, an XMA2 voice (decoded to PCM16 by XCL), an Opus voice
+//! (decoded via MSOpusDecoder) and a plain PCM voice. Buffer callbacks must come back with
+//! the title's contexts and the streams must end on time.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -76,6 +76,22 @@ const END_OF_STREAM: u32 = 0x40;
 const XMA_CONTEXT: usize = 0x100;
 const PCM_CONTEXT: usize = 0x2_0000;
 const OPUS_CONTEXT: usize = 0x4000;
+
+// Real 48 kHz mono XMA2 packet prefix (zero-padded to 2048 B; 12 frames = 6080 samples).
+const XMA2_MONO_48K_PREFIX: &[u8] = &[
+    0x30, 0x00, 0x00, 0x00, 0x00, 0xe7, 0x00, 0x0c, 0x13, 0xe3, 0xff, 0xff, 0xfb, 0x39, 0x46, 0x44,
+    0xf6, 0x55, 0xa0, 0x1c, 0xe0, 0x01, 0x82, 0x7c, 0x7f, 0xff, 0xff, 0x67, 0x28, 0xc8, 0x9d, 0xca,
+    0xb4, 0x03, 0x9c, 0x00, 0x30, 0x4f, 0x8f, 0xff, 0xff, 0xec, 0xe5, 0x19, 0x13, 0xd9, 0x56, 0x80,
+    0x73, 0x80, 0x06, 0x09, 0xf1, 0xff, 0xff, 0xfd, 0x9c, 0xa3, 0x22, 0x77, 0x2a, 0xd0, 0x0e, 0x70,
+    0x00, 0xc1, 0x3e, 0x3f, 0xff, 0xff, 0xb3, 0x94, 0x64, 0x4f, 0x65, 0x5a, 0x01, 0xce, 0x00, 0x18,
+    0x27, 0xc7, 0xff, 0xff, 0xf6, 0x72, 0x8c, 0x89, 0xdc, 0xab, 0x40, 0x39, 0xc0, 0x03, 0x04, 0xf8,
+    0xff, 0xff, 0xfe, 0xce, 0x51, 0x91, 0x3d, 0x95, 0x68, 0x07, 0x38, 0x00, 0x60, 0x9f, 0x1f, 0xff,
+    0xff, 0xd9, 0xca, 0x32, 0x27, 0x72, 0xad, 0x00, 0xe7, 0x00, 0x0c, 0x13, 0xe3, 0xff, 0xff, 0xfb,
+    0x39, 0x46, 0x44, 0xf6, 0x55, 0xa0, 0x1c, 0xe0, 0x01, 0x82, 0x7c, 0x7f, 0xff, 0xff, 0x67, 0x28,
+    0xc8, 0x9d, 0xca, 0xb4, 0x03, 0x9c, 0x00, 0x30, 0x4f, 0x8f, 0xff, 0xff, 0xec, 0xe5, 0x19, 0x13,
+    0xd9, 0x56, 0x80, 0x73, 0x80, 0x06, 0x09, 0xf1, 0xff, 0xff, 0xfd, 0x9c, 0xa3, 0x22, 0x77, 0x2a,
+    0xc0,
+];
 
 // Five real 20 ms (960-sample) Hybrid FB mono Opus packets (100 ms total at 48 kHz).
 const OPUS_PACKETS: &[&[u8]] = &[
@@ -180,12 +196,12 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
             return Ok(());
         }
 
-        // XMA2 mono 48 kHz – Windows XAudio2 cannot play it
+        // XMA2 mono 48 kHz – decoded to PCM16 by XCL (Windows XAudio2 cannot play it natively)
         let xma = Xma2Format {
             wfx: WaveFormatEx { tag: 0x166, channels: 1, rate: 48_000, avg_bytes: 6000, block_align: 1, bits: 16, cb_size: 34 },
             num_streams: 1,
             channel_mask: 4,
-            samples_encoded: 9600,
+            samples_encoded: 6080,
             bytes_per_block: 2048,
             encoder_version: 4,
             block_count: 1,
@@ -204,13 +220,15 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if (ch, rate) != (1, 48_000) {
             return Err(format!("XMA2 voice: {ch} ch., {rate} Hz"));
         }
-        let packet = vec![0x5au8; 2048];
+        let _ = method::<SetVolume>(xv, 12)(xv, 0.0, 0); // stay silent during automated tests
+        let mut packet = vec![0u8; 2048];
+        packet[..XMA2_MONO_48K_PREFIX.len()].copy_from_slice(XMA2_MONO_48K_PREFIX);
         let xb = Buffer {
             flags: END_OF_STREAM,
             audio_bytes: 2048,
             audio_data: packet.as_ptr(),
             play_begin: 0,
-            play_length: 4800, // 0.1 s
+            play_length: 4800, // 0.1 s slice of the 6080 decoded samples
             loop_begin: 0,
             loop_length: 0,
             loop_count: 0,
@@ -219,6 +237,15 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         let hr = method::<Submit>(xv, 21)(xv, &xb, std::ptr::null());
         if hr != 0 {
             return Err(format!("SubmitSourceBuffer(XMA2) → {:#x}", hr as u32));
+        }
+        let mut xst = VoiceState::default();
+        method::<GetState>(xv, 25)(xv, &mut xst, 0);
+        if { xst.current_buffer_context } as usize != XMA_CONTEXT || { xst.buffers_queued } != 1 {
+            return Err(format!(
+                "XMA2 GetState: ctx={:#x}, queued={}",
+                { xst.current_buffer_context } as usize,
+                { xst.buffers_queued }
+            ));
         }
 
         // plain PCM16 voice must pass through untouched

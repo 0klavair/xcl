@@ -153,19 +153,21 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(d3["uma_gpu_va"].as_str().is_some_and(|v| v.starts_with("0x")), "d3d12: {d3}");
     assert_eq!(dumps.iter().filter(|n| n.ends_with(".fssm0.p0.hlsl")).count(), 1, "{dumps:?}");
 
-    // (5b) XAudio2: genuine Windows engine; XMA2 voice replaced, console flags dropped
+    // (5b) XAudio2: genuine Windows engine; XMA2 and Opus voices decoded to PCM16, console flags dropped
     let a = &report["audio"];
     assert_eq!(a["engines"], 1, "audio: {a}");
     assert_eq!(a["engine_errors"], 0, "audio: {a}");
     assert!(a["dropped_flags"].as_array().unwrap().iter().any(|f| f == "XAudio2Create:0x41"), "audio: {a}");
     if a["mastering_voices"] == 1 {
         assert_eq!(a["xma_voices"], 1, "audio: {a}");
+        assert_eq!(a["xma_buffers_decoded"], 1, "audio: {a}");
+        assert_eq!(a["xma_decode_errors"], 0, "audio: {a}");
         assert_eq!(a["opus_voices"], 1, "audio: {a}");
         assert_eq!(a["opus_buffers_decoded"], 1, "audio: {a}");
         assert_eq!(a["opus_decode_errors"], 0, "audio: {a}");
-        assert_eq!(a["silent_voices"], 1, "audio: {a}");
+        assert_eq!(a["silent_voices"], 0, "audio: {a}");
         assert_eq!(a["source_voices"], 3, "audio: {a}");
-        assert_eq!(a["buffers_silenced"], 1, "audio: {a}");
+        assert_eq!(a["buffers_silenced"], 0, "audio: {a}");
         assert_eq!(a["source_voice_errors"], 0, "audio: {a}");
     } else {
         eprintln!("e2e: no audio device – XAudio2 voices not checked ({a})");
