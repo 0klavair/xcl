@@ -1104,6 +1104,22 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   reach memory only through those windows – the pool does not fit (and 12+ GB committed is near this PC's commit
   limit). Options: a much larger UMA (commit cost), or a GPU page table in translated shaders (title memory stays where
   it is, per-chunk heaps) – the general one, larger work. Until then Map of such a buffer fails and the title stops.
+- **Decided (user): a GPU page table in translated shaders.** Measured with `tests/heap_probe.rs` (GPU copies only):
+  - a heap over a file mapping (`OpenExistingHeapFromFileMapping`) works for **SEC_COMMIT** sections – the GPU reads
+    what the CPU wrote and the CPU sees GPU writes; **SEC_RESERVE** sections are refused (E_INVALIDARG) even when
+    every page is committed – a heap always costs its full commit, like the address one (fully committed VirtualAlloc
+    allocation, < 4 GiB);
+  - a reservation made as a **placeholder** (`VirtualAlloc2` MEM_RESERVE_PLACEHOLDER), a chunk split off it
+    (`VirtualFree` MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) and replaced by a SEC_COMMIT section mapped at that address
+    (`MapViewOfFile3` MEM_REPLACE_PLACEHOLDER): each chunk opens as its own heap, GPU and CPU coherent at the title's
+    address, neighbouring chunks independent (`heaps_over_sections_in_a_placeholder`, 2 MiB chunks).
+  - Plan: (1) kernelx – title reservations become placeholders, MEM_COMMIT inside turns the touched chunks into
+    sections (commit charge per used chunk), each a heap + a raw buffer over it; decommit / release restore the
+    placeholder; (2) each chunk's buffer gets a UAV in a part of every shader-visible view heap XCL reserves, and a
+    page table (chunk of the address → descriptor index) goes to the shaders; (3) the recompiler's `mem` accesses go
+    through the table (`ResourceDescriptorHeap[i]`), the UMA windows stay the fast path; (4) PC-side users of buffers
+    in chunked memory (IA vertex / index buffers, copies, clears) cannot span chunks: vertex fetch in the translated VS
+    from memory, copies and clears as XCL compute passes over `mem`.
 - Diagnostics: `XCL_FRAME_DUMP=1` writes every 120th presented frame (a quarter of each side) as `frame_<n>.bmp` in
   the logs folder; `XCL_TRACE_MEM=1` logs allocations ≥ 64 KiB outside unified memory.
 - **Safety nets** (after a GPU hang that needed a PC restart – it came from a diagnostic run that skipped barriers):
