@@ -32,6 +32,8 @@ pub struct Config {
     /// Executable inside the game folder (auto-detected when empty).
     pub exe: String,
     pub package_identifier: String,
+    /// Xbox title id (hex) for XGameGetXboxTitleId; empty = `<TitleId>` of MicrosoftGame.Config.
+    pub title_id: String,
     /// Console path prefix → target. `{game}` and `{data}` are expanded.
     pub mounts: BTreeMap<String, String>,
     /// Import DLL pattern → route: an HLE module ("kernelx.dll"), "@system" or "@stub".
@@ -75,6 +77,12 @@ impl Config {
                 None => 4096,
             };
         }
+        if self.title_id.is_empty() {
+            if let Some(t) = manifest.and_then(|m| m.title_id.clone()) {
+                from.push(format!("TitleId {t}"));
+                self.title_id = t;
+            }
+        }
         if self.uma_mb == 0 {
             self.uma_mb = if self.title_memory == "advanced" { 4095 } else { 2048 };
         }
@@ -112,6 +120,7 @@ impl Default for Config {
             log_to_stderr: true,
             exe: String::new(),
             package_identifier: String::new(),
+            title_id: String::new(),
             mounts,
             aliases: BTreeMap::new(),
             stub_returns: BTreeMap::new(),

@@ -3,6 +3,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod api;
 pub mod gamesave;
 pub mod taskqueue;
 pub mod xasync;
@@ -14,10 +15,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
 use gamesave::*;
 use taskqueue::*;
+use api::{InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl, UninitializeApiImpl, XErrorReport};
 use xasync::*;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
+        // the GDK thunk protocol (api.rs) – what titles actually call
+        InitializeApiImpl,
+        InitializeApiImplEx,
+        InitializeApiImplEx2,
+        UninitializeApiImpl,
+        QueryApiImpl,
+        XErrorReport,
         // runtime
         XGameRuntimeInitialize,
         XGameRuntimeInitializeWithOptions,
@@ -541,6 +550,7 @@ mod tests {
 
     #[test]
     fn user_add_and_queries() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             assert_eq!(XUserAddAsync(1, &mut b), S_OK);
@@ -574,6 +584,7 @@ mod tests {
 
     #[test]
     fn save_folder_async() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             assert_eq!(XGameSaveFilesGetFolderWithUiAsync(std::ptr::null_mut(), b"scid-1\0".as_ptr(), &mut b), S_OK);

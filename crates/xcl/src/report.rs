@@ -63,6 +63,10 @@ pub struct Report {
     /// XAudio2: engines, mastering/source voices, XMA voices played as silence, dropped console flags
     #[serde(default)]
     pub audio: crate::hle::xaudio2::AudioStats,
+    /// XGameRuntime through the GDK thunks: which classes the title asked for and who answered,
+    /// XCL slots it called that XCL does not implement
+    #[serde(default)]
+    pub xgameruntime: crate::hle::xgameruntime::api::ApiStats,
     pub notes: Vec<String>,
 }
 
@@ -126,6 +130,7 @@ pub fn build() -> Report {
         shaders: crate::gpu::shader::stats(),
         d3d12: crate::hle::d3d12x::real::stats(),
         audio: crate::hle::xaudio2::stats(),
+        xgameruntime: crate::hle::xgameruntime::api::stats(),
         notes: vec![
             "Metody D3D12.X spoza PC widać w called_stubs jako '<Interfejs>::#slot (spoza PC)'.".into(),
             "Shadery w formacie konsolowym są zastępowane (fallback_pipelines) do czasu ukończenia recompilera RDNA2.".into(),

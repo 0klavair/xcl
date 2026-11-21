@@ -536,6 +536,34 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## XGameRuntime przez thunki GDK (sesja 5, 2026-11-21)
+- **Luka (blokowała start każdej gry GDK):** tytuły nie importują XTaskQueueCreate / XUserAddAsync… po nazwie – mają
+  wkompilowane thunki, które ładują `xgameruntime.dll` i biorą `InitializeApiImpl(Ex/Ex2)`, `QueryApiImpl`,
+  `UninitializeApiImpl`, `XErrorReport`; każde API to slot vtable obiektu z `QueryApiImpl(clsid, iid)` (0..2 = IUnknown).
+  XCL tego nie miał → `HCInitialize` z libHttpClient.GDK dawało 0x89240101 (gra: XGameRuntimeInitialize tak samo).
+- **Teraz** (`hle/xgameruntime/api.rs`): 6 punktów wejścia. `QueryApiImpl`: XCL odpowiada sam dla XUser (`01acd177`,
+  iid `26f3c674` + `cef4fac0` = XUserGetGamertag), XGameSave (`704c3f58`), XPackage (`af406016`), XGame (`973a344e`:
+  XGameGetXboxTitleId z `<TitleId>` MicrosoftGame.Config / `title_id` w xcl.toml), XSystem (`e349bd1a`: console/sandbox
+  id, reszta do PC), XGameUi (`dfcd4649`: tylko okna bez uchwytu użytkownika – wiadomość, błąd, tekst – idą do PC);
+  odmawia XStore (`0dd112ac`) i XUser-urządzenia (`7d824997`) – thunk zwraca wtedy swój błąd „API niedostępne”;
+  resztę przekazuje do systemowego `System32\xgameruntime.dll` (te same klasy i GUID-y: 27 z 29 par z konsolowych DLL) –
+  XAsync/XTaskQueue/XThread (`073b7dcb`), XNetworking, XGameInvite… Po inicjalizacji XAsync XCL deleguje do PC-owego
+  (`xasync::use_pc`; sloty 3 GetStatus, 4 GetResultSize, 5 Cancel, 6 Run, 7 Begin, 9 Schedule, 10 Complete, 11 GetResult),
+  bo kolejki i bloki należą wtedy do PC – wszystkie async XCL (`begin_with`) działają bez zmian. Init PC: Ex2 → Ex → Impl
+  (starszy runtime nie zna nowych flag: libHttpClient podaje 0x3).
+- **Skąd mapy slotów:** thunki w XCurl.dll / libHttpClient.GDK.dll (para GUID, slot, szerokości argumentów i wyniku), nazwy
+  w kodzie slotów PC-owego runtime (identyfikatory XAsync, `GameSaveImpl::…`), kolejność nagłówków GDK; potwierdzone
+  zgodnością liczby argumentów i szerokości zapisów (np. XUser 13 zapisuje bajt = GetIsGuest, 14 dword = GetState).
+  Funkcje XCL dostają argumenty bez `this` (shimy per slot). Nieobsłużone sloty → E_NOTIMPL (bool → false) + log.
+- **Bezpieczeństwo:** PC-owy runtime nie waliduje obcych uchwytów (XGameUiShowPlayerProfileCardAsync z uchwytem XCL →
+  access violation), dlatego nic, co bierze uchwyt XUser/XGameSave XCL, nie idzie do PC.
+- **Raport:** `xgameruntime.apis` (para → kto odpowiedział) i `xgameruntime.unimplemented` („XUser#23” → liczba wywołań).
+- **Nieustalone (z exe):** klasa PLS (kandydat `7f0fe8b8`, wymaga nieznanego IID) i slot XSystemGetDeviceType (PC poda
+  „Pc”) – do odczytania z thunków exe; `0a2192aa` to API tylko konsolowe (na PC zaślepki `WindowsGRTSStub`).
+- Testy: `thunk_protocol_with_xcl_objects_on_pc_queues` (XUserAddAsync/Result i XGameSave async przez vtable na
+  kolejkach PC, XStore odrzucony, nieobsłużony slot w raporcie), `libhttpclient_initialises_through_the_xgameruntime_thunks`
+  (prawdziwy DLL: HCInitialize → S_OK). Bez systemowego xgameruntime.dll: klasy XCL działają, reszta „brak”.
+
 ## Tekstury kafelkowane z pamięci konsoli (sesja 5, 2026-11-21)
 - **Łańcuch mipów GFX10** (`tiling::Chain`, `tiling::image_chain(&desc::Image, cfg)`; addrlib
   Gfx10Lib::ComputeSurfaceInfoMacroTiled/MicroTiled): na slice najpierw blok mip tail (poziomy ≤ pół bloku szerokości,
@@ -691,7 +719,8 @@ Nic otwartego.
 ## Dalsze kroki (priorytet)
 Bez exe zostało niewiele – reszta potrzebuje prawdziwego wywołania gry.
 1. Gdy użytkownik będzie miał legalny exe gry: `xcl inspect`, `xcl run`, analiza `report.json`
-   (`called_stubs` z `(spoza PC)` → mapowanie slotów konsolowych np. PresentX; `d3d12.unknown_iids`; brakujące XGameRuntime;
+   (`called_stubs` z `(spoza PC)` → mapowanie slotów konsolowych np. PresentX; `d3d12.unknown_iids`; `xgameruntime.apis` / `.unimplemented` (klasy i sloty thunków
+   do dopisania: PLS, XSystemGetDeviceType);
    `shaders.rdna2_mnemonics`; `audio` – formaty głosów, `unsupported_formats`; importy związane z Opus/XMA/AcpHal).
 2. Wiązanie przy rysowaniu: argumenty root gry → SGPR w `io`, `mem` → bufor UMA; przechwytywanie list poleceń dla GS
    i dispatchy Compute; `XboxBvhBuilder` (lub `BuildRaytracingAccelerationStructure`) → `gpu::bvh::build/build_top`

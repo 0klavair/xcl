@@ -2,6 +2,10 @@
 //!
 //! `XAsyncBlock` = { queue, context, callback, internal[32] }. We keep a pointer to our
 //! state in `internal[0..8]`.
+//!
+//! A title that reaches the runtime through the GDK thunks (`api.rs`) gets its task queues and
+//! async blocks from the PC's XGameRuntime; then these functions – and so every XCL async API
+//! (`begin_with`) – go to the PC runtime's XAsync object (`use_pc`) instead.
 
 #![allow(non_snake_case)]
 
@@ -34,6 +38,24 @@ pub struct XAsyncProviderData {
 }
 
 pub type XAsyncProvider = unsafe extern "system" fn(u32, *const XAsyncProviderData) -> HRESULT;
+
+/// The PC runtime's XAsync / XTaskQueue object (0 = XCL's own queues). Its slots: 3 GetStatus,
+/// 4 GetResultSize, 5 Cancel, 6 Run, 7 Begin, 9 Schedule, 10 Complete, 11 GetResult.
+static PC_ASYNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// tests that use XCL's queues and the one that switches to the PC runtime take turns
+#[cfg(test)]
+pub static ASYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn use_pc(object: usize) {
+    PC_ASYNC.store(object, std::sync::atomic::Ordering::Release);
+}
+
+/// (object, slot function) of the PC XAsync object, when in use
+unsafe fn pc(slot: usize) -> Option<(usize, usize)> {
+    let o = PC_ASYNC.load(std::sync::atomic::Ordering::Acquire);
+    (o != 0).then(|| (o, *(*(o as *const *const usize)).add(slot)))
+}
 pub type XAsyncWork = unsafe extern "system" fn(*mut XAsyncBlock) -> HRESULT;
 type Completion = unsafe extern "system" fn(*mut XAsyncBlock);
 
@@ -123,6 +145,10 @@ pub unsafe extern "system" fn XAsyncBegin(
     _identity_name: *const u8,
     provider: usize,
 ) -> HRESULT {
+    if let Some((o, f)) = pc(7) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, context, identity, _identity_name, provider);
+    }
     if b.is_null() || provider == 0 {
         return E_INVALIDARG;
     }
@@ -143,6 +169,10 @@ pub unsafe extern "system" fn XAsyncBegin(
 }
 
 pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
+    if let Some((o, f)) = pc(9) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, delay_ms);
+    }
     if b.is_null() {
         return E_INVALIDARG;
     }
@@ -152,6 +182,10 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
 }
 
 pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESULT, required: usize) {
+    if let Some((o, f)) = pc(10) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
+        return f(o, b, result, required);
+    }
     let Some(s) = state_of(b) else { return };
     let cleanup_now;
     {
@@ -179,6 +213,10 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
 }
 
 pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT {
+    if let Some((o, f)) = pc(3) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, bool) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, wait);
+    }
     let Some(s) = state_of(b) else { return E_INVALIDARG };
     let mut g = s.inner.lock().unwrap();
     if wait {
@@ -194,6 +232,10 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
 }
 
 pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    if let Some((o, f)) = pc(4) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, size);
+    }
     let Some(s) = state_of(b) else { return E_INVALIDARG };
     let g = s.inner.lock().unwrap();
     if !g.done {
@@ -212,6 +254,10 @@ pub unsafe extern "system" fn XAsyncGetResult(
     buffer: *mut c_void,
     used: *mut usize,
 ) -> HRESULT {
+    if let Some((o, f)) = pc(11) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *const c_void, usize, *mut c_void, *mut usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, identity, size, buffer, used);
+    }
     let Some(s) = state_of(b) else { return E_INVALIDARG };
     let (status, need, cleaned) = {
         let g = s.inner.lock().unwrap();
@@ -248,6 +294,10 @@ pub unsafe extern "system" fn XAsyncGetResult(
 }
 
 pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
+    if let Some((o, f)) = pc(5) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock) = std::mem::transmute(f);
+        return f(o, b);
+    }
     let Some(s) = state_of(b) else { return };
     if s.inner.lock().unwrap().done {
         return;
@@ -257,6 +307,10 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
 }
 
 pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
+    if let Some((o, f)) = pc(6) {
+        let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, b, work);
+    }
     if b.is_null() || work == 0 {
         return E_INVALIDARG;
     }
@@ -333,6 +387,7 @@ mod tests {
 
     #[test]
     fn begin_with_payload_roundtrip() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             b.callback = on_done as usize;
@@ -361,6 +416,7 @@ mod tests {
 
     #[test]
     fn errors_propagate() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             begin_with(&mut b, 1, || Err(crate::util::E_FAIL));
@@ -374,6 +430,7 @@ mod tests {
 
     #[test]
     fn xasync_run() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut b: XAsyncBlock = std::mem::zeroed();
             assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);

@@ -481,6 +481,7 @@ mod tests {
 
     #[test]
     fn containers_blobs_round_trip() {
+    let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let cfg = format!("xcl-test-{}\0", std::process::id());
             let mut p = std::ptr::null_mut();

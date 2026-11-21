@@ -12,6 +12,8 @@ pub struct Manifest {
     /// `<XboxAnacondaTitleMemory>` / `<XboxLockhartTitleMemory>`: "Standard" or "Advanced"
     pub anaconda_memory: Option<String>,
     pub lockhart_memory: Option<String>,
+    /// `<TitleId>` (hex)
+    pub title_id: Option<String>,
 }
 
 fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
@@ -27,6 +29,7 @@ pub fn parse(xml: &str) -> Manifest {
         pls_mb: pls.and_then(|v| v.parse().ok()),
         anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
         lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
+        title_id: element(xml, "TitleId").map(str::to_string),
     }
 }
 

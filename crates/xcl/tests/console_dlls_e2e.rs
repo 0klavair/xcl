@@ -115,6 +115,22 @@ fn other_console_dlls_map_and_initialise() {
     }
 }
 
+/// libHttpClient.GDK initialises: its XGameRuntime thunks (statically linked, as in every
+/// GDK title) load xgameruntime.dll and go through InitializeApiImpl* / QueryApiImpl.
+#[test]
+fn libhttpclient_initialises_through_the_xgameruntime_thunks() {
+    let Some(dir) = setup() else { return };
+    let m = load(dir, "libHttpClient.GDK.dll");
+    unsafe {
+        let init: extern "system" fn(*mut std::ffi::c_void) -> i32 = std::mem::transmute(proc(&m, "HCInitialize"));
+        let hr = init(std::ptr::null_mut());
+        println!("HCInitialize → {:#010x}", hr as u32);
+        assert!(hr >= 0, "HCInitialize: {:#010x}", hr as u32);
+        let cleanup: extern "system" fn() = std::mem::transmute(proc(&m, "HCCleanup"));
+        cleanup();
+    }
+}
+
 #[repr(C)]
 struct GeometryDesc {
     ty: u32,
