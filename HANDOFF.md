@@ -541,14 +541,13 @@ Nic otwartego.
   `VirtualMachine/SMTEnabled` = true, `XboxAnacondaTitleMemory` / `XboxLockhartTitleMemory` = Advanced.
 - `manifest.rs` (NOWE) czyta te pola z folderu gry; `Config::resolve` (launcher) wypełnia ustawienia „auto”:
   - `pls_mb` → XPersistentLocalStorageGetSpaceInfo (było na sztywno 4 GiB);
-  - `smt` → kernelx: GetSystemInfo / GetNativeSystemInfo / GetActive/MaximumProcessorCount = **14** (7 rdzeni × SMT;
-    7 bez SMT), GetCurrentProcessorNumber(Ex) modulo 14 (tablice per rdzeń w grze), SetThreadAffinityMask /
-    SetThreadIdealProcessor / GetProcessAffinityMask – maski konsoli składane na procesory PC (`fold_affinity`);
+  - SMT bez znaczenia: **gra widzi procesory PC** (decyzja użytkownika – „odpalamy na PC”; wersja z 14 procesorami
+    konsoli była niespójna: CRT widział 14, OpenMP 16);
   - `title_memory` → `uma_mb` 4095 dla „advanced” (inaczej 2048; `XCL_UMA_MB` nadal wygrywa). Budżet
     TitleMemoryStatus zostaje standardowy (13 824 / 8 192 MB) – liczby trybu „Advanced” nie są publiczne
     (docs.xbox.com za logowaniem), `title_memory_mb` w xcl.toml go nadpisuje.
 - Test: manifest testowy (`tests/data/testgame/MicrosoftGame.config`) ma te wartości, e2e sprawdza log launchera i
-  boot.json; `manifest::tests`, `affinity_masks_fold_onto_the_pc`.
+  boot.json; `manifest::tests`.
 
 ## Instrukcje spoza paczki, sterty konsoli, struktura (sesja 5, 2026-11-21)
 - **Pokrycie ISA** (`isa_coverage`, każda instrukcja dekodera osobno; MIMG z DMASK=1, VOP3_SDST z VCC – wcześniej

@@ -24,9 +24,6 @@ pub struct Config {
     pub title_memory: String,
     /// Persistent local storage quota (MiB); 0 = MicrosoftGame.Config, else 4096.
     pub pls_mb: u64,
-    /// SMT of the title's VM: "auto" (MicrosoftGame.Config, else on), "on" (7 cores,
-    /// 14 logical processors) or "off" (7).
-    pub smt: String,
     /// Unified (GPU-visible) memory (MiB, ≤ 4095); 0 = 4095 for "advanced" title memory,
     /// else 2048. `XCL_UMA_MB` overrides.
     pub uma_mb: u64,
@@ -78,13 +75,6 @@ impl Config {
                 None => 4096,
             };
         }
-        if self.smt == "auto" {
-            let on = manifest.and_then(|m| m.smt);
-            if let Some(v) = on {
-                from.push(format!("SMT {}", if v { "włączone" } else { "wyłączone" }));
-            }
-            self.smt = if on.unwrap_or(true) { "on" } else { "off" }.into();
-        }
         if self.uma_mb == 0 {
             self.uma_mb = if self.title_memory == "advanced" { 4095 } else { 2048 };
         }
@@ -97,15 +87,6 @@ impl Config {
             0 if self.device_type.eq_ignore_ascii_case("lockhart") => 8_192,
             0 => 13_824,
             v => v,
-        }
-    }
-
-    /// Logical processors of the title's VM: 7 cores, 2 threads each with SMT.
-    pub fn console_processors(&self) -> u32 {
-        if self.smt == "off" {
-            7
-        } else {
-            14
         }
     }
 }
@@ -126,7 +107,6 @@ impl Default for Config {
             title_memory_mb: 0,
             title_memory: "auto".into(),
             pls_mb: 0,
-            smt: "auto".into(),
             uma_mb: 0,
             log_level: "info".into(),
             log_to_stderr: true,

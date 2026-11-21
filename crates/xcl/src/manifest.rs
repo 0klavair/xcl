@@ -1,5 +1,6 @@
 //! The few `MicrosoftGame.Config` settings XCL uses (game manifest in the game folder):
-//! the persistent local storage quota, SMT and the title memory mode. Plain text search –
+//! the persistent local storage quota and the title memory mode (the title sees the PC's
+//! processors, so SMT does not matter). Plain text search –
 //! the file is small XML and only these elements matter.
 
 use std::path::Path;
@@ -8,8 +9,6 @@ use std::path::Path;
 pub struct Manifest {
     /// `<PersistentLocalStorage><SizeMB>`
     pub pls_mb: Option<u64>,
-    /// `<VirtualMachine><SMTEnabled>`
-    pub smt: Option<bool>,
     /// `<XboxAnacondaTitleMemory>` / `<XboxLockhartTitleMemory>`: "Standard" or "Advanced"
     pub anaconda_memory: Option<String>,
     pub lockhart_memory: Option<String>,
@@ -26,7 +25,6 @@ pub fn parse(xml: &str) -> Manifest {
     let pls = xml.find("<PersistentLocalStorage>").and_then(|i| element(&xml[i..], "SizeMB"));
     Manifest {
         pls_mb: pls.and_then(|v| v.parse().ok()),
-        smt: element(xml, "SMTEnabled").map(|v| v.eq_ignore_ascii_case("true")),
         anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
         lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
     }
@@ -62,7 +60,7 @@ mod tests {
   </VirtualMachine>
 </Game>"#;
         let m = parse(xml);
-        assert_eq!((m.pls_mb, m.smt), (Some(2048), Some(true)));
+        assert_eq!(m.pls_mb, Some(2048));
         assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
         assert_eq!(parse("<Game/>"), Manifest::default());
     }

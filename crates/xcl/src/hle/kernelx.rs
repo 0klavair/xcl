@@ -49,15 +49,6 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         GetThreadName,
         SetThreadpoolAffinityMask,
         QueryProcessorSchedulingStatistics,
-        GetSystemInfo,
-        GetNativeSystemInfo,
-        GetActiveProcessorCount,
-        GetMaximumProcessorCount,
-        GetCurrentProcessorNumber,
-        GetCurrentProcessorNumberEx,
-        SetThreadAffinityMask,
-        SetThreadIdealProcessor,
-        GetProcessAffinityMask,
         GetConsoleType,
         OutputDebugStringA,
         OutputDebugStringW,
@@ -455,104 +446,6 @@ pub unsafe extern "system" fn GetThreadName(h: HANDLE, buf: *mut u16, len: usize
     1
 }
 
-// ---------------------------------------------------------------------------------------
-// processors: the title sees its VM (7 cores, 14 logical processors with SMT – per-core
-// tables sized for that stay in range); affinity masks fold onto the PC's processors
-// ---------------------------------------------------------------------------------------
-
-fn console_cpus() -> u32 {
-    crate::state::config().console_processors()
-}
-
-fn pc_cpus() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| unsafe {
-        let mut si = std::mem::zeroed::<windows_sys::Win32::System::SystemInformation::SYSTEM_INFO>();
-        windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut si);
-        si.dwNumberOfProcessors.clamp(1, 64)
-    })
-}
-
-/// A mask over the title's logical processors → the same work spread over the PC's.
-pub fn fold_affinity(mask: usize, pc: u32) -> usize {
-    let mut out = 0usize;
-    for i in 0..usize::BITS {
-        if mask >> i & 1 == 1 {
-            out |= 1 << (i % pc);
-        }
-    }
-    if out == 0 {
-        (1usize << pc.min(63)) - 1
-    } else {
-        out
-    }
-}
-
-fn console_mask() -> usize {
-    (1usize << console_cpus()) - 1
-}
-
-unsafe fn patch_system_info(si: *mut windows_sys::Win32::System::SystemInformation::SYSTEM_INFO) {
-    if !si.is_null() {
-        (*si).dwNumberOfProcessors = console_cpus();
-        (*si).dwActiveProcessorMask = console_mask();
-    }
-}
-
-pub unsafe extern "system" fn GetSystemInfo(si: *mut windows_sys::Win32::System::SystemInformation::SYSTEM_INFO) {
-    windows_sys::Win32::System::SystemInformation::GetSystemInfo(si);
-    patch_system_info(si);
-}
-
-pub unsafe extern "system" fn GetNativeSystemInfo(si: *mut windows_sys::Win32::System::SystemInformation::SYSTEM_INFO) {
-    windows_sys::Win32::System::SystemInformation::GetNativeSystemInfo(si);
-    patch_system_info(si);
-}
-
-pub unsafe extern "system" fn GetActiveProcessorCount(_group: u16) -> u32 {
-    console_cpus()
-}
-
-pub unsafe extern "system" fn GetMaximumProcessorCount(_group: u16) -> u32 {
-    console_cpus()
-}
-
-pub unsafe extern "system" fn GetCurrentProcessorNumber() -> u32 {
-    thr::GetCurrentProcessorNumber() % console_cpus()
-}
-
-/// PROCESSOR_NUMBER { WORD Group; BYTE Number; BYTE Reserved; }
-pub unsafe extern "system" fn GetCurrentProcessorNumberEx(out: *mut [u8; 4]) {
-    if !out.is_null() {
-        *out = [0, 0, (GetCurrentProcessorNumber() & 0xFF) as u8, 0];
-    }
-}
-
-pub unsafe extern "system" fn SetThreadAffinityMask(thread: fnd::HANDLE, mask: usize) -> usize {
-    match thr::SetThreadAffinityMask(thread, fold_affinity(mask, pc_cpus())) {
-        0 => 0,
-        _ => console_mask(),
-    }
-}
-
-pub unsafe extern "system" fn SetThreadIdealProcessor(thread: fnd::HANDLE, ideal: u32) -> u32 {
-    // MAXIMUM_PROCESSORS (32 on x64 for this call) asks for the current one
-    let real = if ideal >= 32 { ideal } else { ideal % pc_cpus() };
-    match thr::SetThreadIdealProcessor(thread, real) {
-        u32::MAX => u32::MAX,
-        prev => prev % console_cpus(),
-    }
-}
-
-pub unsafe extern "system" fn GetProcessAffinityMask(_process: fnd::HANDLE, proc_mask: *mut usize, sys_mask: *mut usize) -> BOOL {
-    for p in [proc_mask, sys_mask] {
-        if !p.is_null() {
-            *p = console_mask();
-        }
-    }
-    1
-}
-
 pub unsafe extern "system" fn SetThreadpoolAffinityMask(_pool: *mut c_void, _mask: usize) -> BOOL {
     1
 }
@@ -912,18 +805,5 @@ mod tests {
         assert!(s.avail <= s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
-    }
-}
-
-#[cfg(test)]
-mod affinity_tests {
-    #[test]
-    fn affinity_masks_fold_onto_the_pc() {
-        use super::fold_affinity;
-        // 14 console processors on an 8-thread PC: 8..13 land on 0..5
-        assert_eq!(fold_affinity(1 << 13, 8), 1 << 5);
-        assert_eq!(fold_affinity(0x3FFF, 8), 0xFF);
-        assert_eq!(fold_affinity(1 << 3, 16), 1 << 3);
-        assert_eq!(fold_affinity(0, 4), 0xF, "empty mask: every PC processor");
     }
 }
