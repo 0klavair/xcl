@@ -151,8 +151,8 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
     INIT_COUNT.fetch_sub(1, Ordering::AcqRel);
 }
 
-pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(_feature: u32) -> bool {
-    true
+pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
+    matches!(feature, 0 | 2..=13 | 15..=21)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -590,6 +590,43 @@ pub unsafe extern "system" fn XStoreCloseContextHandle(_h: *mut c_void) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_availability_covers_the_public_feature_enum() {
+        let features = [
+            (0, "XAccessibility"),
+            (1, "XAppCapture"),
+            (2, "XAsync"),
+            (3, "XAsyncProvider"),
+            (4, "XDisplay"),
+            (5, "XGame"),
+            (6, "XGameInvite"),
+            (7, "XGameSave"),
+            (8, "XGameUI"),
+            (9, "XLauncher"),
+            (10, "XNetworking"),
+            (11, "XPackage"),
+            (12, "XPersistentLocalStorage"),
+            (13, "XSpeechSynthesizer"),
+            (14, "XStore"),
+            (15, "XSystem"),
+            (16, "XTaskQueue"),
+            (17, "XThread"),
+            (18, "XUser"),
+            (19, "XError"),
+            (20, "XGameEvent"),
+            (21, "XGameStreaming"),
+        ];
+        for (feature, name) in features {
+            assert_eq!(
+                unsafe { XGameRuntimeIsFeatureAvailable(feature) },
+                feature != 1 && feature != 14,
+                "unexpected availability for {name} ({feature})"
+            );
+        }
+        assert!(!unsafe { XGameRuntimeIsFeatureAvailable(22) });
+        assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
+    }
 
     #[test]
     fn user_add_and_queries() {
