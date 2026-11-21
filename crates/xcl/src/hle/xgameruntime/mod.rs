@@ -152,20 +152,7 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
 }
 
 pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
-    matches!(
-        feature,
-        2  // XAsync
-            | 3  // XAsyncProvider
-            | 5  // XGame
-            | 7  // XGameSave
-            | 11 // XPackage
-            | 12 // XPersistentLocalStorage
-            | 15 // XSystem
-            | 16 // XTaskQueue
-            | 17 // XThread
-            | 18 // XUser
-            | 19 // XError
-    )
+    matches!(feature, 0 | 2..=13 | 15..=21)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -605,15 +592,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn feature_availability_reports_only_implemented_families() {
-        let expected = [2, 3, 5, 7, 11, 12, 15, 16, 17, 18, 19];
-        for feature in 0..=21 {
+    fn feature_availability_covers_the_public_feature_enum() {
+        let features = [
+            (0, "XAccessibility"),
+            (1, "XAppCapture"),
+            (2, "XAsync"),
+            (3, "XAsyncProvider"),
+            (4, "XDisplay"),
+            (5, "XGame"),
+            (6, "XGameInvite"),
+            (7, "XGameSave"),
+            (8, "XGameUI"),
+            (9, "XLauncher"),
+            (10, "XNetworking"),
+            (11, "XPackage"),
+            (12, "XPersistentLocalStorage"),
+            (13, "XSpeechSynthesizer"),
+            (14, "XStore"),
+            (15, "XSystem"),
+            (16, "XTaskQueue"),
+            (17, "XThread"),
+            (18, "XUser"),
+            (19, "XError"),
+            (20, "XGameEvent"),
+            (21, "XGameStreaming"),
+        ];
+        for (feature, name) in features {
             assert_eq!(
                 unsafe { XGameRuntimeIsFeatureAvailable(feature) },
-                expected.contains(&feature),
-                "unexpected availability for public feature {feature}"
+                feature != 1 && feature != 14,
+                "unexpected availability for {name} ({feature})"
             );
         }
+        assert!(!unsafe { XGameRuntimeIsFeatureAvailable(22) });
         assert!(!unsafe { XGameRuntimeIsFeatureAvailable(u32::MAX) });
     }
 
