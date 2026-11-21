@@ -64,9 +64,27 @@ struct VoiceDetails {
     rate: u32,
 }
 
+#[repr(C, packed)]
+#[derive(Default)]
+struct VoiceState {
+    current_buffer_context: *mut c_void,
+    buffers_queued: u32,
+    samples_played: u64,
+}
+
 const END_OF_STREAM: u32 = 0x40;
 const XMA_CONTEXT: usize = 0x100;
 const PCM_CONTEXT: usize = 0x2_0000;
+const OPUS_CONTEXT: usize = 0x4000;
+
+// Five real 20 ms (960-sample) Hybrid FB mono Opus packets (100 ms total at 48 kHz).
+const OPUS_PACKETS: &[&[u8]] = &[
+    &[0x78, 0x81, 0x7b, 0xc6, 0x11, 0x76, 0xf4, 0x75, 0x00, 0x00, 0x07, 0x8e, 0xca, 0x69, 0xdb, 0xbb, 0xcc, 0x48, 0xdc, 0x16, 0xbd, 0x9b, 0xd3, 0x58, 0x27, 0x78, 0x93, 0xbc, 0x37, 0x44, 0x5e, 0xcf, 0x2d, 0x97, 0x00, 0x69, 0x80, 0x11, 0x80, 0x2c, 0x03, 0x38, 0xab, 0x45, 0x61, 0xfd, 0x89, 0xb7, 0x7e, 0x0d, 0x17, 0xbf, 0x20, 0xa5, 0x2b, 0xb5, 0xea, 0x2b, 0x5e, 0xd3, 0xa7, 0x48, 0xd1, 0x18, 0xf2, 0x0b, 0x5c, 0x01, 0x4f, 0x5f, 0xa1, 0x96, 0x21, 0xae, 0xde, 0xe0, 0x53, 0x00, 0xd6, 0x65, 0x65, 0x3f, 0x1f, 0xa6, 0xcb, 0xb9, 0x77, 0xbf, 0x97, 0x62, 0xc1, 0x12, 0xcf, 0x8d, 0xc2, 0x7d, 0xfd, 0x00, 0x80, 0xff, 0xfa, 0xc6, 0x88, 0xb6, 0xde, 0x10, 0xb8, 0x4f, 0xc6, 0x23, 0x6b, 0xea, 0x87, 0xc9, 0x05],
+    &[0x78, 0x9e, 0x1e, 0xa1, 0xe7, 0xfc, 0x95, 0x4d, 0x4e, 0xaa, 0x18, 0x0a, 0xca, 0x5d, 0x07, 0x64, 0x44, 0x34, 0x94, 0x45, 0x3e, 0x66, 0x66, 0xca, 0x44, 0xed, 0x1f, 0x0d, 0x44, 0x6b, 0xf3, 0x4f, 0xcc, 0xa5, 0x55, 0x45, 0x41, 0x9e, 0xb4, 0xf3, 0xfc, 0x13, 0x38, 0x65, 0x79, 0xed, 0x99, 0xf0, 0x1b, 0x7f, 0xbd, 0x3c, 0x92, 0x73, 0xd5, 0xee, 0x8f, 0xeb, 0xab, 0x76, 0x32, 0xa5, 0xf4, 0xa1, 0x0c, 0x35, 0xbe, 0xab, 0xbb, 0x61, 0x99, 0xbf, 0xbd],
+    &[0x78, 0x99, 0xc2, 0x5f, 0x75, 0x9c, 0xfc, 0x4b, 0x3a, 0x45, 0xab, 0x5a, 0x7e, 0x7d, 0x7b, 0x37, 0x7c, 0x02, 0xb4, 0x4a, 0x61, 0xf0, 0x89, 0x27, 0x87, 0xce, 0x50, 0xfb, 0xe3, 0xc3, 0x04, 0xcb, 0xaf, 0x99, 0x64, 0x7c, 0x17, 0x1a, 0x33, 0x8d, 0xeb, 0xae, 0xba, 0x19, 0x9b, 0xdb, 0xe1, 0xd7, 0x19, 0xb5, 0xc8, 0xa1, 0x79, 0xd6, 0x1c, 0xb3, 0x68, 0xe5, 0x2b, 0x25, 0x98, 0x0c, 0x5c, 0xbd, 0x64, 0x08, 0x11, 0xbb, 0x14, 0xd0, 0xbb, 0x08, 0x0d, 0xf9, 0xff, 0xdb, 0x05],
+    &[0x78, 0x99, 0xc2, 0x5f, 0x73, 0x2d, 0xd2, 0x2d, 0xed, 0xd7, 0x7f, 0xc4, 0x72, 0x9e, 0xe4, 0xeb, 0x27, 0x57, 0xa3, 0x16, 0xf3, 0xb3, 0xb6, 0x2c, 0x03, 0xfc, 0x49, 0x19, 0x83, 0x78, 0x64, 0x9d, 0x41, 0x4c, 0x6a, 0x16, 0xfc, 0x80, 0xea, 0x13, 0xc6, 0x03, 0x49, 0xbf, 0xa5, 0x19, 0x46, 0x91, 0x46, 0x8c, 0xc6, 0x1e, 0x3d, 0x86, 0xd9, 0x6e, 0x57, 0xa8, 0x95, 0x55, 0x90, 0x38, 0x9d, 0xf3, 0x03, 0x88, 0x71, 0x90, 0x83, 0x6f, 0x80, 0x8a, 0x96, 0x45, 0xb9, 0x64, 0xc3, 0xb6, 0x4d],
+    &[0x78, 0x99, 0xc2, 0x5f, 0x73, 0x2d, 0xd2, 0x31, 0x33, 0xbf, 0x7b, 0x34, 0x8a, 0x71, 0x0f, 0x77, 0xd5, 0xd5, 0x1b, 0xda, 0x78, 0xa4, 0x47, 0xbb, 0x8c, 0x85, 0x53, 0xbe, 0x21, 0xd6, 0x5f, 0x9f, 0x2e, 0xba, 0x38, 0xfa, 0x2d, 0x32, 0xbc, 0xa1, 0xd7, 0xce, 0xb0, 0x1b, 0x08, 0x44, 0x28, 0x21, 0xcb, 0x80, 0x40, 0xaf, 0xc4, 0x08, 0xdc, 0x96, 0xfd, 0xb6, 0x95, 0x96, 0xda, 0xf3, 0xae, 0x6c, 0x2b, 0x04, 0xc4, 0x23, 0xb8, 0x12, 0x45, 0x51, 0xf9, 0x5f, 0x9b, 0xb0, 0xc6, 0x86, 0xed, 0x08, 0x0c],
+];
 
 static BUFFER_END: AtomicUsize = AtomicUsize::new(0);
 static STREAM_END: AtomicUsize = AtomicUsize::new(0);
@@ -74,6 +92,8 @@ static VOICE_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static STARTED: OnceLock<Instant> = OnceLock::new();
 /// ms from Start to the end of the XMA2 buffer
 static XMA_END_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// ms from Start to the end of the Opus buffer
+static OPUS_END_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 // IXAudio2VoiceCallback (no IUnknown)
 #[repr(C)]
@@ -97,6 +117,10 @@ unsafe extern "system" fn on_buffer_end(_: *mut c_void, ctx: *mut c_void) {
     if ctx as usize == XMA_CONTEXT {
         if let Some(t0) = STARTED.get() {
             XMA_END_MS.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
+        }
+    } else if ctx as usize == OPUS_CONTEXT {
+        if let Some(t0) = STARTED.get() {
+            OPUS_END_MS.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
         }
     }
     BUFFER_END.fetch_add(ctx as usize, Ordering::SeqCst);
@@ -131,7 +155,9 @@ type CreateSourceVoice =
     unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *const c_void, u32, f32, *const c_void, *const c_void, *const c_void) -> i32;
 type CreateMasteringVoice = unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32, u32, u32, *const u16, *const c_void, u32) -> i32;
 type GetVoiceDetails = unsafe extern "system" fn(*mut c_void, *mut VoiceDetails);
+type SetVolume = unsafe extern "system" fn(*mut c_void, f32, u32) -> i32;
 type Submit = unsafe extern "system" fn(*mut c_void, *const Buffer, *const c_void) -> i32;
+type GetState = unsafe extern "system" fn(*mut c_void, *mut VoiceState, u32);
 type Start = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
 type Destroy = unsafe extern "system" fn(*mut c_void);
 type Release = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -217,21 +243,68 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if method::<Submit>(pv, 21)(pv, &pb, std::ptr::null()) != 0 {
             return Err("SubmitSourceBuffer(PCM)".into());
         }
+
+        // Opus mono 48 kHz (0x704F) in a 2048 B AWC-framed block – decoded to PCM16 by XCL
+        let opus_fmt = WaveFormatEx { tag: 0x704F, channels: 1, rate: 48_000, avg_bytes: 4000, block_align: 2048, bits: 0, cb_size: 0 };
+        let mut ov: *mut c_void = std::ptr::null_mut();
+        let hr = create_source(eng, &mut ov, &opus_fmt as *const WaveFormatEx as *const c_void, 0, 2.0, cb, std::ptr::null(), std::ptr::null());
+        if hr != 0 || ov.is_null() {
+            return Err(format!("CreateSourceVoice(Opus) → {:#x}", hr as u32));
+        }
+        let mut odet = VoiceDetails::default();
+        method::<GetVoiceDetails>(ov, 0)(ov, &mut odet);
+        if (odet.channels, odet.rate) != (1, 48_000) {
+            return Err(format!("Opus voice: {} ch., {} Hz", { odet.channels }, { odet.rate }));
+        }
+        let _ = method::<SetVolume>(ov, 12)(ov, 0.0, 0); // stay silent during automated tests
+        let mut opus_block = vec![0u8; 2048];
+        let mut pos = 0usize;
+        for &pkt in OPUS_PACKETS {
+            opus_block[pos..pos + 2].copy_from_slice(&(pkt.len() as u16).to_le_bytes());
+            opus_block[pos + 2..pos + 2 + pkt.len()].copy_from_slice(pkt);
+            pos += 2 + pkt.len();
+        }
+        let ob = Buffer {
+            flags: END_OF_STREAM,
+            audio_bytes: opus_block.len() as u32,
+            audio_data: opus_block.as_ptr(),
+            play_begin: 0,
+            play_length: 0, // decoded length: 5 * 960 = 4800 samples = 0.1 s
+            loop_begin: 0,
+            loop_length: 0,
+            loop_count: 0,
+            context: OPUS_CONTEXT as *mut c_void,
+        };
+        let hr = method::<Submit>(ov, 21)(ov, &ob, std::ptr::null());
+        if hr != 0 {
+            return Err(format!("SubmitSourceBuffer(Opus) → {:#x}", hr as u32));
+        }
+        let mut ost = VoiceState::default();
+        method::<GetState>(ov, 25)(ov, &mut ost, 0);
+        if { ost.current_buffer_context } as usize != OPUS_CONTEXT || { ost.buffers_queued } != 1 {
+            return Err(format!(
+                "Opus GetState: ctx={:#x}, queued={}",
+                { ost.current_buffer_context } as usize,
+                { ost.buffers_queued }
+            ));
+        }
+
         STARTED.get_or_init(Instant::now);
-        for v in [xv, pv] {
+        for v in [xv, pv, ov] {
             let hr = method::<Start>(v, 19)(v, 0, 0);
             if hr != 0 {
                 return Err(format!("Start → {:#x}", hr as u32));
             }
         }
+        let expected_ctx = XMA_CONTEXT + PCM_CONTEXT + OPUS_CONTEXT;
         let t0 = Instant::now();
-        while (BUFFER_END.load(Ordering::SeqCst) != XMA_CONTEXT + PCM_CONTEXT || STREAM_END.load(Ordering::SeqCst) < 2)
+        while (BUFFER_END.load(Ordering::SeqCst) != expected_ctx || STREAM_END.load(Ordering::SeqCst) < 3)
             && t0.elapsed() < Duration::from_secs(5)
         {
             std::thread::sleep(Duration::from_millis(10));
         }
         let ends = BUFFER_END.load(Ordering::SeqCst);
-        if ends != XMA_CONTEXT + PCM_CONTEXT || STREAM_END.load(Ordering::SeqCst) < 2 {
+        if ends != expected_ctx || STREAM_END.load(Ordering::SeqCst) < 3 {
             return Err(format!("callbacks: OnBufferEnd context sum {ends:#x}, OnStreamEnd {}", STREAM_END.load(Ordering::SeqCst)));
         }
         if VOICE_ERRORS.load(Ordering::SeqCst) != 0 {
@@ -243,12 +316,16 @@ pub fn xaudio2_console_voices() -> Result<(), String> {
         if !(70..=2000).contains(&ms) {
             return Err(format!("XMA2 buffer ended after {ms} ms (expected ≈100)"));
         }
-        println!("  (XMA2 buffer ended after {ms} ms)");
-        for v in [xv, pv, master] {
+        let oms = OPUS_END_MS.load(Ordering::SeqCst);
+        if !(70..=2000).contains(&oms) {
+            return Err(format!("Opus buffer ended after {oms} ms (expected ≈100)"));
+        }
+        println!("  (XMA2 buffer ended after {ms} ms; Opus buffer ended after {oms} ms)");
+        for v in [xv, pv, ov, master] {
             method::<Destroy>(v, 18)(v);
         }
         release(eng);
-        drop((packet, samples));
+        drop((packet, samples, opus_block));
         Ok(())
     }
 }
