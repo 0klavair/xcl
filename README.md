@@ -41,7 +41,7 @@ measurements and next steps:
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **XGameRuntime** | ✅ | the GDK thunk protocol real titles use; offline XUser, XGameSave, XPackage, XGame (title id), XSystem; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users and saves through the real call path |
+| **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
 | **Input** | ✅ | GameInput → the system GameInput | – |
 | **Audio** | 🟡 | XAudio2 → system XAudio2.9 (PCM / float voices) | unit tests; Opus / XMA2 voices are silent for now |
 
@@ -71,7 +71,7 @@ measurements and next steps:
 | D3D12.X draw records and `PresentX` / frame pacing | – | Xbox Live, Store licensing (offline by design) |
 | root arguments → shader registers for graphics | Opus / XMA2 audio decoding | decrypting XVC packages or any DRM |
 | texture creation in title memory (binding the detiler) | hull / domain / amplification shaders (none in the sample game) | console SDK headers / binaries in the repository |
-| the persistent-local-storage class and `XSystemGetDeviceType` slot of the thunk protocol | linear / 3D / MSAA tiled textures | |
+| – | linear / 3D / MSAA tiled textures | |
 | Bink GPU decoding, rehydrating prebuilt BVHs | performance work (GPU buffers live in system memory) | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

@@ -716,6 +716,16 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// A stand-in pipeline released for good takes its background-built real pipeline with it.
+unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        super::pso_async::release(super::pso_async::released(this as usize));
+    }
+    n
+}
+
 /// resource #11 GetGPUVirtualAddress for console code
 unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
@@ -1028,6 +1038,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
         Kind::Resource => v.push(("Release", res_release as usize)),
+        Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         _ => {}
     }

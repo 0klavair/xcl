@@ -17,6 +17,8 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// the stand-in was released before the real pipeline was built
+    orphan: std::sync::atomic::AtomicBool,
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -49,8 +51,13 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
                 } else {
                     BUILT.fetch_add(1, Ordering::Relaxed);
                 }
-                p.real.store(real, Ordering::Release);
-                *p.done.lock().unwrap() = true;
+                let mut done = p.done.lock().unwrap();
+                if p.orphan.load(Ordering::Acquire) {
+                    release(real);
+                } else {
+                    p.real.store(real, Ordering::Release);
+                }
+                *done = true;
                 p.cv.notify_all();
             });
         }
@@ -58,9 +65,16 @@ fn queue() -> &'static Mutex<mpsc::Sender<(Arc<Pending>, Job)>> {
     })
 }
 
+/// Release a pipeline state XCL owns (raw pointer, 0 = none).
+pub fn release(p: usize) {
+    if p != 0 {
+        unsafe { drop(<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState as windows::core::Interface>::from_raw(p as *mut std::ffi::c_void)) };
+    }
+}
+
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute });
+    let p = Arc::new(Pending { real: AtomicUsize::new(0), done: Mutex::new(false), cv: Condvar::new(), compute, orphan: Default::default() });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -100,6 +114,21 @@ pub fn resolve_for_bind(pso: usize) -> usize {
         Some(p) if p.compute => resolve_wait(pso),
         Some(_) => resolve(pso),
         None => pso,
+    }
+}
+
+/// The title released stand-in `pso` for good: forget it (its address may come back for
+/// another object) and return its real pipeline to release (0: none, or still being built –
+/// the worker's result is then released when it arrives).
+pub fn released(pso: usize) -> usize {
+    let Some(p) = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&pso)) else { return 0 };
+    let done = p.done.lock().unwrap();
+    if *done {
+        p.real.swap(0, Ordering::AcqRel)
+    } else {
+        // the worker stores its result into a Pending nobody will read: mark it orphaned
+        p.orphan.store(true, Ordering::Release);
+        0
     }
 }
 

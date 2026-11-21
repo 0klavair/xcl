@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod gamesave;
+pub mod gdk_table;
 pub mod taskqueue;
 pub mod xasync;
 
@@ -218,11 +219,11 @@ fn fixed64(s: &str) -> [u8; 64] {
     a
 }
 
+/// What a console reports: the Xbox OS build, family "Windows.Xbox".
 pub unsafe extern "system" fn XSystemGetAnalyticsInfo() -> XSystemAnalyticsInfo {
-    let (major, minor, build) = super::kernelx::host_os_version();
-    let v = XVersion { major: major as u16, minor: minor as u16, build: build as u16, revision: 0 };
+    let v = XVersion { major: 10, minor: 0, build: 25398, revision: 0 };
     let form = if crate::state::config().is_series_s() { "Xbox Series S" } else { "Xbox Series X" };
-    XSystemAnalyticsInfo { os_version: v, hosting_os_version: v, family: fixed64("Gaming"), form: fixed64(form) }
+    XSystemAnalyticsInfo { os_version: v, hosting_os_version: v, family: fixed64("Windows.Xbox"), form: fixed64(form) }
 }
 
 // ---------------------------------------------------------------------------------------

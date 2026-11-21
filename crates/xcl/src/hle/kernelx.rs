@@ -24,6 +24,11 @@ type BOOL = i32;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
     crate::hle_exports![
+        // registry: the console mode the GDK thunks read (XSystemGetDeviceType)
+        RegOpenKeyW,
+        RegOpenKeyExW,
+        RegQueryValueExW,
+        RegCloseKey,
         // memory
         VirtualAlloc,
         VirtualAllocEx,
@@ -508,6 +513,85 @@ pub unsafe extern "system" fn GetSystemOSVersion(out: *mut SystemOsVersionInfo) 
 }
 
 // ---------------------------------------------------------------------------------------
+// Registry: the console mode
+// ---------------------------------------------------------------------------------------
+//
+// The GDK thunks a title links compute XSystemGetDeviceType from
+// HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM, value ConsoleMode (REG_DWORD):
+// 0x64 Series X (XboxScarlettAnaconda), 0x60 Series S (Lockhart), 0x68 devkit, 0x40 / 0x50 /
+// 0x58 Xbox One S / X / devkit, no key = PC – read from the thunk in the game's XCurl.dll.
+// Only that key is answered here; everything else goes to the real registry.
+
+const OEM_KEY: &str = "software\\microsoft\\windows nt\\currentversion\\oem";
+/// handle of the answered key (never reaches the real registry)
+const OEM_HANDLE: usize = 0x5843_4C4F; // "XCLO"
+
+fn console_mode() -> u32 {
+    if crate::state::config().is_series_s() {
+        0x60
+    } else {
+        0x64
+    }
+}
+
+unsafe fn is_oem_key(root: usize, path: *const u16) -> bool {
+    let hklm = windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE as usize;
+    root == hklm && from_wide_ptr(path).is_some_and(|p| p.trim_start_matches('\\').eq_ignore_ascii_case(OEM_KEY))
+}
+
+pub unsafe extern "system" fn RegOpenKeyExW(root: usize, path: *const u16, options: u32, sam: u32, out: *mut usize) -> u32 {
+    if is_oem_key(root, path) && !out.is_null() {
+        crate::xlog_debug!("registry: OEM key → console mode {:#x}", console_mode());
+        *out = OEM_HANDLE;
+        return 0;
+    }
+    windows_sys::Win32::System::Registry::RegOpenKeyExW(root as _, path, options, sam, out as _)
+}
+
+pub unsafe extern "system" fn RegOpenKeyW(root: usize, path: *const u16, out: *mut usize) -> u32 {
+    if is_oem_key(root, path) && !out.is_null() {
+        *out = OEM_HANDLE;
+        return 0;
+    }
+    windows_sys::Win32::System::Registry::RegOpenKeyW(root as _, path, out as _)
+}
+
+pub unsafe extern "system" fn RegQueryValueExW(key: usize, name: *const u16, reserved: *mut u32, ty: *mut u32, data: *mut u8, size: *mut u32) -> u32 {
+    if key != OEM_HANDLE {
+        return windows_sys::Win32::System::Registry::RegQueryValueExW(key as _, name, reserved, ty, data, size);
+    }
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_MORE_DATA: u32 = 234;
+    if !from_wide_ptr(name).is_some_and(|n| n.eq_ignore_ascii_case("ConsoleMode")) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+    if !ty.is_null() {
+        *ty = 4; // REG_DWORD
+    }
+    if !data.is_null() {
+        if size.is_null() || *size < 4 {
+            if !size.is_null() {
+                *size = 4;
+            }
+            return ERROR_MORE_DATA;
+        }
+        std::ptr::copy_nonoverlapping(console_mode().to_le_bytes().as_ptr(), data, 4);
+    }
+    if !size.is_null() {
+        *size = 4;
+    }
+    0
+}
+
+pub unsafe extern "system" fn RegCloseKey(key: usize) -> u32 {
+    if key == OEM_HANDLE {
+        0
+    } else {
+        windows_sys::Win32::System::Registry::RegCloseKey(key as _)
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------------------
 
@@ -711,6 +795,31 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The GDK thunks' device type lookup: RegOpenKeyW(HKLM\…\OEM) + RegQueryValueExW(ConsoleMode).
+    #[test]
+    fn console_mode_registry_value() {
+        unsafe {
+            let hklm = windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE as usize;
+            let path = crate::util::wide("Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM");
+            let mut k = 0usize;
+            assert_eq!(RegOpenKeyW(hklm, path.as_ptr(), &mut k), 0);
+            let (mut ty, mut v, mut n) = (0u32, 0u32, 4u32);
+            let name = crate::util::wide("ConsoleMode");
+            assert_eq!(RegQueryValueExW(k, name.as_ptr(), std::ptr::null_mut(), &mut ty, &mut v as *mut u32 as *mut u8, &mut n), 0);
+            assert_eq!((ty, n), (4, 4));
+            assert_eq!(v, console_mode());
+            let other = crate::util::wide("Other");
+            assert_eq!(RegQueryValueExW(k, other.as_ptr(), std::ptr::null_mut(), &mut ty, &mut v as *mut u32 as *mut u8, &mut n), 2);
+            assert_eq!(RegCloseKey(k), 0);
+            // any other key: the real registry
+            let real = crate::util::wide("Software\\Microsoft\\Windows NT\\CurrentVersion");
+            let mut r = 0usize;
+            assert_eq!(RegOpenKeyExW(hklm, real.as_ptr(), 0, 0x20019, &mut r), 0);
+            assert_ne!(r, OEM_HANDLE);
+            assert_eq!(RegCloseKey(r), 0);
+        }
+    }
 
     #[test]
     fn console_alloc_flags_are_stripped() {

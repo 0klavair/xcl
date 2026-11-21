@@ -97,7 +97,7 @@ fn build(config: &Config) -> Registry {
         }
     }
     let k = idx(KERNELX);
-    for p in ["kernelx.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-*", "ext-ms-win-core-*"] {
+    for p in ["kernelx.dll", "kernel32.dll", "kernelbase.dll", "advapi32.dll", "api-ms-win-core-*", "ext-ms-win-core-*"] {
         routes.push((p.into(), Route::Hle(k)));
     }
     let x = idx(XGAMERUNTIME);

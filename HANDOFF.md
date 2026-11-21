@@ -536,6 +536,32 @@ Nothing open.
   Unexplained: 6 packets per subblock with a table difference of 12·960 – TOC 0xFC is CELT FB 20 ms **stereo**, so the table
   probably counts samples × channels.
 
+## XGameRuntime: objects from the GDK table, persistent local storage, device type (session 5, 2026-11-21)
+- **Persistent local storage gap:** class `f4faf4d4` / `41a4e10c` went to the PC runtime, which fails it (E_FAIL) for an
+  unpackaged process – a title would not get its PLS path. Now XCL's (GetPathSize / GetPath / GetSpaceInfo; the space a
+  title asks for is granted). Slots agree with the game's libHttpClient thunks (3: 1 ptr, 4: 3 args, 5: 1 ptr, 6, 7, 8).
+- **Device type:** `XSystemGetDeviceType` is computed in the thunk library, not through QueryApiImpl: `RegOpenKeyW(HKLM,
+  Software\Microsoft\Windows NT\CurrentVersion\OEM)` + `RegQueryValueExW(ConsoleMode)` – mapping read from the thunk in the
+  game's XCurl.dll: 0x60 → Lockhart (6), 0x64 → Anaconda (7), 0x68 → devkit (8), 0x40 / 0x50 / 0x58 → Xbox One S / X /
+  devkit, no key → PC (1). kernelx now answers `RegOpenKeyW` / `RegOpenKeyExW` / `RegQueryValueExW` / `RegCloseKey` for
+  that key only (0x64 or 0x60 by `device_type`); `advapi32.dll` imports go through kernelx (other functions still resolve
+  to advapi32 itself).
+- **GDK table** (`hle/xgameruntime/gdk_table.rs`, `scripts/gen_gdk_table.py`): 396 functions → (class, interface, slot) as
+  the public PC GDK's `xgameruntime.lib` calls them. XCL's objects are built from it **by function name** (`api::layout`):
+  a class's interface ids whose slots do not collide share one vtable – they are GDK versions appending functions (XUser:
+  base 3..36, `eb9bf948` 37–38, `079415e3` 42, `26f3c674` 43–46, `5131d685` 47–49); `cef4fac0` (XUserGetGamertag) has its
+  own. An interface id the table does not know (another GDK version: the game's libHttpClient asks XPackage `e2a4734b`,
+  the table has `0b9d556e`) gets the main vtable. Unimplemented functions are logged and reported by name.
+  The table agrees with the hand mapping from the game's thunks (test `vtables_follow_the_gdk_table`) and corrects two
+  guessed XPackage slots (EnumerateFeatures = 33, 27 = GetIdentifier).
+- **New in XCL:** XUser device association (registration tokens, FindForDevice → not found); XUser privilege / issue UI
+  (completed), sign-out deferral (not available), AddByIdWithUi, Platform* hooks, IsSignOutPresent / IsStoreUser (false),
+  SignOut; XPackage locale (Windows), chunks (all ready, install = done, estimate 0), write stats, kind (Game),
+  MountWithUi, EnumeratePackages (the game itself with its details); XSystem app-specific device id, handle tracking;
+  analytics (family "Windows.Xbox", OS 10.0.25398, Series X / S); runtime features (true); XDisplay (XLaunchUri refused,
+  timeout deferral); XGameEvent (offline: accepted, dropped). Refused: XStore, XAppBroadcast, XAppCapture.
+- Tests: `vtables_follow_the_gdk_table`, `console_mode_registry_value`, PLS in `thunk_protocol_with_xcl_objects_on_pc_queues`.
+
 ## Non-blocking pipeline creation (session 5, 2026-11-21)
 - **Gap:** DXC ran in the title's `Create*PipelineState` call: 0.2 s median, seconds for big programs – thousands of
   pipelines while a title loads meant minutes of stall on the first run (the DXIL disk cache helps only later runs).
@@ -554,7 +580,10 @@ Nothing open.
   in the background renders the same triangle pixel for pixel; a mesh pipeline returns after ~0.1 s, real after ~1 s,
   two-pass parts found through the stand-in, title's description freed before the worker ran); the game's BVH builder
   with an empty cache (52 programs compiled in the background, compute waited for at replay) builds BLAS + TLAS.
-- Not yet: releasing a stand-in does not release its real pipeline (pipelines live until the process ends).
+- Releasing a stand-in for good (PipelineState `Release` override) releases its real pipeline and forgets the address
+  (a later object at the same address must not resolve to it); a stand-in released while building: the worker's result is
+  released when it arrives. Tests: `pso_through_hook` returns the real pipeline (works with a cold DXIL cache), the
+  background test restores `XCL_DXIL_CACHE` through a guard.
 
 ## Title memory above 4 GB: UMA windows (session 5, 2026-11-21)
 - **Gap:** shaders addressed one `mem` buffer with the low 32 bits of the address, and D3D12 opens a heap from an
