@@ -595,7 +595,7 @@ fn main() {
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);
     check("D3D12.X: a texture in title memory (XG layout, #44) follows CPU writes", gpu::title_texture);
     check("D3D12.X: a texture in a streaming pool gets its texels once pages are mapped in", gpu::streamed_texture);
-    check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);
+    check("XAudio2: console flags/device, XMA2 & Opus voices decoded, PCM passes, callbacks", audio::xaudio2_console_voices);
 
     let failures = FAILURES.load(Ordering::SeqCst);
     println!("xcl_testtitle: done, failures: {failures}");

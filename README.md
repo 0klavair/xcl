@@ -43,7 +43,7 @@ measurements and next steps:
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
 | **Input** | ✅ | GameInput → the system GameInput | – |
-| **Audio** | 🟡 | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`) | unit + end-to-end tests; XMA2 voices are silent for now |
+| **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
 
@@ -68,9 +68,9 @@ measurements and next steps:
 
 | Needs a game executable | Not done yet | Not planned |
 |---|---|---|
-| D3D12.X draw records and `PresentX` / frame pacing | XMA2 audio decoding | Xbox Live, Store licensing (offline by design) |
-| root arguments → shader registers for graphics | performance work (GPU buffers live in system memory) | decrypting XVC packages or any DRM |
-| texture creation in title memory (binding the detiler), MSAA tiled textures | hull / domain / amplification shaders (none in the sample game) | console SDK headers / binaries in the repository |
+| D3D12.X draw records and `PresentX` / frame pacing | performance work (GPU buffers live in system memory) | Xbox Live, Store licensing (offline by design) |
+| root arguments → shader registers for graphics | hull / domain / amplification shaders (none in the sample game) | decrypting XVC packages or any DRM |
+| texture creation in title memory (binding the detiler), MSAA tiled textures | | console SDK headers / binaries in the repository |
 | Bink GPU decoding, rehydrating prebuilt BVHs | | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

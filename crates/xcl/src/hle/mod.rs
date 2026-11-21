@@ -17,6 +17,7 @@ pub mod dxcompiler;
 pub mod kernelx;
 pub mod opus;
 pub mod xaudio2;
+pub mod xma2;
 pub mod xg;
 pub mod xgameruntime;
 
