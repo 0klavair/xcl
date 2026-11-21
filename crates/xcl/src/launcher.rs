@@ -200,6 +200,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     };
     let exe = if !config.exe.is_empty() && root.join(&config.exe).is_file() { root.join(&config.exe) } else { exe };
     config.exe = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let manifest = crate::manifest::load(&root);
+    let from_manifest = config.resolve(manifest.as_ref());
     crate::tls::cleanup_cache(&data_dir.join("cache"));
     let boot = Boot { title: title.clone(), exe_path: exe.clone(), game_root: root.clone(), data_dir: data_dir.clone(), config };
     let boot_path = data_dir.join("cache").join("boot.json");
@@ -212,6 +214,9 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     println!("XCL {} – uruchamiam '{title}'", env!("CARGO_PKG_VERSION"));
     println!("  exe:   {}", exe.display());
     println!("  dane:  {}", data_dir.display());
+    if !from_manifest.is_empty() {
+        println!("  MicrosoftGame.Config: {}", from_manifest.join(", "));
+    }
     match crate::inspect::console_imports(&exe) {
         Some(c) if c.is_empty() => println!(
             "  UWAGA: ten plik nie importuje żadnej biblioteki konsoli (kernelx / xgameruntime / d3d12_xs) –\n         to raczej zwykły program Windows, a nie gra z Xbox Series."

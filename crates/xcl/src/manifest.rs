@@ -1,0 +1,69 @@
+//! The few `MicrosoftGame.Config` settings XCL uses (game manifest in the game folder):
+//! the persistent local storage quota, SMT and the title memory mode. Plain text search –
+//! the file is small XML and only these elements matter.
+
+use std::path::Path;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    /// `<PersistentLocalStorage><SizeMB>`
+    pub pls_mb: Option<u64>,
+    /// `<VirtualMachine><SMTEnabled>`
+    pub smt: Option<bool>,
+    /// `<XboxAnacondaTitleMemory>` / `<XboxLockhartTitleMemory>`: "Standard" or "Advanced"
+    pub anaconda_memory: Option<String>,
+    pub lockhart_memory: Option<String>,
+}
+
+fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let at = xml.find(&open)? + open.len();
+    let end = xml[at..].find(&format!("</{name}>"))?;
+    Some(xml[at..at + end].trim())
+}
+
+pub fn parse(xml: &str) -> Manifest {
+    let pls = xml.find("<PersistentLocalStorage>").and_then(|i| element(&xml[i..], "SizeMB"));
+    Manifest {
+        pls_mb: pls.and_then(|v| v.parse().ok()),
+        smt: element(xml, "SMTEnabled").map(|v| v.eq_ignore_ascii_case("true")),
+        anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
+        lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
+    }
+}
+
+/// `MicrosoftGame.Config` of a game folder (None: no manifest).
+pub fn load(game_root: &Path) -> Option<Manifest> {
+    let p = std::fs::read_dir(game_root).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.Config")))?;
+    let raw = std::fs::read(p).ok()?;
+    // UTF-8 or UTF-16 LE (with BOM)
+    let text = if raw.starts_with(&[0xFF, 0xFE]) {
+        String::from_utf16_lossy(&raw[2..].chunks(2).map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)])).collect::<Vec<_>>())
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    Some(parse(&text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_settings_xcl_uses() {
+        let xml = r#"<Game configVersion="1">
+  <PersistentLocalStorage>
+    <SizeMB>2048</SizeMB>
+  </PersistentLocalStorage>
+  <VirtualMachine>
+    <SMTEnabled>true</SMTEnabled>
+    <XboxLockhartTitleMemory>Advanced</XboxLockhartTitleMemory>
+    <XboxAnacondaTitleMemory>Advanced</XboxAnacondaTitleMemory>
+  </VirtualMachine>
+</Game>"#;
+        let m = parse(xml);
+        assert_eq!((m.pls_mb, m.smt), (Some(2048), Some(true)));
+        assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
+        assert_eq!(parse("<Game/>"), Manifest::default());
+    }
+}

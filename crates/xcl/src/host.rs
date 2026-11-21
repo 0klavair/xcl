@@ -25,6 +25,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::xlog_info!("gra: {} (folder tylko do odczytu: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("dane XCL: {}", boot.data_dir.display());
 
+    if std::env::var_os("XCL_UMA_MB").is_none() && boot.config.uma_mb != 0 {
+        std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
+    }
     crate::state::set_boot(boot.clone());
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);

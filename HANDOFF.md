@@ -536,6 +536,20 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## MicrosoftGame.Config (sesja 5, 2026-11-21)
+- Z manifestu gry (od użytkownika; reszta pliku bez znaczenia dla XCL): `PersistentLocalStorage/SizeMB` = 2048,
+  `VirtualMachine/SMTEnabled` = true, `XboxAnacondaTitleMemory` / `XboxLockhartTitleMemory` = Advanced.
+- `manifest.rs` (NOWE) czyta te pola z folderu gry; `Config::resolve` (launcher) wypełnia ustawienia „auto”:
+  - `pls_mb` → XPersistentLocalStorageGetSpaceInfo (było na sztywno 4 GiB);
+  - `smt` → kernelx: GetSystemInfo / GetNativeSystemInfo / GetActive/MaximumProcessorCount = **14** (7 rdzeni × SMT;
+    7 bez SMT), GetCurrentProcessorNumber(Ex) modulo 14 (tablice per rdzeń w grze), SetThreadAffinityMask /
+    SetThreadIdealProcessor / GetProcessAffinityMask – maski konsoli składane na procesory PC (`fold_affinity`);
+  - `title_memory` → `uma_mb` 4095 dla „advanced” (inaczej 2048; `XCL_UMA_MB` nadal wygrywa). Budżet
+    TitleMemoryStatus zostaje standardowy (13 824 / 8 192 MB) – liczby trybu „Advanced” nie są publiczne
+    (docs.xbox.com za logowaniem), `title_memory_mb` w xcl.toml go nadpisuje.
+- Test: manifest testowy (`tests/data/testgame/MicrosoftGame.config`) ma te wartości, e2e sprawdza log launchera i
+  boot.json; `manifest::tests`, `affinity_masks_fold_onto_the_pc`.
+
 ## Instrukcje spoza paczki, sterty konsoli, struktura (sesja 5, 2026-11-21)
 - **Pokrycie ISA** (`isa_coverage`, każda instrukcja dekodera osobno; MIMG z DMASK=1, VOP3_SDST z VCC – wcześniej
   fałszywe braki): **975 / 1157 (84,3%)**, było 766. Dodane (test GPU `gpu_more_atomics_sub_dword_scratch_valu` +

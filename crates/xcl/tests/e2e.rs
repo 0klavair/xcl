@@ -94,6 +94,12 @@ fn test_title_runs_and_game_folder_is_untouched() {
     // (2) the game folder is untouched
     assert_eq!(snapshot(&game), before, "FOLDER GRY ZOSTAŁ ZMIENIONY");
 
+    // (2b) MicrosoftGame.config (tests/data/testgame): PLS quota, SMT and the title memory mode
+    assert!(stdout.contains("MicrosoftGame.Config: pamięć tytułu Advanced, PLS 2048 MB, SMT włączone"), "launcher: {stdout}");
+    let boot: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(data.join("XCL.TestTitle").join("cache").join("boot.json")).unwrap()).unwrap();
+    let c = &boot["config"];
+    assert_eq!((c["pls_mb"].as_u64(), c["smt"].as_str(), c["title_memory"].as_str(), c["uma_mb"].as_u64()), (Some(2048), Some("on"), Some("advanced"), Some(4095)));
+
     // (3) overlay contents
     let tdata = data.join("XCL.TestTitle");
     let ov = tdata.join("overlay").join("data");

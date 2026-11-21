@@ -17,8 +17,19 @@ pub struct Config {
     pub user_id: u64,
     pub console_id: String,
     pub sandbox_id: String,
-    /// Title memory budget reported by TitleMemoryStatus (MiB).
+    /// Title memory budget reported by TitleMemoryStatus (MiB); 0 = the standard budget of
+    /// `device_type` (13 824 Series X, 8 192 Series S).
     pub title_memory_mb: u64,
+    /// "auto" (MicrosoftGame.Config), "standard" or "advanced" title memory mode.
+    pub title_memory: String,
+    /// Persistent local storage quota (MiB); 0 = MicrosoftGame.Config, else 4096.
+    pub pls_mb: u64,
+    /// SMT of the title's VM: "auto" (MicrosoftGame.Config, else on), "on" (7 cores,
+    /// 14 logical processors) or "off" (7).
+    pub smt: String,
+    /// Unified (GPU-visible) memory (MiB, ≤ 4095); 0 = 4095 for "advanced" title memory,
+    /// else 2048. `XCL_UMA_MB` overrides.
+    pub uma_mb: u64,
     pub log_level: String,
     pub log_to_stderr: bool,
     /// Executable inside the game folder (auto-detected when empty).
@@ -42,6 +53,63 @@ pub struct Config {
     pub window_height: u32,
 }
 
+impl Config {
+    /// Fill the "auto" settings from the game's MicrosoftGame.Config (if any); afterwards every
+    /// setting has a concrete value. Returns what came from the manifest (for the log).
+    pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
+        let mut from = Vec::new();
+        let series_s = self.device_type.eq_ignore_ascii_case("lockhart");
+        if self.title_memory == "auto" {
+            let m = manifest.and_then(|m| if series_s { m.lockhart_memory.clone() } else { m.anaconda_memory.clone() });
+            if let Some(m) = &m {
+                from.push(format!("pamięć tytułu {m}"));
+            }
+            self.title_memory = m.unwrap_or_else(|| "standard".into()).to_ascii_lowercase();
+        }
+        // the standard budgets; "advanced" adds memory the console docs do not give publicly –
+        // the standard figure stays (xcl.toml can raise it)
+        self.title_memory_mb = self.title_memory_budget_mb();
+        if self.pls_mb == 0 {
+            self.pls_mb = match manifest.and_then(|m| m.pls_mb) {
+                Some(v) => {
+                    from.push(format!("PLS {v} MB"));
+                    v
+                }
+                None => 4096,
+            };
+        }
+        if self.smt == "auto" {
+            let on = manifest.and_then(|m| m.smt);
+            if let Some(v) = on {
+                from.push(format!("SMT {}", if v { "włączone" } else { "wyłączone" }));
+            }
+            self.smt = if on.unwrap_or(true) { "on" } else { "off" }.into();
+        }
+        if self.uma_mb == 0 {
+            self.uma_mb = if self.title_memory == "advanced" { 4095 } else { 2048 };
+        }
+        from
+    }
+
+    /// TitleMemoryStatus budget (MiB): `title_memory_mb`, 0 = the device's standard budget.
+    pub fn title_memory_budget_mb(&self) -> u64 {
+        match self.title_memory_mb {
+            0 if self.device_type.eq_ignore_ascii_case("lockhart") => 8_192,
+            0 => 13_824,
+            v => v,
+        }
+    }
+
+    /// Logical processors of the title's VM: 7 cores, 2 threads each with SMT.
+    pub fn console_processors(&self) -> u32 {
+        if self.smt == "off" {
+            7
+        } else {
+            14
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut mounts = BTreeMap::new();
@@ -55,7 +123,11 @@ impl Default for Config {
             user_id: 0x0009_0000_0000_0001,
             console_id: "XCL00000000000000000000000000000000000001".into(),
             sandbox_id: "RETAIL".into(),
-            title_memory_mb: 13_824,
+            title_memory_mb: 0,
+            title_memory: "auto".into(),
+            pls_mb: 0,
+            smt: "auto".into(),
+            uma_mb: 0,
             log_level: "info".into(),
             log_to_stderr: true,
             exe: String::new(),
@@ -136,7 +208,7 @@ mod tests {
         let s = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_eq!(back.mounts.get("G:").map(String::as_str), Some("{game}"));
-        assert_eq!(back.title_memory_mb, 13_824);
+        assert_eq!(back.title_memory_mb, 0);
     }
 
     #[test]

@@ -328,7 +328,11 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
     }
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     GetDiskFreeSpaceExW(crate::util::wide(&pls_path()).as_ptr(), &mut avail, &mut total, &mut free);
-    let budget = 4u64 << 30; // report a 4 GiB PLS quota
+    // the title's quota (MicrosoftGame.Config <PersistentLocalStorage><SizeMB>, else 4 GiB)
+    let budget = match crate::state::config().pls_mb {
+        0 => 4096,
+        mb => mb,
+    } << 20;
     *info = XPersistentLocalStorageSpaceInfo {
         available_free_bytes: avail.min(budget),
         total_free_bytes: free.min(budget),
