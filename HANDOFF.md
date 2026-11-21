@@ -599,6 +599,8 @@ Console GPU addresses in unified memory are the title's own: memory operations g
   output for SetFrameIntervalX through `device.As(&dxgiDevice) → GetAdapter → EnumOutputs(0)` and ThrowIfFailed –
   a PC D3D12 device answers E_NOINTERFACE. `d3d12x/dxgi_device.rs`: a small object with the device's real adapter
   (by LUID); every other interface is the device's. EnqueueSetEvent is not supported (needs the title's queues).
+  Console code only (device #0 split): DXGI asks a D3D12 device for IDXGIDevice / IDXGIObject while creating a swap
+  chain, and answering it made that crash now and then.
 - `XMemVirtualAlloc(address, size, type, XALLOC_ATTRIBUTES, protect)` (kernelx; also found by name for `xmem.dll`
   imports): a graphics memory type allocates in unified memory, as MEM_GRAPHICS. It was a stub returning null.
 - Looked at (independent projects, only facts taken): GDKScarlett (Xbox One `d3d12_x` titles, GCN shaders; its
