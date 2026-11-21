@@ -444,6 +444,9 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
 /// its contents.
 const PHYS_PAGE: usize = 0x1_0000;
 
+/// Size of one console physical page (64 KiB).
+pub const PHYS_PAGE_SIZE: usize = PHYS_PAGE;
+
 /// first page number → (pages in the block, pages still allocated)
 static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
@@ -462,6 +465,65 @@ fn page_home(page: usize) -> Option<usize> {
     let blocks = PHYS_BLOCKS.lock().ok()?;
     let (&first, &(count, live)) = blocks.range(..=index).next_back()?;
     (live > 0 && index < first.checked_add(count)?).then(|| u.base().checked_add(index.checked_mul(PHYS_PAGE)?)).flatten().filter(|&p| p + PHYS_PAGE <= u.base() + u.size())
+}
+
+/// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
+/// Caller must hold `AWAY`.
+fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: usize, len: usize) -> Option<Vec<usize>> {
+    if offset >= PHYS_PAGE {
+        return None;
+    }
+    let span = offset.checked_add(len)?;
+    let need = span.div_ceil(PHYS_PAGE);
+    if pages.len() < need {
+        return None;
+    }
+    let mut addrs = Vec::with_capacity(need);
+    for &p in &pages[..need] {
+        let home = page_home(p)?;
+        let addr = away.and_then(|a| a.page.get(&p).copied()).unwrap_or(home);
+        addrs.push(addr);
+    }
+    Some(addrs)
+}
+
+/// Copy `dst.len()` bytes starting at `offset` within `pages` (each a 64 KiB physical page
+/// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
+/// `pages` is too short, or any page is not a live allocation.
+pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return offset < PHYS_PAGE;
+    }
+    let g = AWAY.lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, dst.len()) else { return false };
+    let mut done = 0;
+    let mut page_off = offset;
+    for addr in addrs {
+        let chunk = (PHYS_PAGE - page_off).min(dst.len() - done);
+        std::ptr::copy_nonoverlapping((addr + page_off) as *const u8, dst.as_mut_ptr().add(done), chunk);
+        done += chunk;
+        page_off = 0;
+    }
+    true
+}
+
+/// Copy `src` into `pages` starting at `offset` within the first page. Validates every page
+/// before writing so the destination gets all bytes or nothing.
+pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -> bool {
+    if src.is_empty() {
+        return offset < PHYS_PAGE;
+    }
+    let g = AWAY.lock().unwrap();
+    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else { return false };
+    let mut done = 0;
+    let mut page_off = offset;
+    for addr in addrs {
+        let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
+        std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
+        done += chunk;
+        page_off = 0;
+    }
+    true
 }
 
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).

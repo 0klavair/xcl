@@ -7,10 +7,14 @@
 //!   SetDebugFlags(flags), SetStagingBufferSize(bytes), then 7 more,
 //! * queue desc (0x18): source type u32 @0 (0 file, 1 memory), capacity u16 @8, priority i8
 //!   @10 (-1 … 2; memory queues 2), name @0x10,
-//! * request (0x48): options u64 @0 (compression = bits 0–7: 0 none, 1 zlib; bit 22 memory
-//!   source), destination @8, destination size u32 @0x18, source @0x20 (an IDStorageFileX or
-//!   memory), file offset @0x28, source size u32 @0x30, intermediate size u32 @0x34,
-//!   cancellation tag @0x38, name @0x40,
+//! * request (0x48): options u64 @0 (`DSTORAGE_REQUEST_OPTIONS`: bit 0 `ZlibDecompress`,
+//!   bits 1–4 `BcpackMode`, bits 5–20 `SwizzleMode`, bit 21 `DestinationIsPhysicalPages`,
+//!   bit 22 `SourceType` (0 file / 1 memory), bit 23 `SourceIsPhysicalPages`),
+//!   destination @8 (`void*` virtual/UMA address or `PULONG_PTR DestinationPageArray`),
+//!   `DestinationPageOffset` u16 @0x10, destination size u32 @0x18,
+//!   source @0x20 (`IDStorageFileX*`, `const void*`, or `PULONG_PTR SourcePageArray`),
+//!   file offset u64 / `SourcePageOffset` u16 @0x28, source size u32 @0x30,
+//!   intermediate size u32 @0x34, cancellation tag @0x38, name @0x40,
 //! * queue: QueryInterface, AddRef, Release, EnqueueRequest, EnqueueStatus(array, index),
 //!   EnqueueSignal(fence, value), Submit, CancelRequestsWithTag(mask, value), Close,
 //!   GetErrorEvent, RetrieveErrorRecord (0x290 bytes), Query (0x1C: the desc, then empty
@@ -65,7 +69,27 @@ const IID_FILE: GUID = GUID::from_u128(0x43704f9f_27c6_4a9f_8815_d16527894df4);
 const IID_QUEUE: GUID = GUID::from_u128(0xa3f6649a_8c2c_4b3a_8b6e_10186a04b9bc);
 const IID_STATUS_ARRAY: GUID = GUID::from_u128(0xcd66d752_2786_44f7_9070_e2a6fdad3f1b);
 
+/// Console `DSTORAGE_REQUEST_OPTIONS` bitfields (Xbox Series X|S `dstorage_xs.h`):
+/// - bit  0      : `ZlibDecompress` (1 bit: RFC 1950 zlib)
+/// - bits 1..=4  : `BcpackMode` (4 bits: 0 = none, 1..=7 = BC1..BC7)
+/// - bits 5..=20 : `SwizzleMode` (16 bits: 0 = none, 1..=4 = hardware texture swizzle)
+/// - bit  21     : `DestinationIsPhysicalPages` (1 bit)
+/// - bit  22     : `SourceType` (1 bit: 0 = file, 1 = memory)
+/// - bit  23     : `SourceIsPhysicalPages` (1 bit)
+/// - bits 24..=63: `Reserved` (40 bits)
+///
+/// Unlike PC DirectStorage (`dstorage.h`), Xbox Series X|S is UMA: placed D3D12 buffers and
+/// textures live at virtual addresses in UMA or graphics reservations (tracked by
+/// `MEM_WRITE_WATCH`), or in 64 KiB physical page arrays from `AllocateTitlePhysicalPages`.
+const ZLIB_BIT: u64 = 1 << 0;
+const BCPACK_SHIFT: u32 = 1;
+const BCPACK_MASK: u64 = 0xF << BCPACK_SHIFT;
+const SWIZZLE_SHIFT: u32 = 5;
+const SWIZZLE_MASK: u64 = 0xFFFF << SWIZZLE_SHIFT;
+const DEST_PHYS_PAGES_BIT: u64 = 1 << 21;
 const SOURCE_MEMORY_BIT: u64 = 1 << 22;
+const SOURCE_PHYS_PAGES_BIT: u64 = 1 << 23;
+const KNOWN_OPTIONS_MASK: u64 = (1u64 << 24) - 1;
 const REQUEST_BYTES: usize = 0x48;
 const ERROR_RECORD_BYTES: usize = 0x290;
 const NO_COMMAND: u32 = 0xFFFF_FFFF;
@@ -343,9 +367,11 @@ unsafe extern "system" fn status_get_hresult(p: *mut c_void, index: u32) -> HRES
 struct Request {
     options: u64,
     destination: u64,
+    destination_page_offset: u16,
     destination_size: u32,
     source: u64,
     offset: u64,
+    source_page_offset: u16,
     source_size: u32,
     intermediate_size: u32,
     tag: u64,
@@ -355,45 +381,122 @@ impl Request {
     fn parse(b: &[u8; REQUEST_BYTES]) -> Request {
         let q = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
         let d = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-        let memory = q(0) & SOURCE_MEMORY_BIT != 0;
+        let w = |o: usize| u16::from_le_bytes(b[o..o + 2].try_into().unwrap());
+        let options = q(0);
+        let memory = options & SOURCE_MEMORY_BIT != 0;
+        let dest_phys = options & DEST_PHYS_PAGES_BIT != 0;
+        let src_phys = memory && (options & SOURCE_PHYS_PAGES_BIT != 0);
         Request {
-            options: q(0),
+            options,
             destination: q(8),
+            destination_page_offset: if dest_phys { w(0x10) } else { 0 },
             destination_size: d(0x18),
             source: q(0x20),
             offset: if memory { 0 } else { q(0x28) },
+            source_page_offset: if src_phys { w(0x28) } else { 0 },
             source_size: d(0x30),
             intermediate_size: d(0x34),
             tag: q(0x38),
         }
     }
 
+    fn zlib(&self) -> bool {
+        self.options & ZLIB_BIT != 0
+    }
+
+    fn bcpack(&self) -> u8 {
+        ((self.options & BCPACK_MASK) >> BCPACK_SHIFT) as u8
+    }
+
+    fn swizzle(&self) -> u16 {
+        ((self.options & SWIZZLE_MASK) >> SWIZZLE_SHIFT) as u16
+    }
+
+    fn dest_physical_pages(&self) -> bool {
+        self.options & DEST_PHYS_PAGES_BIT != 0
+    }
+
     fn memory_source(&self) -> bool {
         self.options & SOURCE_MEMORY_BIT != 0
     }
 
-    fn compression(&self) -> u8 {
-        self.options as u8
+    fn source_physical_pages(&self) -> bool {
+        self.options & SOURCE_PHYS_PAGES_BIT != 0
     }
 
     /// What a queue of `source_memory` refuses at enqueue.
     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
-        if self.memory_source() != source_memory {
+        if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
             return Err(E_SOURCE_TYPE);
         }
         if self.destination == 0 || (self.memory_source() && self.source == 0) {
             return Err(E_ACCESS_VIOLATION);
         }
-        let sizes_ok = match self.compression() {
-            0 => self.destination_size == self.source_size,
-            1 => self.destination_size > self.source_size,
-            _ => return Err(E_DECOMPRESSION),
-        };
-        if !sizes_ok || (self.intermediate_size != 0 && self.intermediate_size != self.destination_size) {
-            return Err(E_DESTINATION_SIZE);
+        if self.options & !KNOWN_OPTIONS_MASK != 0 {
+            warn_once("DSTORAGE_REQUEST_OPTIONS", format_args!("unknown high option bits {:#x}", self.options & !KNOWN_OPTIONS_MASK));
+        }
+        if self.swizzle() != 0 {
+            warn_once("SwizzleMode", format_args!("hardware swizzle mode {} unsupported", self.swizzle()));
+            return Err(E_DECOMPRESSION);
+        }
+        match (self.zlib(), self.bcpack()) {
+            // Uncompressed copy: source and destination sizes must match.
+            (false, 0) => {
+                if self.destination_size != self.source_size || (self.intermediate_size != 0 && self.intermediate_size != self.destination_size) {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            }
+            // Zlib decompression: if `intermediate_size > 0`, inflate into an intermediate buffer
+            // of that size (`source_size < intermediate_size <= destination_size`) before copying.
+            (true, 0) => {
+                if self.intermediate_size == 0 {
+                    if self.destination_size <= self.source_size {
+                        return Err(E_DESTINATION_SIZE);
+                    }
+                } else if self.intermediate_size <= self.source_size || self.intermediate_size > self.destination_size {
+                    return Err(E_DESTINATION_SIZE);
+                }
+            }
+            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack.
+            (true, bc) => {
+                if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
+                    return Err(E_DESTINATION_SIZE);
+                }
+                warn_once(
+                    "BCPack",
+                    format_args!("zlib + BCPack mode {bc} unsupported (src={}, intermediate={}, dst={})", self.source_size, self.intermediate_size, self.destination_size),
+                );
+                return Err(E_DECOMPRESSION);
+            }
+            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
+            (false, bc) => {
+                if self.intermediate_size != 0 {
+                    return Err(E_DESTINATION_SIZE);
+                }
+                warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
+                return Err(E_DECOMPRESSION);
+            }
         }
         Ok(())
     }
+}
+
+/// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
+unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
+    if byte_len == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(span) = (offset as usize).checked_add(byte_len as usize) else {
+        return Err(E_DESTINATION_SIZE);
+    };
+    let count = span.div_ceil(crate::hle::kernelx::PHYS_PAGE_SIZE);
+    let Some(bytes) = count.checked_mul(std::mem::size_of::<usize>()) else {
+        return Err(E_ACCESS_VIOLATION);
+    };
+    if !crate::gpu::shader::readable(ptr as usize, bytes) {
+        return Err(E_ACCESS_VIOLATION);
+    }
+    Ok(std::slice::from_raw_parts(ptr as *const usize, count).to_vec())
 }
 
 /// Whether `n` bytes at `p` are committed, writable memory.
@@ -428,33 +531,59 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    if !writable(r.destination as usize, n) {
+    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
-        if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
-            return Err(E_ACCESS_VIOLATION);
+        let mut b = vec![0u8; r.source_size as usize];
+        if r.source_physical_pages() {
+            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            if !b.is_empty() {
+                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
+            }
         }
-        std::slice::from_raw_parts(r.source as *const u8, r.source_size as usize).to_vec()
+        b
     } else {
         let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
         let mut b = vec![0u8; r.source_size as usize];
         read_exact_at(&f, r.offset, &mut b)?;
         b
     };
-    let out = std::slice::from_raw_parts_mut(r.destination as *mut u8, n);
-    match r.compression() {
-        0 => out.copy_from_slice(&src[..n]),
-        1 => {
-            let d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, n).map_err(|_| E_ZLIB_DATA)?;
-            if d.len() != n {
-                return Err(E_ZLIB_DATA);
-            }
-            out.copy_from_slice(&d);
+
+    if r.swizzle() != 0 || r.bcpack() != 0 {
+        return Err(E_DECOMPRESSION);
+    }
+
+    let payload: Vec<u8> = if r.zlib() {
+        let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        if d.len() != stage1_len {
+            return Err(E_ZLIB_DATA);
         }
-        _ => return Err(E_DECOMPRESSION),
+        if d.len() < n {
+            d.resize(n, 0);
+        }
+        d
+    } else {
+        src
+    };
+
+    if r.dest_physical_pages() {
+        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+    } else if n > 0 {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
     }
     Ok(())
 }
@@ -463,13 +592,56 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>) -> Result<(), HRESULT> 
 // queues
 // ---------------------------------------------------------------------------------------
 
+/// RAII wrapper holding one COM reference to an `ID3D12Fence` so it is never leaked on
+/// queue close, cancellation, or drop.
+struct FenceRef(usize);
+
+impl FenceRef {
+    unsafe fn signal(&self, value: u64) {
+        let vt = *(self.0 as *const *const usize);
+        let signal: unsafe extern "system" fn(usize, u64) -> HRESULT = std::mem::transmute(*vt.add(FENCE_SIGNAL));
+        signal(self.0, value);
+    }
+}
+
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        unsafe {
+            let vt = *(self.0 as *const *const usize);
+            let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*vt.add(2));
+            release(self.0);
+        }
+    }
+}
+
 enum Entry {
-    Request(Request, Option<Arc<FileInner>>),
+    Request {
+        seq: u64,
+        req: Request,
+        file: Option<Arc<FileInner>>,
+        dest_pages: Option<Vec<usize>>,
+        src_pages: Option<Vec<usize>>,
+    },
     /// refused at enqueue: counts as a failed request
     Refused(HRESULT),
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
-    Signal(usize, u64),
+    Signal(FenceRef, u64),
+    #[cfg(test)]
+    /// Test-only barrier to hold the worker deterministically while testing submitted-batch cancellation.
+    Gate(Arc<std::sync::Barrier>),
+}
+
+struct Pending {
+    entries: Vec<Entry>,
+    next_seq: u64,
+}
+
+struct CancelRule {
+    /// Cancels requests with `seq <= up_to_seq` (enqueued before this `CancelRequestsWithTag` call).
+    up_to_seq: u64,
+    mask: u64,
+    value: u64,
 }
 
 struct FirstError {
@@ -482,7 +654,8 @@ struct QueueInner {
     desc: [u8; 0x18],
     source_memory: bool,
     capacity: usize,
-    pending: Mutex<Vec<Entry>>,
+    pending: Mutex<Pending>,
+    cancels: Mutex<Vec<CancelRule>>,
     worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
     closed: AtomicBool,
     error_event: usize,
@@ -499,12 +672,22 @@ impl QueueInner {
         unsafe { SetEvent(self.error_event as HANDLE) };
     }
 
+    fn is_cancelled(&self, seq: u64, tag: u64) -> bool {
+        let mut rules = self.cancels.lock().unwrap();
+        // Worker processes requests in strictly increasing `seq` order, so rules with
+        // `up_to_seq < seq` can never match this or any later request.
+        rules.retain(|r| r.up_to_seq >= seq);
+        rules.iter().any(|r| tag & r.mask == r.value)
+    }
+
     fn submit(self: &Arc<Self>) {
-        let batch = std::mem::take(&mut *self.pending.lock().unwrap());
+        // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
+        // batches to the channel in strict `seq` order.
+        let mut w = self.worker.lock().unwrap();
+        let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
         if batch.is_empty() {
             return;
         }
-        let mut w = self.worker.lock().unwrap();
         if w.is_none() {
             let (tx, rx) = mpsc::channel::<Vec<Entry>>();
             let q = Arc::clone(self);
@@ -523,9 +706,13 @@ impl QueueInner {
         for batch in rx {
             for e in batch {
                 match e {
-                    Entry::Request(r, f) => {
-                        if let Err(hr) = unsafe { execute(&r, f.as_deref()) } {
-                            self.fail(hr, r, f.as_deref());
+                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                        if self.is_cancelled(seq, req.tag) {
+                            // Cancelled requests are skipped without affecting status or error record.
+                            continue;
+                        }
+                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                            self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
                                 since_status = hr;
                             }
@@ -543,12 +730,12 @@ impl QueueInner {
                         since_status = S_OK;
                     }
                     Entry::Signal(fence, value) => unsafe {
-                        let vt = *(fence as *const *const usize);
-                        let signal: unsafe extern "system" fn(usize, u64) -> HRESULT = std::mem::transmute(*vt.add(FENCE_SIGNAL));
-                        signal(fence, value);
-                        let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*vt.add(2));
-                        release(fence);
+                        fence.signal(value);
                     },
+                    #[cfg(test)]
+                    Entry::Gate(b) => {
+                        b.wait();
+                    }
                 }
             }
         }
@@ -557,10 +744,23 @@ impl QueueInner {
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
             let mut p = self.pending.lock().unwrap();
-            p.push(e);
-            p.len()
+            p.entries.push(e);
+            p.entries.len()
         };
         // as on PC: a half-full queue submits by itself
+        if n >= (self.capacity / 2).max(1) {
+            self.submit();
+        }
+    }
+
+    fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
+        let n = {
+            let mut p = self.pending.lock().unwrap();
+            let seq = p.next_seq;
+            p.next_seq += 1;
+            p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
+            p.entries.len()
+        };
         if n >= (self.capacity / 2).max(1) {
             self.submit();
         }
@@ -626,7 +826,8 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         desc: raw,
         source_memory: source == 1,
         capacity,
-        pending: Mutex::new(Vec::new()),
+        pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
+        cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
         closed: AtomicBool::new(false),
         error_event: ev as usize,
@@ -681,7 +882,29 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
-    q.enqueue(Entry::Request(r, file));
+    let dest_pages = if r.dest_physical_pages() {
+        match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
+            Ok(pages) => Some(pages),
+            Err(hr) => {
+                q.fail(hr, r, file.as_deref());
+                return q.enqueue(Entry::Refused(hr));
+            }
+        }
+    } else {
+        None
+    };
+    let src_pages = if r.memory_source() && r.source_physical_pages() {
+        match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
+            Ok(pages) => Some(pages),
+            Err(hr) => {
+                q.fail(hr, r, file.as_deref());
+                return q.enqueue(Entry::Refused(hr));
+            }
+        }
+    } else {
+        None
+    };
+    q.enqueue_request(r, file, dest_pages, src_pages);
 }
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
@@ -704,7 +927,7 @@ unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_voi
     let vt = *(fence as *const *const usize);
     let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
     add(fence);
-    q.enqueue(Entry::Signal(fence as usize, value));
+    q.enqueue(Entry::Signal(FenceRef(fence as usize), value));
 }
 
 unsafe extern "system" fn queue_submit(p: *mut c_void) {
@@ -714,9 +937,24 @@ unsafe extern "system" fn queue_submit(p: *mut c_void) {
     }
 }
 
-/// requests not submitted yet whose tag matches (`tag & mask == value`) are dropped
+/// Requests enqueued before this call (both pending and already submitted but not yet
+/// executed) whose tag matches (`tag & mask == value`) are skipped without error.
 unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
-    queue(p).pending.lock().unwrap().retain(|e| !matches!(e, Entry::Request(r, _) if r.tag & mask == value));
+    let q = queue(p);
+    let cutoff = {
+        let mut pend = q.pending.lock().unwrap();
+        pend.entries.retain(|e| !matches!(e, Entry::Request { req, .. } if req.tag & mask == value));
+        pend.next_seq.saturating_sub(1)
+    };
+    if cutoff == 0 {
+        return;
+    }
+    let mut rules = q.cancels.lock().unwrap();
+    if let Some(existing) = rules.iter_mut().find(|r| r.mask == mask && r.value == value) {
+        existing.up_to_seq = existing.up_to_seq.max(cutoff);
+    } else {
+        rules.push(CancelRule { up_to_seq: cutoff, mask, value });
+    }
 }
 
 unsafe extern "system" fn queue_close(p: *mut c_void) {
@@ -724,20 +962,13 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
     if q.closed.swap(true, Ordering::AcqRel) {
         return;
     }
-    for e in std::mem::take(&mut *q.pending.lock().unwrap()) {
-        match e {
-            Entry::Status(s, i) => {
-                if let Some(slot) = s.slots.get(i as usize) {
-                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                }
+    for e in std::mem::take(&mut q.pending.lock().unwrap().entries) {
+        if let Entry::Status(s, i) = e {
+            if let Some(slot) = s.slots.get(i as usize) {
+                slot.store(E_QUEUE_CLOSED, Ordering::Release);
             }
-            Entry::Signal(fence, _) => {
-                let vt = *(fence as *const *const usize);
-                let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*vt.add(2));
-                release(fence);
-            }
-            _ => {}
         }
+        // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
     q.worker.lock().unwrap().take();
 }
@@ -782,7 +1013,7 @@ unsafe extern "system" fn queue_query(p: *mut c_void, out: *mut u8) {
         return;
     }
     let q = queue(p);
-    let pending = q.pending.lock().unwrap().len();
+    let pending = q.pending.lock().unwrap().entries.len();
     let empty = q.capacity.saturating_sub(pending) as u16;
     let until = (q.capacity / 2).max(1).saturating_sub(pending).max(1) as u16;
     let mut info = [0u8; 0x1C];
@@ -870,6 +1101,386 @@ mod tests {
             let mut info = [0u8; 0x1C];
             qinfo(q, info.as_mut_ptr());
             assert_eq!((info[10], u16::from_le_bytes([info[0x18], info[0x19]])), (2, 8));
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    fn request_ex(
+        options: u64,
+        dst: u64,
+        dst_page_offset: u16,
+        dst_size: u32,
+        src: u64,
+        offset_or_page_off: u64,
+        src_size: u32,
+        intermediate_size: u32,
+        tag: u64,
+    ) -> [u8; REQUEST_BYTES] {
+        let mut b = request(options, dst, dst_size, src, offset_or_page_off, src_size);
+        b[0x10..0x12].copy_from_slice(&dst_page_offset.to_le_bytes());
+        b[0x34..0x38].copy_from_slice(&intermediate_size.to_le_bytes());
+        b[0x38..0x40].copy_from_slice(&tag.to_le_bytes());
+        b
+    }
+
+    #[repr(C)]
+    struct MockFence {
+        vtbl: *const usize,
+        refs: AtomicU32,
+        signalled: std::sync::atomic::AtomicU64,
+    }
+
+    fn mock_fence_vtbl() -> &'static [usize] {
+        unsafe extern "system" fn qi(_p: *mut c_void, _riid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
+            E_NOINTERFACE
+        }
+        unsafe extern "system" fn add(p: *mut c_void) -> u32 {
+            (*(p as *const MockFence)).refs.fetch_add(1, Ordering::Relaxed) + 1
+        }
+        unsafe extern "system" fn rel(p: *mut c_void) -> u32 {
+            (*(p as *const MockFence)).refs.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        unsafe extern "system" fn sig(p: *mut c_void, val: u64) -> HRESULT {
+            (*(p as *const MockFence)).signalled.store(val, Ordering::Release);
+            S_OK
+        }
+        static V: OnceLock<&'static [usize]> = OnceLock::new();
+        V.get_or_init(|| {
+            let mut v = vec![0usize; FENCE_SIGNAL + 1];
+            v[0] = qi as usize;
+            v[1] = add as usize;
+            v[2] = rel as usize;
+            v[FENCE_SIGNAL] = sig as usize;
+            Box::leak(v.into_boxed_slice())
+        })
+    }
+
+    #[test]
+    fn cancel_pending_and_submitted_requests_by_tag() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes()); // memory queue
+            desc[8..10].copy_from_slice(&32u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 3, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) = std::mem::transmute(*qv.add(5));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let cancel: unsafe extern "system" fn(*mut c_void, u64, u64) = std::mem::transmute(*qv.add(7));
+            let record: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*qv.add(10));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            let src_a = b"SUBMITTED_CANCELLED";
+            let src_b = b"SUBMITTED_KEPT_____";
+            let src_c = b"POST_CANCEL_MATCH__";
+            let src_d = b"PENDING_CANCELLED__";
+            let mut dst_a = vec![0u8; src_a.len()];
+            let mut dst_b = vec![0u8; src_b.len()];
+            let mut dst_c = vec![0u8; src_c.len()];
+            let mut dst_d = vec![0u8; src_d.len()];
+
+            let fence = MockFence {
+                vtbl: mock_fence_vtbl().as_ptr(),
+                refs: AtomicU32::new(1),
+                signalled: std::sync::atomic::AtomicU64::new(0),
+            };
+            let fence_ptr = &fence as *const MockFence as *mut c_void;
+
+            // Block the worker deterministically so the submitted batch sits in the channel.
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            queue(q).enqueue(Entry::Gate(Arc::clone(&gate)));
+            // Submitted + matching tag (0x1001 & 0xF000 == 0x1000) -> cancelled.
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT, dst_a.as_mut_ptr() as u64, 0, dst_a.len() as u32, src_a.as_ptr() as u64, 0, src_a.len() as u32, 0, 0x1001).as_ptr());
+            // Submitted + matching tag pointing to unwritable address (0x10) -> cancelled before execute, so S_OK & 0 errors!
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT, 0x10, 0, 4, src_a.as_ptr() as u64, 0, 4, 0, 0x1002).as_ptr());
+            // Submitted + non-matching tag (0x2001) -> executes.
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT, dst_b.as_mut_ptr() as u64, 0, dst_b.len() as u32, src_b.as_ptr() as u64, 0, src_b.len() as u32, 0, 0x2001).as_ptr());
+            status(q, s, 0);
+            signal(q, fence_ptr, 42);
+            submit(q);
+            assert_eq!(fence.refs.load(Ordering::Acquire), 2, "queue holds one fence reference");
+
+            // Also enqueue an unsubmitted request with a matching tag before cancelling.
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT, dst_d.as_mut_ptr() as u64, 0, dst_d.len() as u32, src_d.as_ptr() as u64, 0, src_d.len() as u32, 0, 0x1003).as_ptr());
+            cancel(q, 0xF000, 0x1000);
+
+            // Enqueued AFTER CancelRequestsWithTag with a matching tag -> must NOT be cancelled.
+            enqueue(q, request_ex(SOURCE_MEMORY_BIT, dst_c.as_mut_ptr() as u64, 0, dst_c.len() as u32, src_c.as_ptr() as u64, 0, src_c.len() as u32, 0, 0x1004).as_ptr());
+            status(q, s, 1);
+            submit(q);
+
+            // Release the worker and wait for completion.
+            gate.wait();
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(complete(s, 0) && complete(s, 1));
+            assert_eq!((hresult(s, 0), hresult(s, 1)), (S_OK, S_OK));
+            assert!(dst_a.iter().all(|&b| b == 0), "submitted request should be cancelled");
+            assert!(dst_d.iter().all(|&b| b == 0), "pending request should be cancelled");
+            assert_eq!(dst_b.as_slice(), src_b);
+            assert_eq!(dst_c.as_slice(), src_c, "request enqueued after cancel must run");
+            assert_eq!(fence.signalled.load(Ordering::Acquire), 42);
+            assert_eq!(fence.refs.load(Ordering::Acquire), 1, "fence reference released after signal");
+            assert!(queue(q).cancels.lock().unwrap().is_empty(), "expired cancel rules are pruned");
+
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 0, "cancelled requests do not record errors");
+
+            // Closing a queue with an unsubmitted signal must release its fence ref cleanly.
+            signal(q, fence_ptr, 99);
+            status(q, s, 2);
+            assert_eq!(fence.refs.load(Ordering::Acquire), 2);
+            queue_close(q);
+            assert_eq!(fence.refs.load(Ordering::Acquire), 1, "queue_close releases pending fence");
+            assert_eq!(hresult(s, 2), E_QUEUE_CLOSED);
+
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn multi_stage_intermediate_size_validation_and_zlib() {
+        // Validation matrix for Request::check
+        let bc1 = 1u64 << BCPACK_SHIFT;
+        let bc7 = 7u64 << BCPACK_SHIFT;
+        let swiz = 1u64 << SWIZZLE_SHIFT;
+
+        // Zlib only with valid intermediate_size (== dst and < dst)
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        // Zlib only with invalid intermediate_size (<= src or > dst)
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION, invalid intermediate -> E_DESTINATION_SIZE
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION
+        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
+        // Hardware swizzle mode unsupported
+        assert_eq!(Request::parse(&request_ex(swiz, 0x1000, 0, 64, 0x2000, 0, 64, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        // SourceIsPhysicalPages requires memory source
+        assert_eq!(Request::parse(&request_ex(SOURCE_PHYS_PAGES_BIT, 0x1000, 0, 64, 0x2000, 0, 64, 0, 0)).check(false), Err(E_SOURCE_TYPE));
+
+        // End-to-end execution: zlib with intermediate_size < destination_size (padded destination)
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let plain = b"XCL intermediate-buffer zlib test payload! XCL intermediate-buffer zlib test payload!".to_vec();
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            assert!(packed.len() < plain.len());
+            let mut dst = vec![0xCCu8; plain.len() + 32];
+
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // Valid intermediate_size == plain.len() < dst.len()
+            enqueue(
+                q,
+                request_ex(SOURCE_MEMORY_BIT | ZLIB_BIT, dst.as_mut_ptr() as u64, 0, dst.len() as u32, packed.as_ptr() as u64, 0, packed.len() as u32, plain.len() as u32, 0).as_ptr(),
+            );
+            status(q, s, 0);
+            // Wrong intermediate_size (1 byte off) -> E_ZLIB_DATA
+            let mut dst_bad = vec![0u8; plain.len() + 32];
+            enqueue(
+                q,
+                request_ex(SOURCE_MEMORY_BIT | ZLIB_BIT, dst_bad.as_mut_ptr() as u64, 0, dst_bad.len() as u32, packed.as_ptr() as u64, 0, packed.len() as u32, (plain.len() + 1) as u32, 0).as_ptr(),
+            );
+            status(q, s, 1);
+            submit(q);
+
+            let t = std::time::Instant::now();
+            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!((hresult(s, 0), hresult(s, 1)), (S_OK, E_ZLIB_DATA));
+            assert_eq!(&dst[..plain.len()], plain.as_slice());
+            assert!(dst[plain.len()..].iter().all(|&b| b == 0), "trailing padding zeroed");
+
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn physical_page_destinations_and_sources() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        unsafe {
+            let mut count = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 4, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // 1. Zlib inflate into scattered physical pages [pages[2], pages[0]] crossing a 64 KiB boundary.
+            let plain: Vec<u8> = (0..0x1000u32).map(|i| ((i * 37) ^ (i >> 3)) as u8).collect();
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let page_off = (PHYS_PAGE_SIZE - 0x800) as u16;
+            let mut scattered = [pages[2], pages[0]];
+            enqueue(
+                q,
+                request_ex(
+                    SOURCE_MEMORY_BIT | ZLIB_BIT | DEST_PHYS_PAGES_BIT,
+                    scattered.as_ptr() as u64,
+                    page_off,
+                    plain.len() as u32,
+                    packed.as_ptr() as u64,
+                    0,
+                    packed.len() as u32,
+                    0,
+                    0,
+                )
+                .as_ptr(),
+            );
+            // Clobber the stack array before Submit() to verify the page list was snapshotted at enqueue.
+            std::ptr::write_volatile(&mut scattered, [0, 0]);
+            status(q, s, 0);
+
+            // 2. Read back from those scattered physical pages via SourceIsPhysicalPages into plain memory.
+            let mut readback = vec![0u8; plain.len()];
+            let src_scattered = [pages[2], pages[0]];
+            enqueue(
+                q,
+                request_ex(
+                    SOURCE_MEMORY_BIT | SOURCE_PHYS_PAGES_BIT,
+                    readback.as_mut_ptr() as u64,
+                    0,
+                    readback.len() as u32,
+                    src_scattered.as_ptr() as u64,
+                    page_off as u64,
+                    readback.len() as u32,
+                    0,
+                    0,
+                )
+                .as_ptr(),
+            );
+            status(q, s, 1);
+
+            // 3. Map pages[1] into a reserved virtual address (like a streamed texture) and write via physical page!
+            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                PHYS_PAGE_SIZE,
+                windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_READWRITE,
+            );
+            assert!(!reserved.is_null());
+            assert_eq!(MapTitlePhysicalPages(reserved, 1, 0, 4, &mut pages[1]), reserved);
+            let streamed = b"DIRECTSTORAGE_TO_MAPPED_PAGE";
+            let mapped_list = [pages[1]];
+            enqueue(
+                q,
+                request_ex(
+                    SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT,
+                    mapped_list.as_ptr() as u64,
+                    0x40,
+                    streamed.len() as u32,
+                    streamed.as_ptr() as u64,
+                    0,
+                    streamed.len() as u32,
+                    0,
+                    0,
+                )
+                .as_ptr(),
+            );
+            status(q, s, 2);
+
+            // 4. Invalid physical page number -> E_ACCESS_VIOLATION.
+            let bogus = [usize::MAX];
+            enqueue(
+                q,
+                request_ex(
+                    SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT,
+                    bogus.as_ptr() as u64,
+                    0,
+                    streamed.len() as u32,
+                    streamed.as_ptr() as u64,
+                    0,
+                    streamed.len() as u32,
+                    0,
+                    0,
+                )
+                .as_ptr(),
+            );
+            status(q, s, 3);
+
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 3) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!((hresult(s, 0), hresult(s, 1), hresult(s, 2), hresult(s, 3)), (S_OK, S_OK, S_OK, E_ACCESS_VIOLATION));
+            assert_eq!(readback, plain);
+            let mapped_slice = std::slice::from_raw_parts((reserved as *const u8).add(0x40), streamed.len());
+            assert_eq!(mapped_slice, streamed, "DirectStorage physical-page write lands in mapped reservation");
+
+            // Unmap and free cleanly.
+            MapTitlePhysicalPages(reserved, 1, 0, 4, std::ptr::null_mut());
+            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             queue_close(q);
             queue_release(q);
             status_release(s);

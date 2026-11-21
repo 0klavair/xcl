@@ -532,6 +532,42 @@ pub fn direct_storage() -> Result<(), String> {
         ensure!(hr == 0, "request status {hr:#x}");
         let disk = std::fs::read(&exe).map_err(|x| x.to_string())?;
         ensure!(dst[..] == disk[..512] && dst.starts_with(b"MZ"), "the read bytes are not the file's");
+
+        // Also check physical-page destination (bit 21) and CancelRequestsWithTag.
+        let mut page_count = 1usize;
+        let mut page = [0u64; 1];
+        ensure!(crate::XMemAllocatePhysicalPages(0, &mut page_count, page.as_mut_ptr()) != 0, "XMemAllocatePhysicalPages");
+        let mut req_phys = [0u8; 0x48];
+        req_phys[0..8].copy_from_slice(&(1u64 << 21).to_le_bytes()); // DestinationIsPhysicalPages
+        req_phys[8..16].copy_from_slice(&(page.as_ptr() as u64).to_le_bytes());
+        req_phys[0x10..0x12].copy_from_slice(&0x80u16.to_le_bytes()); // DestinationPageOffset
+        req_phys[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
+        req_phys[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req_phys[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
+        let mut cancelled_dst = vec![0u8; 512];
+        let mut req_cancel = [0u8; 0x48];
+        req_cancel[8..16].copy_from_slice(&(cancelled_dst.as_mut_ptr() as u64).to_le_bytes());
+        req_cancel[0x18..0x1C].copy_from_slice(&512u32.to_le_bytes());
+        req_cancel[0x20..0x28].copy_from_slice(&(file as u64).to_le_bytes());
+        req_cancel[0x30..0x34].copy_from_slice(&512u32.to_le_bytes());
+        req_cancel[0x38..0x40].copy_from_slice(&0xCAFE_0001u64.to_le_bytes()); // CancellationTag
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req_phys.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *const u8)>(slot(q, 3))(q, req_cancel.as_ptr());
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u64, u64)>(slot(q, 7))(q, 0xFFFF_0000, 0xCAFE_0000);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u32)>(slot(q, 4))(q, status, 0);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, *mut c_void, u64)>(slot(q, 5))(q, fence.as_raw(), 2);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void)>(slot(q, 6))(q);
+        fence.SetEventOnCompletion(2, windows::Win32::Foundation::HANDLE(ev)).map_err(e)?;
+        ensure!(WaitForSingleObject(ev, 5000) == 0, "the second DirectStorage fence was not signalled");
+        let hr2 = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void, u32) -> HRESULT>(slot(status, 4))(status, 0);
+        ensure!(hr2 == 0, "physical-page request status {hr2:#x}");
+        let mapped = crate::XMemMapPhysicalPages(std::ptr::null_mut(), 1, page.as_mut_ptr());
+        ensure!(!mapped.is_null(), "XMemMapPhysicalPages");
+        let phys_slice = std::slice::from_raw_parts((mapped as *const u8).add(0x80), 512);
+        ensure!(phys_slice == &disk[..512], "physical-page DirectStorage read mismatch");
+        ensure!(cancelled_dst.iter().all(|&b| b == 0), "cancelled DirectStorage request wrote to destination");
+        ensure!(crate::XMemFreePhysicalPages(1, page.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
+
         for o in [status, file, q] {
             std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(o, 2))(o);
         }
