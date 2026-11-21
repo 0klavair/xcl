@@ -61,19 +61,32 @@ pub const XUSER: Guid = g(0x01acd177_91f9_4763_a38e_ccbb55ce32e0);
 /// interface of XUserGetGamertag (with a gamertag component): its own vtable
 #[cfg_attr(not(test), allow(dead_code))]
 const XUSER_GAMERTAG_IID: Guid = g(0xcef4fac0_7676_4a94_a119_4c43f9eb5b74);
+/// older console GDK XUser IID (same base slot layout)
+const XUSER_V2_IID: Guid = g(0x1bf2f8c5_d507_4e52_bb05_f726d0e71161);
 const XUSER_DEVICE: Guid = g(0x7d824997_10dc_45ab_86b7_2737767c0bf1);
 pub const XGAMESAVE: Guid = g(0x704c3f58_e629_4cc2_b197_30511b996fe2);
 /// the interface the game's libHttpClient asks for (GDK table: 0b9d556e)
 #[cfg_attr(not(test), allow(dead_code))]
 const XPACKAGE_OLD_IID: Guid = g(0xe2a4734b_2f4a_456d_aa8f_d065e04fb209);
+/// console GDK 19041 XPackage v1 IID: XPackageEnumeratePackages is at slot 28
+const XPACKAGE_V1_IID: Guid = g(0xbe3f3e9f_c4b3_424d_9a95_d1af060559a5);
+/// console GDK 19041/22000 XPackage v2 IID: EnumeratePackages @ 35, RegisterPackageInstalled @ 36
+const XPACKAGE_V2_IID: Guid = g(0xf92d8712_2b27_4d8a_bf01_11a6f8e3eb42);
 pub const XPACKAGE: Guid = g(0xaf406016_e850_4aa8_a88d_2f3dcb9dac7e);
 pub const XPLS: Guid = g(0xf4faf4d4_2d04_4fce_b3e0_474a713a3e84);
+const XPLS_V1_IID: Guid = g(0xd29411df_0794_4553_8b27_95fc02d0f75d);
 pub const XGAME: Guid = g(0x973a344e_24bf_4d0f_8457_56c534892b29);
+const XGAME_V1_IID: Guid = g(0x50849859_0ad8_4f81_80e4_5bc78626f852);
 pub const XSYSTEM: Guid = g(0xe349bd1a_fc20_4e40_b99c_4178cc6b409f);
+const XSYSTEM_V2_IID: Guid = g(0x67ce4bfc_b1d1_4ac7_bc3a_cb9219a97a85);
+/// console GDK XSystem v3 IID: XSystemGetAppSpecificDeviceId is at slot 4 (not slot 5)
+const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
 const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
 const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
 const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
+pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
+pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
 pub const XGAMEUI: Guid = g(0xdfcd4649_4ff8_4043_ba07_35d607df98b0);
 const XSTORE: Guid = g(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
 const XAPPBROADCAST: Guid = g(0x186d5592_a72d_45fb_9560_11aed0e6647a);
@@ -198,8 +211,50 @@ pub unsafe extern "system" fn UninitializeApiImpl() {
     }
 }
 
+static ERROR_CB: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
+
 pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const u8) {
-    crate::xlog_warn!("XErrorReport {:#x}: {}", hr as u32, crate::util::from_cstr_ptr(message).unwrap_or_default());
+    let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
+    crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
+    if let Some((cb, ctx)) = *ERROR_CB.lock().unwrap() {
+        let f: unsafe extern "system" fn(HRESULT, *const u8, *mut c_void) -> bool = std::mem::transmute(cb);
+        let _ = f(hr, message, ctx as *mut c_void);
+    }
+}
+
+unsafe extern "system" fn error_set_callback(cb: usize, ctx: *mut c_void) {
+    *ERROR_CB.lock().unwrap() = (cb != 0).then_some((cb, ctx as usize));
+}
+
+unsafe extern "system" fn error_set_options(options: u32, _reserved: usize) {
+    // Store requested options without triggering DebugBreak in-process.
+    ERROR_OPTIONS.store(options as usize, Ordering::Relaxed);
+}
+
+/// Separate per-IID clones for forwarding classes (such as XGameUi) when a title queries an
+/// older/unknown interface version, preventing its shorter PC vtable from poisoning the main
+/// interface's cached `pc` pointer.
+fn forward_alias_obj(base: &'static Obj, c: Guid, i: Guid) -> &'static Obj {
+    static ALIASES: OnceLock<Mutex<BTreeMap<(Guid, Guid), &'static Obj>>> = OnceLock::new();
+    let map = ALIASES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut g = map.lock().unwrap();
+    if let Some(&existing) = g.get(&(c, i)) {
+        return existing;
+    }
+    let iface = Iface {
+        name: base.iface.name,
+        clsid: base.iface.clsid,
+        iids: vec![i],
+        main: false,
+        names: base.iface.names.clone(),
+        slots: base.iface.slots.clone(),
+        forward: base.iface.forward.clone(),
+    };
+    let obj = object(iface);
+    obj.pc.store(unsafe { pc_object(&c, &i).unwrap_or(0) }, Ordering::Release);
+    g.insert((c, i), obj);
+    obj
 }
 
 pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
@@ -215,16 +270,30 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
     if let Some(o) = own(&c, &i) {
         let known = o.iface.iids.contains(&i) || i == c;
         note(c, i, format!("{}: XCL{}", o.iface.name, if known { "" } else { " (interface version not in the GDK table: the main vtable)" }));
-        if !o.iface.forward.is_empty() && o.pc.load(Ordering::Acquire) == 0 {
-            o.pc.store(pc_object(&c, &i).unwrap_or(0), Ordering::Release);
-        }
-        *out = o as *const Obj as *mut c_void;
+        let target = if !o.iface.forward.is_empty() {
+            if known {
+                if o.pc.load(Ordering::Acquire) == 0 {
+                    o.pc.store(pc_object(&c, &i).unwrap_or(0), Ordering::Release);
+                }
+                o
+            } else {
+                forward_alias_obj(o, c, i)
+            }
+        } else {
+            o
+        };
+        *out = target as *const Obj as *mut c_void;
         return S_OK;
     }
     match pc_object(&c, &i) {
         Some(p) => {
             note(c, i, format!("{}: PC", family(&c)));
             *out = p as *mut c_void;
+            S_OK
+        }
+        None if c == XASYNC => {
+            note(c, i, "XAsync: XCL (fallback – no system xgameruntime.dll)".into());
+            *out = xcl_xasync_object() as *const Obj as *mut c_void;
             S_OK
         }
         None => {
@@ -282,7 +351,7 @@ struct Obj {
 unsafe impl Sync for Obj {}
 unsafe impl Send for Obj {}
 
-const SLOTS: usize = 80;
+const SLOTS: usize = 96;
 
 unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() || iid.is_null() {
@@ -367,7 +436,8 @@ macro_rules! per_slot {
     };
 }
 per_slot!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39
-    40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79);
+    40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79
+    80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95);
 
 fn object(iface: Iface) -> &'static Obj {
     let mut v: Vec<usize> = (0..SLOTS).map(|k| STUBS[k] as usize).collect();
@@ -447,6 +517,8 @@ fn classes() -> Vec<Class> {
             },
             // telemetry: offline, accepted and dropped
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
+            Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
+            Class { name: "XError", clsid: XERROR, impls: xerror(), forward: &[] },
             // dialogs and text entry without a user handle go to the PC runtime
             Class {
                 name: "XGameUi",
@@ -473,9 +545,108 @@ fn classes() -> Vec<Class> {
     ]
 }
 
+/// Build an explicit legacy console interface vtable from `(slot, function_name)` rows.
+fn legacy_iface(
+    name: &'static str,
+    clsid: Guid,
+    iid: Guid,
+    rows: &[(usize, &'static str)],
+    impls: &[(&'static str, usize)],
+) -> Iface {
+    let mut names = vec![None; SLOTS];
+    let mut slots = Vec::new();
+    for &(slot, fname) in rows {
+        if slot < SLOTS {
+            names[slot] = Some(fname);
+            if let Some(&(_, ptr)) = impls.iter().find(|&&(n, _)| n == fname) {
+                slots.push((slot, ptr));
+            }
+        }
+    }
+    Iface { name, clsid, iids: vec![iid], main: false, names, slots, forward: Vec::new() }
+}
+
+/// Older console GDK (19041 / 2020) interface versions whose vtable slot indices differ
+/// from the PC GDK 261000 table.
+fn legacy_ifaces() -> Vec<Iface> {
+    let pkg = xpackage();
+    let sys = xsystem();
+    let pkg_v1 = [
+        (3, "XPackageGetCurrentProcessPackageIdentifier"),
+        (4, "XPackageIsPackagedProcess"),
+        (5, "XPackageCreateInstallationMonitor"),
+        (6, "XPackageCloseInstallationMonitorHandle"),
+        (7, "XPackageGetInstallationProgress"),
+        (8, "XPackageUpdateInstallationMonitor"),
+        (9, "XPackageRegisterInstallationProgressChanged"),
+        (10, "XPackageUnregisterInstallationProgressChanged"),
+        (11, "XPackageGetUserLocale"),
+        (12, "XPackageFindChunkAvailability"),
+        (13, "XPackageEnumerateChunkAvailability"),
+        (14, "XPackageChangeChunkInstallOrder"),
+        (16, "XPackageInstallChunksAsync"),
+        (17, "XPackageInstallChunksResult"),
+        (28, "XPackageEnumeratePackages"),
+    ];
+    let pkg_v2 = [
+        (3, "XPackageGetCurrentProcessPackageIdentifier"),
+        (4, "XPackageIsPackagedProcess"),
+        (5, "XPackageCreateInstallationMonitor"),
+        (6, "XPackageCloseInstallationMonitorHandle"),
+        (7, "XPackageGetInstallationProgress"),
+        (8, "XPackageUpdateInstallationMonitor"),
+        (9, "XPackageRegisterInstallationProgressChanged"),
+        (10, "XPackageUnregisterInstallationProgressChanged"),
+        (11, "XPackageGetUserLocale"),
+        (18, "XPackageEstimateDownloadSize"),
+        (22, "XPackageUnregisterPackageInstalled"),
+        (24, "XPackageGetMountPathSize"),
+        (25, "XPackageGetMountPath"),
+        (26, "XPackageCloseMountHandle"),
+        (30, "XPackageGetWriteStats"),
+        (33, "XPackageEnumerateFeatures"),
+        (35, "XPackageEnumeratePackages"),
+        (36, "XPackageRegisterPackageInstalled"),
+    ];
+    let sys_v3 = [(4, "XSystemGetAppSpecificDeviceId")];
+    vec![
+        legacy_iface("XPackage", XPACKAGE, XPACKAGE_V1_IID, &pkg_v1, &pkg),
+        legacy_iface("XPackage", XPACKAGE, XPACKAGE_V2_IID, &pkg_v2, &pkg),
+        legacy_iface("XSystem", XSYSTEM, XSYSTEM_V3_IID, &sys_v3, &sys),
+    ]
+}
+
+/// Built-in XAsync / XTaskQueue / XThread COM object used as a fallback when Gaming Services
+/// (`System32\xgameruntime.dll`) is not installed on the host.
+fn xcl_xasync_object() -> &'static Obj {
+    static O: OnceLock<&'static Obj> = OnceLock::new();
+    O.get_or_init(|| {
+        let mut ifaces = layout(Class { name: "XAsync", clsid: XASYNC, impls: xasync_impls(), forward: &[] });
+        object(ifaces.remove(0))
+    })
+}
+
 fn objects() -> &'static [&'static Obj] {
     static O: OnceLock<Vec<&'static Obj>> = OnceLock::new();
-    O.get_or_init(|| classes().into_iter().flat_map(layout).map(object).collect())
+    O.get_or_init(|| {
+        let mut ifaces: Vec<Iface> = classes().into_iter().flat_map(layout).collect();
+        // Register older compatible console IIDs whose slot layouts match the main vtable.
+        for f in &mut ifaces {
+            if !f.main {
+                continue;
+            }
+            match f.clsid {
+                c if c == XUSER => f.iids.push(XUSER_V2_IID),
+                c if c == XSYSTEM => f.iids.push(XSYSTEM_V2_IID),
+                c if c == XGAME => f.iids.push(XGAME_V1_IID),
+                c if c == XPLS => f.iids.push(XPLS_V1_IID),
+                c if c == XNETWORKING => f.iids.push(XNETWORKING),
+                _ => {}
+            }
+        }
+        ifaces.extend(legacy_ifaces());
+        ifaces.into_iter().map(object).collect()
+    })
 }
 
 /// XCL's object for (clsid, iid): the vtable holding that interface, else the class's main one.
@@ -509,6 +680,12 @@ fn xuser() -> Vec<(&'static str, usize)> {
         XUserCheckPrivilege,
         XUserRegisterForChangeEvent,
         XUserUnregisterForChangeEvent,
+        XUserGetTokenAndSignatureAsync,
+        XUserGetTokenAndSignatureResultSize,
+        XUserGetTokenAndSignatureResult,
+        XUserGetTokenAndSignatureUtf16Async,
+        XUserGetTokenAndSignatureUtf16ResultSize,
+        XUserGetTokenAndSignatureUtf16Result,
     ];
     v.extend([
         ("XUserFindUserByLocalId", find_user as usize),
@@ -538,15 +715,17 @@ fn xuser() -> Vec<(&'static str, usize)> {
     v
 }
 
-/// device association: the local user plays on every controller, no device is a user's
+/// device association: every controller belongs to the single local signed-in user
 fn xuser_devices() -> Vec<(&'static str, usize)> {
     vec![
         ("XUserRegisterForDeviceAssociationChanged", register_token4 as usize),
         ("XUserUnregisterForDeviceAssociationChanged", yes as usize),
         ("XUserRegisterForDefaultAudioEndpointUtf16Changed", register_token4 as usize),
         ("XUserUnregisterForDefaultAudioEndpointUtf16Changed", yes as usize),
-        ("XUserFindForDevice", user_not_found as usize),
+        ("XUserFindForDevice", XUserFindForDevice as usize),
         ("XUserGetDefaultAudioEndpointUtf16", default_audio_endpoint as usize),
+        ("XUserFindControllerForUserWithUiAsync", XUserFindControllerForUserWithUiAsync as usize),
+        ("XUserFindControllerForUserWithUiResult", XUserFindControllerForUserWithUiResult as usize),
     ]
 }
 
@@ -625,6 +804,7 @@ fn xpackage() -> Vec<(&'static str, usize)> {
         ("XPackageMountWithUiAsync", mount_with_ui_async as usize),
         ("XPackageMountWithUiResult", mount_with_ui_result as usize),
         ("XPackageEnumeratePackages", enumerate_packages as usize),
+        ("XPackageGetIdentifier", XPackageGetCurrentProcessPackageIdentifier as usize),
     ]);
     v
 }
@@ -633,6 +813,66 @@ fn xsystem() -> Vec<(&'static str, usize)> {
     let mut v = named![XSystemGetConsoleId, XSystemGetXboxLiveSandboxId, XSystemGetAppSpecificDeviceId];
     v.extend([("XSystemHandleTrack", ok as usize), ("XSystemIsHandleValid", yes as usize), ("XSystemAllowFullDownloadBandwidth", nothing as usize)]);
     v
+}
+
+fn xnetworking() -> Vec<(&'static str, usize)> {
+    named![
+        XNetworkingQueryPreferredLocalUdpMultiplayerPort,
+        XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync,
+        XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult,
+        XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged,
+        XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged,
+        XNetworkingQuerySecurityInformationForUrlAsync,
+        XNetworkingQuerySecurityInformationForUrlAsyncResultSize,
+        XNetworkingQuerySecurityInformationForUrlAsyncResult,
+        XNetworkingQuerySecurityInformationForUrlUtf16Async,
+        XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize,
+        XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult,
+        XNetworkingVerifyServerCertificate,
+        XNetworkingGetConnectivityHint,
+        XNetworkingRegisterConnectivityHintChanged,
+        XNetworkingUnregisterConnectivityHintChanged,
+    ]
+}
+
+fn xerror() -> Vec<(&'static str, usize)> {
+    vec![
+        ("XErrorReport", XErrorReport as usize),
+        ("XErrorSetCallback", error_set_callback as usize),
+        ("XErrorSetOptions", error_set_options as usize),
+    ]
+}
+
+fn xasync_impls() -> Vec<(&'static str, usize)> {
+    named![
+        XAsyncGetStatus,
+        XAsyncGetResultSize,
+        XAsyncCancel,
+        XAsyncRun,
+        XAsyncBegin,
+        XAsyncSchedule,
+        XAsyncComplete,
+        XAsyncGetResult,
+        XTaskQueueCreate,
+        XTaskQueueCreateComposite,
+        XTaskQueueGetPort,
+        XTaskQueueDuplicateHandle,
+        XTaskQueueDispatch,
+        XTaskQueueCloseHandle,
+        XTaskQueueSubmitCallback,
+        XTaskQueueSubmitDelayedCallback,
+        XTaskQueueRegisterWaiter,
+        XTaskQueueUnregisterWaiter,
+        XTaskQueueTerminate,
+        XTaskQueueRegisterMonitor,
+        XTaskQueueUnregisterMonitor,
+        XTaskQueueGetCurrentProcessTaskQueue,
+        XTaskQueueSetCurrentProcessTaskQueue,
+        XThreadSetTimeSensitive,
+        XThreadVerifyNotTimeSensitive,
+        XThreadAssertNotTimeSensitive,
+        XThreadIsTimeSensitive,
+    ]
 }
 
 // ---------------------------------------------------------------------------------------
@@ -711,13 +951,6 @@ unsafe extern "system" fn add_by_id_async(id: u64, b: *mut XAsyncBlock) -> HRESU
     }
     XUserCloseHandle(h);
     XUserAddAsync(0, b)
-}
-
-unsafe extern "system" fn user_not_found(_device: usize, out: *mut usize) -> HRESULT {
-    if !out.is_null() {
-        *out = 0;
-    }
-    E_GAMEUSER_USER_NOT_FOUND
 }
 
 /// Opening links on the title's behalf would act on the PC: refused.
@@ -1259,10 +1492,49 @@ mod tests {
             let (_, ui) = query(XGAMEUI, g(0xeaf669df_5542_4590_99a3_8dc061f837cc));
             let open = slot_in_table("XGameUiTextEntryOpen").2;
             assert_eq!(*(*(ui as *const *const usize)).add(open), FORWARDS[open] as usize, "TextEntryOpen is forwarded");
+            // XUserGetTokenAndSignatureAsync/ResultSize/Result (slots 23-25) complete on PC queues
+            let tok_async: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                *const u8,
+                *const u8,
+                usize,
+                *const c_void,
+                usize,
+                *const c_void,
+                *mut XAsyncBlock,
+            ) -> HRESULT = slot(u, 23);
+            let tok_size: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(u, 24);
+            let tok_result: unsafe extern "system" fn(
+                *mut c_void,
+                *mut XAsyncBlock,
+                usize,
+                *mut c_void,
+                *mut *mut XUserGetTokenAndSignatureData,
+                *mut usize,
+            ) -> HRESULT = slot(u, 25);
+            let mut tb: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(
+                tok_async(u, user, 0, b"GET\0".as_ptr(), b"https://example.invalid/hotfix\0".as_ptr(), 0, std::ptr::null(), 0, std::ptr::null(), &mut tb),
+                S_OK
+            );
+            assert_eq!(get_status(xa, &mut tb, true), S_OK);
+            let mut tsz = 0usize;
+            assert_eq!(tok_size(u, &mut tb, &mut tsz), S_OK);
+            let mut tbuf = vec![0u8; tsz];
+            let mut tptr: *mut XUserGetTokenAndSignatureData = std::ptr::null_mut();
+            let mut tused = 0usize;
+            assert_eq!(tok_result(u, &mut tb, tbuf.len(), tbuf.as_mut_ptr() as *mut c_void, &mut tptr, &mut tused), S_OK);
+            assert_eq!(tused, tsz);
+            assert_eq!(tptr as *const u8, tbuf.as_ptr());
+            assert!(crate::util::from_cstr_ptr((*tptr).token).unwrap().starts_with("XBL3.0 "));
+            assert!(!crate::util::from_cstr_ptr((*tptr).signature).unwrap().is_empty());
+
             // an unimplemented slot answers E_NOTIMPL and is reported
-            let token: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(u, 23);
-            assert_eq!(token(u), E_NOTIMPL);
-            assert!(stats().unimplemented.contains_key("XUserGetTokenAndSignatureAsync"), "{:?}", stats().unimplemented);
+            let ach: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(ui, slot_in_table("XGameUiShowAchievementsAsync").2);
+            assert_eq!(ach(ui), E_NOTIMPL);
+            assert!(stats().unimplemented.contains_key("XGameUiShowAchievementsAsync"), "{:?}", stats().unimplemented);
 
             // XGameSave: provider (async), container, write a blob, read it back (async)
             let (_, s) = query(XGAMESAVE, g(0x1bfff3af_f14a_40a3_8e35_9ada906593f9));
@@ -1312,6 +1584,214 @@ mod tests {
             }
             super::super::xasync::use_pc(0);
             assert!(DONE.load(Ordering::SeqCst) >= 1, "XAsync completion callback");
+        }
+    }
+
+    #[test]
+    fn legacy_console_iids_map_to_their_own_slots() {
+        // SLOTS must cover the full GDK table (highest slot is 83).
+        let max_slot = table().map(|r| r.3).max().unwrap_or(0);
+        assert!(max_slot < SLOTS, "SLOTS={SLOTS} truncates slot {max_slot}");
+
+        // XPackage v1 (be3f3e9f): XPackageEnumeratePackages is at slot 28.
+        let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).expect("XPackage v1");
+        assert!(!p1.iface.main);
+        assert_eq!(p1.targets[28], enumerate_packages as usize);
+
+        // XPackage v2 (f92d8712): EnumeratePackages @ 35, RegisterPackageInstalled @ 36.
+        let p2 = own(&XPACKAGE, &XPACKAGE_V2_IID).expect("XPackage v2");
+        assert!(!p2.iface.main);
+        assert_eq!(p2.targets[35], enumerate_packages as usize);
+        assert_eq!(p2.targets[36], register_token4 as usize);
+
+        // XPackage main: XPackageGetIdentifier at slot 27.
+        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
+        assert_eq!(pm.targets[27], XPackageGetCurrentProcessPackageIdentifier as usize);
+
+        // XSystem v3 (6fd71f09): XSystemGetAppSpecificDeviceId is at slot 4 (not SandboxId).
+        let s3 = own(&XSYSTEM, &XSYSTEM_V3_IID).expect("XSystem v3");
+        assert!(!s3.iface.main);
+        assert_eq!(s3.targets[4], XSystemGetAppSpecificDeviceId as usize);
+        let sm = own(&XSYSTEM, &XSYSTEM).expect("XSystem main");
+        assert_eq!(sm.targets[4], XSystemGetXboxLiveSandboxId as usize);
+        assert_eq!(sm.targets[5], XSystemGetAppSpecificDeviceId as usize);
+
+        // Compatible alias IIDs resolve cleanly to their main vtables.
+        assert!(own(&XUSER, &XUSER_V2_IID).unwrap().iface.iids.contains(&XUSER_V2_IID));
+        assert!(own(&XSYSTEM, &XSYSTEM_V2_IID).unwrap().iface.iids.contains(&XSYSTEM_V2_IID));
+        assert!(own(&XGAME, &XGAME_V1_IID).unwrap().iface.iids.contains(&XGAME_V1_IID));
+        assert!(own(&XPLS, &XPLS_V1_IID).unwrap().iface.iids.contains(&XPLS_V1_IID));
+    }
+
+    #[test]
+    fn token_and_signature_utf8_and_utf16_through_vtable() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (hr, u) = query(XUSER, XUSER);
+            assert_eq!(hr, S_OK);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XUserAddAsync(1, &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut user = std::ptr::null_mut();
+            assert_eq!(XUserAddResult(&mut b, &mut user), S_OK);
+
+            // UTF-8 slots 23..=25
+            let tok_async: unsafe extern "system" fn(
+                *mut c_void, *mut c_void, u32, *const u8, *const u8, usize, *const c_void, usize, *const c_void, *mut XAsyncBlock,
+            ) -> HRESULT = slot(u, 23);
+            let tok_size: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(u, 24);
+            let tok_res: unsafe extern "system" fn(
+                *mut c_void, *mut XAsyncBlock, usize, *mut c_void, *mut *mut XUserGetTokenAndSignatureData, *mut usize,
+            ) -> HRESULT = slot(u, 25);
+            let mut b8: XAsyncBlock = std::mem::zeroed();
+            let body = b"{\"hello\":\"world\"}";
+            assert_eq!(
+                tok_async(u, user, 0, b"POST\0".as_ptr(), b"https://userstats.xboxlive.com/batch\0".as_ptr(), 0, std::ptr::null(), body.len(), body.as_ptr() as *const c_void, &mut b8),
+                S_OK
+            );
+            assert_eq!(XAsyncGetStatus(&mut b8, true), S_OK);
+            let mut n8 = 0usize;
+            assert_eq!(tok_size(u, &mut b8, &mut n8), S_OK);
+            assert!(n8 > 32);
+            let mut buf8 = vec![0u8; n8];
+            let mut data8: *mut XUserGetTokenAndSignatureData = std::ptr::null_mut();
+            let mut used8 = 0usize;
+            assert_eq!(tok_res(u, &mut b8, buf8.len(), buf8.as_mut_ptr() as *mut c_void, &mut data8, &mut used8), S_OK);
+            assert_eq!(used8, n8);
+            let tok_s = crate::util::from_cstr_ptr((*data8).token).unwrap();
+            let sig_s = crate::util::from_cstr_ptr((*data8).signature).unwrap();
+            assert!(tok_s.starts_with("XBL3.0 x=xcl;"));
+            assert_eq!((*data8).token_size, tok_s.len() + 1);
+            assert_eq!((*data8).signature_size, sig_s.len() + 1);
+            assert!(sig_s.len() >= 100, "base64 of 76-byte XSTS header: {sig_s}");
+
+            // UTF-16 slots 26..=28
+            let tok16_async: unsafe extern "system" fn(
+                *mut c_void, *mut c_void, u32, *const u16, *const u16, usize, *const c_void, usize, *const c_void, *mut XAsyncBlock,
+            ) -> HRESULT = slot(u, 26);
+            let tok16_size: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(u, 27);
+            let tok16_res: unsafe extern "system" fn(
+                *mut c_void, *mut XAsyncBlock, usize, *mut c_void, *mut *mut XUserGetTokenAndSignatureUtf16Data, *mut usize,
+            ) -> HRESULT = slot(u, 28);
+            let method16 = crate::util::wide("GET");
+            let url16 = crate::util::wide("https://social.xboxlive.com/users/me/people");
+            let mut b16: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(
+                tok16_async(u, user, 0, method16.as_ptr(), url16.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null(), &mut b16),
+                S_OK
+            );
+            assert_eq!(XAsyncGetStatus(&mut b16, true), S_OK);
+            let mut n16 = 0usize;
+            assert_eq!(tok16_size(u, &mut b16, &mut n16), S_OK);
+            let mut buf16 = vec![0u8; n16];
+            let mut data16: *mut XUserGetTokenAndSignatureUtf16Data = std::ptr::null_mut();
+            let mut used16 = 0usize;
+            assert_eq!(tok16_res(u, &mut b16, buf16.len(), buf16.as_mut_ptr() as *mut c_void, &mut data16, &mut used16), S_OK);
+            assert_eq!(used16, n16);
+            let tok16 = crate::util::from_wide_ptr((*data16).token).unwrap();
+            let sig16 = crate::util::from_wide_ptr((*data16).signature).unwrap();
+            assert!(tok16.starts_with("XBL3.0 x=xcl;"));
+            assert_eq!((*data16).token_count, tok16.encode_utf16().count() + 1);
+            assert_eq!((*data16).signature_count, sig16.encode_utf16().count() + 1);
+
+            XUserCloseHandle(user);
+        }
+    }
+
+    #[test]
+    fn user_device_association_and_controller_lookup() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let (hr, dev) = query(XUSER_DEVICE, XUSER_DEVICE);
+            assert_eq!(hr, S_OK);
+            let find_dev: unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> HRESULT = slot(dev, 3);
+            let device_id = [0x42u8; 32];
+            let mut user = std::ptr::null_mut();
+            assert_eq!(find_dev(dev, device_id.as_ptr(), &mut user), S_OK);
+            assert!(!user.is_null());
+
+            let find_ctrl: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut XAsyncBlock) -> HRESULT = slot(dev, 9);
+            let find_ctrl_res: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut [u8; 32]) -> HRESULT = slot(dev, 10);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(find_ctrl(dev, user, &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut out_dev = [0xFFu8; 32];
+            assert_eq!(find_ctrl_res(dev, &mut b, &mut out_dev), S_OK);
+            assert_eq!(out_dev, [0u8; 32]);
+
+            XUserCloseHandle(user);
+        }
+    }
+
+    #[test]
+    fn xnetworking_and_xerror_through_vtable() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static ERR_SEEN: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn on_error(hr: HRESULT, _msg: *const u8, _ctx: *mut c_void) -> bool {
+            ERR_SEEN.store(hr as u32, Ordering::SeqCst);
+            true
+        }
+        unsafe {
+            // Both XNetworking CLSID and v2 IID resolve to XCL's XNetworking object.
+            let (hr, net) = query(XNETWORKING, XNETWORKING);
+            assert_eq!(hr, S_OK);
+            let (hr2, net2) = query(XNETWORKING, g(0xbf2346b2_39af_4658_b5ea_44713c7e83b3));
+            assert_eq!(hr2, S_OK);
+            assert_eq!(net, net2);
+            let get_port: unsafe extern "system" fn(*mut c_void, *mut u16) -> HRESULT = slot(net, 3);
+            let mut port = 0u16;
+            assert_eq!(get_port(net, &mut port), S_OK);
+            assert_eq!(port, networking::DEFAULT_UDP_PORT);
+            let get_hint: unsafe extern "system" fn(*mut c_void, *mut networking::XNetworkingConnectivityHint) -> HRESULT = slot(net, 15);
+            let mut hint: networking::XNetworkingConnectivityHint = std::mem::zeroed();
+            assert_eq!(get_hint(net, &mut hint), S_OK);
+            assert!(hint.network_initialized);
+
+            // XError vtable (slots 3..=5): callback runs and DebugBreak is not triggered.
+            let (hr, err) = query(XERROR, XERROR);
+            assert_eq!(hr, S_OK);
+            let report: unsafe extern "system" fn(*mut c_void, HRESULT, *const u8) = slot(err, 3);
+            let set_cb: unsafe extern "system" fn(*mut c_void, usize, *mut c_void) = slot(err, 4);
+            let set_opt: unsafe extern "system" fn(*mut c_void, u32, usize) = slot(err, 5);
+            set_opt(err, 3, 0);
+            set_cb(err, on_error as usize, std::ptr::null_mut());
+            report(err, crate::util::E_FAIL, b"unit test error\0".as_ptr());
+            assert_eq!(ERR_SEEN.load(Ordering::SeqCst), crate::util::E_FAIL as u32);
+            set_cb(err, 0, std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn xcl_xasync_fallback_vtable_covers_composite_queues_and_threads() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let xa = xcl_xasync_object() as *const Obj as *mut c_void;
+            let q_create: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT = slot(xa, 12);
+            let q_comp: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT = slot(xa, 13);
+            let q_port: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut *mut c_void) -> HRESULT = slot(xa, 14);
+            let q_close: unsafe extern "system" fn(*mut c_void, *mut c_void) = slot(xa, 17);
+            let set_ts: unsafe extern "system" fn(*mut c_void, bool) -> HRESULT = slot(xa, 27);
+            let verify_ts: unsafe extern "system" fn(*mut c_void) -> HRESULT = slot(xa, 28);
+            let assert_ts: unsafe extern "system" fn(*mut c_void) = slot(xa, 29);
+            let is_ts: unsafe extern "system" fn(*mut c_void) -> bool = slot(xa, 30);
+
+            let mut base = std::ptr::null_mut();
+            assert_eq!(q_create(xa, 0, 0, &mut base), S_OK);
+            let (mut wp, mut cp) = (std::ptr::null_mut(), std::ptr::null_mut());
+            assert_eq!(q_port(xa, base, 0, &mut wp), S_OK);
+            assert_eq!(q_port(xa, base, 1, &mut cp), S_OK);
+            let mut comp = std::ptr::null_mut();
+            assert_eq!(q_comp(xa, wp, cp, &mut comp), S_OK);
+            assert!(!comp.is_null());
+            q_close(xa, comp);
+            q_close(xa, base);
+
+            assert_eq!(set_ts(xa, true), S_OK);
+            assert!(is_ts(xa));
+            assert_eq!(verify_ts(xa), S_OK);
+            assert_ts(xa);
+            assert_eq!(set_ts(xa, false), S_OK);
+            assert!(!is_ts(xa));
         }
     }
 }

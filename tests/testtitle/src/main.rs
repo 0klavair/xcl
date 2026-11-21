@@ -70,6 +70,8 @@ extern "system" {
     fn XGameRuntimeInitialize() -> HRESULT;
     fn XSystemGetDeviceType() -> u32;
     fn XTaskQueueCreate(work: u32, completion: u32, out: *mut *mut c_void) -> HRESULT;
+    fn XTaskQueueGetPort(q: *mut c_void, port: u32, out: *mut *mut c_void) -> HRESULT;
+    fn XTaskQueueCreateComposite(work: *mut c_void, completion: *mut c_void, out: *mut *mut c_void) -> HRESULT;
     fn XTaskQueueSubmitCallback(q: *mut c_void, port: u32, ctx: *mut c_void, cb: unsafe extern "system" fn(*mut c_void, bool)) -> HRESULT;
     fn XTaskQueueSubmitDelayedCallback(q: *mut c_void, port: u32, ms: u32, ctx: *mut c_void, cb: unsafe extern "system" fn(*mut c_void, bool)) -> HRESULT;
     fn XTaskQueueDispatch(q: *mut c_void, port: u32, timeout: u32) -> bool;
@@ -78,8 +80,30 @@ extern "system" {
     fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -> HRESULT;
     fn XUserAddAsync(options: u32, b: *mut XAsyncBlock) -> HRESULT;
     fn XUserAddResult(b: *mut XAsyncBlock, user: *mut *mut c_void) -> HRESULT;
+    fn XUserFindForDevice(device: *const c_void, user: *mut *mut c_void) -> HRESULT;
+    fn XUserGetTokenAndSignatureAsync(
+        u: *mut c_void,
+        options: u32,
+        method: *const u8,
+        url: *const u8,
+        header_count: usize,
+        headers: *const c_void,
+        body_size: usize,
+        body: *const c_void,
+        b: *mut XAsyncBlock,
+    ) -> HRESULT;
+    fn XUserGetTokenAndSignatureResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT;
+    fn XUserGetTokenAndSignatureResult(
+        b: *mut XAsyncBlock,
+        size: usize,
+        buf: *mut c_void,
+        ptr: *mut *mut c_void,
+        used: *mut usize,
+    ) -> HRESULT;
     fn XUserGetGamertag(u: *mut c_void, comp: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT;
     fn XUserCloseHandle(u: *mut c_void);
+    fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(port: *mut u16) -> HRESULT;
+    fn XNetworkingGetConnectivityHint(out: *mut u8) -> HRESULT;
     fn XGameSaveFilesGetFolderWithUiAsync(u: *mut c_void, scid: *const u8, b: *mut XAsyncBlock) -> HRESULT;
     fn XGameSaveFilesGetFolderWithUiResult(b: *mut XAsyncBlock, size: usize, buf: *mut u8) -> HRESULT;
     fn XPersistentLocalStorageGetPath(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT;
@@ -466,7 +490,7 @@ fn main() {
         Ok(())
     });
 
-    check("XUser: silent sign-in of the offline user", || unsafe {
+    check("XUser: silent sign-in, device association, and XSTS token/signature", || unsafe {
         let mut b: XAsyncBlock = std::mem::zeroed();
         ensure!(XUserAddAsync(1, &mut b) == 0, "XUserAddAsync");
         ensure!(XAsyncGetStatus(&mut b, true) == 0, "status");
@@ -476,7 +500,73 @@ fn main() {
         let mut used = 0usize;
         ensure!(XUserGetGamertag(u, 0, 16, tag.as_mut_ptr(), &mut used) == 0, "gamertag");
         ensure!(cstr(&tag) == "Player1", "gamertag = {}", cstr(&tag));
+        let dev = [1u8; 32];
+        let mut du = std::ptr::null_mut();
+        ensure!(XUserFindForDevice(dev.as_ptr() as *const c_void, &mut du) == 0 && du == u, "XUserFindForDevice");
+        XUserCloseHandle(du);
+
+        let mut tb: XAsyncBlock = std::mem::zeroed();
+        ensure!(
+            XUserGetTokenAndSignatureAsync(
+                u,
+                0,
+                b"GET\0".as_ptr(),
+                b"https://example.invalid/hotfix\0".as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &mut tb,
+            ) == 0,
+            "XUserGetTokenAndSignatureAsync"
+        );
+        ensure!(XAsyncGetStatus(&mut tb, true) == 0, "token status");
+        let mut tsz = 0usize;
+        ensure!(XUserGetTokenAndSignatureResultSize(&mut tb, &mut tsz) == 0 && tsz > 32, "token size {tsz}");
+        let mut tbuf = vec![0u8; tsz];
+        let mut tptr = std::ptr::null_mut();
+        let mut tused = 0usize;
+        ensure!(
+            XUserGetTokenAndSignatureResult(&mut tb, tbuf.len(), tbuf.as_mut_ptr() as *mut c_void, &mut tptr, &mut tused) == 0,
+            "token result"
+        );
+        let tok_ptr = *(tptr as *const *const u8).add(2);
+        let sig_ptr = *(tptr as *const *const u8).add(3);
+        let tok_len = *(tptr as *const usize);
+        let sig_len = *(tptr as *const usize).add(1);
+        let tok = cstr(std::slice::from_raw_parts(tok_ptr, tok_len));
+        let sig = cstr(std::slice::from_raw_parts(sig_ptr, sig_len));
+        ensure!(tok.starts_with("XBL3.0 ") && sig.len() >= 100, "tok={tok:?} sig_len={}", sig.len());
         XUserCloseHandle(u);
+        Ok(())
+    });
+
+    check("XTaskQueue composite + XNetworking + advapi32legacy LSA fallback", || unsafe {
+        let mut base = std::ptr::null_mut();
+        ensure!(XTaskQueueCreate(0, 0, &mut base) == 0, "create base");
+        let (mut wp, mut cp) = (std::ptr::null_mut(), std::ptr::null_mut());
+        ensure!(XTaskQueueGetPort(base, 0, &mut wp) == 0 && XTaskQueueGetPort(base, 1, &mut cp) == 0, "get ports");
+        let mut comp = std::ptr::null_mut();
+        ensure!(XTaskQueueCreateComposite(wp, cp, &mut comp) == 0, "create composite");
+        FLAG.store(0, Ordering::SeqCst);
+        ensure!(XTaskQueueSubmitCallback(base, 0, 5 as _, set_flag) == 0, "submit base");
+        ensure!(XTaskQueueSubmitCallback(comp, 0, 7 as _, set_flag) == 0, "submit comp");
+        // Terminating composite must not cancel base's queued callback.
+        ensure!(XTaskQueueTerminate(comp, true, std::ptr::null_mut(), 0) == 0, "terminate comp");
+        ensure!(FLAG.load(Ordering::SeqCst) == 0, "base item ran/canceled early");
+        ensure!(XTaskQueueDispatch(base, 0, 0) && FLAG.load(Ordering::SeqCst) == 5, "base dispatch");
+        XTaskQueueCloseHandle(comp);
+        XTaskQueueTerminate(base, true, std::ptr::null_mut(), 0);
+        XTaskQueueCloseHandle(base);
+
+        let mut udp = 0u16;
+        ensure!(XNetworkingQueryPreferredLocalUdpMultiplayerPort(&mut udp) == 0 && udp == 3074, "udp={udp}");
+        let mut hint = [0u8; 16];
+        ensure!(XNetworkingGetConnectivityHint(hint.as_mut_ptr()) == 0 && hint[12] == 1, "hint={hint:?}");
+
+        let adv = LoadLibraryW(wide("advapi32legacy.dll").as_ptr());
+        ensure!(adv != 0, "LoadLibrary(advapi32legacy.dll)");
+        ensure!(GetProcAddress(adv, b"LsaOpenPolicy\0".as_ptr()) != 0, "advapi32legacy!LsaOpenPolicy");
         Ok(())
     });
 
