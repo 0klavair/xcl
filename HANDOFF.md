@@ -1,6 +1,6 @@
 # XCL – work handoff (status as of 2026-11-20, session 5)
 
-Xbox Series X|S → Windows compatibility layer (no CPU emulation), Rust, `<repo>`.
+Xbox Series X|S → Windows compatibility layer (no CPU emulation), Rust (this repository).
 Design: `docs/specs/2026-11-20-xcl-design.md` (sections 5.x, including 5.7a – console shader format, 5.7b – recompiler status). Manual: `README.md`.
 Conversation with the user in Polish; everything in the repo (code, comments, messages, docs) in English. Git repo: `main`, pushed to origin; commits only at the user's request.
 
@@ -128,7 +128,7 @@ NOTE:
   `report.json → shaders.recomp_*` (programs, complete ones, modes, missing mnemonics); `XCL_RECOMP_DXC=1` compiles through
   `dxc::compile_cached` (DXIL cache in `%LOCALAPPDATA%\xcl\dxil` or `XCL_DXIL_CACHE`). e2e checks this.
 - Gallery: `retail_ps_gallery` (ignored test, `XCL_GALLERY_DIR`) – 24 PS shaders from the pack drawn on the GPU (PNG + page
-  `gallery/index.html`), approx. 10 s. Placeholder inputs/constants – these are not images from the game.
+  `index.html` in that folder, kept locally – not in the repository: renders of game shaders), approx. 10 s.
 - FSSM header: `--example name=…` prints it (the dwords up to the code). Stage descriptor +0x110 looks like RSRC2 (USER_SGPR in
   bits 5:1, e.g. 0x18 → 12); from approx. +0x25C in PS an export patch table (`exp` variants). The root signature → user
   SGPR mapping is done by the D3D12.X runtime (the SGPRs carry pointers to tables) – to be determined only from the game exe.

@@ -489,7 +489,7 @@ the game in a child `xcl.exe` process with the game's command line (argv[0] = th
 static modules; x64 only; LGPL-3.0 license (since 2026-11-20: GPL-2.0-only, §8); offline XGameRuntime; XStore without
 faking licenses; native D3D12 as the backend; XAudio2 → system XAudio2.9
 + FFmpeg for XMA2; data in `%LOCALAPPDATA%\XCL\`; the name XCL; project
-in `<repo>`; **null D3D12.X in M1, image only in M2**;
+in this repository; **null D3D12.X in M1, image only in M2**;
 Windows only (no requirement of Wine compatibility); real titles are tested by
 the user, and the implementer works from the reports; a data-driven resolver
 (ordinal database).
