@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -175,16 +176,57 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     }
 }
 
+fn toolchain_identity() -> &'static str {
+    static IDENTITY: OnceLock<String> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        let Some(dir) = candidates().into_iter().find(|dir| dir.join("dxcompiler.dll").is_file()) else {
+            return "unavailable".into();
+        };
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut buffer = [0u8; 64 * 1024];
+        for name in ["dxcompiler.dll", "dxil.dll"] {
+            for byte in name.bytes().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+            let Ok(mut file) = std::fs::File::open(dir.join(name)) else {
+                h ^= 0xff;
+                h = h.wrapping_mul(0x100_0000_01b3);
+                continue;
+            };
+            loop {
+                let Ok(read) = file.read(&mut buffer) else {
+                    h ^= 0xfe;
+                    h = h.wrapping_mul(0x100_0000_01b3);
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                for &byte in &buffer[..read] {
+                    h ^= byte as u64;
+                    h = h.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        format!("{h:016x}")
+    })
+}
+
 /// FNV-1a 64 of the inputs that determine the DXIL.
-fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
+fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), profile, entry, src] {
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
         }
     }
     h
+}
+
+fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
+    cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -407,6 +449,14 @@ mod cache_tests {
         assert!(hit && a == b);
         assert_ne!(cache_key(src, "main", "cs_6_6"), cache_key(src, "main", "cs_6_7"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_key_tracks_the_dxc_toolchain() {
+        let a = cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a");
+        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
     }
 
     #[test]
