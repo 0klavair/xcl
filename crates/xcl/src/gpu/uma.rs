@@ -17,6 +17,9 @@ use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
 
+/// VirtualAlloc: track CPU writes (GetWriteWatch)
+const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
 /// allocation granularity (as VirtualAlloc)
 pub const GRAIN: usize = 0x1_0000;
 /// largest region D3D12 opens as a heap
@@ -59,7 +62,8 @@ impl Uma {
             let mut got = Vec::new();
             for k in 0..windows {
                 let want = base + k * WINDOW;
-                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+                // write-watched: textures the title keeps here are uploaded again after CPU writes
+                let p = unsafe { VirtualAlloc(want as *const std::ffi::c_void, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
                 if p.is_null() {
                     break;
                 }

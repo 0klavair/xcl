@@ -864,6 +864,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             u.free(p);
@@ -2210,6 +2211,8 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    // textures in title memory the CPU wrote since: uploaded again first
+    super::title_textures::refresh();
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void>;
     let lists = if n > 0 && !lists.is_null() {

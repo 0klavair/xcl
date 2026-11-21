@@ -19,6 +19,12 @@ extern "system" {
     fn D3D12SerializeRootSignature(desc: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT;
 }
 
+// the console's texture layout library
+#[link(name = "xg_xs", kind = "raw-dylib")]
+extern "system" {
+    fn XGCreateTextureComputer(desc: *const D3D12_RESOURCE_DESC, computer: *mut *mut c_void) -> HRESULT;
+}
+
 // Fortnite reads its data through the console's DirectStorage
 #[link(name = "xcrdapi", kind = "raw-dylib")]
 extern "system" {
@@ -526,6 +532,119 @@ pub fn direct_storage() -> Result<(), String> {
         for o in [status, file, q] {
             std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(o, 2))(o);
         }
+        Ok(())
+    }
+}
+
+/// A texture in the title's own memory, as a console title streams one: its layout from the
+/// layout library (64KB_S_X, 2 slices x 2 mips), texels written there tiled, the texture placed
+/// at that address (#44) - the GPU reads every subresource; then one subresource is written
+/// again and the next ExecuteCommandLists sees the new texels.
+pub fn title_texture() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 80,
+            Height: 40,
+            DepthOrArraySize: 2,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        desc.Layout = D3D12_TEXTURE_LAYOUT(0x119); // the console's 64KB_S_X
+        let mut xg = std::ptr::null_mut();
+        ensure!(XGCreateTextureComputer(&desc, &mut xg) == 0, "XGCreateTextureComputer");
+        let size = std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u64>(slot(xg, 3))(xg) as usize;
+        type Into = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let into: Into = std::mem::transmute(slot(xg, 8));
+        let graphics = 1u64 << 29;
+        let mem = crate::XMemAlloc(size, graphics) as *mut u8;
+        ensure!(!mem.is_null(), "graphics memory");
+        let dims = |mip: u32| ((80u32 >> mip).max(1), (40u32 >> mip).max(1));
+        let texels = |sub: u32, salt: u8| -> Vec<u8> {
+            let (w, h) = dims(sub % 2);
+            (0..w * h * 4).map(|i| (i as u8).wrapping_mul(7).wrapping_add(sub as u8 * 31).wrapping_add(salt)).collect()
+        };
+        for sub in 0..4u32 {
+            let (w, h) = dims(sub % 2);
+            ensure!(into(xg, mem, 0, sub, texels(sub, 0).as_ptr(), w * 4, w * h * 4) == 0, "CopyIntoSubresource {sub}");
+        }
+        type PlacedX = unsafe extern "system" fn(*mut c_void, u64, *const D3D12_RESOURCE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        let mut raw = std::ptr::null_mut();
+        let hr = std::mem::transmute::<usize, PlacedX>(slot(dev.as_raw(), 44))(dev.as_raw(), mem as u64, &desc, 0, std::ptr::null(), &ID3D12Resource::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreatePlacedResourceX texture hr={hr:#x}");
+        let tex = ID3D12Resource::from_raw(raw);
+
+        // all four subresources through the GPU
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let pc = tex.GetDesc();
+        let mut fps = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 4];
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&pc, 0, 4, 0, Some(fps.as_mut_ptr()), None, None, Some(&mut total));
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(e)?;
+        let rb = rb.ok_or("no readback buffer")?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        list.Close().map_err(e)?;
+        let mut step = 0u64;
+        let mut read_back = |want: &dyn Fn(u32) -> Vec<u8>| -> Result<(), String> {
+            alloc.Reset().map_err(e)?;
+            list.Reset(&alloc, None).map_err(e)?;
+            for (sub, fp) in fps.iter().enumerate() {
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&tex), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub as u32 } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            list.Close().map_err(e)?;
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+            step += 1;
+            wait(&queue, &fence, step)?;
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).map_err(e)?;
+            let mut result = Ok(());
+            for (sub, fp) in fps.iter().enumerate() {
+                let (w, h) = dims(sub as u32 % 2);
+                let exp = want(sub as u32);
+                for y in 0..h as usize {
+                    let got = std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), w as usize * 4);
+                    if got != &exp[y * w as usize * 4..(y + 1) * w as usize * 4] {
+                        result = Err(format!("subresource {sub} row {y} differs from the title memory"));
+                        break;
+                    }
+                }
+            }
+            rb.Unmap(0, None);
+            result
+        };
+        read_back(&|sub| texels(sub, 0))?;
+        // stream new texels into slice 1 mip 0 (subresource 2) and run work: the GPU sees them
+        ensure!(into(xg, mem, 0, 2, texels(2, 99).as_ptr(), 80 * 4, 80 * 40 * 4) == 0, "CopyIntoSubresource again");
+        read_back(&|sub| texels(sub, if sub == 2 { 99 } else { 0 }))?;
+        drop(tex);
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(xg, 1))(xg);
+        crate::XMemFree(mem as *mut c_void, graphics);
         Ok(())
     }
 }

@@ -1,0 +1,170 @@
+//! Textures a title places in its own memory (CreatePlacedResourceX): on the console the GPU
+//! samples that memory, laid out as the console's layout library says (`hle::xg`, checked
+//! against the console's own). Here a PC texture holds a detiled copy: uploaded when the
+//! texture is created and again before the title's next ExecuteCommandLists once the CPU wrote
+//! any of its pages (unified memory is write-watched, `gpu::uma`) – textures streamed in after
+//! creation (mips loaded later, DirectStorage) included.
+//!
+//! The copy waits for the GPU on an XCL queue of the device. Memory that is not readable
+//! (reserved, not mapped yet) reads as zero. GPU writes into the title's memory (copies to the
+//! address) are not seen; the title's own GPU work on the texture goes to the PC texture.
+
+use std::collections::BTreeMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use windows::core::Interface;
+use windows::Win32::Graphics::Direct3D12::*;
+
+use crate::gpu::texture::{self, Subresource};
+use crate::hle::xg;
+
+/// GetWriteWatch / ResetWriteWatch
+const WRITE_WATCH_FLAG_RESET: u32 = 1;
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
+    fn ResetWriteWatch(base: *const c_void, size: usize) -> u32;
+}
+
+/// (device, address, layout, state) of an upload
+type Upload = (usize, usize, Arc<xg::Texture>, D3D12_RESOURCE_STATES);
+
+struct Entry {
+    device: usize,
+    va: usize,
+    tex: Arc<xg::Texture>,
+    /// the state the texture was created in (uploads leave it there)
+    state: D3D12_RESOURCE_STATES,
+}
+
+// raw COM pointers of the title's objects; uploads hold a reference while they run
+unsafe impl Send for Entry {}
+
+/// PC texture → its place in the title's memory
+static TEXTURES: Mutex<BTreeMap<usize, Entry>> = Mutex::new(BTreeMap::new());
+/// the queue uploads go to, per device
+static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
+static UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of textures kept in title memory and uploads done so far.
+pub fn counts() -> (usize, u64) {
+    (TEXTURES.lock().unwrap().len(), UPLOADS.load(Ordering::Relaxed))
+}
+
+/// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
+pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    let bytes = tex.size() as usize;
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state };
+    if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) {
+        ResetWriteWatch(va as *const c_void, bytes);
+    }
+    let upload = (e.device, e.va, Arc::clone(&e.tex), e.state);
+    TEXTURES.lock().unwrap().insert(res as usize, e);
+    let r = ID3D12Resource::from_raw_borrowed(&res).ok_or("no resource")?;
+    run_upload(upload, r)
+}
+
+/// The PC texture was released for good.
+pub fn forget(res: usize) {
+    TEXTURES.lock().unwrap().remove(&res);
+}
+
+/// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
+/// uploaded again.
+pub(super) unsafe fn refresh() {
+    thread_local! {
+        static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    // the uploads' own ExecuteCommandLists come back here
+    if BUSY.with(|b| b.replace(true)) {
+        return;
+    }
+    refresh_once();
+    BUSY.with(|b| b.set(false));
+}
+
+unsafe fn refresh_once() {
+    if TEXTURES.lock().unwrap().is_empty() {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let mut dirty: Vec<usize> = Vec::new();
+    let mut page = 0x1000u32;
+    for k in 0..u.windows() {
+        let (base, size) = u.window(k);
+        loop {
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
+            let mut n = buf.len();
+            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
+                break;
+            }
+            dirty.extend(buf[..n].iter().map(|&p| p as usize));
+            if n < buf.len() {
+                break;
+            }
+        }
+    }
+    if dirty.is_empty() {
+        return;
+    }
+    dirty.sort_unstable();
+    // textures with a written page; a reference each while they are uploaded
+    let todo: Vec<(ID3D12Resource, Upload)> = {
+        let t = TEXTURES.lock().unwrap();
+        t.iter()
+            .filter(|(_, e)| {
+                let i = dirty.partition_point(|&p| p + page as usize <= e.va);
+                dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
+            })
+            .filter_map(|(&res, e)| {
+                let p = res as *mut c_void;
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
+            })
+            .collect()
+    };
+    for (r, u) in todo {
+        if let Err(e) = run_upload(u, &r) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("title texture: upload again failed: {e}");
+            }
+        }
+    }
+}
+
+/// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
+unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
+    let c = &tex.chain;
+    let bpe = tex.bpe as usize;
+    let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
+    for s in 0..tex.array as usize {
+        let at = va + s * c.slice_bytes;
+        let slice: &[u8] = if crate::gpu::shader::readable(at, c.slice_bytes) { std::slice::from_raw_parts(at as *const u8, c.slice_bytes) } else { &[] };
+        for (i, l) in c.levels.iter().enumerate() {
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+        }
+    }
+    out
+}
+
+unsafe fn run_upload((device, va, tex, state): Upload, res: &ID3D12Resource) -> Result<(), String> {
+    let d = device as *mut c_void;
+    let dev = ID3D12Device::from_raw_borrowed(&d).ok_or("no device")?;
+    let queue = {
+        let mut q = QUEUES.lock().unwrap();
+        if let Some(q) = q.get(&device) {
+            q.clone()
+        } else {
+            let made: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(|e| e.to_string())?;
+            q.insert(device, made.clone());
+            made
+        }
+    };
+    let subs = subresources(va, &tex);
+    texture::upload(dev, &queue, res, &subs, state, state)?;
+    UPLOADS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}

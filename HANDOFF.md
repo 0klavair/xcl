@@ -644,6 +644,15 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   - Modes the library takes for 2D: 1 2 5 6 9 10 17 18 21 22 25 26 27, 24 (and VAR 28) for ≤ 8-byte non-BC elements,
     VAR 31; `Layout` 0 / 2 = its choice (64KB_D for 2, 4KB_S, UAVs 4KB_S_X up to 64 KB else 64KB_R_X). Not modelled
     (E_NOTIMPL): render targets / depth (CMASK / HTILE planes), planar depth-stencil formats, MSAA, 1D / 3D, VAR modes.
+- **Textures in title memory** (`d3d12x/title_textures.rs`): CreatePlacedResourceX of a texture gets a PC texture kept in
+  step with the title's memory – every mip and slice detiled with the XG layout (`hle::xg`) and uploaded at creation;
+  unified memory is reserved with MEM_WRITE_WATCH (OpenExistingHeapFromAddress takes it), and before each
+  ExecuteCommandLists one GetWriteWatch per window finds the textures whose pages the CPU wrote (streamed mips,
+  DirectStorage reads) and uploads them again (on an XCL queue, waiting for it). Unreadable memory (reserved, not mapped)
+  reads as zero. The test title writes a 64KB_S_X array through XG, places it, reads every subresource back through
+  the GPU, rewrites one and sees it after the next ExecuteCommandLists. Not yet: GPU writes into the title's memory
+  (copies to the address), mapping physical pages into reserved address space (Fortnite's streaming does that), the
+  upload without a CPU wait, the state if the title moved the texture out of its initial one.
 - XGameRuntime task queues: handles are looked up in a set of live ones before being read – an XAsync completing on a
   worker after its queue was closed read freed memory (a rare lib-test panic in `queue_from`).
 

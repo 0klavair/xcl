@@ -379,8 +379,8 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 
 /// device #44 CreatePlacedResourceX(address, desc, initial state, clear value, riid, resource):
 /// a resource in title memory. A buffer at a 64 KiB-aligned address in unified memory is that
-/// memory (placed in its UMA heap); anything else gets memory of its own – a texture's console
-/// tiling has no PC equivalent, so what the title writes at the address is not seen there.
+/// memory (placed in its UMA heap); a texture gets a PC texture kept in step with the memory
+/// (`title_textures`: detiled as the console lays it out, uploaded again after CPU writes).
 pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void, va: u64, desc: *const u8, state: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static N: AtomicU64 = AtomicU64::new(0);
     if desc.is_null() || ppv.is_null() || !crate::gpu::shader::readable(desc as usize, 0x38) {
@@ -396,6 +396,14 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    if hr >= 0 && !buffer && !(*ppv).is_null() {
+        static M: AtomicU64 = AtomicU64::new(0);
+        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+            Ok(()) => return hr,
+            Err(e) if once(&M, 4) => crate::xlog_warn!("D3D12.X: CreatePlacedResourceX texture at {va:#x}: not kept in step with the memory ({e})"),
+            Err(_) => {}
+        }
+    }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
         crate::xlog_info!(
