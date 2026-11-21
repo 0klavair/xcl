@@ -12,6 +12,8 @@ use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUG
 
 use crate::gpu::pack;
 
+const AUTO_PROBE_SIZE: u64 = 1024 * 1024 * 1024;
+
 /// Printable signature of unpacked data: 4 ASCII bytes or hex.
 fn magic(b: &[u8]) -> String {
     let m = &b[..b.len().min(4)];
@@ -100,6 +102,26 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let find = opt("--find");
     let extract = opt("--extract");
     let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rpf_out"));
+    let len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            eprintln!("xcl rpf: {}: {error}", path.display());
+            return 2;
+        }
+    };
+    let explicit_probe = args.iter().any(|arg| arg == "--probe");
+    let force_full = args.iter().any(|arg| arg == "--full");
+    if explicit_probe {
+        return crate::rpf_probe::run(path, top);
+    }
+    if len > AUTO_PROBE_SIZE && !force_full {
+        if find.is_some() || extract.is_some() {
+            eprintln!("xcl rpf: detailed options on archives larger than 1 GB require --full");
+            return 2;
+        }
+        println!("archive exceeds 1 GB; using bounded-memory probe (pass --full to request a detailed scan)");
+        return crate::rpf_probe::run(path, top);
+    }
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
