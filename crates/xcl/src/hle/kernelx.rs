@@ -119,12 +119,37 @@ pub fn sanitize_protect(p: u32) -> u32 {
     }
 }
 
+/// Graphics address space the title reserved (no commit) – where it maps physical pages (a
+/// texture streaming pool): base → size. Write-watched, like unified memory, so textures in it
+/// follow CPU writes (`d3d12x::title_textures`).
+static GRAPHICS_RESERVATIONS: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The title's graphics reservations (base, size).
+pub fn graphics_reservations() -> Vec<(usize, usize)> {
+    GRAPHICS_RESERVATIONS.lock().unwrap().iter().map(|(&b, &s)| (b, s)).collect()
+}
+
+/// Whether `p` lies in one of the title's graphics reservations.
+pub fn in_graphics_reservation(p: usize) -> bool {
+    GRAPHICS_RESERVATIONS.lock().unwrap().range(..=p).next_back().is_some_and(|(&b, &s)| p < b + s)
+}
+
+const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
-/// memory region the GPU uses directly (`gpu::uma`); everything else from Windows.
+/// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
+/// write-watched address space of Windows; everything else from Windows.
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 0)) {
             return q as *mut c_void;
+        }
+    }
+    if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+        let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
+        if !q.is_null() {
+            GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+            return q;
         }
     }
     mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p))
@@ -141,6 +166,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             std::ptr::write_bytes(addr as *mut u8, 0, size);
         }
         return 1;
+    }
+    if t & 0x8000 != 0 {
+        GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
     }
     mem::VirtualFree(addr, size, t)
 }
@@ -382,13 +410,46 @@ pub unsafe extern "system" fn ToolingMemoryStatus(buf: *mut u32) -> BOOL {
 }
 
 /// Title physical pages (64 KiB) emulated in the unified memory region: an allocation is one
-/// contiguous UMA block, page numbers = offset / 64 KiB in UMA. Mapping consecutive pages
-/// returns their UMA address (GPU-visible, no copy); choosing that same address is supported.
-/// A different address or scattered pages cannot alias memory this way – logged and refused.
+/// contiguous UMA block – its pages' home; a page's number is its UMA page index + 1 (0 means
+/// "none": unmap). Mapping consecutive pages at their home (or at no chosen address) returns
+/// that UMA address (GPU-visible, no copy). Mapping pages at another address – address space
+/// the title reserved, in any order – commits it and copies their data there; unmapping them
+/// (or mapping them elsewhere) copies it back home: a page is in one place at a time and keeps
+/// its contents.
 const PHYS_PAGE: usize = 0x1_0000;
 
 /// first page number → (pages in the block, pages still allocated)
 static PHYS_BLOCKS: std::sync::Mutex<std::collections::BTreeMap<usize, (usize, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Pages mapped away from home: address → page, and page → address.
+#[derive(Default)]
+struct Away {
+    at: std::collections::BTreeMap<usize, usize>,
+    page: std::collections::HashMap<usize, usize>,
+}
+static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
+
+/// The home address of page `page` if it belongs to a live allocation.
+fn page_home(page: usize) -> Option<usize> {
+    let u = crate::gpu::uma::get()?;
+    let index = page.checked_sub(1)?;
+    let blocks = PHYS_BLOCKS.lock().ok()?;
+    let (&first, &(count, live)) = blocks.range(..=index).next_back()?;
+    (live > 0 && index < first.checked_add(count)?).then(|| u.base().checked_add(index.checked_mul(PHYS_PAGE)?)).flatten().filter(|&p| p + PHYS_PAGE <= u.base() + u.size())
+}
+
+/// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).
+unsafe fn unmap_away(away: &mut Away, at: usize) {
+    if let Some(page) = away.at.remove(&at) {
+        away.page.remove(&page);
+        if let Some(home) = page_home(page) {
+            std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
+        }
+        if !crate::gpu::uma::get().is_some_and(|u| u.contains(at)) {
+            mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
+        }
+    }
+}
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
     if num.is_null() || arr.is_null() || *num == 0 {
@@ -407,7 +468,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     };
     let first = (block as usize - u.base()) / PHYS_PAGE;
     for i in 0..n {
-        *arr.add(i) = first + i;
+        *arr.add(i) = first + i + 1;
     }
     PHYS_BLOCKS.lock().unwrap().insert(first, (n, n));
     1
@@ -419,9 +480,17 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return 0;
     }
+    // freed pages mapped elsewhere: that address keeps whatever it holds, the mapping goes
+    if let Some(away) = AWAY.lock().unwrap().as_mut() {
+        for i in 0..n {
+            if let Some(at) = away.page.remove(&*arr.add(i)) {
+                away.at.remove(&at);
+            }
+        }
+    }
     let mut g = PHYS_BLOCKS.lock().unwrap();
     for i in 0..n {
-        let page = *arr.add(i);
+        let Some(page) = (*arr.add(i)).checked_sub(1) else { continue };
         // the block holding this page
         let Some((&first, &(count, _))) = g.range(..=page).next_back() else { continue };
         if page >= first + count {
@@ -438,38 +507,56 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
 }
 
 pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
-    let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
-    if n == 0 || arr.is_null() {
+    if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
-    let first = *arr;
-    let consecutive = (1..n).all(|i| first.checked_add(i).is_some_and(|page| *arr.add(i) == page));
-    let at = consecutive.then(|| {
-        let end_page = first.checked_add(n)?;
-        let blocks = PHYS_BLOCKS.lock().ok()?;
-        let (&block_first, &(block_pages, live_pages)) = blocks.range(..=first).next_back()?;
-        let block_end = block_first.checked_add(block_pages)?;
-        if live_pages == 0 || end_page > block_end {
-            return None;
-        }
-        let offset = first.checked_mul(PHYS_PAGE)?;
-        let bytes = n.checked_mul(PHYS_PAGE)?;
-        let address = u.base().checked_add(offset)?;
-        let end = address.checked_add(bytes)?;
-        (end <= u.base().checked_add(u.size())?).then_some(address as *mut c_void)
-    }).flatten();
-    if let Some(at) = at {
-        if va.is_null() || va == at {
-            return at;
-        }
+    let pages: Vec<usize> = if arr.is_null() { vec![0; n] } else { (0..n).map(|i| *arr.add(i)).collect() };
+    if pages.iter().any(|&p| p != 0 && page_home(p).is_none()) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
     }
-    static WARNED: AtomicU32 = AtomicU32::new(0);
-    if WARNED.fetch_add(1, Ordering::Relaxed) < 5 {
-        crate::xlog_warn!("MapTitlePhysicalPages({va:?}, {n} pages, consecutive: {consecutive}) – mapping at a chosen address / of scattered pages not supported yet");
+    let mut g = AWAY.lock().unwrap();
+    let away = g.get_or_insert_with(Away::default);
+    // consecutive pages at their home (or no address chosen): that UMA memory itself
+    let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i) == Some(pages[i]));
+    let home = if consecutive { page_home(pages[0]).filter(|_| page_home(pages[n - 1]).is_some()) } else { None };
+    if va.is_null() || home == Some(va as usize) {
+        let Some(home) = home else {
+            fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED); // scattered pages need an address
+            return std::ptr::null_mut();
+        };
+        for &p in &pages {
+            if let Some(&at) = away.page.get(&p) {
+                unmap_away(away, at);
+            }
+        }
+        return home as *mut c_void;
     }
-    fnd::SetLastError(fnd::ERROR_NOT_SUPPORTED);
-    std::ptr::null_mut()
+    let base = va as usize;
+    if !base.is_multiple_of(PHYS_PAGE) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.contains(a));
+    for (i, &p) in pages.iter().enumerate() {
+        let at = base + i * PHYS_PAGE;
+        unmap_away(away, at);
+        if p == 0 {
+            continue;
+        }
+        if let Some(&old) = away.page.get(&p) {
+            unmap_away(away, old);
+        }
+        if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(page_home(p).unwrap() as *const u8, at as *mut u8, PHYS_PAGE);
+        away.at.insert(at, p);
+        away.page.insert(p, at);
+    }
+    va
 }
 
 /// `BOOL XMemAllocatePhysicalPages(XALLOC_ATTRIBUTES, SIZE_T* count, ULONG64* pages)`: the
@@ -992,13 +1079,13 @@ mod tests {
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr()).is_null());
             // Page numbers must refer to one registered allocation; arithmetic is checked before
             // constructing an address inside the reserved UMA region.
-            let mut outside = [u.size() / PHYS_PAGE];
+            let mut outside = [u.size() / PHYS_PAGE + 1];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, outside.as_mut_ptr()).is_null());
             let mut wrapping = [usize::MAX];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, wrapping.as_mut_ptr()).is_null());
             // freed: the block is gone (other tests use UMA at the same time, so not `u.used()`)
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
-            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&pages[0]));
+            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&(pages[0] - 1)));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
         }
     }

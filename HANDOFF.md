@@ -651,8 +651,16 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   DirectStorage reads) and uploads them again (on an XCL queue, waiting for it). Unreadable memory (reserved, not mapped)
   reads as zero. The test title writes a 64KB_S_X array through XG, places it, reads every subresource back through
   the GPU, rewrites one and sees it after the next ExecuteCommandLists. Not yet: GPU writes into the title's memory
-  (copies to the address), mapping physical pages into reserved address space (Fortnite's streaming does that), the
-  upload without a CPU wait, the state if the title moved the texture out of its initial one.
+  (copies to the address), the upload without a CPU wait, the state if the title moved the texture out of its initial
+  one.
+- **Physical pages mapped into reserved address space** (Fortnite's texture streaming, `kernelx`): a graphics
+  reservation (VirtualAlloc / XMemVirtualAlloc, MEM_RESERVE without commit) is Windows address space reserved with
+  MEM_WRITE_WATCH and remembered; a page (number = UMA page index + 1, 0 = unmap) lives in its allocation's UMA block;
+  mapping pages at another address, in any order, commits it and copies their data there, unmapping (null / 0 pages,
+  or mapping them elsewhere) copies it back – a page is in one place at a time and keeps its contents (no aliasing:
+  two addresses of one page at once are not possible this way). Title textures placed there read only the committed
+  pages and are uploaded again after the mapping / the writes. Tests: reverse-order mapping, moving a page, unmapping
+  and mapping it again (xmem); a texture placed in an empty pool gets its texels once a page is mapped in (GPU).
 - XGameRuntime task queues: handles are looked up in a set of live ones before being read – an XAsync completing on a
   worker after its queue was closed read freed memory (a rare lib-test panic in `queue_from`).
 

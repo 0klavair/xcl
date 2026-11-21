@@ -649,6 +649,87 @@ pub fn title_texture() -> Result<(), String> {
     }
 }
 
+/// A texture placed in a streaming pool before any memory is there: address space reserved,
+/// the texture placed at it (#44, its texels read as zero), then a physical page mapped in and
+/// the texels written – the GPU sees them after the next ExecuteCommandLists.
+pub fn streamed_texture() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        desc.Layout = D3D12_TEXTURE_LAYOUT(0x105); // 4KB_S: 16 KB
+        let mut xg = std::ptr::null_mut();
+        ensure!(XGCreateTextureComputer(&desc, &mut xg) == 0, "XGCreateTextureComputer");
+        let page = 0x1_0000usize;
+        let va = crate::XMemVirtualAlloc(std::ptr::null(), page, 0x2000, 1u64 << 29, 4) as usize;
+        ensure!(va != 0, "reservation");
+        type PlacedX = unsafe extern "system" fn(*mut c_void, u64, *const D3D12_RESOURCE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+        let mut raw = std::ptr::null_mut();
+        let hr = std::mem::transmute::<usize, PlacedX>(slot(dev.as_raw(), 44))(dev.as_raw(), va as u64, &desc, 0, std::ptr::null(), &ID3D12Resource::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreatePlacedResourceX hr={hr:#x}");
+        let tex = ID3D12Resource::from_raw(raw);
+        let (mut n, mut pages) = (1usize, [0u64; 1]);
+        ensure!(crate::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) != 0, "XMemAllocatePhysicalPages");
+        ensure!(crate::XMemMapPhysicalPages(va as *mut c_void, 1, pages.as_mut_ptr()) as usize == va, "XMemMapPhysicalPages");
+        let texels: Vec<u8> = (0..64 * 64 * 4).map(|i: u32| (i as u8).wrapping_mul(13) ^ 0x5A).collect();
+        type Into = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        ensure!(std::mem::transmute::<usize, Into>(slot(xg, 8))(xg, va as *mut u8, 0, 0, texels.as_ptr(), 256, 256 * 64) == 0, "CopyIntoSubresource");
+
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&tex.GetDesc(), 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(e)?;
+        let rb = rb.ok_or("no readback buffer")?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&tex), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).map_err(e)?;
+        let same = (0..64usize).all(|y| std::slice::from_raw_parts((p as *const u8).add(fp.Offset as usize + y * fp.Footprint.RowPitch as usize), 256) == &texels[y * 256..(y + 1) * 256]);
+        rb.Unmap(0, None);
+        ensure!(same, "the texture does not have the texels mapped in after it was placed");
+        drop(tex);
+        ensure!(crate::XMemFreePhysicalPages(1, pages.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
+        std::mem::transmute::<usize, unsafe extern "system" fn(*mut c_void) -> u32>(slot(xg, 1))(xg);
+        crate::VirtualFree(va as *mut c_void, 0, 0x8000);
+        Ok(())
+    }
+}
+
 pub fn render_triangle() -> Result<(), String> {
     unsafe {
         let dev = device()?;

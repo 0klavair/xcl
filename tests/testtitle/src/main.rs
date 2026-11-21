@@ -247,6 +247,31 @@ fn main() {
         Ok(())
     });
 
+    check("xmem: physical pages mapped into reserved address space keep their contents", || unsafe {
+        let (reserve, rw, graphics) = (0x2000u32, 4u32, 1u64 << 29);
+        let page = 0x1_0000usize;
+        let va = XMemVirtualAlloc(std::ptr::null(), 4 * page, reserve, graphics, rw) as usize;
+        ensure!(va != 0 && va.is_multiple_of(page), "reservation {va:#x}");
+        let (mut n, mut pages) = (2usize, [0u64; 2]);
+        ensure!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) != 0, "XMemAllocatePhysicalPages");
+        // in the reverse order, one page in: page b at va + 1, page a at va + 2
+        let mut ba = [pages[1], pages[0]];
+        ensure!(XMemMapPhysicalPages((va + page) as *mut c_void, 2, ba.as_mut_ptr()) as usize == va + page, "map b, a");
+        *((va + page) as *mut u32) = 0xB;
+        *((va + 2 * page) as *mut u32) = 0xA;
+        // page a moves to va: its data with it
+        let mut a = [pages[0]];
+        ensure!(XMemMapPhysicalPages(va as *mut c_void, 1, a.as_mut_ptr()) as usize == va, "map a at va");
+        ensure!(*(va as *const u32) == 0xA, "page a moved without its data");
+        // unmapped (null pages) and mapped again further on: still its data
+        ensure!(XMemMapPhysicalPages(va as *mut c_void, 1, std::ptr::null_mut()) as usize == va, "unmap");
+        ensure!(XMemMapPhysicalPages((va + 3 * page) as *mut c_void, 1, a.as_mut_ptr()) as usize == va + 3 * page, "map a again");
+        ensure!(*((va + 3 * page) as *const u32) == 0xA && *((va + page) as *const u32) == 0xB, "contents after remapping");
+        ensure!(XMemFreePhysicalPages(2, pages.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
+        ensure!(VirtualFree(va as *mut c_void, 0, 0x8000) != 0, "VirtualFree");
+        Ok(())
+    });
+
     check("kernelx: graphics memory lives in the GPU-visible 4 GiB-aligned region (UMA)", || unsafe {
         let attrs = 1u64 << 29; // memory type 1: graphics
         let a = XMemAlloc(0x20000, attrs);
@@ -479,6 +504,7 @@ fn main() {
     check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy)", gpu::console_list_methods);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);
     check("D3D12.X: a texture in title memory (XG layout, #44) follows CPU writes", gpu::title_texture);
+    check("D3D12.X: a texture in a streaming pool gets its texels once pages are mapped in", gpu::streamed_texture);
     check("XAudio2: console flags/device, XMA2 voice plays silence, PCM passes, callbacks", audio::xaudio2_console_voices);
 
     let failures = FAILURES.load(Ordering::SeqCst);

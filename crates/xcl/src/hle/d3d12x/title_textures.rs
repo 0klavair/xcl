@@ -2,8 +2,9 @@
 //! samples that memory, laid out as the console's layout library says (`hle::xg`, checked
 //! against the console's own). Here a PC texture holds a detiled copy: uploaded when the
 //! texture is created and again before the title's next ExecuteCommandLists once the CPU wrote
-//! any of its pages (unified memory is write-watched, `gpu::uma`) – textures streamed in after
-//! creation (mips loaded later, DirectStorage) included.
+//! any of its pages (unified memory and the title's graphics reservations are write-watched,
+//! `gpu::uma`, `kernelx::VirtualAlloc`) – textures streamed in after creation (mips loaded
+//! later, physical pages mapped in, DirectStorage) included.
 //!
 //! The copy waits for the GPU on an XCL queue of the device. Memory that is not readable
 //! (reserved, not mapped yet) reads as zero. GPU writes into the title's memory (copies to the
@@ -58,7 +59,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
     let bytes = tex.size() as usize;
     let e = Entry { device: device as usize, va, tex: Arc::new(tex), state };
-    if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) {
+    if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) || crate::hle::kernelx::in_graphics_reservation(va) {
         ResetWriteWatch(va as *const c_void, bytes);
     }
     let upload = (e.device, e.va, Arc::clone(&e.tex), e.state);
@@ -93,8 +94,8 @@ unsafe fn refresh_once() {
     let Some(u) = crate::gpu::uma::get() else { return };
     let mut dirty: Vec<usize> = Vec::new();
     let mut page = 0x1000u32;
-    for k in 0..u.windows() {
-        let (base, size) = u.window(k);
+    let regions: Vec<(usize, usize)> = (0..u.windows()).map(|k| u.window(k)).chain(crate::hle::kernelx::graphics_reservations()).collect();
+    for (base, size) in regions {
         loop {
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
             let mut n = buf.len();
@@ -135,16 +136,36 @@ unsafe fn refresh_once() {
     }
 }
 
+/// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
+/// has only some of its pages mapped).
+unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let mut out = vec![0u8; len];
+    let mut p = at;
+    while p < at + len {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 {
+            break;
+        }
+        let end = (m.BaseAddress as usize + m.RegionSize).min(at + len);
+        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
+        if readable {
+            std::ptr::copy_nonoverlapping(p as *const u8, out.as_mut_ptr().add(p - at), end - p);
+        }
+        p = end;
+    }
+    out
+}
+
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
 unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let at = va + s * c.slice_bytes;
-        let slice: &[u8] = if crate::gpu::shader::readable(at, c.slice_bytes) { std::slice::from_raw_parts(at as *const u8, c.slice_bytes) } else { &[] };
+        let slice = read_committed(va + s * c.slice_bytes, c.slice_bytes);
         for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
         }
     }
     out
