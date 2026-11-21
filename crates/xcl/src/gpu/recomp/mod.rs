@@ -399,6 +399,12 @@ fn why(_at: u64, msg: &str) {
 /// (lo, hi, exit, nest, loop head of `continue`, targets entering the range)
 type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 
+/// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
+/// the prelude) – console code that loops on what XCL passed it wrong (an address, a count)
+/// must not run on the PC GPU until the driver resets it. Once the budget is spent every loop
+/// leaves at its next iteration and the program runs to its end.
+const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
 /// Target of an s_endpgm before the end of the program: "skip to the end".
 const END: u64 = u64::MAX;
 /// "Target" of a jump back to the head of the innermost loop: `continue`.
@@ -717,7 +723,7 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n"));
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {LOOP_GUARD}\n"));
                 let (lcont, lin) = if entry.is_none() { (Some(a), &inner) } else { (None, &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -822,7 +828,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n"));
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {LOOP_GUARD}\n"));
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
             i = c.leaders.partition_point(|&l| l < b);

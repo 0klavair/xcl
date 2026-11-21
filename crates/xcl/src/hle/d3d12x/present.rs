@@ -50,6 +50,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     }
     super::frame::mark_flipped((planes as *const u64).read_unaligned());
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
+    super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }

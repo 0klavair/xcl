@@ -9,6 +9,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod bind;
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
@@ -21,6 +22,7 @@ pub mod null;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+pub mod title_list;
 pub mod title_textures;
 
 use std::ffi::c_void;

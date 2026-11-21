@@ -676,8 +676,20 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
         Kind::DmaList => vec![(9, super::list_x::dma_close_x as usize), (10, super::list_x::reset_x as usize), (12, super::list_x::dma_copy_texture_region_x as usize)],
         Kind::CommandList => {
+            use super::bind as b;
             use super::list_x as l;
             vec![
+                // compute root arguments of console code: kept for translated dispatches
+                (14, b::dispatch as usize),
+                (26, l::resource_barrier_x as usize),
+                (25, b::set_pipeline_state as usize),
+                (33, b::set_compute_root_signature as usize),
+                (35, b::set_compute_root_table as usize),
+                (37, b::set_compute_root_constant as usize),
+                (39, b::set_compute_root_constants as usize),
+                (41, b::set_compute_root_descriptor as usize),
+                (43, b::set_compute_root_descriptor as usize),
+                (45, b::set_compute_root_descriptor as usize),
                 (10, l::reset_x as usize),
                 (28, l::begin_query_x as usize),
                 (29, l::end_query_x as usize),
@@ -976,7 +988,18 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 
 /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
 /// same address and must not inherit its root signature or compute pass).
+/// compute pipelines that run a translated console shader
+static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `pso` runs a translated console compute shader.
+pub fn is_translated_compute(pso: usize) -> bool {
+    pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
 fn forget_pso(pso: usize) {
+    if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
@@ -1982,6 +2005,12 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     }
 }
 
+unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    }
+}
+
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
@@ -1991,12 +2020,14 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
             // a console program the worker is translating (its root signature comes with it)
             LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
             LAST_COMPUTE_RS.with(|c| c.set(0));
+            note_translated_compute(hr, ppv);
             return hr;
         }
         console = translated_compute_pso(this, f, desc, riid, ppv);
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
+        note_translated_compute(hr, ppv);
         return hr;
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
@@ -2356,6 +2387,11 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
 }
 
 /// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
+/// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
+pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
+    cl_set_pipeline_state(this, pso)
+}
+
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
@@ -2381,7 +2417,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void>;
     let lists = if n > 0 && !lists.is_null() {
-        mapped = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| super::console_list::pc_list(l).unwrap_or(l)).collect();
+        mapped = std::slice::from_raw_parts(lists, n as usize).iter().map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l)).collect();
         mapped.as_ptr()
     } else {
         lists
@@ -2389,5 +2425,23 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     f(this, n, lists);
     if n > 0 && !lists.is_null() {
         super::present::note_execute(this, std::slice::from_raw_parts(lists, n as usize));
+    }
+    stop_if_device_removed();
+}
+
+/// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
+/// submitting work to a hung device can keep the driver from recovering), with the reason in
+/// the log and the report.
+pub fn stop_if_device_removed() {
+    let raw = device_raw();
+    let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
+    if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        let msg = format!("the D3D12 device was removed ({:#x}: {}) – the title is stopped", e.code().0 as u32, e.message());
+        crate::xlog_error!("{msg}");
+        crate::report::write_final(Some(msg));
+        crate::log::flush();
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
+        }
     }
 }

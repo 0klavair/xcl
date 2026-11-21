@@ -1073,11 +1073,24 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - **Device #27 CreateCommittedResource from console code**: buffers go to unified memory (as #76); textures get UMA
   memory of the console size and become title-memory textures (`place_console_texture`), their GetGPUVirtualAddress
   is that address – XDefiant clears a 32 MB texture with memset through it.
-- **Where it stops now**: D3D12.X code compiled into the title writes graphics records into the command list object
-  (+0x18 write pointer, +0x30 end; e.g. 0xC000B600 + topology from `IASetPrimitiveTopology`). A PC list has other
-  data there (write to 0x100000000). `XCL_CONSOLE_LISTS=1` (compute records only) gets less far: its lists are not
-  DMA lists. Next: console-shaped graphics lists – the record formats from the title's inline writers, as done for
-  compute in `console_list`.
+- **Command lists of console code** (`title_list`): the SDK's inline writers put records into the list object when
+  its buffer has room (+0x18 write pointer, +0x30 end, +0x28 dispatch limit) and otherwise call the method the
+  record stands for (0xC000B600 + topology → #20 IASetPrimitiveTopology, 0xC000B800 → the method at vtable +0xC0).
+  Console code gets a console-shaped object whose buffer never has room: every inline write becomes the method call
+  on the adopted PC list behind it (a thunk per slot). `XCL_LIST_TRACE=1` keeps the last 64 slots called and logs
+  them when Close fails.
+- **Compute root arguments of console code** (`bind`): SetComputeRootSignature / tables / constants / root
+  descriptors (#33–#45) are packed by the root signature's layout; a Dispatch (#14) with a translated pipeline binds
+  XCL's ABI root signature, writes the user SGPRs and the table to unified memory (`user_data`) and dispatches; that
+  memory is freed when the list's allocator is reset. A dispatch whose pipeline has no translation is skipped.
+- **ResourceBarrier** (#26): aliasing barriers become ones for any resources (both pointers null) – the PC allows
+  them only between placed / reserved resources, and the console's texture memory is mostly XCL's committed
+  resources (the list failed to Close with E_INVALIDARG); console state bits the PC does not know are dropped.
+- **Result**: the title runs – in one minute 957 presents, 3 443 pipelines from translated console shaders, 966 of
+  966 programs translated, no failed pipeline, no crash. Whether the picture is right is not checked yet.
+- **Safety nets** (after a GPU hang that needed a PC restart – it came from a diagnostic run that skipped barriers):
+  every loop of a translated shader has a per-lane budget (`LOOP_GUARD`, 4 M iterations); when the D3D12 device is
+  removed (after ExecuteCommandLists, at PresentX) the title is stopped with the reason in the log and the report.
 - Diagnostics added: `XCL_WATCH_DEVICE=1` / `XCL_WATCH_DMA=1` put a hardware write watchpoint (debug registers, all
   threads) on the title's device / first DMA list and log each writer with its callers (`eh::watch_writes`);
   `XCL_D3D12_DEBUG=1` turns on the debug layer and copies its messages into the log (needs the Windows "Graphics

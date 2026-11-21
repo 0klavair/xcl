@@ -31,7 +31,6 @@ use super::real;
 const PC_GET_TYPE: usize = 8;
 const PC_RESET: usize = 10;
 const PC_DRAW_INDEXED: usize = 13;
-const PC_DISPATCH: usize = 14;
 const PC_COPY_BUFFER_REGION: usize = 15;
 const PC_COPY_TEXTURE_REGION: usize = 16;
 const PC_COPY_RESOURCE: usize = 17;
@@ -304,7 +303,7 @@ pub(super) unsafe extern "system" fn set_depth_bounds_x(this: *mut c_void, min: 
 
 /// command list #78 DispatchX(x, y, z, flags)
 pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u32, z: u32, _flags: u32) {
-    pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, PC_DISPATCH)(this, x, y, z);
+    super::bind::dispatch(this, x, y, z);
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
@@ -431,6 +430,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
     if let Some(m) = OCCLUSION.lock().unwrap().as_mut() {
         m.remove(&(this as usize));
     }
+    super::bind::reset(this, alloc);
     // the PC runtime writes its own vtable into a copy list again on Reset: keep XCL's
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, pso);
@@ -438,6 +438,52 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         *(this as *mut usize) = ext;
     }
     hr
+}
+
+/// the D3D12_RESOURCE_STATES bits the PC knows
+const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
+
+/// #26 ResourceBarrier(count, barriers): console barriers (D3D12_RESOURCE_BARRIER, 32 bytes) as
+/// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
+/// transition left with nothing to do goes, aliasing barriers cover any resources
+pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if barriers.is_null() || n == 0 {
+        return;
+    }
+    let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize);
+    for k in 0..n as usize {
+        let mut b = barriers.add(k).read_unaligned();
+        let (ty, flags) = (b[0], b[1]);
+        if ty > 2 || flags > 3 {
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!("D3D12.X: ResourceBarrier: console barrier type {ty} flags {flags:#x} dropped ({:x?})", b);
+            }
+            continue;
+        }
+        if ty == 1 {
+            // aliasing (resource before +8, after +16): on the PC only between placed / reserved
+            // resources, and the console's texture memory is mostly XCL's committed resources
+            // (the list would fail to Close) – an aliasing barrier for any resources instead
+            b[2..6].fill(0);
+        }
+        if ty == 0 {
+            // transition: resource (+8), subresource (+16), before (+20), after (+24)
+            let (before, after) = (b[5], b[6]);
+            if (before | after) & !PC_STATES != 0 && N.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!("D3D12.X: ResourceBarrier: console state bits {:#x} → {:#x} dropped", before & !PC_STATES, after & !PC_STATES);
+            }
+            b[5] &= PC_STATES;
+            b[6] &= PC_STATES;
+            if b[5] == b[6] {
+                continue;
+            }
+        }
+        out.push(b);
+    }
+    if !out.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+    }
 }
 
 /// A D3D12_TEXTURE_COPY_LOCATION for the log.
