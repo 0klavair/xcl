@@ -337,6 +337,9 @@ where
         let _ = std::fs::remove_file(&file);
     }
     let b = compile_one()?;
+    if !valid_dxil_container(&b) {
+        return Err("DXIL cache: compiler returned an invalid DXIL container".into());
+    }
     if std::fs::create_dir_all(dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
@@ -456,6 +459,27 @@ mod cache_tests {
         assert_eq!(rebuilt, synthetic_dxil(8));
         let (_, hit) = compile_cached_in_with(&dir, "corrupt", "main", "cs_6_6", || panic!("valid rebuilt entry was not reused")).unwrap();
         assert!(hit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_invalid_fresh_dxil_without_poisoning_the_cache() {
+        let dir = std::env::temp_dir().join(format!("olympus-dxil-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = cache_key("fresh validation", "main", "cs_6_6");
+        let file = dir.join(format!("{key:016x}.dxil"));
+
+        let error = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || Ok(b"not DXIL".to_vec())).unwrap_err();
+        assert!(error.contains("invalid DXIL container"));
+        assert!(!file.exists());
+
+        let valid = synthetic_dxil(11);
+        let (rebuilt, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || Ok(valid.clone())).unwrap();
+        assert!(!hit);
+        assert_eq!(rebuilt, valid);
+        let (_, hit) = compile_cached_in_with(&dir, "fresh validation", "main", "cs_6_6", || panic!("valid retry was not cached")).unwrap();
+        assert!(hit);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
