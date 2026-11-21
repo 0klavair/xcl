@@ -126,6 +126,11 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
 /// A legacy GS pipeline: the ES variant of the console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
+    let es_end = g.gs_start.unwrap_or(0) as usize;
+    let hazards = super::geometry_wave32_hazards(&code[..es_end.min(code.len())]);
+    if !hazards.is_empty() {
+        return Err(format!("ES requires unsupported cross-half wave64 semantics: {hazards:?}"));
+    }
     let record = g.record();
     two_pass(&code, Mode::Geometry(g), true, record, ps)
 }
