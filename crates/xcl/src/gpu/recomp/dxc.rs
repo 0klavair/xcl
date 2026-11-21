@@ -272,17 +272,31 @@ impl Drop for ProcessCacheLock {
 }
 
 fn cache_mutex_name(file: &Path) -> String {
-    let absolute = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(file)
-    };
+    let absolute = file
+        .parent()
+        .and_then(|parent| file.file_name().map(|name| normalized_cache_dir(parent).join(name)))
+        .unwrap_or_else(|| std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()));
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for b in absolute.to_string_lossy().to_lowercase().bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     format!(r"Local\XclDxilCache-{h:016x}")
+}
+
+fn normalized_cache_dir(dir: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(dir) {
+        return canonical;
+    }
+    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    for ancestor in absolute.ancestors().skip(1) {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            if let Ok(remainder) = absolute.strip_prefix(ancestor) {
+                return canonical.join(remainder);
+            }
+        }
+    }
+    absolute
 }
 
 fn process_cache_lock(file: &Path) -> Result<ProcessCacheLock, String> {
@@ -356,6 +370,7 @@ where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
     let key = cache_key(src, entry, profile);
+    let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
         return Ok((b, true));
@@ -366,7 +381,7 @@ where
         MISSED.with(|m| m.set(true));
         return Err("DXIL not compiled yet".into());
     }
-    let flight = cache_flight((dir.to_path_buf(), key));
+    let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
@@ -382,7 +397,7 @@ where
     if !valid_dxil_container(&b) {
         return Err("DXIL cache: compiler returned an invalid DXIL container".into());
     }
-    if std::fs::create_dir_all(dir).is_ok() {
+    if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
         if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &file).is_err() {
@@ -604,6 +619,54 @@ mod cache_tests {
             assert_eq!(b.join().unwrap().unwrap().0, synthetic_dxil(2));
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_aliases_share_the_same_cache_flight() {
+        let root = std::env::temp_dir().join(format!("olympus-dxil-alias-{}", std::process::id()));
+        let dir = root.join("cache");
+        let child = dir.join("child");
+        let alias = child.join("..");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&child).unwrap();
+        assert_eq!(normalized_cache_dir(&dir), normalized_cache_dir(&alias));
+        assert_eq!(normalized_cache_dir(&root.join("future")), normalized_cache_dir(&child.join("..").join("..").join("future")));
+        let key = cache_key("aliased source", "main", "cs_6_6");
+        assert_eq!(
+            cache_mutex_name(&dir.join(format!("{key:016x}.dxil"))),
+            cache_mutex_name(&alias.join(format!("{key:016x}.dxil")))
+        );
+
+        let start = std::sync::Barrier::new(2);
+        let calls = AtomicUsize::new(0);
+        let hits = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                compile_cached_in_with(&dir, "aliased source", "main", "cs_6_6", || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(synthetic_dxil(12))
+                })
+                .unwrap()
+            });
+            let second = scope.spawn(|| {
+                start.wait();
+                compile_cached_in_with(&alias, "aliased source", "main", "cs_6_6", || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    Ok(synthetic_dxil(12))
+                })
+                .unwrap()
+            });
+            for result in [first.join().unwrap(), second.join().unwrap()] {
+                assert_eq!(result.0, synthetic_dxil(12));
+                hits.fetch_add(result.1 as usize, Ordering::SeqCst);
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
