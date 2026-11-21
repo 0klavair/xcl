@@ -2215,3 +2215,46 @@ fn retail_shader_cost() {
         }
     }
 }
+
+/// ISA coverage: every instruction the decoder knows (RDNA2 spec + console extensions), one
+/// at a time with zero operands, through the translator (compute kernel mode, then pixel
+/// mode for graphics-only ones). Per encoding: translated / all, and the missing ones.
+#[test]
+#[ignore]
+fn isa_coverage() {
+    use crate::gpu::rdna2::{all_instructions, encode};
+    use crate::gpu::rdna2_spec::ENCODINGS;
+    use std::collections::BTreeMap;
+    let mut per_enc: BTreeMap<&str, (usize, usize, Vec<&str>)> = BTreeMap::new();
+    let try_mode = |code: &[u8], mode: Mode| match translate(code, &Options { mode, ..Default::default() }) {
+        Ok(t) => t.complete(),
+        Err(_) => false,
+    };
+    std::panic::set_hook(Box::new(|_| {}));
+    for inst in all_instructions() {
+        // the first plain encoding (not an SDWA / DPP / literal variant)
+        let Some(ie) = inst.encs.iter().find(|e| ENCODINGS[e.encoding as usize].primary) else { continue };
+        let enc = ENCODINGS[ie.encoding as usize].name;
+        let lit = inst.always_literal.then_some(0);
+        let Ok(mut code) = encode(inst.name, enc, &[], lit) else { continue };
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let ok = std::panic::catch_unwind(|| {
+            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F }))
+        })
+        .unwrap_or(false);
+        let e = per_enc.entry(enc.trim_start_matches("ENC_")).or_default();
+        e.1 += 1;
+        if ok {
+            e.0 += 1;
+        } else {
+            e.2.push(inst.name);
+        }
+    }
+    let _ = std::panic::take_hook();
+    let (ok, all) = per_enc.values().fold((0, 0), |s, v| (s.0 + v.0, s.1 + v.1));
+    println!("instrukcje RDNA2 (spec + konsola): {all}, tłumaczone: {ok} ({:.1}%)", 100.0 * ok as f64 / all.max(1) as f64);
+    for (enc, (ok, all, missing)) in &per_enc {
+        let m: Vec<String> = missing.iter().map(|n| n.to_lowercase()).collect();
+        println!("  {enc:<12} {ok:>4} / {all:<4} brak: {}", if m.len() > 14 { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
+    }
+}
