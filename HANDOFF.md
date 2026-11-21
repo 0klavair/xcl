@@ -561,10 +561,10 @@ Nothing open.
   analytics (family "Windows.Xbox", OS 10.0.25398, Series X / S); runtime features (true); XDisplay (XLaunchUri refused,
   timeout deferral); XGameEvent (offline: accepted, dropped). Refused: XStore, XAppBroadcast, XAppCapture.
 - Tests: `vtables_follow_the_gdk_table`, `console_mode_registry_value`, PLS in `thunk_protocol_with_xcl_objects_on_pc_queues`.
-- **Who answers the 396 functions** (counted on the GDK table): XCL 122 (+7 dialogs and 7 text-entry / notification
+- **Who answers the 396 functions** (counted on the GDK table): XCL 123 (+7 dialogs and 7 text-entry / notification
   calls forwarded to the PC runtime), the PC runtime's whole classes 111 (XAsync / XTaskQueue / XThread, XGameStreaming,
   XNetworking, speech, invites / activation / protocols, XError, closed captions), refused 109 (XStore, XAppBroadcast /
-  XAppCapture), not implemented in XCL classes 40 – Xbox Live and account UI (token and signature, player picker,
+  XAppCapture), not implemented in XCL classes 39 – Xbox Live and account UI (token and signature, player picker,
   profile card, achievements, invites, web authentication, state share, UI response setters), XUserFindControllerFor-
   UserWithUi, and three without public signatures (XGameUiShowManageSpace*, XPackageGetIdentifier) plus
   XPackageUninstallUWPInstance / XPersistentLocalStorageMountForPackage.
