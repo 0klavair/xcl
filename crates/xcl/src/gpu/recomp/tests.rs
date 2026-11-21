@@ -202,6 +202,8 @@ fn gpu_v_swaprel_b32() {
         ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 32)], None), // exec = s[32:33]: all lanes
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 129)], None), // m0 = 1
         ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 6)], None), // v7 <-> v7: no-op
+        // relative targets lie within the program's VGPRs (as in gpu_v_movrel): v15 used directly
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 15)], None),
     ]);
     let mut st = KernelState::default();
     st.sgpr[30] = 0x5555_5555;
@@ -293,7 +295,9 @@ fn unary_f64_math_vop1_and_vop3() {
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
     assert_eq!(t.hlsl.matches("ceil_d(").count(), 3, "{}", t.hlsl); // helper plus two calls
     assert_eq!(t.hlsl.matches("fract_d(").count(), 3, "{}", t.hlsl); // helper plus two calls
-    assert_eq!(t.hlsl.matches("1.0 / sqrt(").count(), 2, "{}", t.hlsl);
+    // f64 roots through sqrt_d (HLSL's sqrt is f32): V_SQRT / V_RSQ, twice each
+    assert_eq!(t.hlsl.matches("sqrt_d(").count(), 1 + 4, "{}", t.hlsl); // helper plus four calls
+    assert_eq!(t.hlsl.matches("(double)1 / sqrt_d(").count(), 2, "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }

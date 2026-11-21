@@ -2467,8 +2467,8 @@ impl Em {
                     "v_fract_f64" => format!("fract_d({})", f64v(0)),
                     "v_rndne_f64" => format!("round_ne_d({})", f64v(0)),
                     "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
-                    "v_sqrt_f64" => format!("sqrt({})", f64v(0)),
-                    "v_rsq_f64" => format!("(1.0 / sqrt({}))", f64v(0)),
+                    "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
+                    "v_rsq_f64" => format!("((double)1 / sqrt_d({}))", f64v(0)),
                     "v_trunc_f64" => format!("(double)(int64_t){}", f64v(0)),
                     "v_ldexp_f64" => format!("({} * (double)exp2((float)(int){}))", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
@@ -4382,7 +4382,16 @@ int frexp_exp_d(double x) {
     return (int)top - 1073;
 }
 double floor_d(double x) { double t = (double)(int64_t)x; return t > x ? t - 1.0 : t; }
-double ceil_d(double x) { return (isinf(x) || isnan(x)) ? x : -floor_d(-x); }
+// no f64 negation here: -floor_d(-x) gave -0.0 for 1.5625 on an AMD driver
+// HLSL has no f64 sqrt (it computes in f32): the f32 root refined by two Newton steps in f64;
+// zero, negative, inf, NaN and values outside the f32 range keep the f32 result
+double sqrt_d(double x) {
+    double y = (double)sqrt((float)x);
+    if (!(y > 0.0) || isinf(y)) return y;
+    y = y + (x - y * y) / (y + y);
+    return y + (x - y * y) / (y + y);
+}
+double ceil_d(double x) { if (isinf(x) || isnan(x) || abs(x) >= 4503599627370496.0) return x; double t = (double)(int64_t)x; return t < x ? t + 1.0 : t; }
 double fract_d(double x) { return (isinf(x) || isnan(x)) ? x - x : min(x - floor_d(x), asdouble(0xFFFFFFFFu, 0x3FEFFFFFu)); }
 double round_ne_d(double x) {
     uint l, h; asuint(x, l, h);
