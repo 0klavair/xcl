@@ -496,6 +496,12 @@ mod tests {
 
     #[test]
     fn read_blob_names_require_a_complete_counted_array() {
+        // Another test temporarily routes the process-global XAsync entry points
+        // through the system runtime. Keep this invalid-block status check on the
+        // local implementation, like every other test that exercises XAsync.
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             let mut provider = std::ptr::null_mut();
             assert_eq!(
