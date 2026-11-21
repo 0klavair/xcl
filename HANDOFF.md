@@ -603,6 +603,10 @@ Console GPU addresses in unified memory are the title's own: memory operations g
   chain, and answering it made that crash now and then.
 - `XMemVirtualAlloc(address, size, type, XALLOC_ATTRIBUTES, protect)` (kernelx; also found by name for `xmem.dll`
   imports): a graphics memory type allocates in unified memory, as MEM_GRAPHICS. It was a stub returning null.
+- Public Series S research (SystemOS side, CS-Unit "XboxSeries-Archive"): the texture layout library takes the hardware
+  version (Series S vs X) and lays textures out differently for each – so `texture::CONSOLE_PIPES` (still unknown, only
+  the _X modes need it) must be found per console and follow what `XSystemGetDeviceType` reports (Anaconda by default,
+  Lockhart with the Series S setting). The rest of that write-up is the system partition, not the title's.
 - Looked at (independent projects, only facts taken): GDKScarlett (Xbox One `d3d12_x` titles, GCN shaders; its
   PIX / AcpHal / mfplat stubs answer what XCL's automatic stubs already answer) and SlimEra (XDK-era kernelx:
   Era* / Etx* functions – no GDK title seen importing them).

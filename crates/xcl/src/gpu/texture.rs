@@ -16,7 +16,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
 /// Not known yet (to be found on an _X texture from the game); the non-XOR modes the
-/// archives use do not need it.
+/// archives use do not need it. Series S and X differ (the console's layout library takes
+/// the hardware version): the value has to follow the device type XCL reports.
 pub const CONSOLE_PIPES: PipeConfig = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
 
 /// Linear data of one subresource: `depth` slices (3D, else 1) of `rows` rows of `row_bytes`
