@@ -306,6 +306,8 @@ pub struct Options {
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
     /// two independent halves – the wave-size independent form VS/PS always get (tests)
     pub hw_wave: u32,
+    /// geometry mode: emulate one logical wave64 with two native wave32 phases
+    pub geometry_wave32: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -320,7 +322,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -898,8 +900,8 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Geometry translation rejects these in the ES phase;
-/// the GS phase uses at most 21 lanes and therefore stays wholly in the first native wave.
+/// preserving one logical wave64. Split geometry translation rejects these rather than
+/// silently changing cross-half lane or mask semantics.
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
@@ -1150,7 +1152,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
         } else {
-            if gs_jump.is_some() {
+            if gs_jump.is_some() && opt.geometry_wave32 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
             } else {
                 code.push_str("    uint pc = 0;\n");

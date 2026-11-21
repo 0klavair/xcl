@@ -64,6 +64,13 @@ fn geometry_wave32_rejects_cross_half_operations() {
 }
 
 #[test]
+fn geometry_wave_path_selection_preserves_native_wave64() {
+    assert!(super::pso::geometry_uses_wave32(32, 32));
+    assert!(!super::pso::geometry_uses_wave32(32, 64));
+    assert!(!super::pso::geometry_uses_wave32(64, 64));
+}
+
+#[test]
 fn hlsl_is_generated_for_straight_line_and_branches() {
     let code = prog(&[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 133)], None),
@@ -2141,7 +2148,12 @@ fn gpu_geometry_mode_es_gs_strip() {
     };
     let mut code = es;
     code.extend_from_slice(&gs);
-    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, ..Default::default() }).unwrap();
+    let native = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, geometry_wave32: false, ..Default::default() }).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"));
+    assert!(!native.hlsl.contains("xcl_es_phase") && !native.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
+    let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, geometry_wave32: true, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("[WaveSize(32)]"));
+    assert!(t.hlsl.contains("xcl_es_phase") && t.hlsl.contains("GroupMemoryBarrierWithGroupSync();\n    if (gi < 32u)"));
     assert!(t.complete(), "{:?}", t.unsupported_why);
     let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     let rec = g.record();

@@ -97,8 +97,8 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
-fn two_pass(code: &[u8], mode: Mode, wave64: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
-    let t = translate(code, &Options { mode, wave64, ..Default::default() })?;
+fn two_pass(code: &[u8], mode: Mode, wave64: bool, geometry_wave32: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
+    let t = translate(code, &Options { mode, wave64, geometry_wave32, ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -120,19 +120,25 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    two_pass(code, mode.clone(), super::detect_wave64(code), record, ps)
+    two_pass(code, mode.clone(), super::detect_wave64(code), false, record, ps)
 }
 
-/// A legacy GS pipeline: the ES variant of the console VS + the GS as one program.
-pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>) -> Result<TwoPass, String> {
+/// Whether the adapter's supported wave range requires split geometry execution.
+pub fn geometry_uses_wave32(wave_min: u32, wave_max: u32) -> bool {
+    !(wave_min <= 64 && wave_max >= 64)
+}
+
+/// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
+pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, geometry_wave32: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
-    let es_end = g.gs_start.unwrap_or(0) as usize;
-    let hazards = super::geometry_wave32_hazards(&code[..es_end.min(code.len())]);
-    if !hazards.is_empty() {
-        return Err(format!("ES requires unsupported cross-half wave64 semantics: {hazards:?}"));
+    if geometry_wave32 {
+        let hazards = super::geometry_wave32_hazards(&code);
+        if !hazards.is_empty() {
+            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
+        }
     }
     let record = g.record();
-    two_pass(&code, Mode::Geometry(g), true, record, ps)
+    two_pass(&code, Mode::Geometry(g), true, geometry_wave32, record, ps)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.

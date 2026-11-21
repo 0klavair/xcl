@@ -274,6 +274,27 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
+fn geometry_wave32_required(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return true;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if dev
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                &mut options as *mut _ as _,
+                std::mem::size_of_val(&options) as u32,
+            )
+            .is_err()
+        {
+            return true;
+        }
+        crate::gpu::recomp::pso::geometry_uses_wave32(options.WaveLaneCountMin, options.WaveLaneCountMax)
+    }
+}
+
 fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
     let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
     String::from_utf16_lossy(&desc.Description[..n])
@@ -1863,7 +1884,10 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let (tp, (ps, ps_samplers)) = match (crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS)), two_pass_ps(shader_bytes(&d.PS))) {
+    let (tp, (ps, ps_samplers)) = match (
+        crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), geometry_wave32_required(this)),
+        two_pass_ps(shader_bytes(&d.PS)),
+    ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("VS+GS: {e}"));
