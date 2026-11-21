@@ -10,6 +10,7 @@ pub mod recomp;
 mod rdna2_spec;
 mod rdna2_xbox;
 pub mod shader;
+pub mod texture;
 pub mod tiling;
 mod tiling_tables;
 pub mod uma;

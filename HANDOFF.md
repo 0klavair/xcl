@@ -536,6 +536,25 @@ Nic otwartego.
   Niewyjaśnione: 6 pakietów na podblok przy różnicy w tablicy 12·960 – TOC 0xFC to CELT FB 20 ms **stereo**, więc tablica
   liczy chyba próbki × kanały.
 
+## Tekstury kafelkowane z pamięci konsoli (sesja 5, 2026-11-21)
+- **Łańcuch mipów GFX10** (`tiling::Chain`, `tiling::image_chain(&desc::Image, cfg)`; addrlib
+  Gfx10Lib::ComputeSurfaceInfoMacroTiled/MicroTiled): na slice najpierw blok mip tail (poziomy ≤ pół bloku szerokości,
+  najwyżej log2(blok) − 4 poziomów; bloki 64 KB / 4 KB), potem poziomy od najmniejszego do mip 0, slice'y co
+  `slice_bytes`. Poziom w tail: origin w bloku z jego offsetu (bity nieparzyste → x, parzyste → y, ×blok 256 B).
+  `detile_level` / `tile_level`. Rozmiary poziomów = piksele >> i zaokrąglone w górę do elementów (jak D3D12).
+- **`gpu/texture.rs`**: `placement(T#)` (adres wyrównany do bloku, bajty, łańcuch, slice'y), `subresources(T#, pamięć)`
+  (kolejność D3D12: mip + slice × mips), `uma_bytes(T#)`, `create(dev, queue, T#, pamięć)` → tekstura PC (stan SRV),
+  `upload(...)` – ponowne wgranie, gdy tytuł przepisze pamięć. `CONSOLE_PIPES` – konfiguracja pipe/packer konsoli dla
+  trybów _X, nadal nieznana (archiwa używają trybów bez XOR).
+- **Zweryfikowane na TTPF** (`XCL_SAMPLE_TTPF`, test `retail_ttpf_textures_detile_with_their_mip_chains`): model daje
+  dokładnie miejsce, które zajmuje 908 z 912 tekstur (odstają 2 cube'y w trybie 2, 1 wolumen, ostatnia ucięta). Liczba
+  mipów = `dword0 >> 28` (0 → 1), slice'y = `(dword1 >> 10) & 0x7FF` + 1. Mipy tekstur R8/RGBA8/RGBA16 ≈ poprzedni
+  poziom pomniejszony (6/6); 15 poziomów w mip tail: błąd 0,66/255, w złym miejscu bloku 150/255.
+- Test GPU `gpu_console_textures_upload_every_mip_and_slice`: kafelkowana pamięć → tekstura PC → odczyt = dane, bit w
+  bit, każdy mip i slice (tablica RGBA8 4 KB, cube BC7 64 KB).
+- **Do zrobienia z exe:** wiązanie z API, którym tytuł tworzy tekstury w swojej pamięci (CreatePlacedResourceX / sterta
+  pod adresem), i moment ponownego wgrania (zapis CPU / kopia GPU); tekstury liniowe, 3D (thick), MSAA.
+
 ## Samplery statyczne (sesja 5, 2026-11-21)
 - **Luka:** tłumacz brał indeks samplera PC zawsze z S# słowo 3 [11:0], a S# zbudowany ze stałych w kodzie (statyczne
   samplery root signature konsoli) ma tam co innego → zły sampler / odczyt poza stertą. W PS_PedTextured_Eight_Fire 66
@@ -677,8 +696,8 @@ Bez exe zostało niewiele – reszta potrzebuje prawdziwego wywołania gry.
 2. Wiązanie przy rysowaniu: argumenty root gry → SGPR w `io`, `mem` → bufor UMA; przechwytywanie list poleceń dla GS
    i dispatchy Compute; `XboxBvhBuilder` (lub `BuildRaytracingAccelerationStructure`) → `gpu::bvh::build/build_top`
    (geometria z buforów GPU w UMA; Rehydrate = gotowe BVH z `*_bvh4.rpf` – format do sprawdzenia).
-3. Tekstury: konfiguracja pipe/packer konsoli dla trybów _X (`tiling::PipeConfig`), untiling przy tworzeniu zasobów
-   z pamięci konsoli, układ łańcucha mipów GFX10.
+3. Tekstury: wiązanie `gpu::texture` z API tytułu (tekstury w jego pamięci, ponowne wgranie po zapisie), konfiguracja
+   pipe/packer konsoli dla trybów _X (`texture::CONSOLE_PIPES`), tekstury liniowe / 3D.
 4. Audio: Opus (MFT wyżej) dla głosów XAudio2 0x704F lub API konsoli – zależnie od tego, co pokaże exe; XMA2 niski priorytet.
 5. Mniejsze: 749 programów wave64 z ryzykiem w fali 32 (dopiero jeśli się objawią), `image_sample_o` z offsetem z VGPR,
    mniejszy HLSL, kolejne API XGameRuntime (XGameUI, XNetworking…), GameInput → systemowe GameInput.dll,

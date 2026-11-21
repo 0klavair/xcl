@@ -162,6 +162,119 @@ pub fn image_layout(t: &super::desc::Image, cfg: PipeConfig) -> Option<(Layout, 
     Some((l, t.width.div_ceil(side) as usize, t.height.div_ceil(side) as usize))
 }
 
+/// One mip level of a tiled 2D surface, in elements.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MipLevel {
+    pub width: usize,
+    pub height: usize,
+    /// byte offset of the level's first block from the start of its slice
+    pub offset: usize,
+    /// width in elements the level's blocks are laid out for (the tail block's width in the tail)
+    pub pitch: usize,
+    /// where the level lies inside the mip tail block (levels in the tail), else (0, 0)
+    pub origin: (usize, usize),
+}
+
+/// The mip chain of a tiled 2D surface (addrlib Gfx10Lib::ComputeSurfaceInfoMacroTiled /
+/// MicroTiled). Per slice: first the mip tail – one block shared by the smallest levels, those
+/// at most half a block wide (64 KB / 4 KB blocks only) – then the other levels from the
+/// smallest to mip 0; slices follow each other `slice_bytes` apart. On the retail TTPF archive
+/// the space between textures is exactly this size for 908 of its 912 textures.
+#[derive(Clone, Debug)]
+pub struct Chain {
+    pub layout: Layout,
+    pub levels: Vec<MipLevel>,
+    pub slice_bytes: usize,
+}
+
+impl Chain {
+    /// `width` × `height` pixels, `side` pixels per element side (4 for BCn), `mips` levels;
+    /// a level is the pixel size halved, rounded up to whole elements (as D3D12 sizes it).
+    pub fn new(layout: Layout, width: u32, height: u32, side: u32, mips: u32) -> Chain {
+        let mips = mips.max(1) as usize;
+        let (bw, bh) = (layout.block_w, layout.block_h);
+        let blk = layout.block_bytes.trailing_zeros() as usize;
+        let size = |i: usize| (((width >> i).max(1)).div_ceil(side) as usize, ((height >> i).max(1)).div_ceil(side) as usize);
+        // at most this many levels in the tail (GetMaxNumMipsInTail, 2D)
+        let max_tail = blk.saturating_sub(4);
+        let first_tail = if mips > 1 && blk > 8 {
+            (0..mips)
+                .find(|&i| {
+                    let (w, h) = size(i);
+                    w <= bw / 2 && h <= bh && mips - i <= max_tail
+                })
+                .unwrap_or(mips)
+        } else {
+            mips
+        };
+        let mut levels = vec![MipLevel::default(); mips];
+        let mut offset = if first_tail < mips { layout.block_bytes } else { 0 };
+        for i in (0..first_tail).rev() {
+            let (w, h) = size(i);
+            levels[i] = MipLevel { width: w, height: h, offset, pitch: w.div_ceil(bw) * bw, origin: (0, 0) };
+            offset += layout.size(w, h);
+        }
+        // a level in the tail: its offset there (256-byte units, largest level first) gives its
+        // origin, x from the odd and y from the even address bits above 256 B
+        let e = layout.elem_log2 as usize;
+        let (w256, h256) = (1usize << [4, 4, 3, 3, 2][e], 1usize << [4, 3, 3, 2, 2][e]);
+        for i in first_tail..mips {
+            let m = max_tail - 1 - (i - first_tail);
+            let at = if m > 6 { 16usize << m } else { m << 8 };
+            let (mut mx, mut my) = (0, 0);
+            for b in 0..6 {
+                mx |= ((at >> (9 + 2 * b)) & 1) << b;
+                my |= ((at >> (8 + 2 * b)) & 1) << b;
+            }
+            let (w, h) = size(i);
+            levels[i] = MipLevel { width: w, height: h, offset: 0, pitch: bw, origin: (mx * w256, my * h256) };
+        }
+        Chain { layout, levels, slice_bytes: offset }
+    }
+
+    fn element_at(&self, l: &MipLevel, x: usize, y: usize) -> usize {
+        l.offset + self.layout.offset(x + l.origin.0, y + l.origin.1, l.pitch)
+    }
+
+    /// level `i` of one slice (`src` = the slice's bytes) → linear rows of elements; bytes
+    /// past the end of `src` read as 0
+    pub fn detile_level(&self, src: &[u8], i: usize) -> Vec<u8> {
+        let l = self.levels[i];
+        let e = 1usize << self.layout.elem_log2;
+        let mut out = vec![0u8; l.width * l.height * e];
+        for y in 0..l.height {
+            for x in 0..l.width {
+                let o = self.element_at(&l, x, y);
+                if let Some(s) = src.get(o..o + e) {
+                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// linear rows of level `i` → its place in one slice (`dst`, `slice_bytes` long)
+    pub fn tile_level(&self, dst: &mut [u8], i: usize, linear: &[u8]) {
+        let l = self.levels[i];
+        let e = 1usize << self.layout.elem_log2;
+        for y in 0..l.height {
+            for x in 0..l.width {
+                let o = self.element_at(&l, x, y);
+                dst[o..o + e].copy_from_slice(&linear[(y * l.width + x) * e..][..e]);
+            }
+        }
+    }
+}
+
+/// The mip chain of a T#'s image (all `max_mip + 1` levels of the resource, base swizzle in
+/// `base_xor`); the data starts at `address & !(block_bytes - 1)`.
+pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
+    let (e, side) = element(t.format)?;
+    let mut l = Layout::new(t.swizzle_mode, e, cfg)?;
+    l.base_xor = (t.address as usize) & (l.block_bytes - 1);
+    Some(Chain::new(l, t.width, t.height, side, t.max_mip + 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +307,50 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Sizes of retail textures (TTPF): the space each takes in the archive.
+    #[test]
+    fn mip_chain_sizes_match_retail_textures() {
+        let cfg = PipeConfig { pipes_log2: 0, pkrs_log2: 0 };
+        // (mode, element log2, side, width, height, mips, bytes)
+        for (mode, e, side, w, h, mips, bytes) in [
+            (5, 4, 4, 128, 1024, 5, 192512), // BC7, 4 KB tiles
+            (5, 2, 1, 128, 128, 7, 90112),   // BGRA8
+            (5, 4, 4, 512, 64, 9, 65536),
+            (5, 3, 4, 64, 512, 9, 61440), // BC1
+            (10, 4, 4, 2048, 2048, 1, 4194304),
+            (10, 4, 4, 512, 512, 8, 393216), // one slice of a 32-slice array
+            (5, 4, 4, 16, 16, 5, 4096),      // all in the tail
+        ] {
+            let c = Chain::new(Layout::new(mode, e, cfg).unwrap(), w, h, side, mips);
+            assert_eq!(c.slice_bytes, bytes, "{w}x{h} e{e} mode {mode} mips {mips}");
+        }
+    }
+
+    /// Every level of a chain (with a mip tail) gets its own elements: tiling all levels with
+    /// distinct values and detiling them gives each back unchanged.
+    #[test]
+    fn mip_chain_levels_do_not_overlap() {
+        for (mode, e, w, h, mips) in [(5u32, 2u32, 128u32, 96u32, 8u32), (10, 4, 64, 64, 7), (10, 0, 512, 128, 10), (1, 2, 40, 24, 6)] {
+            let c = Chain::new(Layout::new(mode, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), w, h, 1, mips);
+            let mut slice = vec![0u8; c.slice_bytes];
+            let mut want = Vec::new();
+            let mut n = 0u32;
+            for (i, l) in c.levels.iter().enumerate() {
+                let lin: Vec<u8> = (0..l.width * l.height << e)
+                    .map(|_| {
+                        n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                        (n >> 16) as u8 | 1
+                    })
+                    .collect();
+                c.tile_level(&mut slice, i, &lin);
+                want.push(lin);
+            }
+            for (i, lin) in want.iter().enumerate() {
+                assert_eq!(&c.detile_level(&slice, i), lin, "mode {mode} e{e}: level {i} overwritten");
             }
         }
     }
