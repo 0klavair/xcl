@@ -6,7 +6,7 @@ use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 
 use super::xasync::*;
-use crate::util::{from_cstr_ptr, E_INVALIDARG, HRESULT, S_OK};
+use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -375,6 +375,15 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     if hr < 0 {
         return hr;
     }
+    if need < std::mem::size_of::<u32>() {
+        return E_FAIL;
+    }
+    let body_size = need - std::mem::size_of::<u32>();
+    if out.is_null() || size < body_size {
+        // Do not consume the one-shot XAsync result until the caller can
+        // receive it; the documented insufficient-buffer retry must succeed.
+        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    }
     let mut tmp = vec![0u8; need];
     let hr = XAsyncGetResult(b, &READ_ID as *const u8 as *const c_void, need, tmp.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
     if hr < 0 {
@@ -382,9 +391,7 @@ pub unsafe extern "system" fn XGameSaveReadBlobDataResult(b: *mut XAsyncBlock, s
     }
     let n = u32::from_le_bytes(tmp[..4].try_into().unwrap());
     let body = &tmp[4..];
-    if out.is_null() || size < body.len() {
-        return E_GS_PROVIDED_BUFFER_TOO_SMALL;
-    }
+    debug_assert_eq!(body.len(), body_size);
     std::ptr::copy_nonoverlapping(body.as_ptr(), out as *mut u8, body.len());
     fix_up(out, n);
     if !count.is_null() {
@@ -579,7 +586,12 @@ mod tests {
             assert_eq!(XGameSaveReadBlobDataAsync(c, names.as_ptr(), 1, &mut blk), S_OK);
             assert_eq!(XAsyncGetStatus(&mut blk, true), S_OK);
             let mut buf2 = vec![0u64; 16];
-            let mut n2 = 0u32;
+            let mut n2 = u32::MAX;
+            assert_eq!(
+                XGameSaveReadBlobDataResult(&mut blk, 1, buf2.as_mut_ptr() as *mut Blob, &mut n2),
+                E_GS_PROVIDED_BUFFER_TOO_SMALL
+            );
+            assert_eq!(n2, u32::MAX, "failed result changed the output count");
             assert_eq!(XGameSaveReadBlobDataResult(&mut blk, 128, buf2.as_mut_ptr() as *mut Blob, &mut n2), S_OK);
             let b1 = &*(buf2.as_ptr() as *const Blob);
             assert_eq!((n2, std::slice::from_raw_parts(b1.data, 2)), (1, &b"xy"[..]));
