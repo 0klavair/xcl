@@ -84,7 +84,7 @@ pub const MINUSERX: &str = "minuserx.dll";
 
 fn build(config: &Config) -> Registry {
     let modules = vec![
-        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll"]),
+        HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
         HleModule::new(XAUDIO2, xaudio2::exports(), &["xaudio2_9.dll"]),

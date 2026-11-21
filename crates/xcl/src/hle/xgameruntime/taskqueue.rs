@@ -3,14 +3,18 @@
 //! Dispatch modes: Manual (caller pumps `XTaskQueueDispatch`), ThreadPool,
 //! SerializedThreadPool (pool, one at a time) and Immediate (run on the submitting
 //! thread). Callbacks submitted after `XTaskQueueTerminate` run with `canceled = true`.
+//!
+//! Ports are reference-counted (`Arc<Port>`) so composite queues created via
+//! `XTaskQueueGetPort` + `XTaskQueueCreateComposite` can share underlying work/completion
+//! ports without terminating or cancelling items belonging to sibling queues.
 
 #![allow(non_snake_case)]
 
-use std::collections::{BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::util::{E_INVALIDARG, HRESULT, S_OK};
@@ -26,6 +30,7 @@ pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01ABu32 as i32;
 
 pub type XTaskQueueCallback = unsafe extern "system" fn(*mut c_void, bool);
 pub type XTaskQueueTerminatedCallback = unsafe extern "system" fn(*mut c_void);
+pub type XTaskQueueMonitorCallback = unsafe extern "system" fn(*mut c_void, *mut c_void, u32);
 
 #[derive(Clone, Copy)]
 pub struct Item {
@@ -40,24 +45,45 @@ impl Item {
     }
 }
 
+struct QueuedItem {
+    item: Item,
+    queue: Arc<Queue>,
+}
+
+#[derive(Clone, Copy)]
+struct Monitor {
+    token: u64,
+    queue_handle: usize,
+    ctx: usize,
+    cb: usize,
+}
+
 pub struct Port {
     mode: u32,
-    items: Mutex<VecDeque<Item>>,
+    items: Mutex<VecDeque<QueuedItem>>,
     cv: Condvar,
     running: AtomicBool,
 }
 
 impl Port {
-    fn new(mode: u32) -> Port {
-        Port { mode, items: Mutex::new(VecDeque::new()), cv: Condvar::new(), running: AtomicBool::new(false) }
+    fn new(mode: u32) -> Arc<Port> {
+        Arc::new(Port {
+            mode,
+            items: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            running: AtomicBool::new(false),
+        })
     }
 }
 
 pub struct Queue {
-    ports: [Port; 2],
+    ports: [Arc<Port>; 2],
+    #[allow(dead_code)]
+    owns_ports: bool,
     terminated: AtomicBool,
     inflight: AtomicUsize,
     idle: (Mutex<()>, Condvar),
+    monitors: Mutex<Vec<Monitor>>,
 }
 
 /// What an `XTaskQueueHandle` points to.
@@ -159,6 +185,7 @@ fn timer() -> &'static (Mutex<BinaryHeap<Timed>>, Condvar) {
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
+static NEXT_MONITOR_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------------------
 // core operations
@@ -168,9 +195,22 @@ impl Queue {
     pub fn new(work_mode: u32, completion_mode: u32) -> Arc<Queue> {
         Arc::new(Queue {
             ports: [Port::new(work_mode), Port::new(completion_mode)],
+            owns_ports: true,
             terminated: AtomicBool::new(false),
             inflight: AtomicUsize::new(0),
             idle: (Mutex::new(()), Condvar::new()),
+            monitors: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn composite(work: Arc<Port>, completion: Arc<Port>) -> Arc<Queue> {
+        Arc::new(Queue {
+            ports: [work, completion],
+            owns_ports: false,
+            terminated: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            idle: (Mutex::new(()), Condvar::new()),
+            monitors: Mutex::new(Vec::new()),
         })
     }
 
@@ -186,14 +226,23 @@ impl Queue {
         item.run(canceled);
         self.done_one();
     }
+
+    fn notify_monitors(&self, port: u32) {
+        let snapshot: Vec<Monitor> = self.monitors.lock().unwrap().clone();
+        for m in snapshot {
+            unsafe {
+                let f: XTaskQueueMonitorCallback = std::mem::transmute(m.cb);
+                f(m.ctx as *mut c_void, m.queue_handle as *mut c_void, port);
+            }
+        }
+    }
 }
 
-fn drain_serialized(q: Arc<Queue>, port: u32) {
-    let p = &q.ports[port as usize];
+fn drain_serialized(p: Arc<Port>) {
     loop {
         let next = p.items.lock().unwrap().pop_front();
         match next {
-            Some(it) => unsafe { q.execute(it) },
+            Some(qi) => unsafe { qi.queue.execute(qi.item) },
             None => {
                 p.running.store(false, Ordering::Release);
                 // re-check: an item may have arrived after pop but before the store
@@ -211,21 +260,27 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) {
     let p = &q.ports[port as usize];
     q.inflight.fetch_add(1, Ordering::AcqRel);
     match p.mode {
-        MODE_IMMEDIATE => unsafe { q.execute(item) },
+        MODE_IMMEDIATE => unsafe {
+            q.notify_monitors(port);
+            q.execute(item);
+        },
         MODE_THREAD_POOL => {
+            q.notify_monitors(port);
             let q2 = q.clone();
             spawn(Box::new(move || unsafe { q2.execute(item) }));
         }
         MODE_SERIALIZED_THREAD_POOL => {
-            p.items.lock().unwrap().push_back(item);
+            p.items.lock().unwrap().push_back(QueuedItem { item, queue: q.clone() });
+            q.notify_monitors(port);
             if !p.running.swap(true, Ordering::AcqRel) {
-                let q2 = q.clone();
-                spawn(Box::new(move || drain_serialized(q2, port)));
+                let p2 = p.clone();
+                spawn(Box::new(move || drain_serialized(p2)));
             }
         }
         _ => {
-            p.items.lock().unwrap().push_back(item);
+            p.items.lock().unwrap().push_back(QueuedItem { item, queue: q.clone() });
             p.cv.notify_one();
+            q.notify_monitors(port);
         }
     }
 }
@@ -248,6 +303,9 @@ pub fn submit_delayed(q: &Arc<Queue>, port: u32, delay_ms: u32, item: Item) {
 /// Dispatch one item from a Manual port. Returns true when something ran.
 pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
     let p = &q.ports[port as usize];
+    if p.mode != MODE_MANUAL {
+        return false;
+    }
     let mut g = p.items.lock().unwrap();
     if g.is_empty() && timeout_ms != 0 {
         let dur = if timeout_ms == u32::MAX { Duration::from_secs(u64::MAX / 4) } else { Duration::from_millis(timeout_ms as u64) };
@@ -260,19 +318,43 @@ pub fn dispatch(q: &Arc<Queue>, port: u32, timeout_ms: u32) -> bool {
             g = p.cv.wait_timeout(g, deadline - now).unwrap().0;
         }
     }
-    let Some(item) = g.pop_front() else { return false };
+    let Some(qi) = g.pop_front() else { return false };
     drop(g);
-    unsafe { q.execute(item) };
+    unsafe { qi.queue.execute(qi.item) };
     true
 }
 
 // ---------------------------------------------------------------------------------------
-// handles + process queue
+// handles + port handles + process queue
 // ---------------------------------------------------------------------------------------
 
 /// Live queue handles: a handle is only read while it is in here (under the lock), so one
 /// closed on another thread – or a stale value in an XAsyncBlock – is not dereferenced.
 static HANDLES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Weak registry of `XTaskQueuePortHandle` values handed out by `XTaskQueueGetPort`.
+/// GDK has no close function for port handles; weak references keep them valid as long as
+/// any queue referencing the port is alive without leaking memory.
+static PORT_HANDLES: Mutex<Option<HashMap<usize, Weak<Port>>>> = Mutex::new(None);
+
+fn register_port_handle(p: &Arc<Port>) -> *mut c_void {
+    let key = Arc::as_ptr(p) as usize;
+    let mut guard = PORT_HANDLES.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() > 64 {
+        map.retain(|_, w| w.strong_count() > 0);
+    }
+    map.insert(key, Arc::downgrade(p));
+    key as *mut c_void
+}
+
+fn port_from_handle(h: *mut c_void) -> Option<Arc<Port>> {
+    if h.is_null() {
+        return None;
+    }
+    let guard = PORT_HANDLES.lock().unwrap();
+    guard.as_ref()?.get(&(h as usize))?.upgrade()
+}
 
 pub fn new_handle(q: Arc<Queue>) -> *mut QueueHandle {
     let h = Box::into_raw(Box::new(QueueHandle { magic: MAGIC, queue: q }));
@@ -333,6 +415,30 @@ pub unsafe extern "system" fn XTaskQueueCreate(work: u32, completion: u32, out: 
     S_OK
 }
 
+pub unsafe extern "system" fn XTaskQueueGetPort(h: *mut c_void, port: u32, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() || port > 1 {
+        return E_INVALIDARG;
+    }
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    *out = register_port_handle(&q.ports[port as usize]);
+    S_OK
+}
+
+pub unsafe extern "system" fn XTaskQueueCreateComposite(
+    work_port: *mut c_void,
+    completion_port: *mut c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let (Some(w), Some(c)) = (port_from_handle(work_port), port_from_handle(completion_port)) else {
+        return E_INVALIDARG;
+    };
+    *out = new_handle(Queue::composite(w, c)) as *mut c_void;
+    S_OK
+}
+
 pub unsafe extern "system" fn XTaskQueueDuplicateHandle(h: *mut c_void, out: *mut *mut c_void) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
@@ -388,7 +494,10 @@ pub unsafe extern "system" fn XTaskQueueDispatch(h: *mut c_void, port: u32, time
 
 pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bool {
     match queue_from(h) {
-        Some(q) if port <= 1 => q.ports[port as usize].items.lock().unwrap().is_empty() && q.inflight.load(Ordering::Acquire) == 0,
+        Some(q) if port <= 1 => {
+            let items = q.ports[port as usize].items.lock().unwrap();
+            !items.iter().any(|qi| Arc::ptr_eq(&qi.queue, &q)) && q.inflight.load(Ordering::Acquire) == 0
+        }
         _ => true,
     }
 }
@@ -396,11 +505,23 @@ pub unsafe extern "system" fn XTaskQueueIsEmpty(h: *mut c_void, port: u32) -> bo
 pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ctx: *mut c_void, cb: usize) -> HRESULT {
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
     q.terminated.store(true, Ordering::Release);
-    // cancel everything still queued on manual/serialized ports
+    // Cancel only queued items submitted through `q`; sibling queues sharing a composite port
+    // keep their pending work untouched.
     for port in 0..2 {
-        let pending: Vec<Item> = q.ports[port].items.lock().unwrap().drain(..).collect();
-        for it in pending {
-            q.execute(it);
+        let mut items = q.ports[port].items.lock().unwrap();
+        let mut mine = Vec::new();
+        let mut keep = VecDeque::with_capacity(items.len());
+        while let Some(qi) = items.pop_front() {
+            if Arc::ptr_eq(&qi.queue, &q) {
+                mine.push(qi);
+            } else {
+                keep.push_back(qi);
+            }
+        }
+        *items = keep;
+        drop(items);
+        for qi in mine {
+            qi.queue.execute(qi.item);
         }
     }
     let ctx = ctx as usize; // raw pointers are not Send
@@ -499,19 +620,57 @@ pub unsafe extern "system" fn XTaskQueueUnregisterWaiter(_h: *mut c_void, token:
     drop(Box::from_raw(w));
 }
 
-pub unsafe extern "system" fn XTaskQueueRegisterMonitor(_h: *mut c_void, _ctx: *mut c_void, _cb: usize, token: *mut RegistrationToken) -> HRESULT {
-    // Monitors are notified when work is queued; games use them to wake manual pumps.
-    // Not needed for thread-pool queues – accept and never fire.
-    if !token.is_null() {
-        (*token).token = 1;
+pub unsafe extern "system" fn XTaskQueueRegisterMonitor(
+    h: *mut c_void,
+    ctx: *mut c_void,
+    cb: usize,
+    token: *mut RegistrationToken,
+) -> HRESULT {
+    let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    if token.is_null() || cb == 0 {
+        return E_INVALIDARG;
     }
+    let id = NEXT_MONITOR_TOKEN.fetch_add(1, Ordering::Relaxed);
+    q.monitors.lock().unwrap().push(Monitor {
+        token: id,
+        queue_handle: h as usize,
+        ctx: ctx as usize,
+        cb,
+    });
+    (*token).token = id;
     S_OK
 }
 
-pub unsafe extern "system" fn XTaskQueueUnregisterMonitor(_h: *mut c_void, _token: RegistrationToken) {}
+pub unsafe extern "system" fn XTaskQueueUnregisterMonitor(h: *mut c_void, token: RegistrationToken) {
+    let Some(q) = queue_from(h) else { return };
+    q.monitors.lock().unwrap().retain(|m| m.token != token.token);
+}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    static CANCELED: AtomicU32 = AtomicU32::new(0);
+    static MONITOR_PORTS: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "system" fn bump(ctx: *mut c_void, canceled: bool) {
+        HITS.fetch_add(ctx as usize as u32, Ordering::SeqCst);
+        if canceled {
+            CANCELED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "system" fn on_monitor(ctx: *mut c_void, _q: *mut c_void, port: u32) {
+        let bit = 1u32 << port;
+        if !ctx.is_null() {
+            let slot = &*(ctx as *const AtomicU32);
+            slot.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            MONITOR_PORTS.fetch_or(bit, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn closed_and_stray_handles_are_not_read() {
@@ -523,18 +682,6 @@ mod tests {
             assert!(queue_from(h).is_none(), "a closed handle");
             XTaskQueueCloseHandle(h); // twice: nothing to free
             assert!(queue_from(0x1235 as *mut c_void).is_none(), "a stray (misaligned) value is not dereferenced");
-        }
-    }
-    use super::*;
-    use std::sync::atomic::AtomicU32;
-
-    static HITS: AtomicU32 = AtomicU32::new(0);
-    static CANCELED: AtomicU32 = AtomicU32::new(0);
-
-    unsafe extern "system" fn bump(ctx: *mut c_void, canceled: bool) {
-        HITS.fetch_add(ctx as usize as u32, Ordering::SeqCst);
-        if canceled {
-            CANCELED.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -593,6 +740,86 @@ mod tests {
                 assert_eq!(HITS.load(Ordering::SeqCst), b + 50);
                 XTaskQueueCloseHandle(t);
             }
+        }
+    }
+
+    #[test]
+    fn composite_queue_termination_preserves_shared_parent_port_work() {
+        struct Rec {
+            hits: AtomicU32,
+            canceled: AtomicU32,
+            val: u32,
+        }
+        unsafe extern "system" fn record(ctx: *mut c_void, canceled: bool) {
+            let r = &*(ctx as *const Rec);
+            r.hits.fetch_add(r.val, Ordering::SeqCst);
+            if canceled {
+                r.canceled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe {
+            let mut base = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut base), S_OK);
+            let mut work_port = std::ptr::null_mut();
+            let mut comp_port = std::ptr::null_mut();
+            assert_eq!(XTaskQueueGetPort(base, PORT_WORK, &mut work_port), S_OK);
+            assert_eq!(XTaskQueueGetPort(base, PORT_COMPLETION, &mut comp_port), S_OK);
+            let mut comp = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreateComposite(work_port, comp_port, &mut comp), S_OK);
+
+            // Submit one item on base and one on the composite queue sharing the same manual work port.
+            let base_rec = Rec { hits: AtomicU32::new(0), canceled: AtomicU32::new(0), val: 1 };
+            let comp_rec = Rec { hits: AtomicU32::new(0), canceled: AtomicU32::new(0), val: 2 };
+            assert_eq!(XTaskQueueSubmitCallback(base, PORT_WORK, &base_rec as *const Rec as *mut c_void, record as usize), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(comp, PORT_WORK, &comp_rec as *const Rec as *mut c_void, record as usize), S_OK);
+
+            // Terminating the composite queue cancels ONLY the composite queue's item.
+            assert_eq!(XTaskQueueTerminate(comp, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(comp_rec.canceled.load(Ordering::SeqCst), 1);
+            assert_eq!(comp_rec.hits.load(Ordering::SeqCst), 2);
+            assert_eq!(base_rec.hits.load(Ordering::SeqCst), 0);
+            assert!(!XTaskQueueIsEmpty(base, PORT_WORK));
+
+            // Base queue's item still dispatches normally (canceled == false).
+            assert!(XTaskQueueDispatch(base, PORT_WORK, 0));
+            assert_eq!(base_rec.canceled.load(Ordering::SeqCst), 0);
+            assert_eq!(base_rec.hits.load(Ordering::SeqCst), 1);
+            assert!(XTaskQueueIsEmpty(base, PORT_WORK));
+
+            XTaskQueueCloseHandle(comp);
+            XTaskQueueCloseHandle(base);
+
+            // Once all queues owning the port are closed, stale port handles are rejected.
+            let mut stale = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreateComposite(work_port, comp_port, &mut stale), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn monitor_fires_on_submit_and_stops_after_unregister() {
+        unsafe extern "system" fn noop(_ctx: *mut c_void, _canceled: bool) {}
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_IMMEDIATE, &mut q), S_OK);
+            let seen = AtomicU32::new(0);
+            let mut tok = RegistrationToken { token: 0 };
+            assert_eq!(
+                XTaskQueueRegisterMonitor(q, &seen as *const AtomicU32 as *mut c_void, on_monitor as usize, &mut tok),
+                S_OK
+            );
+            assert_ne!(tok.token, 0);
+            assert_eq!(XTaskQueueSubmitCallback(q, PORT_WORK, std::ptr::null_mut(), noop as usize), S_OK);
+            assert_eq!(seen.load(Ordering::SeqCst), 1 << PORT_WORK);
+            assert_eq!(XTaskQueueSubmitCallback(q, PORT_COMPLETION, std::ptr::null_mut(), noop as usize), S_OK);
+            assert_eq!(seen.load(Ordering::SeqCst), (1 << PORT_WORK) | (1 << PORT_COMPLETION));
+
+            XTaskQueueUnregisterMonitor(q, tok);
+            seen.store(0, Ordering::SeqCst);
+            assert_eq!(XTaskQueueSubmitCallback(q, PORT_WORK, std::ptr::null_mut(), noop as usize), S_OK);
+            assert_eq!(seen.load(Ordering::SeqCst), 0);
+
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
+            XTaskQueueCloseHandle(q);
         }
     }
 }

@@ -6,8 +6,10 @@
 pub mod api;
 pub mod gamesave;
 pub mod gdk_table;
+pub mod networking;
 pub mod taskqueue;
 pub mod xasync;
+pub mod xsign;
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
 use gamesave::*;
+use networking::*;
 use taskqueue::*;
 use api::{InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl, UninitializeApiImpl, XErrorReport};
 use xasync::*;
@@ -35,6 +38,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XGameRuntimeIsFeatureAvailable,
         // task queue
         XTaskQueueCreate,
+        XTaskQueueCreateComposite,
+        XTaskQueueGetPort,
         XTaskQueueDuplicateHandle,
         XTaskQueueCloseHandle,
         XTaskQueueSubmitCallback,
@@ -59,7 +64,25 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XAsyncRun,
         // threads
         XThreadSetTimeSensitive,
+        XThreadVerifyNotTimeSensitive,
+        XThreadAssertNotTimeSensitive,
         XThreadIsTimeSensitive,
+        // networking
+        XNetworkingQueryPreferredLocalUdpMultiplayerPort,
+        XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync,
+        XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult,
+        XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged,
+        XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged,
+        XNetworkingQuerySecurityInformationForUrlAsync,
+        XNetworkingQuerySecurityInformationForUrlAsyncResultSize,
+        XNetworkingQuerySecurityInformationForUrlAsyncResult,
+        XNetworkingQuerySecurityInformationForUrlUtf16Async,
+        XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize,
+        XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult,
+        XNetworkingVerifyServerCertificate,
+        XNetworkingGetConnectivityHint,
+        XNetworkingRegisterConnectivityHintChanged,
+        XNetworkingUnregisterConnectivityHintChanged,
         // system
         XSystemGetDeviceType,
         XSystemGetConsoleId,
@@ -124,6 +147,15 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XUserGetAgeGroup,
         XUserRegisterForChangeEvent,
         XUserUnregisterForChangeEvent,
+        XUserGetTokenAndSignatureAsync,
+        XUserGetTokenAndSignatureResultSize,
+        XUserGetTokenAndSignatureResult,
+        XUserGetTokenAndSignatureUtf16Async,
+        XUserGetTokenAndSignatureUtf16ResultSize,
+        XUserGetTokenAndSignatureUtf16Result,
+        XUserFindForDevice,
+        XUserFindControllerForUserWithUiAsync,
+        XUserFindControllerForUserWithUiResult,
         // store (offline)
         XStoreCreateContext,
         XStoreCloseContextHandle,
@@ -170,6 +202,19 @@ pub unsafe extern "system" fn XThreadSetTimeSensitive(v: bool) -> HRESULT {
 
 pub unsafe extern "system" fn XThreadIsTimeSensitive() -> bool {
     TIME_SENSITIVE.with(|c| c.get())
+}
+
+pub unsafe extern "system" fn XThreadVerifyNotTimeSensitive() -> HRESULT {
+    if TIME_SENSITIVE.with(|c| c.get()) {
+        crate::xlog_warn!("XThreadVerifyNotTimeSensitive called on a time-sensitive thread");
+    }
+    S_OK
+}
+
+pub unsafe extern "system" fn XThreadAssertNotTimeSensitive() {
+    if TIME_SENSITIVE.with(|c| c.get()) {
+        crate::xlog_warn!("XThreadAssertNotTimeSensitive called on a time-sensitive thread");
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -571,6 +616,164 @@ pub unsafe extern "system" fn XUserRegisterForChangeEvent(_q: *mut c_void, _ctx:
 
 pub unsafe extern "system" fn XUserUnregisterForChangeEvent(_token: RegistrationToken, _wait: bool) -> bool {
     true
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureData {
+    pub token_size: usize,
+    pub signature_size: usize,
+    pub token: *const u8,
+    pub signature: *const u8,
+}
+
+#[repr(C)]
+pub struct XUserGetTokenAndSignatureUtf16Data {
+    pub token_count: usize,
+    pub signature_count: usize,
+    pub token: *const u16,
+    pub signature: *const u16,
+}
+
+static TOKEN_UTF8_ID: u8 = 0;
+static TOKEN_UTF16_ID: u8 = 0;
+static FIND_CONTROLLER_ID: u8 = 0;
+
+fn build_token_payload(utf16: bool, method: &str, url: &str, body: &[u8]) -> Result<PayloadBuf, HRESULT> {
+    let tok_str = xsign::offline_token();
+    let sig_str = xsign::sign_request(method, url, &tok_str, body)?;
+    let (tok_bytes, sig_bytes, unit) = if utf16 {
+        let tb: Vec<u8> = tok_str.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        let sb: Vec<u8> = sig_str.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        (tb, sb, 2usize)
+    } else {
+        let mut tb = tok_str.into_bytes();
+        tb.push(0);
+        let mut sb = sig_str.into_bytes();
+        sb.push(0);
+        (tb, sb, 1usize)
+    };
+    let header_len = 4 * std::mem::size_of::<usize>(); // 32 bytes on x64
+    let sig_offset = header_len + tok_bytes.len();
+    let mut bytes = Vec::with_capacity(sig_offset + sig_bytes.len());
+    bytes.extend_from_slice(&(tok_bytes.len() / unit).to_le_bytes());
+    bytes.extend_from_slice(&(sig_bytes.len() / unit).to_le_bytes());
+    bytes.extend_from_slice(&header_len.to_le_bytes());
+    bytes.extend_from_slice(&sig_offset.to_le_bytes());
+    bytes.extend_from_slice(&tok_bytes);
+    bytes.extend_from_slice(&sig_bytes);
+    Ok(PayloadBuf { bytes, fixups: vec![16, 24] })
+}
+
+unsafe fn copy_capped_body(body_size: usize, body: *const c_void) -> Vec<u8> {
+    if body.is_null() || body_size == 0 {
+        return Vec::new();
+    }
+    let len = body_size.min(8192);
+    std::slice::from_raw_parts(body as *const u8, len).to_vec()
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
+    user: *mut c_void,
+    _options: u32,
+    method: *const u8,
+    url: *const u8,
+    _header_count: usize,
+    _headers: *const c_void,
+    body_size: usize,
+    body: *const c_void,
+    b: *mut XAsyncBlock,
+) -> HRESULT {
+    if !valid_user(user) || url.is_null() {
+        return E_INVALIDARG;
+    }
+    let method = crate::util::from_cstr_ptr(method).filter(|s| !s.is_empty()).unwrap_or_else(|| "GET".into());
+    let url = crate::util::from_cstr_ptr(url).unwrap_or_default();
+    let body = copy_capped_body(body_size, body);
+    begin_with_fixups(b, &TOKEN_UTF8_ID as *const u8 as usize, move || {
+        build_token_payload(false, &method, &url, &body)
+    })
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    XAsyncGetResultSize(b, size)
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureResult(
+    b: *mut XAsyncBlock,
+    buffer_size: usize,
+    buffer: *mut c_void,
+    ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureData,
+    buffer_used: *mut usize,
+) -> HRESULT {
+    let hr = XAsyncGetResult(b, &TOKEN_UTF8_ID as *const u8 as *const c_void, buffer_size, buffer, buffer_used);
+    if hr >= 0 && !ptr_to_buffer.is_null() {
+        *ptr_to_buffer = buffer as *mut XUserGetTokenAndSignatureData;
+    }
+    hr
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Async(
+    user: *mut c_void,
+    _options: u32,
+    method: *const u16,
+    url: *const u16,
+    _header_count: usize,
+    _headers: *const c_void,
+    body_size: usize,
+    body: *const c_void,
+    b: *mut XAsyncBlock,
+) -> HRESULT {
+    if !valid_user(user) || url.is_null() {
+        return E_INVALIDARG;
+    }
+    let method = crate::util::from_wide_ptr(method).filter(|s| !s.is_empty()).unwrap_or_else(|| "GET".into());
+    let url = crate::util::from_wide_ptr(url).unwrap_or_default();
+    let body = copy_capped_body(body_size, body);
+    begin_with_fixups(b, &TOKEN_UTF16_ID as *const u8 as usize, move || {
+        build_token_payload(true, &method, &url, &body)
+    })
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16ResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT {
+    XAsyncGetResultSize(b, size)
+}
+
+pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Result(
+    b: *mut XAsyncBlock,
+    buffer_size: usize,
+    buffer: *mut c_void,
+    ptr_to_buffer: *mut *mut XUserGetTokenAndSignatureUtf16Data,
+    buffer_used: *mut usize,
+) -> HRESULT {
+    let hr = XAsyncGetResult(b, &TOKEN_UTF16_ID as *const u8 as *const c_void, buffer_size, buffer, buffer_used);
+    if hr >= 0 && !ptr_to_buffer.is_null() {
+        *ptr_to_buffer = buffer as *mut XUserGetTokenAndSignatureUtf16Data;
+    }
+    hr
+}
+
+/// Associate every input device with the local signed-in user.
+pub unsafe extern "system" fn XUserFindForDevice(_device: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    USER.refs.fetch_add(1, Ordering::AcqRel);
+    *out = user_ptr();
+    S_OK
+}
+
+pub unsafe extern "system" fn XUserFindControllerForUserWithUiAsync(user: *mut c_void, b: *mut XAsyncBlock) -> HRESULT {
+    if !valid_user(user) {
+        return E_INVALIDARG;
+    }
+    begin_with(b, &FIND_CONTROLLER_ID as *const u8 as usize, || Ok(vec![0u8; 32]))
+}
+
+pub unsafe extern "system" fn XUserFindControllerForUserWithUiResult(b: *mut XAsyncBlock, device_id: *mut [u8; 32]) -> HRESULT {
+    if device_id.is_null() {
+        return E_INVALIDARG;
+    }
+    XAsyncGetResult(b, &FIND_CONTROLLER_ID as *const u8 as *const c_void, 32, device_id as *mut c_void, std::ptr::null_mut())
 }
 
 // ---------------------------------------------------------------------------------------

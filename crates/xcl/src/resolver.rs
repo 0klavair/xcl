@@ -371,6 +371,14 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32legacy.dll", &name("RegOpenKeyW"), 0);
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
+        // Non-hooked advapi32legacy imports (including LSA policy & privilege APIs) fall through
+        // to Windows' advapi32.dll / sechost.dll rather than becoming stubs.
+        for sym in ["LsaOpenPolicy", "LsaQueryInformationPolicy", "LsaClose", "LookupPrivilegeValueW"] {
+            let (a, s) = resolve_inner("advapi32legacy.dll", &name(sym), 0);
+            assert!(a != 0 && matches!(s, Source::System(ref d) if d == "advapi32.dll" || d == "sechost.dll"), "{sym}: {s:?}");
+        }
+        let h = load_library("advapi32legacy.dll").expect("LoadLibrary(advapi32legacy.dll)");
+        assert!(get_proc_address(h, &name("LsaOpenPolicy")).is_some(), "GetProcAddress(advapi32legacy, LsaOpenPolicy)");
     }
 
     #[test]
