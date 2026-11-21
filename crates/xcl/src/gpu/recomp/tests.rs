@@ -2216,14 +2216,21 @@ fn retail_translation_survey() {
                     });
                     // DXC outside the lock
                     let guarded = matches!(&res, Ok(Ok((t, _))) if t.hlsl.contains("pc =="));
+                    // XCL_SURVEY_ONLY=a|b: DXC only for programs whose HLSL contains one of these
+                    let only = std::env::var("XCL_SURVEY_ONLY").ok();
+                    let wanted = |h: &str| only.as_ref().is_none_or(|o| o.split('|').any(|x| h.contains(x)));
                     let dxc = match (&res, with_dxc) {
-                        (Ok(Ok((t, profile))), true) => {
+                        (Ok(Ok((t, profile))), true) if wanted(&t.hlsl) => {
                             if std::env::var_os("XCL_SURVEY_TRACE").is_some() {
                                 eprintln!("dxc start {} ({} KB)", r.name, t.hlsl.len() / 1024);
                             }
                             let t1 = std::time::Instant::now();
                             let r = super::dxc::compile(&t.hlsl, "main", profile, &[]);
-                            Some((t1.elapsed().as_secs_f64(), r.err().map(|e| e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or("")).to_string())))
+                            // the specific message (validation failures list it after "validation errors")
+                            let first = |e: &str| {
+                                e.lines().find(|l| l.contains("error") && !l.contains("validation errors")).or_else(|| e.lines().find(|l| l.contains("error"))).unwrap_or(e.lines().next().unwrap_or("")).to_string()
+                            };
+                            Some((t1.elapsed().as_secs_f64(), r.err().map(|e| first(&e))))
                         }
                         _ => None,
                     };

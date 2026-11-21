@@ -3316,7 +3316,11 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 h.push_str("}\n");
             }
             Mode::Pixel(ps) => {
-                h.push_str("struct XclIn {\n    float4 xcl_pos : SV_Position;\n");
+                // conservative depth output (SV_DepthGreater/LessEqual): DXIL wants the position
+                // input non-perspective centroid (or sample)
+                let conservative = ps.outputs.iter().any(|e| matches!(e.system_value, 67 | 68));
+                let pos_mode = if conservative { "noperspective centroid " } else { "" };
+                let _ = writeln!(h, "struct XclIn {{\n    {pos_mode}float4 xcl_pos : SV_Position;");
                 for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
                     let mut m = self.ps_modes.get(&(k as u32)).cloned().unwrap_or_default();
                     if e.component_type != 3 {
