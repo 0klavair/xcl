@@ -1515,6 +1515,15 @@ impl Em {
                 match (&cmp, &grads, &lod, &bias) {
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
                     (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
+                    // cube maps: RDNA takes face-space 2D gradients, HLSL wants direction-space 3D
+                    // ones (and has no clamp form) – the LOD from the gradients and the face size
+                    (None, Some((dx, dy)), _, _) if dim == 3 => {
+                        let len = |x: &[String]| format!("length(float2({}, {}))", x[0], x.get(1).cloned().unwrap_or("0.0f".into()));
+                        let size = format!("{t}_cw");
+                        self.line(&format!("uint {size} = 1u, {t}_ch = 1u, {t}_cn = 1u; {t}_T.GetDimensions(0u, {size}, {t}_ch, {t}_cn);"));
+                        let lod = format!("log2(max(max({}, {}) * (float){size}, 1e-8f))", len(dx), len(dy));
+                        format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(lod))
+                    }
                     (None, Some((dx, dy)), _, _) => {
                         let v = |x: &[String]| if x.len() == 1 { x[0].clone() } else { format!("float{}({})", x.len(), x.join(", ")) };
                         format!("{t}_T.SampleGrad({t}_S, {})", tail(format!("{coord}, {}, {}", v(dx), v(dy))))

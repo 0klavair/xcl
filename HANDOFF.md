@@ -599,6 +599,11 @@ Nic otwartego.
     (PS_PedTextured_Eight_Fire), suma 224 s → **cała paczka ≈ 6 h CPU** (rząd 30 min na wszystkich rdzeniach, jeśli
     starczy pamięci). Pierwszy start gry bez gotowego cache DXIL byłby bardzo długi → potrzebna kompilacja w tle +
     cache (`dxc::compile_cached`, klucz = HLSL) albo wcześniejsze zapełnienie cache z `shaders.rpf`.
+  - **Losowe próbki 1%** (`XCL_SURVEY_SEED=<n>|random`, ziarno wypisywane): ziarno 1795262526659555600 znalazło błąd
+    DXC – `image_sample_d(_cl)` na **teksturze cube**: RDNA podaje gradienty 2D w układzie ściany, HLSL
+    `TextureCube.SampleGrad` chce 3D i nie ma wersji z clamp → teraz LOD = log2(max |grad| · rozmiar ściany) (z clamp)
+    i `SampleLevel` (przybliżenie; skala gradientów ściany do potwierdzenia w grze). Po poprawce to ziarno i nowe
+    (1795262814426998400): 0 błędów. Próbka co 100. rekordu tego nie trafiała – sprawdzać też losowo.
   - MS (NGG) i GS/ES kompilować jako **cs_6_6** (działają jako compute + przejściowy mesh shader; profil ms/gs →
     „WaveSize only allowed on compute”).
 - **Optymalizacja czasu DXC (sesja 5, druga runda)** – porównanie tej samej próbki (co 100. rekord, 241 wariantów) kod

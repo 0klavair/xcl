@@ -2138,7 +2138,24 @@ fn retail_translation_survey() {
     let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
     let every: usize = std::env::var("XCL_SURVEY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let data = std::fs::read(path).unwrap();
-    let records: Vec<_> = crate::gpu::pack::scan(&data, 0x40).into_iter().step_by(every).collect();
+    // XCL_SURVEY_SEED=<n> or "random": a random 1/every of the records (splitmix64), else every N-th
+    let seed = std::env::var("XCL_SURVEY_SEED").ok().map(|v| {
+        v.parse::<u64>().unwrap_or_else(|_| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64))
+    });
+    let mix = |mut z: u64| {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let all = crate::gpu::pack::scan(&data, 0x40);
+    let records: Vec<_> = match seed {
+        Some(sd) => {
+            println!("losowa próbka: ziarno {sd}");
+            all.into_iter().enumerate().filter(|(i, _)| mix(sd ^ (*i as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)) % every as u64 == 0).map(|(_, r)| r).collect()
+        }
+        None => all.into_iter().step_by(every).collect(),
+    };
     #[derive(Default)]
     struct Acc {
         // stage → (variants, complete)
@@ -2344,6 +2361,9 @@ fn retail_shader_cost() {
             let t0 = std::time::Instant::now();
             let r2 = super::dxc::compile(h, "main", profile, &extra);
             let secs = t0.elapsed().as_secs_f64();
+            if let (Err(_), Ok(dir)) = (&r2, std::env::var("XCL_HLSL_OUT")) {
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.failed.hlsl", r.name)), h);
+            }
             println!(
                 "{} [{profile}] instrukcji {}, HLSL {} KB, linii {}, pc-dispatch {}, if {}, for(;;) {}, select {} → DXC {:.2} s, {}",
                 r.name,
