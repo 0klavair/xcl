@@ -126,9 +126,9 @@ pub fn sanitize_protect(p: u32) -> u32 {
     }
 }
 
-/// Graphics address space the title reserved (no commit) – where it maps physical pages (a
-/// texture streaming pool): base → size. Write-watched, like unified memory, so textures in it
-/// follow CPU writes (`d3d12x::title_textures`).
+/// Graphics address space the title reserved (no commit) that unified memory had no room for
+/// – where it maps physical pages (a texture streaming pool): base → size. Write-watched, like
+/// unified memory, so textures in it follow CPU writes (`d3d12x::title_textures`).
 static GRAPHICS_RESERVATIONS: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The title's graphics reservations (base, size).
@@ -153,13 +153,30 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         }
     }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
+        // on the console all graphics memory is GPU-visible, reserved address space too (titles
+        // reserve a range, then commit or map pages and place resources in it): a range of
+        // unified memory, which is committed already
+        if let Some(q) = crate::gpu::uma::get().and_then(|u| u.reserve(size, 0x1_0000)) {
+            return q as *mut c_void;
+        }
         let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
             return q;
         }
     }
-    mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p))
+    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
+    trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    q
+}
+
+/// `XCL_TRACE_MEM=1`: allocations of 64 KiB or more that are not unified memory (first 60)
+fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if size >= 0x1_0000 && *ON.get_or_init(|| std::env::var_os("XCL_TRACE_MEM").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 60 {
+        crate::xlog_info!("mem: {what}({addr:#x}, {size:#x}, flags {flags:#x}, protect {protect:#x}) → {got:#x}");
+    }
 }
 
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
@@ -243,7 +260,9 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
 pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
-        aligned_heap_alloc(size, 1usize << a.alignment.max(4))
+        let q = aligned_heap_alloc(size, 1usize << a.alignment.max(4));
+        trace_mem("XMemAlloc", 0, size, attrs, 0, q as usize);
+        q
     } else if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 1usize << a.alignment.min(30))) {
         q as *mut c_void // graphics memory types: GPU-visible
     } else {

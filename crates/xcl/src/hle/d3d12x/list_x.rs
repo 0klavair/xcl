@@ -308,9 +308,9 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
-pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
+pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
     if dst != src {
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        copy_resource_x(this, dst, src);
     }
 }
 
@@ -486,23 +486,6 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
 }
 
-/// A D3D12_TEXTURE_COPY_LOCATION for the log.
-unsafe fn location(l: *const D3D12_TEXTURE_COPY_LOCATION) -> String {
-    if l.is_null() {
-        return "null".into();
-    }
-    let l = &*l;
-    let res = transmute_copy::<_, usize>(&l.pResource);
-    if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
-        let p = l.Anonymous.PlacedFootprint;
-        let f = p.Footprint;
-        format!("buffer {res:#x} +{:#x} format {} {}x{}x{} pitch {}", p.Offset, f.Format.0, f.Width, f.Height, f.Depth, f.RowPitch)
-    } else {
-        let d = ID3D12Resource::from_raw_borrowed(&(res as *mut c_void)).map(|r| r.GetDesc());
-        format!("texture {res:#x} subresource {} ({:?})", l.Anonymous.SubresourceIndex, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0)))
-    }
-}
-
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
@@ -513,13 +496,36 @@ pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
     hr
 }
 
-/// DMA list #12 CopyTextureRegion(dst, x, y, z, src, box) (PC #16)
-pub(super) unsafe extern "system" fn dma_copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
-    static N: AtomicU64 = AtomicU64::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) < 8 {
-        crate::xlog_info!("D3D12.X: DMA CopyTextureRegion to {} at ({x}, {y}, {z}) from {}{}", location(dst), location(src), if bx.is_null() { String::new() } else { format!(" box {:?}", { let b = *bx; (b.left, b.top, b.front, b.right, b.bottom, b.back) }) });
+/// a copy location with the offset of a buffer placed below its console address added
+unsafe fn pc_location(l: *const D3D12_TEXTURE_COPY_LOCATION) -> Option<D3D12_TEXTURE_COPY_LOCATION> {
+    let mut l = std::ptr::read(l.as_ref()?);
+    if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+        l.Anonymous.PlacedFootprint.Offset += real::buffer_delta(transmute_copy::<_, usize>(&l.pResource));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, dst, x, y, z, src, bx)
+    Some(l)
+}
+
+/// CopyBufferRegion(dst, dst offset, src, src offset, bytes) (PC #15; DMA list #11)
+pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+}
+
+/// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
+pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    std::mem::forget((d, s)); // borrowed resource pointers
+}
+
+/// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
+/// are copied as their own bytes (the PC resources also hold what lies before them)
+pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
+    if dd == 0 && sd == 0 {
+        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+    }
+    let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
+    copy_buffer_region_x(this, dst, 0, src, 0, n);
 }
 
 /// command list #28 BeginQuery(heap, type, index) (PC #52)

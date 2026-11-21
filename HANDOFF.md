@@ -1088,6 +1088,24 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   resources (the list failed to Close with E_INVALIDARG); console state bits the PC does not know are dropped.
 - **Result**: the title runs – in one minute 957 presents, 3 443 pipelines from translated console shaders, 966 of
   966 programs translated, no failed pipeline, no crash. Whether the picture is right is not checked yet.
+- **Graphics root arguments** (`bind`, measured with the console compiler – `print_graphics_root_argument_placement`
+  / `_capacity`): a VS / PS gets root arguments in user SGPRs **s8…s31** (s0…s7 the driver's, s[4:5] of a VS the
+  fetch shader), 24 SGPRs, the rest in the table at s[0:1] (`Layout::inline_gfx`, `user_data_gfx`). Set*Graphics*
+  (#34–#46) are kept like the compute ones; DrawInstanced / DrawIndexedInstanced (#12 / #13) with a translated pipeline
+  bind the ABI root signature and io first (a pipeline still building is waited for).
+- **Resources in title memory**: Map of a resource in unified memory returns its console address (also for textures
+  the PC cannot map); a buffer at an address that is not 64 KiB-aligned is placed from the 64 KiB below it and XCL adds
+  the difference in CopyBufferRegion / CopyTextureRegion / CopyResource (`buffer_delta`); graphics reservations come
+  from unified memory when it has room (`Uma::reserve`, not zeroed).
+- **Why XDefiant's picture is black (open)**: its main pool is one **8 GB reservation** (VirtualAlloc flags
+  0x20402000 = MEM_RESERVE | 0x400000 | MEM_LARGE_PAGES, no MEM_GRAPHICS – `XCL_TRACE_MEM=1`), committed in 64 KiB
+  steps, and it places D3D12 resources in it: on the console all of it is GPU-visible. XCL's unified memory is at most
+  4 windows of 4095 MiB, each fully committed (D3D12's rule for OpenExistingHeapFromAddress), and translated shaders
+  reach memory only through those windows – the pool does not fit (and 12+ GB committed is near this PC's commit
+  limit). Options: a much larger UMA (commit cost), or a GPU page table in translated shaders (title memory stays where
+  it is, per-chunk heaps) – the general one, larger work. Until then Map of such a buffer fails and the title stops.
+- Diagnostics: `XCL_FRAME_DUMP=1` writes every 120th presented frame (a quarter of each side) as `frame_<n>.bmp` in
+  the logs folder; `XCL_TRACE_MEM=1` logs allocations ≥ 64 KiB outside unified memory.
 - **Safety nets** (after a GPU hang that needed a PC restart – it came from a diagnostic run that skipped barriers):
   every loop of a translated shader has a per-lane budget (`LOOP_GUARD`, 4 M iterations); when the D3D12 device is
   removed (after ExecuteCommandLists, at PresentX) the title is stopped with the reason in the log and the report.

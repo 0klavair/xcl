@@ -674,13 +674,28 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
         Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
-        Kind::DmaList => vec![(9, super::list_x::dma_close_x as usize), (10, super::list_x::reset_x as usize), (12, super::list_x::dma_copy_texture_region_x as usize)],
+        Kind::DmaList => {
+            use super::list_x as l;
+            vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
+        }
         Kind::CommandList => {
             use super::bind as b;
             use super::list_x as l;
             vec![
                 // compute root arguments of console code: kept for translated dispatches
+                (12, b::draw_instanced as usize),
+                (15, l::copy_buffer_region_x as usize),
+                (16, l::copy_texture_region_x as usize),
+                (17, l::copy_resource_x as usize),
+                (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
+                (34, b::set_graphics_root_signature as usize),
+                (36, b::set_graphics_root_table as usize),
+                (38, b::set_graphics_root_constant as usize),
+                (40, b::set_graphics_root_constants as usize),
+                (42, b::set_graphics_root_descriptor as usize),
+                (44, b::set_graphics_root_descriptor as usize),
+                (46, b::set_graphics_root_descriptor as usize),
                 (26, l::resource_barrier_x as usize),
                 (25, b::set_pipeline_state as usize),
                 (33, b::set_compute_root_signature as usize),
@@ -704,7 +719,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (70, l::write64_bottom_x as usize),
                 (78, l::dispatch_x as usize),
                 (81, l::draw_indexed_x as usize),
-                (84, l::copy_resource_x as usize),
+                (84, l::copy_resource_flags_x as usize),
                 (85, l::set_predication_buffer_x as usize),
                 (88, l::write32_top_x as usize),
                 (89, l::write64_top_x as usize),
@@ -946,26 +961,96 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     let (base, size) = u.window(k);
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read_unaligned(desc.as_ptr() as *const D3D12_RESOURCE_DESC);
     let bytes = d.Width as usize;
-    if !va.is_multiple_of(0x1_0000) || bytes == 0 || va - base + bytes > size {
+    // a placed PC buffer starts at 64 KiB: one at another address starts below it and XCL adds
+    // the difference where PC methods take an offset into it (`buffer_delta`)
+    let start = va & !0xFFFF;
+    let delta = va - start;
+    if bytes == 0 || va - base + bytes > size {
         return None;
     }
     let heap = *UMA_HEAPS.lock().unwrap().get(k)?;
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
-    let hr = dev_create_placed_resource(this, heap, va - base, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    d.Width = (delta + bytes) as u64;
+    let hr = dev_create_placed_resource(this, heap, start - base, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         return None;
     }
     UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
+    if delta != 0 {
+        BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+    }
     Some(hr)
 }
 
+/// buffers placed below their console address: resource → bytes before it
+static BUFFER_DELTA: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// Where offset 0 of a console buffer is in its PC resource (0 for most).
+pub fn buffer_delta(res: usize) -> u64 {
+    BUFFER_DELTA.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
+}
+
 /// resource Release (every caller): a console buffer's unified memory goes with it
+/// Map: on the console every resource is CPU-visible memory. One in unified memory that the
+/// PC cannot map (a texture XCL keeps in step with it) gives its unified-memory address – what
+/// the console gives; the CPU's writes there reach the texture (`title_textures`).
+unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
+    // a resource in unified memory: its console address (no PC mapping – the PC's would be
+    // the start of the PC resource, before the address for a buffer placed below it)
+    if let Some((p, _)) = console_buffer(this as usize) {
+        if !data.is_null() {
+            *data = p as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+    let hr = f(this, sub, range, data);
+    if hr >= 0 {
+        return hr;
+    }
+    match super::title_textures::address(this as usize) {
+        Some(p) => {
+            if !data.is_null() {
+                *data = p as *mut c_void;
+            }
+            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+            S_OK
+        }
+        None => {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+                crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
+            }
+            hr
+        }
+    }
+}
+
+/// resources whose Map gave their unified-memory address (no PC mapping to undo)
+static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
+    if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+    f(this, sub, range)
+}
+
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+            s.remove(&(this as usize));
+        }
+        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+            m.remove(&(this as usize));
+        }
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
@@ -991,6 +1076,14 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
 /// compute pipelines that run a translated console shader
 static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
+/// graphics pipelines built from translated console shaders
+static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `pso` is a graphics pipeline of translated console shaders.
+pub fn is_translated_graphics(pso: usize) -> bool {
+    pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -998,6 +1091,9 @@ pub fn is_translated_compute(pso: usize) -> bool {
 
 fn forget_pso(pso: usize) {
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
+    if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
@@ -1325,7 +1421,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandList => v.extend_from_slice(&[("OMSetRenderTargets", cl_om_set_render_targets as usize), ("SetPipelineState", cl_set_pipeline_state as usize), ("Close", cl_close as usize)]),
         Kind::CommandQueue => v.push(("ExecuteCommandLists", q_execute_command_lists as usize)),
         Kind::CommandAllocator => v.push(("Reset", alloc_reset as usize)),
-        Kind::Resource => v.push(("Release", res_release as usize)),
+        Kind::Resource => v.extend_from_slice(&[("Release", res_release as usize), ("Map", res_map as usize), ("Unmap", res_unmap as usize)]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         _ => {}
@@ -1775,6 +1871,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{})", n + 1);
     }

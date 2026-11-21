@@ -408,6 +408,7 @@ unsafe fn present_now(min_interval: Duration) {
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, src);
+    let dump = frame_dump_due().then(|| readback_copy(&p.list, src, &desc)).flatten();
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
@@ -421,10 +422,119 @@ unsafe fn present_now(min_interval: Duration) {
     let _ = q.Signal(&p.fence, p.value);
     let _ = sc.Present(0, DXGI_PRESENT(0));
     p.last = Instant::now();
+    if let Some((rb, fp)) = dump {
+        if p.fence.GetCompletedValue() < p.value {
+            let _ = p.fence.SetEventOnCompletion(p.value, p.event);
+            WaitForSingleObject(p.event, 2000);
+        }
+        write_frame(&rb, &fp, desc.Format);
+    }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
+}
+
+/// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder
+/// (`frame_<n>.bmp`, a quarter of each side) – what the title presented, before the window.
+fn frame_dump_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 60
+}
+
+/// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
+unsafe fn readback_copy(list: &ID3D12GraphicsCommandList, src: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    let dev: ID3D12Device = {
+        let mut d: Option<ID3D12Device> = None;
+        src.GetDevice(&mut d).ok()?;
+        d?
+    };
+    let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0u64;
+    dev.GetCopyableFootprints(desc, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+    let mut rb: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(
+        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+        D3D12_HEAP_FLAG_NONE,
+        &D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: total,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        },
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        None,
+        &mut rb,
+    )
+    .ok()?;
+    let rb = rb?;
+    let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+    let s = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(src), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+    list.CopyTextureRegion(&dst, 0, 0, 0, &s, None);
+    Some((rb, fp))
+}
+
+/// texel → 8-bit RGB for the formats titles present in (None: not decoded)
+fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
+    Some(match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM => [(t >> 2 & 0xFF) as u8, (t >> 12 & 0xFF) as u8, (t >> 22 & 0xFF) as u8],
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => [t as u8, (t >> 8) as u8, (t >> 16) as u8],
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => [(t >> 16) as u8, (t >> 8) as u8, t as u8],
+        _ => return None,
+    })
+}
+
+unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT) {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+        return;
+    }
+    let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+    let (ow, oh) = ((w / 4).max(1), (h / 4).max(1));
+    let row = (ow * 3).div_ceil(4) * 4;
+    let mut bmp = Vec::with_capacity(54 + row * oh);
+    let size = (54 + row * oh) as u32;
+    bmp.extend_from_slice(b"BM");
+    for v in [size, 0, 54, 40, ow as u32, oh as u32] {
+        bmp.extend_from_slice(&v.to_le_bytes());
+    }
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&24u16.to_le_bytes());
+    for _ in 0..6 {
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let (mut lit, mut decoded) = (0usize, true);
+    for y in (0..oh).rev() {
+        let start = bmp.len();
+        for x in 0..ow {
+            let t = ((p as *const u8).add(fp.Offset as usize + 4 * y * pitch + 16 * x) as *const u32).read_unaligned();
+            let c = rgb(format, t).unwrap_or_else(|| {
+                decoded = false;
+                [0; 3]
+            });
+            if c.iter().map(|&v| v as u32).sum::<u32>() > 30 {
+                lit += 1;
+            }
+            bmp.extend_from_slice(&[c[2], c[1], c[0]]);
+        }
+        bmp.resize(start + row, 0);
+    }
+    rb.Unmap(0, None);
+    let n = PRESENTS.load(Ordering::Relaxed);
+    let Some(boot) = crate::state::boot() else { return };
+    let path = boot.logs_dir().join(format!("frame_{n}.bmp"));
+    let _ = std::fs::write(&path, &bmp);
+    crate::xlog_info!(
+        "present: frame {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
+        format.0,
+        path.display(),
+        ow * oh,
+        if decoded { "" } else { " (format not decoded)" }
+    );
 }
 
 impl Drop for Presenter {

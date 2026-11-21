@@ -439,3 +439,69 @@ fn print_root_argument_placement() {
         }
     }
 }
+
+/// Where the console puts root arguments for a vertex and a pixel shader: the first
+/// instructions of each and the user SGPR counts of their hardware stages.
+#[test]
+#[ignore]
+fn print_graphics_root_argument_placement() {
+    let Some(c) = console_compiler() else { return };
+    let rs = "RootConstants(num32BitConstants=2, b0), CBV(b1), DescriptorTable(SRV(t0)), StaticSampler(s0)";
+    let common = format!("cbuffer k : register(b0) {{ uint k0; uint k1; }};\ncbuffer m : register(b1) {{ float4 m0; }};\nTexture2D<float4> t : register(t0);\nSamplerState s : register(s0);\n#define ROOT [RootSignature(\"{rs}\")]\n");
+    let shaders = [
+        ("VS", "vs_6_6", "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\nROOT O main(float3 pos : POSITION, float2 uv : TEXCOORD0) { O o; o.p = float4(pos * m0.xyz, (float)k0); o.uv = uv + (float)k1; return o; }\n"),
+        ("PS", "ps_6_6", "ROOT float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.Sample(s, uv) * m0 + (float)(k0 ^ k1); }\n"),
+    ];
+    for (name, profile, body) in shaders {
+        let src = format!("{common}{body}");
+        let blob = match console_compile(&c, &src, &["-E", "main", "-T", profile]) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("{name}: {e}");
+                continue;
+            }
+        };
+        let Some(sh) = xcl::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            println!("{name}: FSSM stages {:?}", f.stages.iter().map(|s| xcl::gpu::xbox::hw_stage_name(s.hw)).collect::<Vec<_>>());
+            for st in &f.stages {
+                // SPI_SHADER_PGM_RSRC2 user SGPR count: bits 5:1 (graphics stages too)
+                let rd = |o: usize| f.data.get(st.offset + o..st.offset + o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                println!("  stage {} descriptor words: {:x?}", xcl::gpu::xbox::hw_stage_name(st.hw), (0..24).map(|k| rd(4 * k).unwrap_or(0)).collect::<Vec<_>>());
+            }
+            if let Some(p) = f.programs.first() {
+                for l in xcl::gpu::rdna2::disassemble(&f.data[p.offset..p.offset + p.len], 0, true).iter().skip(2).take(40) {
+                    println!("    {}", l.text);
+                }
+            }
+        }
+    }
+}
+
+/// The inline / table split of graphics root arguments: n constants + a CBV, for a few n.
+#[test]
+#[ignore]
+fn print_graphics_root_argument_capacity() {
+    let Some(c) = console_compiler() else { return };
+    for n in [20u32, 22, 23, 24, 25, 40] {
+        let rs = format!("RootConstants(num32BitConstants={n}, b0), CBV(b1)");
+        let src = format!(
+            "cbuffer k : register(b0) {{ uint k[{n}]; }};\ncbuffer m : register(b1) {{ float4 m0; }};\n[RootSignature(\"{rs}\")]\nfloat4 main(float4 p : SV_Position) : SV_Target {{ return m0 + (float)(k[0] + k[{}]); }}\n",
+            n - 1
+        );
+        let blob = match console_compile(&c, &src, &["-E", "main", "-T", "ps_6_6"]) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("{n}: {e}");
+                continue;
+            }
+        };
+        let Some(sh) = xcl::gpu::xbox::parse(&blob) else { continue };
+        for f in &sh.fssm {
+            if let Some(p) = f.programs.first() {
+                let lines: Vec<String> = xcl::gpu::rdna2::disassemble(&f.data[p.offset..p.offset + p.len], 0, true).iter().skip(2).take(14).map(|l| l.text.clone()).collect();
+                println!("{n} constants + CBV: {}", lines.join(" | "));
+            }
+        }
+    }
+}

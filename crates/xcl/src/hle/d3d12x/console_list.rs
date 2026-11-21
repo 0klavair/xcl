@@ -66,16 +66,23 @@ pub enum Param {
 }
 
 /// Where a root signature's arguments go: all of them packed in order (`at`, `size` bytes);
-/// the first `inline` bytes of that are passed in user SGPRs from s4, the rest is the table.
+/// the first `inline` bytes of that are passed in user SGPRs (compute from s4, graphics
+/// stages from s8: `inline_gfx` bytes), the rest is the table.
 #[derive(Debug, Default)]
 pub struct Layout {
     pub params: Vec<Param>,
     pub size: u32,
     pub inline: u32,
+    pub inline_gfx: u32,
 }
 
-/// User SGPRs the console's compiler gives root arguments: s4…s15 (s0…s3 are the driver's).
+/// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
+/// driver's), graphics stages (VS, PS) s8…s31 (s0…s7: the driver's, s[4:5] of a VS the
+/// fetch shader) – both measured on its output (`tests/console_shaders.rs`).
 const INLINE_SGPRS: u32 = 12;
+const INLINE_SGPRS_GFX: u32 = 24;
+const FIRST_SGPR: usize = 4;
+const FIRST_SGPR_GFX: usize = 8;
 
 /// Layout from a serialized root signature: a DXBC container with RTS0 or a bare RTS0.
 pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
@@ -92,7 +99,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
     // compiler expects them (HANDOFF: root argument binding)
-    let mut spilled = false;
+    let (mut spilled, mut spilled_gfx) = (false, false);
     for k in 0..n {
         let (ty, pay) = (r(poff + 12 * k)?, r(poff + 12 * k + 8)? as usize);
         let p = match ty {
@@ -109,6 +116,10 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
         if !spilled {
             l.inline += bytes;
         }
+        spilled_gfx |= l.inline_gfx + bytes > 4 * INLINE_SGPRS_GFX;
+        if !spilled_gfx {
+            l.inline_gfx += bytes;
+        }
         l.size += bytes;
         l.params.push(p);
     }
@@ -118,8 +129,19 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
 /// The user SGPRs of a dispatch: s[0:1] = `table_at` (where the bytes of `args` past the
 /// inline part are), from s4 the inline part of `args` (all arguments packed by `l`).
 pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
-    let mut s = vec![table_at as u32, (table_at >> 32) as u32, 0, 0];
-    let inline = &args[..(l.inline as usize).min(args.len())];
+    sgprs(FIRST_SGPR, l.inline, args, table_at)
+}
+
+/// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
+pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
+    sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
+}
+
+fn sgprs(first: usize, inline: u32, args: &[u8], table_at: u64) -> Vec<u32> {
+    let mut s = vec![0u32; first];
+    s[0] = table_at as u32;
+    s[1] = (table_at >> 32) as u32;
+    let inline = &args[..(inline as usize).min(args.len())];
     s.extend(inline.chunks(4).map(|c| {
         let mut w = [0u8; 4];
         w[..c.len()].copy_from_slice(c);
@@ -858,5 +880,18 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 1), (4, 0), (1, 11)])).unwrap();
         let args: Vec<u8> = [7u32, 0x1000, 4].iter().flat_map(|w| w.to_le_bytes()).chain([0u8; 44]).collect();
         assert_eq!(user_data(&l, &args, 0x4_0000_0100), vec![0x100, 4, 0, 0, 7, 0x1000, 4]);
+    }
+
+    /// The same for a vertex / pixel shader: from s8, 24 SGPRs (the console compiler's output).
+    #[test]
+    fn graphics_arguments_go_in_user_sgprs_from_s8() {
+        let inline = |p: &[(u32, u32)]| layout_from_blob(&rts0(p)).unwrap().inline_gfx;
+        assert_eq!(inline(&[(1, 2), (2, 0), (0, 0)]), 20);
+        assert_eq!(inline(&[(1, 22), (2, 0)]), 96);
+        assert_eq!(inline(&[(1, 23), (2, 0)]), 92, "the CBV goes to the table");
+        assert_eq!(inline(&[(1, 25), (2, 0)]), 0);
+        let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
+        let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
     }
 }

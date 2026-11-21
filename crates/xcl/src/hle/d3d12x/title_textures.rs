@@ -77,6 +77,11 @@ pub fn forget(res: usize) {
     TEXTURES.lock().unwrap().remove(&res);
 }
 
+/// The title-memory address of a texture kept in step with it.
+pub fn address(res: usize) -> Option<usize> {
+    TEXTURES.lock().unwrap().get(&res).map(|e| e.va)
+}
+
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
 /// uploaded again.
 pub(super) unsafe fn refresh() {

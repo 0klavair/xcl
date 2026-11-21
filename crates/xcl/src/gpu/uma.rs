@@ -113,16 +113,22 @@ impl Uma {
     /// Zeroed block of `size` bytes aligned to `align` (at least 64 KiB), first fit (window 0
     /// first).
     pub fn alloc(&self, size: usize, align: usize) -> Option<*mut u8> {
-        self.alloc_where(size, align, None)
+        self.alloc_where(size, align, None, true)
+    }
+
+    /// `alloc` for reserved address space: not zeroed (a large reservation is not touched –
+    /// what the title commits or maps there it writes; never-used memory is zero anyway).
+    pub fn reserve(&self, size: usize, align: usize) -> Option<*mut u8> {
+        self.alloc_where(size, align, None, false)
     }
 
     /// `alloc` inside window `k` (memory the console addresses with 32 bits, e.g. descriptor
     /// heaps: window 0).
     pub fn alloc_in(&self, k: usize, size: usize, align: usize) -> Option<*mut u8> {
-        self.alloc_where(size, align, Some(k))
+        self.alloc_where(size, align, Some(k), true)
     }
 
-    fn alloc_where(&self, size: usize, align: usize, window: Option<usize>) -> Option<*mut u8> {
+    fn alloc_where(&self, size: usize, align: usize, window: Option<usize>, zero: bool) -> Option<*mut u8> {
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
         let align = align.max(GRAIN).next_power_of_two();
         let mut g = self.inner.lock().unwrap();
@@ -140,7 +146,9 @@ impl Uma {
         g.used.insert(at, size);
         drop(g);
         let p = (self.base + at) as *mut u8;
-        unsafe { std::ptr::write_bytes(p, 0, size) };
+        if zero {
+            unsafe { std::ptr::write_bytes(p, 0, size) };
+        }
         Some(p)
     }
 
