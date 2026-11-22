@@ -49,6 +49,42 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 #[test]
+fn launcher_uses_configured_exe_in_an_ambiguous_folder() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("xcl-exe-{}-{nonce}", std::process::id()));
+    let game = root.join("game");
+    let data = root.join("data");
+    let title = data.join("XCL.SelectionTest");
+    std::fs::create_dir_all(&game).unwrap();
+    std::fs::create_dir_all(&title).unwrap();
+    std::fs::write(game.join("game.exe"), b"Not a PE file").unwrap();
+    std::fs::write(game.join("other.exe"), b"Also not a PE file").unwrap();
+    std::fs::write(
+        game.join("MicrosoftGame.config"),
+        r#"<Game><Identity Name="XCL.SelectionTest"/></Game>"#,
+    )
+    .unwrap();
+    std::fs::write(title.join("xcl.toml"), "exe = 'game.exe'\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("run")
+        .arg(&game)
+        .env("XCL_DATA_ROOT", &data)
+        .output();
+    let boot = std::fs::read_to_string(title.join("cache").join("boot.json"));
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let output = output.unwrap();
+    let boot = boot.unwrap_or_else(|error| panic!("boot record missing: {error}; {output:?}"));
+    let boot: serde_json::Value = serde_json::from_str(&boot).unwrap();
+    let exe = Path::new(boot["exe_path"].as_str().unwrap());
+    assert_eq!(exe.file_name().unwrap(), "game.exe");
+}
+
+#[test]
 fn test_title_runs_and_game_folder_is_untouched() {
     let xcl = PathBuf::from(env!("CARGO_BIN_EXE_xcl"));
     let bin_dir = xcl.parent().unwrap();
