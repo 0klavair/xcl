@@ -319,6 +319,7 @@ fn run_both(c: &IDxcCompiler3, body: &str) -> Result<(Vec<u32>, Vec<u32>), Strin
 fn console_compiled_kernels_match_the_pc_compile() {
     let Some(c) = console_compiler() else { return };
     if runner::adapter().is_err() {
+        runner::skip_test("no GPU");
         return;
     }
     let mut failed = Vec::new();
@@ -515,6 +516,7 @@ fn console_compiled_graphics_reads_its_root_arguments() {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT;
     let Some(c) = console_compiler() else { return };
     if runner::adapter().is_err() {
+        runner::skip_test("no GPU");
         return;
     }
     let common = "cbuffer k : register(b0) { float k0; float k1; float k2; float k3; };\ncbuffer m : register(b1) { float4 m0; float4 m1; };\n#define ROOT [RootSignature(\"RootConstants(num32BitConstants=4, b0), CBV(b1)\")]\n";
@@ -558,6 +560,7 @@ fn console_compiled_derivatives_hold_on_triangle_edges() {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT;
     let Some(c) = console_compiler() else { return };
     if runner::adapter().is_err() {
+        runner::skip_test("no GPU");
         return;
     }
     let root = "#define ROOT [RootSignature(\"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)\")]\n";

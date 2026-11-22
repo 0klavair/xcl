@@ -297,6 +297,7 @@ mod tests {
     #[test]
     fn gpu_dispatch_matches_native_wave64_reference() {
         if super::super::dxc::location().is_err() {
+            super::super::runner::skip_test("no DXC");
             return;
         }
         let hlsl = validation_hlsl();

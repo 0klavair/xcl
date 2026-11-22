@@ -10,7 +10,8 @@ fn gpu_ready() -> bool {
     match (runner::adapter(), runner::wave64_supported(), super::dxc::location()) {
         (Ok(_), Ok(true), Ok(_)) => true,
         (a, w, d) => {
-            println!("GPU/DXC wave64 unavailable – skipping ({:?} / {:?} / {:?})", a.err(), w.ok(), d.err());
+            println!("GPU/DXC wave64 unavailable – skipping ({:?} / {:?} / {:?})", a.as_ref().err(), w.ok(), d.as_ref().err());
+            runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" });
             false
         }
     }
@@ -20,7 +21,8 @@ fn gpu_ready_wave32() -> bool {
     match (runner::adapter(), super::dxc::location()) {
         (Ok(_), Ok(_)) => true,
         (a, d) => {
-            println!("GPU/DXC unavailable – skipping ({:?} / {:?})", a.err(), d.err());
+            println!("GPU/DXC unavailable – skipping ({:?} / {:?})", a.as_ref().err(), d.as_ref().err());
+            runner::skip_test(if a.is_err() { "no GPU" } else { "no DXC" });
             false
         }
     }
@@ -32,6 +34,7 @@ fn mesh_ready() -> bool {
         Ok(true) => true,
         r => {
             println!("GPU without mesh shaders – skipping ({r:?})");
+            runner::skip_test(if r.is_err() { "no GPU" } else { "no mesh shaders" });
             false
         }
     }
@@ -1655,6 +1658,7 @@ fn gpu_packed_math_dots_movrel() {
 fn dxc_mesh_shader_probe() {
     use super::dxc;
     if dxc::location().is_err() {
+        runner::skip_test("no DXC");
         return;
     }
     let src = r#"
@@ -2501,6 +2505,8 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     let native = translate_geometry(&code, g, false).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
+    } else {
+        runner::skip_test("no wave64");
     }
 }
 

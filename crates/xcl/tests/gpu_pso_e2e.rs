@@ -38,6 +38,7 @@ fn mesh_shaders(dev: &ID3D12Device) -> bool {
         && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
     if !ok {
         println!("GPU without mesh shaders – skipping");
+        xcl::gpu::recomp::runner::skip_test("no mesh shaders");
     }
     ok
 }
@@ -56,6 +57,7 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::Mutex
     };
     if xcl::gpu::recomp::dxc::location().is_err() {
         println!("no DXC – skipping");
+        xcl::gpu::recomp::runner::skip_test("no DXC");
         return None;
     }
     let recs = pack::scan(data, 0x40);
@@ -70,6 +72,7 @@ fn setup(names: &[&str]) -> Option<(Vec<Vec<u8>>, ID3D12Device, std::sync::Mutex
         .collect();
     if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
         println!("no real D3D12 device – skipping");
+        xcl::gpu::recomp::runner::skip_test("no GPU");
         return None;
     }
     println!("backend device: {}", real::stats().adapter);
