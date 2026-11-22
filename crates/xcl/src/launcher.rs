@@ -88,7 +88,7 @@ fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
 
 /// MicrosoftGame.config as text, without its comments: a commented-out `<Executable>` or
 /// `<Identity>` is not the game's.
-fn decode_game_config(raw: &[u8]) -> Option<String> {
+pub(crate) fn decode_game_config(raw: &[u8]) -> Option<String> {
     decode_text(raw).map(|xml| without_comments(&xml))
 }
 
