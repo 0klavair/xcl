@@ -703,6 +703,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     if size == 0 || !size.is_multiple_of(4) {
@@ -1498,14 +1499,69 @@ unsafe fn pc_location(l: *const D3D12_TEXTURE_COPY_LOCATION) -> Option<D3D12_TEX
 }
 
 /// CopyBufferRegion(dst, dst offset, src, src offset, bytes) (PC #15; DMA list #11)
+/// `XCL_TRACE_FRAME`: a GPU copy into title memory that a texture kept in step lies in (the
+/// texture does not see GPU writes)
+fn note_gpu_write(what: &str, va: usize, n: u64) {
+    if !super::present::trace_frame() {
+        return;
+    }
+    let hit = super::title_textures::overlapping(va, n as usize);
+    if hit.is_empty() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!("frame trace: {what} #{k} writes {n:#x} bytes at {va:#x} – into title textures {hit:x?}");
+    }
+}
+
 pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    if super::present::trace_frame() {
+        if let Some(a) = real::title_address(dst) {
+            note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
+        }
+    }
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
     if let Some(d) = dst.as_ref() {
-        super::present::note_use(transmute_copy::<_, usize>(&d.pResource), super::present::USE_COPY);
+        let r: usize = transmute_copy(&d.pResource);
+        super::present::note_use(r, super::present::USE_COPY);
+        super::title_textures::note_gpu_write(r);
+        if super::present::trace_frame() {
+            if let Some(va) = super::title_textures::address(r) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                let k = N.fetch_add(1, Ordering::Relaxed);
+                if k < 8 || k.is_power_of_two() {
+                    // the source: a buffer footprint – where its bytes are for the CPU, and whether
+                    // there is anything there
+                    let src_info = src.as_ref().map(|sl| {
+                        let sr: usize = transmute_copy(&sl.pResource);
+                        let rr = sr as *mut c_void;
+                        let heap = ID3D12Resource::from_raw_borrowed(&rr).and_then(|x| {
+                            let mut hp = D3D12_HEAP_PROPERTIES::default();
+                            let mut hf = D3D12_HEAP_FLAGS::default();
+                            x.GetHeapProperties(Some(&mut hp), Some(&mut hf)).ok().map(|_| hp.Type.0)
+                        });
+                        let (ty, fp) = (sl.Type.0, if sl.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT { Some(sl.Anonymous.PlacedFootprint) } else { None });
+                        let cpu = real::title_address(sr);
+                        let nonzero = match (cpu, fp) {
+                            (Some(a), Some(f)) => {
+                                let at = a + f.Offset as usize;
+                                let n = (f.Footprint.RowPitch as usize * 4).min(4096);
+                                if crate::gpu::shader::readable(at, n) { Some(std::slice::from_raw_parts(at as *const u8, n).iter().filter(|&&b| b != 0).count()) } else { None }
+                            }
+                            _ => None,
+                        };
+                        format!("src {sr:#x} type {ty} heap {heap:?} title address {:?} delta {:#x} footprint {:?} nonzero in the first rows {nonzero:?}", cpu.map(|a| format!("{a:#x}")), real::buffer_delta(sr), fp.map(|f| (f.Offset, f.Footprint.Format.0, f.Footprint.Width, f.Footprint.Height, f.Footprint.RowPitch)))
+                    });
+                    crate::xlog_info!("frame trace: CopyTextureRegion #{k} into title texture {r:#x} (at {va:#x}), subresource {}; {src_info:?}", d.Anonymous.SubresourceIndex);
+                }
+            }
+        }
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
@@ -1522,6 +1578,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_vo
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
+    super::title_textures::note_gpu_write(dst);
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);

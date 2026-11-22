@@ -109,8 +109,34 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
     }
 }
 
+static ORIG_NT_TERMINATE: AtomicUsize = AtomicUsize::new(0);
+static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// ntdll!NtTerminateProcess: the process ending (ExitProcess, abort()'s _exit(3),
+/// TerminateProcess of itself) is logged once – status, the calls that led there and, when the
+/// status is not 0, every other thread – and the log written out. abort() leaves no other
+/// trace: the buffered log lines went with the process.
+unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
+    if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
+        let probe = 0usize;
+        let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
+        if status != 0 {
+            crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+            dump_threads();
+        } else {
+            crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
+        }
+        crate::log::flush();
+    }
+    let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
+    orig(h, status)
+}
+
 pub fn install_crash_handler() {
     unsafe {
+        if let Err(e) = hooks::hook("ntdll.dll", "NtTerminateProcess", hk_nt_terminate_process as usize, &ORIG_NT_TERMINATE) {
+            crate::xlog_warn!("{e}");
+        }
         SetUnhandledExceptionFilter(Some(unhandled_filter));
         install_invalid_parameter_handler();
         windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
@@ -276,6 +302,11 @@ unsafe extern "C" fn invalid_parameter(_expr: *const u16, _function: *const u16,
 /// the first 512 stack slots from `rsp`: the calls that led to a crash (heuristic: values on
 /// the stack that point into code).
 unsafe fn stack_callers(rsp: usize) -> String {
+    stack_callers_n(rsp, 6)
+}
+
+/// `stack_callers` with up to `max` callers.
+unsafe fn stack_callers_n(rsp: usize, max: usize) -> String {
     let mut callers = Vec::new();
     for k in 0..512usize {
         let at = rsp + 8 * k;
@@ -285,7 +316,7 @@ unsafe fn stack_callers(rsp: usize) -> String {
         let d = modules::describe_address((at as *const usize).read_unaligned());
         if d.contains('+') && !d.starts_with("D3D12") && !d.starts_with("ntdll") && !d.starts_with("KERNEL") && !d.ends_with("+0x0") {
             callers.push(d);
-            if callers.len() == 6 {
+            if callers.len() == max {
                 break;
             }
         }
@@ -401,6 +432,7 @@ pub fn dump_threads() {
         crate::xlog_info!("thread dump ({} threads):
 {}", lines.len(), lines.join("
 "));
+        crate::log::flush();
     }
 }
 

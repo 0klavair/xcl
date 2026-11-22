@@ -819,6 +819,26 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
         let gpu = if flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
+        if sampler {
+            // an S# of zeros – a slot nothing was written to – is a sampler on the console: point
+            // filtering, wrap, mip 0 only. Every PC slot starts as that one, so a table entry the
+            // title left empty samples as there (an unwritten PC descriptor is undefined).
+            let zero = D3D12_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: 0.0,
+            };
+            for k in 0..d[1] as u64 {
+                dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
+            }
+        }
         if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, first, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
             if let Some(f) = first {
@@ -1094,6 +1114,11 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
 /// console Map gives that address (the CPU's view of the resource)
 static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
+/// The title address a resource stands for (buffers in unified memory, placed resources).
+pub(super) fn title_address(res: usize) -> Option<usize> {
+    console_buffer(res).map(|b| b.0).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()))
+}
+
 pub(super) fn note_title_address(res: usize, va: usize) {
     TITLE_ADDRESS.lock().unwrap().get_or_insert_with(HashMap::new).insert(res, va);
 }
@@ -1152,6 +1177,13 @@ static TRANSLATED_COMPUTE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 /// Whether `pso` is a graphics pipeline of translated console shaders.
+/// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
+static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+
+pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
+    PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
@@ -1334,6 +1366,17 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
+    if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 24 {
+            let rd = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+            let v = desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0, v.Shader4ComponentMapping, v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels, v.Anonymous.Texture2D.ResourceMinLODClamp));
+            crate::xlog_info!(
+                "frame trace: SRV of title texture {res:p} {:?}: view (format, dimension, mapping, mip, mips, clamp) {v:x?}",
+                rd.map(|d| (d.Width, d.Height, d.Format.0, d.MipLevels, d.Flags.0))
+            );
+        }
+    }
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
@@ -2160,6 +2203,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    if super::present::trace_frame() {
+        let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+    }
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{})", n + 1);
     }

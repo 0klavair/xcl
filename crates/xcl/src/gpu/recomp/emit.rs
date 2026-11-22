@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{ps_input_vgpr, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -1326,19 +1326,24 @@ impl Em {
             }
             (Mode::Vertex(_), 13..=15) => {} // misc vector / clip distances: SV_ClipDistance comes from its param
             (Mode::Vertex(vs), 32..=63) => {
+                // param N is a register: channel c goes to component c of every element there
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let Some(e) = params.get(k) else {
+                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
+                if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
-                };
-                let n = out_comps(e);
-                for c in 0..n {
-                    if enabled(c) {
-                        let v = Self::exp_comp(srcs, compr, c);
-                        let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
-                        let comp = if n == 1 { String::new() } else { format!("[{c}]") };
-                        st.push(format!("xo.p{k}{comp} = {v};"));
+                }
+                for j in at {
+                    let e = params[j];
+                    let n = out_comps(e);
+                    for c in 0..n {
+                        if enabled(c) {
+                            let v = Self::exp_comp(srcs, compr, c);
+                            let v = if e.component_type == 3 { format!("asfloat({v})") } else { format!("{v}") };
+                            let comp = if n == 1 { String::new() } else { format!("[{c}]") };
+                            st.push(format!("xo.p{j}{comp} = {v};"));
+                        }
                     }
                 }
             }
@@ -1381,14 +1386,19 @@ impl Em {
             }
             (Mode::Mesh(_), 13..=15) => {} // misc vector / clip distances (from their params)
             (Mode::Mesh(ms), 32..=63) => {
+                // param N is a register: its record slot is that of every element there (the
+                // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                if k >= ranked(&ms.outputs, true).len() {
+                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
+                if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
                 }
-                for c in 0..4 {
-                    if enabled(c) {
-                        st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (k + 1) + c, Self::exp_comp(srcs, compr, c)));
+                for j in at {
+                    for c in 0..4 {
+                        if enabled(c) {
+                            st.push(format!("res.Store((xcl_vtx + {}u) * 4u, {});", 4 * (j + 1) + c, Self::exp_comp(srcs, compr, c)));
+                        }
                     }
                 }
             }
@@ -1420,12 +1430,11 @@ impl Em {
     /// v_interp_*: attributes come interpolated from the PC rasteriser (PS mode).
     fn interp(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let Mode::Pixel(ps) = &self.opt.mode else { return Err("interpolation outside PS") };
-        let n_attrs = ranked(&ps.inputs, false).len() as u64;
         let (vdst, ij, attr, chan) = Self::interp_fields(d);
-        if attr >= n_attrs {
+        let Some(slot) = ps_attribute_slot(ps, attr as usize, chan as usize) else {
             return Err("attribute outside ISG1");
-        }
-        let src = format!("xi.a{attr}[{chan}]");
+        };
+        let src = format!("xi.a{slot}[{chan}]");
         let act = self.act();
         match name {
             "v_interp_p1_f32" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16" => {
@@ -3739,7 +3748,9 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 let pos_mode = if conservative { "noperspective centroid " } else { "" };
                 let _ = writeln!(h, "struct XclIn {{\n    {pos_mode}float4 xcl_pos : SV_Position;");
                 for (k, e) in ranked(&ps.inputs, false).iter().enumerate() {
-                    let mut m = self.ps_modes.get(&(k as u32)).cloned().unwrap_or_default();
+                    // the mode of the attribute this input is read through (none: never read)
+                    let attr = ps_slot_attribute(ps, k);
+                    let mut m = attr.and_then(|a| self.ps_modes.get(&(a as u32))).cloned().unwrap_or_default();
                     if e.component_type != 3 {
                         m = "nointerpolation".into();
                     }

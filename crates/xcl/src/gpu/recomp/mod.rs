@@ -83,6 +83,9 @@ pub struct VsInterface {
     pub outputs: Vec<SigElement>,
     /// first attribute VGPR: 4 (hardware VS) or 9 (ES variant)
     pub attr_base: u64,
+    /// the OSG1 register of each `exp param N` from the console's table (`vs_output_table`;
+    /// None: the N-th distinct register)
+    pub params: Option<Vec<u32>>,
 }
 
 /// Pixel shader interface.
@@ -92,6 +95,8 @@ pub struct PsInterface {
     pub outputs: Vec<SigElement>,
     /// SPI_PS_INPUT_ENA: which system values occupy the initial VGPRs
     pub input_ena: u32,
+    /// the console's PS input table (`ps_input_table`; None: attributes in register order)
+    pub attrs: Option<Vec<PsAttr>>,
 }
 
 /// Mesh (NGG) shader interface.
@@ -253,6 +258,133 @@ pub fn ranked(sig: &[SigElement], with_clip: bool) -> Vec<&SigElement> {
     user
 }
 
+/// What `exp param N` (VS, MS) and `v_interp attrN` (PS) name on the console is a signature
+/// *register*, not an element: elements packed into one register (XDefiant: UV1 in .xy and UV0
+/// in .zw of one) share a param, and the console's compiler numbers only the registers it uses
+/// (Fortnite's Slate PS reads COLOR0 and TEXCOORD1 of COLOR0, ORIGINAL_POSITION0, TEXCOORD0,
+/// TEXCOORD1: attr1 is TEXCOORD1's register). XCL used to count elements on both sides – right
+/// only while the VS and PS signatures were alike and unpacked (the two errors cancelled), and
+/// Fortnite's UI sampled at ORIGINAL_POSITION. Now a param / attribute is a register: the VS
+/// writes channel c of param N into every element at that register (component c of each), the
+/// PS reads channel c of an attribute from an element at its register – the PC linkage stays
+/// by semantic, the struct declarations are unchanged.
+///
+/// The registers in `exp param` / attribute order when the console's own table is not at hand:
+/// the distinct registers of `ranked(sig, with_clip)` (for unpacked signatures: one per element,
+/// as before).
+pub fn param_registers(sig: &[SigElement], with_clip: bool) -> Vec<u32> {
+    let mut regs = Vec::new();
+    for e in ranked(sig, with_clip) {
+        if !regs.contains(&e.register) {
+            regs.push(e.register);
+        }
+    }
+    regs
+}
+
+/// The elements (places in `ranked(sig, with_clip)`) at signature register `register`.
+pub fn elements_at(sig: &[SigElement], with_clip: bool, register: u32) -> Vec<usize> {
+    ranked(sig, with_clip).iter().enumerate().filter(|(_, e)| e.register == register).map(|(j, _)| j).collect()
+}
+
+/// FSSM sub-version (+0x10): 5 in Fortnite's GDK; 6 in XDefiant's and Minecraft's, which has 8
+/// more bytes before the stage tables.
+fn fssm_shift(fssm: &[u8]) -> Option<usize> {
+    match fssm.get(0x10..0x14).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? {
+        5 => Some(0),
+        6 => Some(8),
+        _ => None,
+    }
+}
+
+/// One attribute of the console's PS input table (FSSM): the ISG1 register `v_interp attrN`
+/// reads and its components; `kind` 6 = a user input (0x11 seen once, for a system value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PsAttr {
+    pub kind: u8,
+    pub register: u8,
+    pub mask: u8,
+    pub flat: bool,
+}
+
+/// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register it
+/// reads. 32 records of 8 bytes at +0x130 (+ the sub-version shift): kind, register, component
+/// mask, attribute number, 0, 0, register again, 1 flat / 2 interpolated; then the record count
+/// (+0x100) and SPI_PS_INPUT_ENA (+0x110). Checked on every cached PS of three titles (472, 34,
+/// 1): consistent, and covering every attribute the code reads.
+pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
+    let base = 0x130 + fssm_shift(fssm)?;
+    let rd = |o: usize| fssm.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let (n, ena) = (rd(base + 0x100)? as usize, rd(base + 0x110)?);
+    if n > 32 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let r = fssm.get(base + 8 * k..base + 8 * k + 8)?;
+        if r[3] as usize != k || r[4] != 0 || r[5] != 0 || r[6] != r[1] {
+            return None;
+        }
+        out.push(PsAttr { kind: r[0], register: r[1], mask: r[2], flat: r[7] == 1 });
+    }
+    Some((ena, out))
+}
+
+/// The VS output table of an FSSM: per `exp param N`, the OSG1 register it writes. 32 records
+/// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
+/// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
+/// register, but not always (a Fortnite VS exports its SV_Position register as a param).
+/// Checked on every cached VS of three titles (984, 13, 1).
+pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
+    let base = 0x1D4 + fssm_shift(fssm)?;
+    let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
+    if n > 32 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
+        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+            return None;
+        }
+        out.push(r[1] as u32);
+    }
+    Some(out)
+}
+
+/// The register `v_interp attr` reads: the console's table, else the attr-th distinct register.
+pub fn ps_attribute_register(ps: &PsInterface, attr: usize) -> Option<u32> {
+    match &ps.attrs {
+        Some(t) => t.get(attr).map(|a| a.register as u32),
+        None => param_registers(&ps.inputs, false).get(attr).copied(),
+    }
+}
+
+/// The place in `ranked(inputs, false)` (the PC input struct's a0, a1 …) to read channel `chan`
+/// of attribute `attr` from: an element at its register (the one declaring `chan`, if any).
+pub fn ps_attribute_slot(ps: &PsInterface, attr: usize, chan: usize) -> Option<usize> {
+    let r = ps_attribute_register(ps, attr)?;
+    let all = ranked(&ps.inputs, false);
+    all.iter().position(|e| e.register == r && e.mask >> chan & 1 == 1).or_else(|| all.iter().position(|e| e.register == r))
+}
+
+/// The attribute the input at `slot` of `ranked(inputs, false)` belongs to (None: not read).
+pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
+    let r = ranked(&ps.inputs, false).get(slot)?.register;
+    match &ps.attrs {
+        Some(t) => t.iter().position(|a| a.register as u32 == r),
+        None => param_registers(&ps.inputs, false).iter().position(|&x| x == r),
+    }
+}
+
+/// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
+pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
+    match &vs.params {
+        Some(t) => t.get(n).copied(),
+        None => param_registers(&vs.outputs, true).get(n).copied(),
+    }
+}
+
 /// Hardware order and VGPR sizes of the PS inputs enabled in SPI_PS_INPUT_ENA (bit → size):
 /// persp sample/center/centroid (2), pull model (3), linear sample/center/centroid (2),
 /// line stipple, pos x/y/z/w, front face, ancillary, sample coverage, pos fixed (1 each).
@@ -271,10 +403,13 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
     let (inputs, outputs) = super::dxbc::signatures(blob);
     let hw = f.stages.first()?.hw;
     match (sh.stage.as_str(), hw) {
-        ("VS", 4) => Some(Mode::Vertex(VsInterface { inputs, outputs, attr_base: 4 })),
+        ("VS", 4) => Some(Mode::Vertex(VsInterface { inputs, outputs, attr_base: 4, params: vs_output_table(&f.data) })),
         ("PS", 5) => {
-            let ena = f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
-            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena }))
+            let (ena, attrs) = match ps_input_table(&f.data) {
+                Some((ena, t)) => (ena, Some(t)),
+                None => (f.data.get(0x248..0x24C).map(|b| u32::from_le_bytes(b.try_into().unwrap()))?, None),
+            };
+            Some(Mode::Pixel(PsInterface { inputs, outputs, input_ena: ena, attrs }))
         }
         // ES variant of a VS (before a GS) and the GS itself, each translatable on its own
         ("VS", 2) => Some(Mode::Geometry(GsInterface { es_inputs: inputs, es_outputs: outputs, max_vertex_count: 1, ..Default::default() })),
@@ -1197,4 +1332,66 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+}
+
+#[cfg(test)]
+mod attribute_tests {
+    use super::*;
+
+    fn input(name: &str, index: u32, register: u32, rw_mask: u8) -> SigElement {
+        SigElement { name: name.into(), index, system_value: 0, component_type: 3, register, mask: 0xF, rw_mask, stream: 0 }
+    }
+
+    /// Fortnite's Slate PS (FSSM sub-version 5): attr0 = COLOR0, attr1 = TEXCOORD1; the table's
+    /// layout one sub-version on (6) sits 8 bytes later
+    #[test]
+    fn ps_attributes_from_the_input_table() {
+        let mut pos = input("SV_Position", 0, 0, 0);
+        pos.system_value = 1;
+        let inputs = vec![pos, input("COLOR", 0, 1, 0xF), input("ORIGINAL_POSITION", 0, 2, 0), input("TEXCOORD", 0, 3, 0), input("TEXCOORD", 1, 4, 3)];
+        for (sub, base) in [(5u32, 0x130usize), (6, 0x138)] {
+            let mut f = vec![0u8; 0x400];
+            f[0x10..0x14].copy_from_slice(&sub.to_le_bytes());
+            f[base..base + 16].copy_from_slice(&[6, 1, 0xF, 0, 0, 0, 1, 2, 6, 4, 0xF, 1, 0, 0, 4, 2]);
+            f[base + 0x100] = 2;
+            f[base + 0x110] = 2;
+            let (ena, attrs) = ps_input_table(&f).unwrap();
+            assert_eq!((ena, attrs.len(), attrs[1].register), (2, 2, 4));
+            let ps = PsInterface { inputs: inputs.clone(), attrs: Some(attrs), ..Default::default() };
+            let all = ranked(&ps.inputs, false);
+            assert_eq!(all[ps_attribute_slot(&ps, 0, 3).unwrap()].semantic(), "COLOR0");
+            assert_eq!(all[ps_attribute_slot(&ps, 1, 0).unwrap()].semantic(), "TEXCOORD1");
+            assert_eq!(ps_attribute_slot(&ps, 2, 0), None);
+            assert_eq!((0..4).map(|j| ps_slot_attribute(&ps, j)).collect::<Vec<_>>(), [Some(0), None, None, Some(1)]);
+        }
+        // no table: the attr-th register
+        let ps = PsInterface { inputs, ..Default::default() };
+        assert_eq!(ps_attribute_slot(&ps, 1, 0), Some(1));
+    }
+
+    /// Elements packed into one register (XDefiant: UV1 in .xy, UV0 in .zw) share a param /
+    /// attribute; channel c is read from the element declaring it.
+    #[test]
+    fn packed_registers_are_one_param() {
+        let mut uv1 = input("UV", 1, 0, 3);
+        uv1.mask = 0x3;
+        let mut uv0 = input("UV", 0, 0, 0xC);
+        uv0.mask = 0xC;
+        let sig = vec![uv1, uv0, input("COLOR", 0, 1, 0xF), input("NORMAL", 0, 2, 0x7)];
+        assert_eq!(param_registers(&sig, true), [0, 1, 2]);
+        assert_eq!(elements_at(&sig, true, 0), [0, 1]);
+        let ps = PsInterface { inputs: sig.clone(), ..Default::default() };
+        assert_eq!((ps_attribute_slot(&ps, 0, 0), ps_attribute_slot(&ps, 0, 3), ps_attribute_slot(&ps, 1, 0)), (Some(0), Some(1), Some(2)));
+        assert_eq!((0..4).map(|j| ps_slot_attribute(&ps, j)).collect::<Vec<_>>(), [Some(0), Some(0), Some(1), Some(2)]);
+        let vs = VsInterface { outputs: sig, ..Default::default() };
+        assert_eq!((vs_param_register(&vs, 1), vs_param_register(&vs, 3)), (Some(1), None));
+        // the console's table: a Fortnite VS whose SV_Position register is param 1
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 5;
+        f[0x1D4..0x1D4 + 18].copy_from_slice(&[6, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 6, 2, 2, 0, 0, 0]);
+        f[0x1D4 + 0xC0] = 3;
+        assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
+        f[0x1D4 + 8] = 7;
+        assert_eq!(vs_output_table(&f), None);
+    }
 }

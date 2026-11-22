@@ -1141,6 +1141,36 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `sparse::mapped_ranges`). Use the release build for game runs: the debug build hashes the dirty chunks ~10×
   slower (and the queues then wait on each other for the sparse lock). The log has
   "sparse windows timing: write-watch / lock wait / chunk scan / upload" lines.
+- **PS attributes / VS params are registers (2026-11-22, latest)**: Fortnite's loading art ("ŁĄCZENIE"), title
+  screen (FORTNITE logo, "press to start", version, Epic/Unreal logos) and UI text now draw. Cause: `exp param N`
+  (VS, MS) and `v_interp attrN` (PS) name a signature *register*, not an element, and the console's compiler
+  numbers only the registers its code still uses. XCL counted ISG1/OSG1 elements in register order on both sides –
+  right only while VS and PS signatures were alike and unpacked (the two errors cancelled). Fortnite's Slate PS has
+  COLOR0, ORIGINAL_POSITION0, TEXCOORD0, TEXCOORD1 and samples attr1 = TEXCOORD1; XCL sampled at the pixel
+  position (white 1x1 quads still looked right, every real texture came out as its empty corner). XDefiant packs
+  elements into registers (UI: UserBig/UserSmall/RenderType in one register) – its UI read ClipPosition as UV and UV0
+  as colour before. The truth is in the FSSM (`recomp::ps_input_table`, `vs_output_table`; checked on every cached
+  shader of three titles): PS 32 × 8-byte records at +0x130 (kind, register, mask, attr, 0, 0, register, 1 flat /
+  2 interpolated), count at +0x100 after them, SPI_PS_INPUT_ENA at +0x110; VS 32 × 6-byte records at +0x1D4 (kind,
+  register, param), count at +0xC0. FSSM sub-version (+0x10) 5 = Fortnite's GDK, 6 = XDefiant's / Minecraft's,
+  8 bytes later – XCL read SPI_PS_INPUT_ENA at a fixed +0x248, wrong for sub-version 5 (Fortnite's PS got
+  "sample" interpolation; the title screen's gradient was flat). The VS now writes channel c of param N into
+  component c of every element at that register, the PS reads channel c from an element there; the MS export
+  likewise; struct declarations and the PC linkage (by semantic) are unchanged. A PS input struct of only the read
+  inputs is refused by the driver (it links by register) – keep declaring every input.
+- **XDefiant "black after a translator change" is a cold DXC cache, not a bug**: the title draws nothing until its
+  pipeline set (1 000+ PSOs) is built; after a change to the translated HLSL every one is compiled again (minutes).
+  Test with `XCL_DXIL_CACHE=<empty dir>` to see it. The crash it exposed (exit 3, AV in a memcpy from
+  `sparse::before_execute`) was real: `kernelx::VirtualFree` decommitted before telling `sparse`, and pages
+  decommitted inside a still-mapped tile were read. Now `sparse::decommitted` runs first (under its lock) and
+  `sparse` keeps holes (uncommitted pages of mapped tiles: not read, their video memory zeroed).
+- Diagnostics added: `ntdll!NtTerminateProcess` hook logs every process end with the calls that led there (and a
+  thread dump when the status is not 0; abort() left no trace before); `XCL_TRACE_FRAME` logs one line per distinct
+  (VS, PS, render target) drawn with the shaders' dump hashes, GPU read-backs of sampled title textures, copies into
+  title textures. Also: title textures a GPU copy wrote are no longer uploaded again from their stale CPU view, and
+  empty sampler slots hold the console's zero S# (point, wrap, mip 0). Note: `cargo test --release` uses
+  `target/release/xcl_testtitle.exe` – rebuild it (`cargo build --release -p xcl-testtitle -p testgame-mw`) or e2e
+  checks a stale title.
 - **Fortnite (XSX 2.0.1461.7919, an older GDK than XDefiant's) now (2026-11-22, later)**: loads (~60 s, its own
   UE log in `[debug]` lines), hides its loading screen and shows the splash screen ("press to start") at ~50 fps –
   2 850 draws and 4 700 dispatches every 2 s, all translated – but the image is one solid blue (0xed242424): the UI's

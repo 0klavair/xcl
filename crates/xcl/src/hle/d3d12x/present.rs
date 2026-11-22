@@ -180,6 +180,12 @@ pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
+/// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
+pub fn rt0_resource(list: usize) -> Option<usize> {
+    let h = *LISTS.lock().unwrap().as_ref()?.get(&list)?;
+    rtv_resource(h)
+}
+
 pub fn note_rt0(list: usize, handle: usize) {
     if !enabled() {
         return;

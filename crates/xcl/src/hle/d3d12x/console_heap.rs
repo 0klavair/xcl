@@ -315,6 +315,30 @@ pub fn copy_words(src: &Slot, dst: &Slot) {
 /// title itself, as memory), buffers, empty.
 pub fn census() {
     let heaps = HEAPS.lock().unwrap();
+    // samplers: S# word 3 [11:0] is the PC index in the sampler heap the slot belongs to
+    for h in heaps.iter().filter(|h| h.sampler) {
+        let (mut empty, mut own, mut other) = (0u32, 0u32, 0u32);
+        let mut examples: Vec<(u32, u32)> = Vec::new();
+        for k in 0..h.n {
+            let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SAMPLER_SLOT) as usize) as *const u32, 4) };
+            if w.iter().all(|&x| x == 0) {
+                empty += 1;
+            } else if w[3] & 0xFFF == k {
+                own += 1;
+            } else {
+                other += 1;
+                if examples.len() < 8 {
+                    examples.push((k, w[3] & 0xFFF));
+                }
+            }
+        }
+        crate::xlog_info!(
+            "frame trace: sampler heap {:#x} ({} slots, {}): {own} with their own index, {other} with another (slot, index: {examples:?}), {empty} empty",
+            h.obj,
+            h.n,
+            if h.visible { "shader visible" } else { "CPU only" }
+        );
+    }
     for h in heaps.iter().filter(|h| !h.sampler) {
         let (mut empty, mut own, mut other, mut buffers) = (0u32, 0u32, 0u32, 0u32);
         let mut examples: Vec<(u32, u32)> = Vec::new();

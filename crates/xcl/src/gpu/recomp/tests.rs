@@ -1070,6 +1070,7 @@ fn gpu_graphics_vs_ps_draw() {
         inputs: vec![el("POSITION", 0, 0, 3, 0, 3), el("COLOR", 0, 0, 3, 1, 0xF)],
         outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
         attr_base: 4,
+        params: None,
     };
     let ps_code = prog(&[
         ("V_CMPX_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)], Some(8.0f32.to_bits())), // keep pos.x > 8
@@ -1085,6 +1086,7 @@ fn gpu_graphics_vs_ps_draw() {
         inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF), el("COLOR", 0, 0, 3, 1, 0xF)],
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
+        attrs: None,
     };
     let vt = translate(&vs_code, &Options { mode: Mode::Vertex(vsi), wave64: true, ..Default::default() }).unwrap();
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
@@ -2476,6 +2478,7 @@ fn vs_system_values_in_isg1_registers() {
         inputs: vec![sig("POSITION", 0, 0), sig("SV_InstanceID", 8, 1), sig("SV_VertexID", 6, 2)],
         outputs: vec![sig("SV_Position", 1, 0)],
         attr_base: 4,
+        params: None,
     };
     let code = prog(&[
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 8), ("VSRC1", 12)], None),
@@ -3408,7 +3411,7 @@ fn isa_coverage() {
         let Ok(mut code) = encode(inst.name, enc, fields, lit) else { continue };
         code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
         let ok = std::panic::catch_unwind(|| {
-            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F }))
+            try_mode(&code, Mode::Kernel) || try_mode(&code, Mode::Pixel(super::PsInterface { inputs: vec![], outputs: vec![], input_ena: 0x7F, attrs: None }))
         })
         .unwrap_or(false);
         let e = per_enc.entry(enc.trim_start_matches("ENC_")).or_default();

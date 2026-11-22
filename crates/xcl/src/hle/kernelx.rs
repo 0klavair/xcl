@@ -230,8 +230,10 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             size
         };
         if n > 0 {
-            mem::VirtualFree(addr, n, mem::MEM_DECOMMIT);
+            // sparse first: under its lock, so no copy of CPU writes to video memory reads the
+            // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
+            mem::VirtualFree(addr, n, mem::MEM_DECOMMIT);
         }
         if t & 0x8000 != 0 {
             u.sparse_release(a);

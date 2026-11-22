@@ -213,7 +213,25 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
     if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
         count(DRAWS_PC);
+        if super::present::trace_frame() {
+            // which pipelines draw without a translation (first 12 distinct)
+            static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            let mut g = SEEN.lock().unwrap();
+            if !g.contains(&pso) && g.len() < 12 {
+                g.push(pso);
+                let real = super::pso_async::resolve_wait(pso);
+                crate::xlog_info!(
+                    "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
+                    super::pso_async::is_pending(pso),
+                    super::real::two_pass_of(real).is_some(),
+                    super::present::rt0_resource(this as usize).map(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }))
+                );
+            }
+        }
         return Some(list); // a PC pipeline: its own root signature and arguments
+    }
+    if super::present::trace_frame() {
+        trace_ui_draw(this, pso);
     }
     match bind_abi(this, &list, pso, true) {
         Ok(()) => {
@@ -229,6 +247,102 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             None
         }
     }
+}
+
+/// `XCL_TRACE_FRAME`: draws into a presented buffer (the UI) once the title has presented for a
+/// while – their pipeline, root arguments and the resources their descriptor tables start with
+/// (format, size, kept in step with title memory or not). The first 24.
+/// `XCL_TRACE_FRAME`, after 300 presents: one line per distinct (VS, PS, render target) drawn –
+/// the shaders' dump hashes, the target and the textures of the first descriptor table.
+unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
+    static SEEN: Mutex<Vec<(u64, u64, usize)>> = Mutex::new(Vec::new());
+    if super::present::activity().0 < 300 {
+        return;
+    }
+    let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
+    let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
+    {
+        let mut g = SEEN.lock().unwrap();
+        if g.len() >= 80 || g.contains(&(vs, ps, rt)) {
+            return;
+        }
+        g.push((vs, ps, rt));
+    }
+    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) });
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut tex = Vec::new();
+    if let (Some(layout), Some(u)) = (layout, crate::gpu::uma::get()) {
+        for p in layout.params.iter() {
+            if let Param::Table { at } = *p {
+                let t = word(at as usize) as usize;
+                for k in 0..4usize {
+                    if let Some(r) = super::console_heap::resource_at(u.base() + t + 32 * k) {
+                        tex.push(format!("{:?}{}", desc(r), super::title_textures::address(r).map_or(String::new(), |a| format!(" at {a:#x}"))));
+                    }
+                }
+            }
+            if tex.len() >= 4 {
+                break;
+            }
+        }
+    }
+    crate::xlog_info!(
+        "frame trace: draws vs {vs:016x} ps {ps:016x} into {:?}{} – textures {}",
+        desc(rt),
+        if super::present::is_presented(rt) { " (presented)" } else { "" },
+        tex.join(", ")
+    );
+}
+
+unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
+    trace_draw_kinds(this, pso);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if super::present::activity().0 < 300 || N.load(std::sync::atomic::Ordering::Relaxed) >= 24 {
+        return;
+    }
+    let Some(rt) = super::present::rt0_resource(this as usize) else { return };
+    if !super::present::is_presented(rt) {
+        return;
+    }
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut what = Vec::new();
+    for (i, p) in layout.params.iter().enumerate() {
+        match *p {
+            Param::Constants { at, count } => what.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
+            Param::Descriptor { at } => {
+                let va = (word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32) as usize;
+                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 32) { (0..8).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
+                what.push(format!("p{i} buffer {va:#x} {w:x?}"));
+            }
+            Param::Table { at } => {
+                let t = word(at as usize) as usize;
+                let slots: Vec<String> = (0..4usize)
+                    .map(|k| {
+                        let at = u.base() + t + 32 * k;
+                        let w = super::console_heap::words_at((t + 32 * k) as u32);
+                        match super::console_heap::resource_at(at) {
+                            Some(r) => {
+                                if super::title_textures::address(r).is_some() {
+                                    super::title_textures::probe_gpu_content(r);
+                                }
+                                let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+                                format!("[{k}] {r:#x} {:?} title {:?} T# {:x?}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0)), super::title_textures::address(r).map(|a| format!("{a:#x}")), w.map(|w| w[..4].to_vec()))
+                            }
+                            None => format!("[{k}] - T# {:x?}", w.map(|w| w[..4].to_vec())),
+                        }
+                    })
+                    .collect();
+                what.push(format!("p{i} table {t:#x}: {}", slots.join(", ")));
+            }
+        }
+    }
+    let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
+    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), what.join("; "));
 }
 
 /// #33 SetComputeRootSignature (PC #29)

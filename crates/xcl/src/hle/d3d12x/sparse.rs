@@ -16,7 +16,7 @@
 //! copies, views and barriers see the same memory. GPU writes are not copied back to the
 //! CPU's view (not needed by rendering so far).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -56,6 +56,9 @@ struct State {
     sent: HashMap<usize, Box<[u64; CHUNKS]>>,
     /// `mapped` as sorted (start, end) runs (None: to be made again)
     runs: Option<Vec<(usize, usize)>>,
+    /// 4 KiB pages of mapped tiles the title has not committed (a tile mapped for part of it,
+    /// a page decommitted inside one): no memory to read there
+    holes: HashSet<usize>,
 }
 
 const PAGE: usize = 0x1000;
@@ -155,6 +158,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
             waited: HashMap::new(),
             sent: HashMap::new(),
             runs: None,
+            holes: HashSet::new(),
         })
     })();
     match made {
@@ -331,12 +335,21 @@ impl State {
     }
 }
 
-/// The title committed `[a, a + n)` in a sparse window.
+/// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
+/// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
     let mut g = STATE.lock().unwrap();
-    match g.as_mut() {
-        Some(s) => s.ensure_mapped(a, n),
-        None => EARLY.lock().unwrap().push((a, n)),
+    let Some(s) = g.as_mut() else {
+        EARLY.lock().unwrap().push((a, n));
+        return;
+    };
+    let tiles: Vec<usize> = (a & !(TILE - 1)..a + n).step_by(TILE).filter(|t| !s.mapped.contains_key(t)).collect();
+    s.ensure_mapped(a, n);
+    for t in tiles.into_iter().filter(|t| s.mapped.contains_key(t)) {
+        s.holes.extend((t..t + TILE).step_by(PAGE).filter(|&pg| pg + PAGE <= a || pg >= a + n));
+    }
+    for pg in (a & !(PAGE - 1)..a + n).step_by(PAGE) {
+        s.holes.remove(&pg);
     }
 }
 
@@ -362,8 +375,18 @@ pub unsafe fn decommitted(a: usize, n: usize) {
             s.unmap_tiles(&r, b, &ts);
         }
     }
+    // pages of tiles that stay mapped: holes, their video memory cleared (sent: absent = zero;
+    // the title finds zeros there when it commits them again)
     for pg in (a & !(PAGE - 1)..a + n).step_by(PAGE) {
         s.sent.remove(&pg);
+        if s.mapped.contains_key(&(pg & !(TILE - 1))) && !tiles.contains(&(pg & !(TILE - 1))) && s.holes.insert(pg) {
+            s.to_zero.push((pg, PAGE));
+        }
+    }
+    for &t in &tiles {
+        for pg in (t..t + TILE).step_by(PAGE) {
+            s.holes.remove(&pg);
+        }
     }
     for t in tiles {
         if let Some(tile) = s.mapped.remove(&t) {
@@ -452,6 +475,10 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
                     // per page: only the chunks the CPU changed since they were sent
                     let mut pg = x & !(PAGE - 1);
                     while pg < end {
+                        if s.holes.contains(&pg) {
+                            pg += PAGE;
+                            continue;
+                        }
                         let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
                         let sent = s.sent.entry(pg).or_insert_with(|| Box::new(zero_hashes()));
                         for (o, n) in changed_chunks(bytes, sent) {

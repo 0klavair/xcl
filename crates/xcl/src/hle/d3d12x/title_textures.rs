@@ -45,6 +45,9 @@ struct Entry {
     state: D3D12_RESOURCE_STATES,
     /// not uploaded yet (made since the last submit)
     pending: bool,
+    /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
+    /// then on and no longer uploaded
+    gpu_written: bool,
 }
 
 /// textures waiting for their first upload
@@ -75,7 +78,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true };
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false };
     if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) || crate::hle::kernelx::in_graphics_reservation(va) {
         ResetWriteWatch(va as *const c_void, bytes);
     }
@@ -86,6 +89,28 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     }
     PENDING.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
+/// holds what the GPU wrote; here the CPU's view of it is stale, so it is not uploaded again
+/// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
+/// stale view over the copy: Fortnite's font atlas is zeros in memory, its glyphs are copied in
+/// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
+/// that copies.
+pub fn note_gpu_write(res: usize) {
+    if let Some(e) = TEXTURES.lock().unwrap().get_mut(&res) {
+        if !e.gpu_written {
+            e.gpu_written = true;
+            GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
+pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
+    TEXTURES.lock().unwrap().iter().filter(|(_, e)| e.va < va + len && va < e.va + e.tex.size() as usize).map(|(&r, e)| (r, e.va)).take(4).collect()
 }
 
 /// The PC texture was released for good.
@@ -172,6 +197,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 if e.pending {
                     return true;
                 }
+                if e.gpu_written {
+                    return false;
+                }
                 let i = dirty.partition_point(|&p| p + page as usize <= e.va);
                 dirty.get(i).is_some_and(|&p| p < e.va + e.tex.size() as usize)
             })
@@ -211,7 +239,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             let (r, (dev, va, tex, state)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
-            batch.push((r, subresources(va, &tex), state, state));
+            let subs = subresources(va, &tex);
+            if super::present::trace_frame() {
+                note_content(va, &r, &subs);
+            }
+            batch.push((r, subs, state, state));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
@@ -231,6 +263,114 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             Err(e) => warn(&e),
         }
+    }
+}
+
+/// `XCL_TRACE_FRAME`: how much of a title texture's top level is not zero, each time it is
+/// uploaded (the first 48 uploads of textures of 64x64 and more).
+fn note_content(va: usize, r: &ID3D12Resource, subs: &[texture::Subresource]) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let Some(top) = subs.first() else { return };
+    let d = unsafe { r.GetDesc() };
+    if d.Width < 64 || d.Height < 64 || N.fetch_add(1, Ordering::Relaxed) >= 48 {
+        return;
+    }
+    let nonzero = top.data.iter().filter(|&&b| b != 0).count();
+    crate::xlog_info!(
+        "frame trace: title texture at {va:#x} ({}x{} format {}) uploaded: {nonzero} of {} bytes of level 0 not zero",
+        d.Width,
+        d.Height,
+        d.Format.0,
+        top.data.len()
+    );
+}
+
+/// `XCL_TRACE_FRAME`: what the GPU holds in level 0 of title texture `res` (read back on XCL's
+/// queue; the texture is taken to be in a shader-resource state) against the CPU's view of the
+/// memory now. Each texture once, four at most.
+pub unsafe fn probe_gpu_content(res: usize) {
+    static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    {
+        let mut g = SEEN.lock().unwrap();
+        if g.contains(&res) || g.len() >= 4 {
+            return;
+        }
+        g.push(res);
+    }
+    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().get(&res).map(|e| (e.device, e.va, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let d = device as *mut c_void;
+    let r = res as *mut c_void;
+    let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
+    let rd = r.GetDesc();
+    let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+    dev.GetCopyableFootprints(&rd, 0, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+    let result = own_work(|| -> Result<Vec<u8>, String> {
+        let queue = upload_queue(dev, device)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| e.to_string())?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(|e| e.to_string())?;
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(|e| e.to_string())?;
+        let rb = rb.ok_or("no readback buffer")?;
+        let barrier = |a: D3D12_RESOURCE_STATES, b: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(r), Subresource: 0, StateBefore: a, StateAfter: b }),
+            },
+        };
+        let srv = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        list.ResourceBarrier(&[barrier(srv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, srv)]);
+        list.Close().map_err(|e| e.to_string())?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(|e| e.to_string())?)]);
+        texture::wait(dev, &queue)?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+        for y in 0..rows as usize {
+            out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+        }
+        rb.Unmap(0, None);
+        Ok(out)
+    });
+    let cpu = subresources(va, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
+    match result {
+        Ok(gpu) => {
+            let nonzero = gpu.iter().filter(|&&b| b != 0).count();
+            let same = gpu.iter().zip(cpu.iter()).filter(|(a, b)| a == b).count();
+            crate::xlog_info!(
+                "frame trace: GPU content of title texture {res:#x} at {va:#x} ({}x{} format {}, {} mips, GPU-written {gpu_written}): {nonzero} of {} bytes of level 0 not zero; {same} equal to the CPU view ({} of its bytes not zero); first bytes {:02x?}",
+                rd.Width,
+                rd.Height,
+                rd.Format.0,
+                rd.MipLevels,
+                gpu.len(),
+                cpu.iter().filter(|&&b| b != 0).count(),
+                &gpu[..gpu.len().min(16)]
+            );
+        }
+        Err(e) => crate::xlog_warn!("frame trace: GPU content of title texture {res:#x}: {e}"),
     }
 }
 
