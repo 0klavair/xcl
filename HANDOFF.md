@@ -1436,6 +1436,23 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - Also seen: 1D and 3D 1×1 default textures (XG: E_NOTIMPL for 1D / 3D – not mirrored), console-only list IIDs
   55050859-…-98cf-645b51dc4874 / c3827890-… (the title takes a null), D3D12ConfigureVirtualMemoryX (stub).
 
+## Wave64 on 32-lane GPUs (NVIDIA), 2026-11-23
+- `Options::split_wave64` (set from `pso::wave32_only_for_device`, in tests from `runner::options`): each console
+  wave of a wave64 kernel / compute / mesh / ES+GS program = two hardware wave32s exchanging through groupshared
+  (`PRELUDE_X64`: masks, readlane / readfirstlane, ds_bpermute, GLC scalar loads; DPP / swizzle / permlane stay
+  in a half). Group barriers with one console wave per group, pairwise counters with several. Replaces the
+  half-local split of #14 / #39 and their refusals. Design + hazards + cost: `docs/wave64-on-wave32.md`.
+- Measured on an RTX 5070 Ti: all recompiler GPU tests run (only `gpu_wave32_program_in_wave64_hardware`, which
+  needs 64-lane hardware, skips); the kernel runner checks both halves end with the same SGPRs; `XCL_WAVE64_SPIN=1`
+  runs every split program in the counter variant (passes too). Native HLSL byte-identical for every program the
+  suite translates (dumped and diffed against main). Not re-run on AMD in that session (no AMD GPU enabled).
+- NVIDIA forms 32-lane waves of non-consecutive `SV_GroupIndex` for 3-D groups (8×8×4): `xcl_x_thread` gives
+  each hardware wave the next 32 console threads as it arrives.
+- Cost (`bench_split_wave64`, worst case: one mask per 8 instructions): 1.3× with one console wave per group, ~5×
+  with four (waiting waves keep issuing). Next: no exchange for masks only used lane by lane (`v_cndmask`).
+- Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
+  waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
