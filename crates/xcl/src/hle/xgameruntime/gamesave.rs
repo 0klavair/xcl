@@ -65,9 +65,24 @@ type BlobCb = unsafe extern "system" fn(*const BlobInfo, *mut c_void) -> bool;
 
 /// File-name form of a container / blob name: unusual characters as %XX.
 fn enc(name: &str) -> String {
-    name.bytes()
+    let mut out: String = name
+        .bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"._- ".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
-        .collect()
+        .collect();
+    // Names Windows does not keep as given get one more character escaped: a device name (with
+    // any extension) opens the device, "." and ".." are the folder itself and its parent, and a
+    // trailing dot or space is dropped.
+    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) && base.as_bytes()[3].is_ascii_digit());
+    if !name.is_empty() && (device || name.bytes().all(|b| b == b'.')) {
+        out.replace_range(..1, &format!("%{:02X}", name.as_bytes()[0]));
+    }
+    if out.ends_with('.') || out.ends_with(' ') {
+        let last = out.pop().unwrap();
+        out.push_str(&format!("%{:02X}", last as u8));
+    }
+    out
 }
 
 fn dec(file: &str) -> String {
@@ -558,6 +573,53 @@ mod tests {
             XGameSaveCloseContainer(container);
             assert_eq!(XGameSaveDeleteContainer(provider, b"slot\0".as_ptr()), S_OK);
             XGameSaveCloseProvider(provider);
+        }
+    }
+
+    unsafe extern "system" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
+        (*(ctx as *mut Vec<(String, u32)>)).push((from_cstr_ptr((*i).name).unwrap(), (*i).size));
+        true
+    }
+
+    /// Names Windows does not keep as file names (device names, a trailing dot or space,
+    /// "." / "..") come back as they were written.
+    #[test]
+    fn names_windows_would_change_round_trip() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-names-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            for container_name in ["aux", "..", "slot."] {
+                let cname = format!("{container_name}\0");
+                let mut c = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
+                let mut u = std::ptr::null_mut();
+                assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+                let blobs: [&[u8]; 4] = [b"aux\0", b"CON.dat\0", b"save.\0", b"save \0"];
+                for (i, name) in blobs.iter().enumerate() {
+                    assert_eq!(XGameSaveSubmitBlobWrite(u, name.as_ptr(), b"0123".as_ptr(), i + 1), S_OK);
+                }
+                assert_eq!(XGameSaveSubmitUpdate(u), S_OK, "{container_name}");
+                XGameSaveCloseUpdate(u);
+                let mut names: Vec<(String, u32)> = Vec::new();
+                assert_eq!(XGameSaveEnumerateBlobInfo(c, &mut names as *mut _ as *mut c_void, Some(blob_names)), S_OK);
+                names.sort();
+                let want: Vec<(String, u32)> = vec![("CON.dat".into(), 2), ("aux".into(), 1), ("save ".into(), 4), ("save.".into(), 3)];
+                assert_eq!(names, want, "{container_name}");
+                XGameSaveCloseContainer(c);
+            }
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            let mut got: Vec<String> = list.into_iter().map(|c| c.0).collect();
+            got.sort();
+            assert_eq!(got, ["..", "aux", "slot."]);
+            for name in [&b"aux\0"[..], b"..\0", b"slot.\0", b".\0"] {
+                assert_eq!(XGameSaveDeleteContainer(p, name.as_ptr()), S_OK);
+            }
+            // deleting "." / ".." deleted only those containers, not the provider's folder or its parent
+            assert!((*p).root.is_dir());
+            XGameSaveCloseProvider(p);
         }
     }
 
