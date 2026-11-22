@@ -13,6 +13,12 @@ fn parse_num(s: &str) -> Option<usize> {
     }
 }
 
+fn number_option(args: &[String], name: &str) -> Result<Option<usize>, String> {
+    let Some(index) = args.iter().position(|arg| arg == name) else { return Ok(None) };
+    let value = args.get(index + 1).ok_or_else(|| format!("{name} requires a byte count"))?;
+    parse_num(value).map(Some).ok_or_else(|| format!("invalid value for {name}: {value}"))
+}
+
 fn print_lines(code: &[u8], base: usize, stop: bool) {
     for l in rdna2::disassemble(code, base as u64, stop) {
         let hex: Vec<String> = l.bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -97,6 +103,13 @@ fn print_xbox(sh: &xbox::XboxShader, full_hex: bool, fssm_out: Option<&str>) {
 }
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
+    let (offset, length) = match (number_option(args, "--offset"), number_option(args, "--length")) {
+        (Ok(offset), Ok(length)) => (offset, length),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("xcl disasm: {error}");
+            return 2;
+        }
+    };
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
@@ -104,16 +117,16 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| parse_num(v));
     let all = args.iter().any(|a| a == "--all");
     println!("{} – {} B, decoder: {}", path.display(), data.len(), crate::gpu::RDNA2_ARCH);
 
-    if let Some(off) = opt("--offset") {
+    if offset.is_some() || length.is_some() {
+        let off = offset.unwrap_or(0);
         if off >= data.len() {
             eprintln!("xcl disasm: offset {off:#x} is past the end of the file");
             return 2;
         }
-        let len = opt("--length").unwrap_or(data.len() - off).min(data.len() - off);
+        let len = length.unwrap_or(data.len() - off).min(data.len() - off);
         print_lines(&data[off..off + len], off, !all);
         return 0;
     }
