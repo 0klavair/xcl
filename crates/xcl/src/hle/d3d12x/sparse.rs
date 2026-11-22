@@ -23,18 +23,24 @@ use std::sync::Mutex;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE};
 
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
 const POOL_TILES: u32 = 1024;
 /// bytes of the upload staging buffer
 const STAGING: usize = 64 << 20;
+/// bytes of the GPU→CPU readback staging buffer
+const READBACK_STAGING: usize = 16 << 20;
 
 struct State {
     dev: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     value: u64,
+    /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
+    rb_fence: ID3D12Fence,
+    rb_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     pools: Vec<ID3D12Heap>,
@@ -48,6 +54,7 @@ struct State {
     /// reused tiles to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     staging: Option<(ID3D12Resource, *mut u8)>,
+    readback: Option<(ID3D12Resource, *mut u8)>,
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     /// the fence value each title queue last waited for
@@ -117,13 +124,16 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     }
 }
 
-/// The sparse windows' buffers on `dev`: (buffer, GPU address) for each window after the
-/// committed ones – the shader ABI's `mem1`… (empty: no sparse windows).
-pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
+/// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
+/// sparse window in `gpu::uma` (empty: no sparse windows).
+pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
     let mut out = Vec::new();
     let mut windows = Vec::new();
-    for k in u.windows()..u.shader_windows() {
+    for k in 0..u.shader_windows() {
+        if !u.is_sparse_window(k) {
+            continue;
+        }
         let (base, size) = u.window(k);
         let mut r: Option<ID3D12Resource> = None;
         if let Err(e) = dev.CreateReservedResource(&buffer_desc(size as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut r) {
@@ -131,12 +141,16 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
             return Vec::new();
         }
         let Some(r) = r else { return Vec::new() };
-        out.push((r.clone().into_raw() as usize, r.GetGPUVirtualAddress()));
+        out.push((k, r.clone().into_raw() as usize, r.GetGPUVirtualAddress()));
         windows.push((base, r));
+    }
+    if out.is_empty() {
+        return out;
     }
     let made = (|| -> windows::core::Result<State> {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)?;
         list.Close()?;
@@ -145,6 +159,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
             queue,
             fence,
             value: 0,
+            rb_fence,
+            rb_value: 0,
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -153,6 +169,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
             buffers: HashMap::new(),
             to_zero: Vec::new(),
             staging: None,
+            readback: None,
             alloc,
             list,
             waited: HashMap::new(),
@@ -193,7 +210,7 @@ impl State {
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = self.dev.CreateHeap(&desc, &mut heap) {
+        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
@@ -284,6 +301,115 @@ impl State {
         self.staging.clone()
     }
 
+    unsafe fn readback_buf(&mut self) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.readback.is_none() {
+            let mut r: Option<ID3D12Resource> = None;
+            let mut d = buffer_desc(READBACK_STAGING as u64);
+            d.Flags = D3D12_RESOURCE_FLAG_NONE;
+            self.dev
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &d,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut r,
+                )
+                .ok()?;
+            let r = r?;
+            let mut p = std::ptr::null_mut();
+            r.Map(0, None, Some(&mut p)).ok()?;
+            self.readback = Some((r, p as *mut u8));
+        }
+        self.readback.clone()
+    }
+
+    /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
+    /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
+    unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut pg = va & !(PAGE - 1);
+        let end = va + len;
+        while pg < end {
+            if !self.holes.contains(&pg) {
+                let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                let sent = self.sent.entry(pg).or_insert_with(|| Box::new(zero_hashes()));
+                let lo = va.saturating_sub(pg) / CHUNK;
+                let hi = (end.min(pg + PAGE) - pg).div_ceil(CHUNK).min(CHUNKS);
+                for k in lo..hi {
+                    sent[k] = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
+                }
+            }
+            pg += PAGE;
+        }
+    }
+
+    /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
+    /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
+    unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+        let Some((rb, p)) = self.readback_buf() else { return };
+        let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
+        let mut used = 0usize;
+        let mut open = false;
+        let flush_and_copy = |s: &mut State, open: &mut bool, pending: &mut Vec<(usize, usize, usize)>, used: &mut usize, p: *mut u8| {
+            s.flush(open);
+            for &(dst, off, len) in pending.iter() {
+                // copy only committed (non-hole) bytes
+                let mut at = dst;
+                let mut src_off = off;
+                let end = dst + len;
+                while at < end {
+                    let pg = at & !(PAGE - 1);
+                    let step = (pg + PAGE).min(end) - at;
+                    if !s.holes.contains(&pg) {
+                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    }
+                    at += step;
+                    src_off += step;
+                }
+                s.sync_sent_range(dst, len);
+            }
+            pending.clear();
+            *used = 0;
+        };
+        for &(a, n) in ranges {
+            if n == 0 {
+                continue;
+            }
+            let mut done = 0usize;
+            while done < n {
+                let cur = a + done;
+                let tile = cur & !(TILE - 1);
+                let Some((b, r)) = self.window(cur).map(|(b, r)| (b, r.clone())) else { break };
+                let to_tile_end = (tile + TILE) - cur;
+                if !self.mapped.contains_key(&tile) {
+                    done += (n - done).min(to_tile_end);
+                    continue;
+                }
+                if used == READBACK_STAGING {
+                    flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+                }
+                let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+                let chunk = (n - done).min(READBACK_STAGING - used).min(to_tile_end).min(to_win_end);
+                if !open {
+                    self.wait_idle();
+                    let _ = self.alloc.Reset();
+                    let _ = self.list.Reset(&self.alloc, None);
+                    open = true;
+                }
+                self.list.CopyBufferRegion(&rb, used as u64, &r, (cur - b) as u64, chunk as u64);
+                pending.push((cur, used, chunk));
+                used += chunk;
+                done += chunk;
+            }
+        }
+        if open {
+            flush_and_copy(self, &mut open, &mut pending, &mut used, p);
+        }
+    }
+
     /// copy `runs` (address, bytes) of the CPU's view into the tiles (`zero`: clear instead)
     unsafe fn upload(&mut self, runs: &[(usize, usize, bool)]) {
         let Some((staging, p)) = self.staging() else { return };
@@ -296,8 +422,9 @@ impl State {
                     self.flush(&mut open);
                     used = 0;
                 }
-                let chunk = (n - done).min(STAGING - used);
                 let Some((b, r)) = self.window(a + done).map(|(b, r)| (b, r.clone())) else { break };
+                let to_win_end = (b + crate::gpu::uma::WINDOW) - (a + done);
+                let chunk = (n - done).min(STAGING - used).min(to_win_end);
                 if !open {
                     self.wait_idle();
                     let _ = self.alloc.Reset();
@@ -326,13 +453,132 @@ impl State {
         *open = false;
         if self.list.Close().is_ok() {
             if let Ok(l) = self.list.cast::<ID3D12CommandList>() {
-                self.queue.ExecuteCommandLists(&[Some(l)]);
+                super::title_textures::own_work(|| {
+                    self.queue.ExecuteCommandLists(&[Some(l)]);
+                });
             }
         }
         self.signal();
         // the staging buffer is written again only after this
         self.wait_idle();
     }
+}
+
+/// Allocate a zeroed, write-watched block in the sparse VRAM windows (never straddling a
+/// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
+/// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
+pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    committed(addr, rounded);
+    Some((addr, rounded))
+}
+
+/// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
+/// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
+pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    let u = crate::gpu::uma::get()?;
+    let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
+    if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
+        u.sparse_release(addr);
+        return None;
+    }
+    committed(addr, rounded);
+    Some((addr, rounded))
+}
+
+/// Release a sparse allocation from `alloc` / `alloc_in` (false: not a sparse allocation).
+pub unsafe fn free(p: usize) -> bool {
+    let Some(u) = crate::gpu::uma::get() else { return false };
+    if !u.is_sparse(p) {
+        return false;
+    }
+    let Some(len) = u.sparse_release(p) else { return false };
+    decommitted(p, len);
+    VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+    true
+}
+
+/// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
+/// `FillMemoryWith32BitValueX`, `CopyMemoryToMemoryX`) back to their CPU view so CPU reads
+/// and spin-waits see the GPU writes without clobbering `sent` hashes.
+pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window(a).is_some()).collect();
+    if filtered.is_empty() {
+        return;
+    }
+    filtered.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(filtered.len());
+    for (a, n) in filtered {
+        match merged.last_mut() {
+            Some(last) if a <= last.0.saturating_add(last.1) => {
+                let end = (last.0 + last.1).max(a + n);
+                last.1 = end - last.0;
+            }
+            _ => merged.push((a, n)),
+        }
+    }
+    s.rb_value += 1;
+    let v = s.rb_value;
+    if queue.Signal(&s.rb_fence, v).is_ok() {
+        let _ = s.queue.Wait(&s.rb_fence, v);
+    }
+    s.readback_ranges(&merged);
+}
+
+/// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
+/// a non-empty read range): flushes pending tile clears and unsubmitted CPU-changed chunks
+/// first so CPU writes are preserved, then copies the range back from VRAM into CPU memory.
+pub unsafe fn readback_now(va: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if s.window(va).is_none() {
+        return;
+    }
+    let zeroed = std::mem::take(&mut s.to_zero);
+    if !zeroed.is_empty() {
+        for &(a, n) in &zeroed {
+            for pg in (a..a + n).step_by(PAGE) {
+                s.sent.remove(&pg);
+            }
+        }
+        let zruns: Vec<(usize, usize, bool)> = zeroed.into_iter().map(|(a, n)| (a, n, true)).collect();
+        s.upload(&zruns);
+    }
+    // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
+    let mut dirty_runs: Vec<(usize, usize, bool)> = Vec::new();
+    let mut pg = va & !(PAGE - 1);
+    let end = va + len;
+    while pg < end {
+        let tile = pg & !(TILE - 1);
+        if s.mapped.contains_key(&tile) && !s.holes.contains(&pg) {
+            let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+            let sent = s.sent.entry(pg).or_insert_with(|| Box::new(zero_hashes()));
+            for (o, n) in changed_chunks(bytes, sent) {
+                match dirty_runs.last_mut() {
+                    Some(last) if last.0 + last.1 == pg + o => last.1 += n,
+                    _ => dirty_runs.push((pg + o, n, false)),
+                }
+            }
+        }
+        pg += PAGE;
+    }
+    if !dirty_runs.is_empty() {
+        s.upload(&dirty_runs);
+    }
+    s.readback_ranges(&[(va, len)]);
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
@@ -455,7 +701,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             s.sent.remove(&pg);
         }
     }
-    let mut runs: Vec<(usize, usize, bool)> = zeroed.into_iter().map(|(a, n)| (a, n, true)).collect();
+    let zero_runs: Vec<(usize, usize, bool)> = zeroed.into_iter().map(|(a, n)| (a, n, true)).collect();
+    let mut dirty_runs: Vec<(usize, usize, bool)> = Vec::new();
     let mut i = 0;
     while i < dirty.len() {
         let a = dirty[i];
@@ -466,39 +713,41 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             i += 1;
         }
         // only what has video memory (committed tiles of a sparse window)
-        if s.window(a).is_some() {
-            let mut x = a;
-            while x < a + n {
-                let t = x & !(TILE - 1);
-                let end = (t + TILE).min(a + n);
-                if s.mapped.contains_key(&t) {
-                    // per page: only the chunks the CPU changed since they were sent
-                    let mut pg = x & !(PAGE - 1);
-                    while pg < end {
-                        if s.holes.contains(&pg) {
-                            pg += PAGE;
-                            continue;
-                        }
-                        let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
-                        let sent = s.sent.entry(pg).or_insert_with(|| Box::new(zero_hashes()));
-                        for (o, n) in changed_chunks(bytes, sent) {
-                            match runs.last_mut() {
-                                Some(last) if !last.2 && last.0 + last.1 == pg + o => last.1 += n,
-                                _ => runs.push((pg + o, n, false)),
-                            }
-                        }
+        let mut x = a;
+        while x < a + n {
+            let t = x & !(TILE - 1);
+            let end = (t + TILE).min(a + n);
+            if s.mapped.contains_key(&t) {
+                // per page: only the chunks the CPU changed since they were sent
+                let mut pg = x & !(PAGE - 1);
+                while pg < end {
+                    if s.holes.contains(&pg) {
                         pg += PAGE;
+                        continue;
                     }
+                    let bytes = std::slice::from_raw_parts(pg as *const u8, PAGE);
+                    let sent = s.sent.entry(pg).or_insert_with(|| Box::new(zero_hashes()));
+                    for (o, n) in changed_chunks(bytes, sent) {
+                        match dirty_runs.last_mut() {
+                            Some(last) if last.0 + last.1 == pg + o => last.1 += n,
+                            _ => dirty_runs.push((pg + o, n, false)),
+                        }
+                    }
+                    pg += PAGE;
                 }
-                x = end;
             }
+            x = end;
         }
     }
     let t_scanned = std::time::Instant::now();
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Relaxed);
-    PHASES[3].fetch_add(runs.len() as u64, Relaxed);
-    if !runs.is_empty() {
-        s.upload(&runs);
+    PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Relaxed);
+    // Flush tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
+    if !zero_runs.is_empty() {
+        s.upload(&zero_runs);
+    }
+    if !dirty_runs.is_empty() {
+        s.upload(&dirty_runs);
     }
     PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Relaxed);
     {
@@ -506,7 +755,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         static CALLS: AtomicU64 = AtomicU64::new(0);
         static BYTES: AtomicU64 = AtomicU64::new(0);
         static MICROS: AtomicU64 = AtomicU64::new(0);
-        let bytes: usize = runs.iter().map(|r| r.1).sum();
+        let bytes: usize = zero_runs.iter().chain(dirty_runs.iter()).map(|r| r.1).sum();
         let n = CALLS.fetch_add(1, Relaxed) + 1;
         let b = BYTES.fetch_add(bytes as u64, Relaxed) + bytes as u64;
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Relaxed) + t0.elapsed().as_micros() as u64;
@@ -546,6 +795,11 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Reserved buffers only accept NONE or ALLOW_UNORDERED_ACCESS (strip console flags and ALLOW_CROSS_ADAPTER).
+    d.Flags &= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if state & (D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32 | D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32) != 0 {
+        d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     let hr = super::real::dev_create_reserved_resource(this, &d as *const _ as usize, state as usize, 0, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;

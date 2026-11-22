@@ -268,7 +268,7 @@ fn main() {
         ensure!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) != 0 && n == 4, "XMemAllocatePhysicalPages");
         let p = XMemMapPhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()) as *mut u32;
         ensure!(!p.is_null() && p as usize >> 32 >= 4, "XMemMapPhysicalPages: {p:?}");
-        *p.add(0x1_0000) = 7; // second page
+        *p.add(0x1_0000 / 4) = 7; // second page
         ensure!(XMemFreePhysicalPages(4, pages.as_mut_ptr()) != 0, "XMemFreePhysicalPages");
         Ok(())
     });
@@ -314,6 +314,12 @@ fn main() {
         ensure!(c == a, "freed blocks merge and are reused: {c:?}");
         ensure!(std::slice::from_raw_parts(c as *const u8, 0x30000).iter().all(|&x| x == 0), "reused block not zeroed");
         XMemFree(c, attrs);
+        // 4 MiB page-size semantics (XALLOC_PAGESIZE_4MB = 2 << 14): 4 MiB-aligned & zeroed
+        let attrs_4m = (1u64 << 29) | (2u64 << 14);
+        let big = XMemAlloc(0x1000, attrs_4m);
+        ensure!(!big.is_null() && (big as usize) % (4 << 20) == 0, "4MB page alloc not 4 MiB aligned: {big:?}");
+        ensure!(*(big as *const u64) == 0 && *((big as usize + (4 << 20) - 8) as *const u64) == 0, "4MB page alloc not zeroed");
+        XMemFree(big, attrs_4m);
         Ok(())
     });
 
@@ -610,6 +616,7 @@ fn main() {
     check("D3D12.X: frame clock + PresentX of the title's back buffer", gpu::present_x_frame);
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
     check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy, KickoffX, Wait32/64)", gpu::console_list_methods);
+    check("D3D12.X: sparse VRAM buffer heaps (placed aliasing, persistent Map coherence, readback)", gpu::sparse_buffer_heap_coherence);
     check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
     check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);

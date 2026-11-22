@@ -181,21 +181,39 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         }
     }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
-        if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 0)) {
-            trace_mem("VirtualAlloc (graphics, UMA)", 0, size, t as u64, p, q as usize);
+        let align = if t & 0x8000_0000 != 0 {
+            4 << 20
+        } else if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 {
+            2 << 20
+        } else {
+            crate::gpu::uma::GRAIN
+        };
+        let rounded = size.max(1).div_ceil(align) * align;
+        if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+            trace_mem("VirtualAlloc (graphics, sparse VRAM)", 0, rounded, t as u64, p, q);
+            return q as *mut c_void;
+        }
+        if let Some(q) = uma.and_then(|u| u.alloc(rounded, align)) {
+            trace_mem("VirtualAlloc (graphics, UMA)", 0, rounded, t as u64, p, q as usize);
             return q as *mut c_void;
         }
     }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x2000 != 0 {
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
-        // reserve a range, then commit or map pages and place resources in it): a range of
-        // unified memory, which is committed already
-        if let Some(q) = crate::gpu::uma::get().and_then(|u| u.reserve(size, 0x1_0000)) {
-            trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
+        // reserve a range, then commit or map pages and place resources in it): prefer the
+        // sparse VRAM windows first so reservations consume zero system RAM until committed
+        let reserved = if t & 0x8000_0000 != 0 {
+            let rounded = size.max(1).div_ceil(4 << 20) * (4 << 20);
+            uma.and_then(|u| u.sparse_alloc(rounded, 4 << 20)).map(|(q, _)| q)
+        } else {
+            uma.and_then(|u| u.sparse_reserve(size))
+        };
+        if let Some(q) = reserved {
+            trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
-        if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
-            trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
+        if let Some(q) = uma.and_then(|u| u.reserve(size, 0x1_0000)) {
+            trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
         let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
@@ -322,17 +340,36 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
     mem::HeapFree(mem::GetProcessHeap(), 0, raw as *const c_void);
 }
 
+/// Rounded byte size and alignment for an XMem graphics allocation honoring `page_size`
+/// (`2` = `XALLOC_PAGESIZE_4MB`, otherwise 64 KiB sparse tile grain) and `alignment`.
+fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> (usize, usize) {
+    let page_grain = match a.page_size {
+        2 => 4 << 20, // XALLOC_PAGESIZE_4MB
+        _ => crate::gpu::uma::GRAIN,
+    };
+    let align = (1usize << a.alignment.min(30)).max(page_grain);
+    let rounded = size.max(1).div_ceil(page_grain) * page_grain;
+    (rounded, align)
+}
+
 pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
         let q = aligned_heap_alloc(size, 1usize << a.alignment.max(4));
         trace_mem("XMemAlloc", 0, size, attrs, 0, q as usize);
-        q
-    } else if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 1usize << a.alignment.min(30))) {
-        q as *mut c_void // graphics memory types: GPU-visible
-    } else {
-        mem::VirtualAlloc(std::ptr::null(), size, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE)
+        return q;
     }
+    let (rounded, align) = xmem_graphics_layout(size, a);
+    // Graphics memory types live in the sparse VRAM pool (fallback to coherent UMA, then Windows).
+    if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+        trace_mem("XMemAlloc (graphics, sparse VRAM)", 0, rounded, attrs, 0, q);
+        return q as *mut c_void;
+    }
+    if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(rounded, align)) {
+        trace_mem("XMemAlloc (graphics, UMA)", 0, rounded, attrs, 0, q as usize);
+        return q as *mut c_void;
+    }
+    mem::VirtualAlloc(std::ptr::null(), rounded, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE)
 }
 
 pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
@@ -341,7 +378,7 @@ pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
     }
     if XAllocAttrs::decode(attrs).memory_type == 0 {
         aligned_heap_free(p);
-    } else if !crate::gpu::uma::get().is_some_and(|u| u.free(p as usize)) {
+    } else if !crate::hle::d3d12x::sparse::free(p as usize) && !crate::gpu::uma::get().is_some_and(|u| u.free(p as usize)) {
         mem::VirtualFree(p, 0, mem::MEM_RELEASE);
     }
 }
@@ -367,9 +404,13 @@ pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
 
 /// `void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD type, XALLOC_ATTRIBUTES attributes,
 /// DWORD protect)`: VirtualAlloc with an allocator's attributes – a graphics memory type is
-/// GPU-visible memory (as MEM_GRAPHICS: unified memory).
+/// GPU-visible memory (as MEM_GRAPHICS: sparse VRAM pool).
 pub unsafe extern "system" fn XMemVirtualAlloc(addr: *const c_void, size: usize, t: u32, attrs: u64, p: u32) -> *mut c_void {
-    let t = if XAllocAttrs::decode(attrs).memory_type != 0 { t | MEM_GRAPHICS } else { t };
+    let a = XAllocAttrs::decode(attrs);
+    let mut t = if a.memory_type != 0 { t | MEM_GRAPHICS } else { t };
+    if a.memory_type != 0 && a.page_size == 2 {
+        t |= 0x8000_0000;
+    }
     VirtualAlloc(addr, size, t, p)
 }
 
@@ -531,7 +572,10 @@ fn page_home(page: usize) -> Option<usize> {
     let index = page.checked_sub(1)?;
     let blocks = PHYS_BLOCKS.lock().ok()?;
     let (&first, &(count, live)) = blocks.range(..=index).next_back()?;
-    (live > 0 && index < first.checked_add(count)?).then(|| u.base().checked_add(index.checked_mul(PHYS_PAGE)?)).flatten().filter(|&p| p + PHYS_PAGE <= u.base() + u.size())
+    (live > 0 && index < first.checked_add(count)?)
+        .then(|| u.base().checked_add(index.checked_mul(PHYS_PAGE)?))
+        .flatten()
+        .filter(|&p| u.window_of(p).is_some() && u.window_of(p + PHYS_PAGE - 1) == u.window_of(p))
 }
 
 /// Resolve the live virtual addresses of the physical pages covering `offset..offset+len`.
@@ -619,12 +663,15 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    let Some(block) = u.alloc(n * PHYS_PAGE, PHYS_PAGE) else {
+    let block = crate::hle::d3d12x::sparse::alloc(n * PHYS_PAGE, PHYS_PAGE)
+        .map(|(p, _)| p)
+        .or_else(|| u.alloc(n * PHYS_PAGE, PHYS_PAGE).map(|p| p as usize));
+    let Some(block) = block else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    let first = (block as usize - u.base()) / PHYS_PAGE;
+    let first = (block - u.base()) / PHYS_PAGE;
     for i in 0..n {
         *arr.add(i) = first + i + 1;
     }
@@ -658,7 +705,12 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         e.1 = e.1.saturating_sub(1);
         if e.1 == 0 {
             g.remove(&first);
-            u.free(u.base() + first * PHYS_PAGE);
+            let addr = u.base() + first * PHYS_PAGE;
+            if u.is_sparse(addr) {
+                crate::hle::d3d12x::sparse::free(addr);
+            } else {
+                u.free(addr);
+            }
         }
     }
     1

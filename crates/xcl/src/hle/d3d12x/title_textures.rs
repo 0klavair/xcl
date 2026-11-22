@@ -132,11 +132,16 @@ thread_local! {
 }
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
-fn own_work<R>(f: impl FnOnce() -> R) -> R {
+pub(super) fn own_work<R>(f: impl FnOnce() -> R) -> R {
     let was = BUSY.with(|b| b.replace(true));
     let r = f();
     BUSY.with(|b| b.set(was));
     r
+}
+
+/// Whether the current thread is inside XCL's own internal GPU setup/upload/readback work.
+pub(super) fn is_own_work() -> bool {
+    BUSY.with(|b| b.get())
 }
 
 /// Before the title's GPU work: textures whose memory the CPU wrote since the last look are
@@ -151,7 +156,7 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
-    let sparse = u.shader_windows() > u.windows();
+    let sparse = u.has_sparse();
     if TEXTURES.lock().unwrap().is_empty() && !sparse {
         return;
     }

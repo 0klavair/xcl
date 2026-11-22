@@ -2024,6 +2024,155 @@ fn gpu_memory_windows_above_4_gib() {
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
 }
 
+/// End-to-end GPU test of the sparse-window VRAM runtime layout:
+/// - Window 0..2 = sparse VRAM (tiled reserved buffers on DEFAULT heaps)
+/// - Window 3 = committed coherent RAM (`OpenExistingHeapFromAddress`)
+/// Exercises a DXC-compiled SM 6.6 translated RDNA2 compute shader (`mem_windows = 4`)
+/// reading a 64-bit spilled root-argument constant from Window 3 (`s[0:1]`), loading two
+/// V# buffer descriptors through a 32-bit `hi = 0` descriptor table pointer in Window 0
+/// sparse VRAM (`console_heap`), reading input from `XMemAlloc` graphics memory in sparse
+/// VRAM, writing to Window 3, and then mutating both the buffer and the descriptor slot in
+/// Window 0 sparse VRAM between submits.
+#[test]
+fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    if !gpu_ready() {
+        return;
+    }
+    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    let u = crate::gpu::uma::get().expect("UMA");
+    assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
+    assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
+    assert!(u.is_committed_window(3), "window 3 coherent committed RAM");
+    let windows = crate::hle::d3d12x::real::uma_window_vas();
+    assert_eq!(windows.len(), 4);
+    assert!(windows.iter().all(|&va| va != 0), "all 4 window GPU VAs must be valid: {windows:x?}");
+
+    // 1. Console descriptor heap in Window 0 sparse VRAM (32-bit hi = 0 table addressing)
+    let heap_obj = 0xDEAD_5EA7usize;
+    assert!(crate::hle::d3d12x::console_heap::register(heap_obj, 4, 0x1000, 0x5000, 32, false, None, true));
+    let heap_va = crate::hle::d3d12x::console_heap::start(heap_obj).unwrap() as usize;
+    assert_eq!(u.window_of(heap_va), Some(0), "descriptor heap must live in window 0");
+    assert!(u.is_sparse(heap_va), "descriptor heap must live in sparse VRAM");
+
+    // 2. XMem graphics allocations in sparse VRAM
+    let gfx_attrs = 1u64 << 29;
+    let in_a = unsafe { crate::hle::kernelx::XMemAllocDefault(0x1_0000, gfx_attrs) } as usize;
+    let in_b = unsafe { crate::hle::kernelx::XMemAllocDefault(0x1_0000, gfx_attrs) } as usize;
+    assert!(in_a != 0 && in_b != 0 && u.is_sparse(in_a) && u.is_sparse(in_b), "XMem graphics buffers must live in sparse VRAM");
+
+    // 3. Coherent Window 3 allocations: spilled root argument table + output buffer + io/res
+    let arg_table = u.alloc(0x1_0000, 256).unwrap() as usize;
+    let out_buf = u.alloc(0x1_0000, 256).unwrap() as usize;
+    let io_buf = u.alloc(0x1_0000, 256).unwrap() as usize;
+    let res_buf = u.alloc(0x1_0000, 256).unwrap() as usize;
+    assert_eq!(u.window_of(arg_table), Some(3));
+    assert_eq!(u.window_of(out_buf), Some(3));
+
+    // Populate initial data & descriptors (slot 0 = V# in_a, slot 1 = V# out_buf)
+    let vsharp = |addr: usize| -> [u32; 4] { [addr as u32, (((addr >> 32) as u32) & 0xFFFF) | (4 << 16), 64, 0] };
+    unsafe {
+        *(arg_table as *mut u32) = 77;
+        for l in 0..64usize {
+            *((in_a + 4 * l) as *mut u32) = 1000 + l as u32;
+            *((in_b + 4 * l) as *mut u32) = 5000 + 2 * l as u32;
+        }
+    }
+    let slot0 = crate::hle::d3d12x::console_heap::slot(heap_va as u64).unwrap();
+    let slot1 = crate::hle::d3d12x::console_heap::slot(heap_va as u64 + 32).unwrap();
+    crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_a));
+    crate::hle::d3d12x::console_heap::write(&slot1, &vsharp(out_buf));
+
+    // Translate + DXC-compile RDNA2 compute shader (4 windows, 32-bit descriptor table with hi = 0)
+    let p = prog(&[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0)], None), // s[0:1] -> Window 3 root arg table
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s5 = 0 (32-bit descriptor table pointer)
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 20), ("VSRC1", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+    ]);
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
+    let t = translate(&p, &Options { mode: Mode::Compute(cs), mem_windows: 4, ..Default::default() }).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+
+    // Execute on the real D3D12.X device + queue (goes through q_execute_command_lists -> sparse::before_execute)
+    unsafe {
+        let dev_raw = crate::hle::d3d12x::real::device_raw();
+        let dev = ID3D12Device::from_raw_borrowed(&dev_raw).expect("device").clone();
+        let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+        let pso: ID3D12PipelineState = dev
+            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                ..Default::default()
+            })
+            .expect("CreateComputePipelineState");
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+        // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
+        let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+        io[0] = arg_table as u32;
+        io[1] = (arg_table >> 32) as u32;
+        io[4] = (heap_va - u.base()) as u32;
+        io[5] = 0xDEAD_BEEF; // shader overwrites s5 = 0 to prove hi == 0 32-bit addressing hits Window 0 sparse VRAM
+        std::ptr::copy_nonoverlapping(io.as_ptr() as *const u8, io_buf as *mut u8, io.len() * 4);
+
+        let record_and_run = |fence_val: u64, first: bool| {
+            if !first {
+                alloc.Reset().unwrap();
+                list.Reset(&alloc, Some(&pso)).unwrap();
+            }
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
+            list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
+            for (k, &va) in windows.iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+            }
+            list.Dispatch(1, 1, 1);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, fence_val).unwrap();
+            if fence.GetCompletedValue() < fence_val {
+                let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(fence_val, ev).unwrap();
+                windows::Win32::System::Threading::WaitForSingleObject(ev, 5000);
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+            }
+        };
+
+        // Submit 1: reads slot 0 -> in_a (sparse VRAM) + arg_table constant 77 (Window 3)
+        record_and_run(1, true);
+        for l in 0..64usize {
+            let got = *((out_buf + 4 * l) as *const u32);
+            assert_eq!(got, 1000 + l as u32 + 77, "submit 1 lane {l} mismatch");
+        }
+
+        // Submit 2: mutate descriptor slot 0 in Window 0 sparse VRAM -> in_b, and mutate in_b[3] + arg_table
+        *(arg_table as *mut u32) = 13;
+        *((in_b + 4 * 3) as *mut u32) = 9999;
+        crate::hle::d3d12x::console_heap::write(&slot0, &vsharp(in_b));
+        record_and_run(2, false);
+        for l in 0..64usize {
+            let expected = if l == 3 { 9999 + 13 } else { 5000 + 2 * l as u32 + 13 };
+            let got = *((out_buf + 4 * l) as *const u32);
+            assert_eq!(got, expected, "submit 2 (mutated sparse descriptor + XMem buffer) lane {l} mismatch");
+        }
+
+        // Clean up
+        crate::hle::d3d12x::console_heap::unregister(heap_obj);
+        crate::hle::kernelx::XMemFreeDefault(in_a as *mut _, gfx_attrs);
+        crate::hle::kernelx::XMemFreeDefault(in_b as *mut _, gfx_attrs);
+        assert!(u.free(arg_table) && u.free(out_buf) && u.free(io_buf) && u.free(res_buf));
+    }
+}
+
 /// Experiment: does OpenExistingHeapFromAddress accept a reservation with only part committed?
 #[test]
 #[ignore]
