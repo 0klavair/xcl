@@ -68,6 +68,13 @@ fn decode_game_config(raw: &[u8]) -> Option<String> {
 }
 
 /// (executables, title) from MicrosoftGame.config if present.
+/// The game's name for people (`ShellVisuals DefaultDisplayName` of MicrosoftGame.config):
+/// None when it is a resource reference (`ms-resource:…`) or missing.
+pub fn display_name(root: &Path) -> Option<String> {
+    let xml = std::fs::read(root.join("MicrosoftGame.config")).ok().and_then(|raw| decode_game_config(&raw))?;
+    xml_attr(&xml, "ShellVisuals", "DefaultDisplayName").filter(|n| !n.trim().is_empty() && !n.starts_with("ms-resource:"))
+}
+
 pub fn read_game_config(root: &Path) -> (Vec<String>, Option<String>) {
     let p = root.join("MicrosoftGame.config");
     let Some(xml) = std::fs::read(p).ok().and_then(|raw| decode_game_config(&raw)) else { return (Vec::new(), None) };
@@ -397,6 +404,18 @@ mod tests {
             <ShellVisuals DefaultDisplayName="X" Name="no"/>"#;
         assert_eq!(xml_attrs(xml, "Executable", "Name"), vec!["Bin\\game.exe".to_string(), "tool.exe".to_string()]);
         assert_eq!(xml_attr(xml, "ShellVisuals", "Name").as_deref(), Some("no"), "DisplayName= must not match Name=");
+    }
+
+    #[test]
+    fn display_name_is_the_shell_name_unless_it_is_a_resource() {
+        let dir = TempDir::new("display_name");
+        let config = |name: &str| std::fs::write(dir.0.join("MicrosoftGame.config"), format!(r#"<Game><Identity Name="Contoso.Test"/><ShellVisuals DefaultDisplayName="{name}" Square44x44Logo="a.png"/></Game>"#)).unwrap();
+        config("Minecraft Preview");
+        assert_eq!(display_name(&dir.0).as_deref(), Some("Minecraft Preview"));
+        config("ms-resource:AppName");
+        assert_eq!(display_name(&dir.0), None);
+        std::fs::remove_file(dir.0.join("MicrosoftGame.config")).unwrap();
+        assert_eq!(display_name(&dir.0), None);
     }
 
     #[test]

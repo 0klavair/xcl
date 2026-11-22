@@ -321,7 +321,46 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             PostQuitMessage(0);
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == COMPILE_TIMER => {
+            show_compiling(hwnd);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// The game's name in the XCL window's title: its display name from MicrosoftGame.config,
+/// else its package identity.
+fn window_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let Some(b) = crate::state::boot() else { return "XCL".into() };
+        crate::launcher::display_name(&b.game_root).unwrap_or_else(|| b.title.clone())
+    })
+    .clone()
+}
+
+/// the XCL window's timer for `show_compiling`
+const COMPILE_TIMER: usize = 0x5C0;
+
+/// While pipelines are built in the background (`pso_async`: the title then draws nothing with
+/// them – a black screen after an XCL update recompiles thousands), the window's title says so:
+/// "XCL – <title> | compiling shaders: N left, M done". The plain title comes back when the
+/// queue is empty.
+unsafe fn show_compiling(hwnd: HWND) {
+    static SHOWN: Mutex<Option<String>> = Mutex::new(None);
+    let (built, failed, pending) = super::pso_async::counts();
+    let title = window_name();
+    let text = if pending > 0 {
+        let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+        format!("XCL – {title} | compiling shaders: {pending} left, {built} done{failed}")
+    } else {
+        format!("XCL – {title}")
+    };
+    let mut shown = SHOWN.lock().unwrap();
+    if shown.as_deref() != Some(text.as_str()) {
+        let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
+        *shown = Some(text);
     }
 }
 
@@ -338,7 +377,7 @@ fn window_thread() {
         };
         RegisterClassW(&wc);
         let cfg = crate::state::config();
-        let title = crate::state::boot().map(|b| b.title.clone()).unwrap_or_else(|| "XCL".into());
+        let title = window_name();
         let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
         let hwnd = CreateWindowExW(
@@ -362,6 +401,7 @@ fn window_thread() {
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
+        SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
