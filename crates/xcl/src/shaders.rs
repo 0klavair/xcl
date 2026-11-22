@@ -813,7 +813,7 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
     if !t.is_empty() {
         let q = |f: f64| t[((t.len() - 1) as f64 * f) as usize].0;
         let sum: f64 = t.iter().map(|x| x.0).sum();
-        println!(
+        eprintln!(
             "DXC time per shader: median {:.2} s, p90 {:.2} s, max {:.2} s, sum {:.0} s (threads: in parallel)",
             q(0.5),
             q(0.9),
@@ -821,7 +821,7 @@ fn compile_samples(samples: &[(String, String, &'static str)]) -> (usize, Vec<St
             sum
         );
         for (secs, len, name) in t.iter().rev().take(5) {
-            println!("  {secs:.1} s, HLSL {} KB: {name}", len / 1024);
+            eprintln!("  {secs:.1} s, HLSL {} KB: {name}", len / 1024);
         }
     }
     (ok, parts.into_iter().flat_map(|p| p.1).collect())
