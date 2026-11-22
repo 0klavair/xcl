@@ -243,6 +243,10 @@ struct Bindings {
     vertex_buffers: std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>,
     /// (handles, single range, depth-stencil handle)
     render_targets: Option<(Vec<usize>, i32, Option<usize>)>,
+    /// slot → the title's (address, bytes, stride) of the vertex buffer (`XCL_TRACE_FRAME`)
+    vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
+    /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
+    index_title: Option<(u64, u32, i32)>,
 }
 
 /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
@@ -253,15 +257,118 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
         let vp = b.viewports.first().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
         let sc = b.scissors.first().map(|r| (r.left, r.top, r.right, r.bottom));
         out = format!(
-            "topology {:?}, stencil ref {:?}, viewport {vp:?} ({} set), scissor {sc:?} ({} set), render targets {:?}",
+            "topology {:?}, stencil ref {:?}, viewport {vp:?} ({} set), scissor {sc:?} ({} set), render targets {:?}{}",
             b.topology,
             b.stencil,
             b.viewports.len(),
             b.scissors.len(),
-            b.render_targets.as_ref().map(|(h, _, d)| (h.len(), d.is_some()))
+            b.render_targets.as_ref().map(|(h, _, d)| (h.len(), d.is_some())),
+            b.render_targets.as_ref().and_then(|(_, _, d)| *d).map_or(String::new(), |d| format!(", DSV {d:#x}"))
         );
     });
     out
+}
+
+/// `XCL_TRACE_FRAME`: the vertex and index buffers a list binds, with their first vertices
+/// and indices as the CPU sees the title's memory.
+pub(super) unsafe fn geometry_summary(list: *mut c_void, draw: (bool, u32, u32, u32, i32)) -> String {
+    let (vbs, ib) = {
+        let mut out = (Vec::new(), None);
+        with_bindings(list, |b| out = (b.vertex_titles.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>(), b.index_title));
+        out
+    };
+    let words = |a: u64, n: usize| -> Option<Vec<u32>> {
+        (a != 0 && crate::gpu::shader::readable(a as usize, 4 * n)).then(|| (0..n).map(|k| ((a as usize + 4 * k) as *const u32).read_unaligned()).collect())
+    };
+    let mut out = Vec::new();
+    for (slot, (a, size, stride)) in vbs {
+        let per = (stride as usize / 4).clamp(1, 12);
+        let verts: Vec<String> = (0..4u64).filter_map(|i| words(a + i * stride as u64, per).map(|w| format!("{w:x?}"))).collect();
+        out.push(format!("VB{slot} {a:#x} ({size} bytes, stride {stride}): {}", verts.join(" ")));
+    }
+    // the vertices the draw names: through its indices (indexed) or from its first vertex
+    let (indexed, count, _, first, base) = draw;
+    let n = count.min(6) as usize;
+    let names: Option<Vec<u64>> = if indexed {
+        ib.and_then(|(a, _, fmt)| {
+            let w = if fmt == 57 { 2 } else { 4 };
+            let at = a as usize + w * first as usize;
+            (a != 0 && crate::gpu::shader::readable(at, w * n)).then(|| {
+                (0..n).map(|k| if w == 2 { ((at + 2 * k) as *const u16).read_unaligned() as u64 } else { ((at + 4 * k) as *const u32).read_unaligned() as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
+            })
+        })
+    } else {
+        Some((0..n as u64).map(|k| first as u64 + k).collect())
+    };
+    out.push(format!("IB {:x?}; the draw's vertices (as indexed now) {names:?}", ib.map(|(a, size, fmt)| (a, size, fmt))));
+    // the title fills ring buffers after recording a draw: the vertices are read again when
+    // the list is executed (`dump_pending_geometry`)
+    if let Some((_, vb)) = vbs_first(list) {
+        PENDING_GEOMETRY.lock().unwrap().push((list as usize, vb, ib, draw));
+    }
+    out.join("; ")
+}
+
+/// draws whose vertices are dumped when their list runs: (list, (VB address, bytes, stride),
+/// (IB address, bytes, format), draw arguments)
+#[allow(clippy::type_complexity)]
+static PENDING_GEOMETRY: Mutex<Vec<(usize, (u64, u32, u32), Option<(u64, u32, i32)>, (bool, u32, u32, u32, i32))>> = Mutex::new(Vec::new());
+
+/// `XCL_TRACE_FRAME`: the vertices of traced draws as the title's memory holds them at the
+/// next present (the CPU has written the frame's vertices by then).
+pub(super) unsafe fn dump_pending_geometry() {
+    let mine: Vec<_> = std::mem::take(&mut *PENDING_GEOMETRY.lock().unwrap());
+    for (_, (a, _, stride), ib, (indexed, count, _, first, base)) in mine {
+        let n = count.min(48) as usize;
+        let names: Vec<u64> = match (indexed, ib) {
+            (true, Some((ia, _, fmt))) => {
+                let w = if fmt == 57 { 2 } else { 4 };
+                let at = ia as usize + w * first as usize;
+                if !crate::gpu::shader::readable(at, w * n) {
+                    continue;
+                }
+                (0..n).map(|k| if w == 2 { ((at + 2 * k) as *const u16).read_unaligned() as u64 } else { ((at + 4 * k) as *const u32).read_unaligned() as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
+            }
+            _ => (0..n as u64).map(|k| first as u64 + k).collect(),
+        };
+        let per = (stride as usize / 4).clamp(1, 12);
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let verts: Vec<String> = unique
+            .iter()
+            .take(24)
+            .map(|&i| {
+                let at = (a + i * stride as u64) as usize;
+                let w: Option<Vec<u32>> = crate::gpu::shader::readable(at, 4 * per).then(|| (0..per).map(|k| ((at + 4 * k) as *const u32).read_unaligned()).collect());
+                format!("v{i}: {w:x?}")
+            })
+            .collect();
+        crate::xlog_info!("frame trace: … its vertices at the present (VB {a:#x}, stride {stride}, indices {names:?}): {}", verts.join("; "));
+    }
+}
+
+fn vbs_first(list: *mut c_void) -> Option<(u32, (u64, u32, u32))> {
+    let mut first = None;
+    with_bindings(list, |b| first = b.vertex_titles.iter().next().map(|(&k, &v)| (k, v)));
+    first
+}
+
+/// The depth-stencil view handle a list last bound (`XCL_TRACE_FRAME`).
+pub(super) fn bound_dsv(list: *mut c_void) -> Option<usize> {
+    let mut d = None;
+    with_bindings(list, |b| d = b.render_targets.as_ref().and_then(|(_, _, h)| *h));
+    d
+}
+
+/// depth-stencil views bound by draws that read a watched target: their clears are traced
+static WATCHED_DSVS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub(super) fn watch_dsv(dsv: usize) {
+    let mut g = WATCHED_DSVS.lock().unwrap();
+    if !g.contains(&dsv) && g.len() < 8 {
+        g.push(dsv);
+    }
 }
 
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
@@ -1379,9 +1486,11 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
         })
         .collect();
     let kept = v.clone();
+    let titles: Vec<(u64, u32, u32)> = (0..n as usize).map(|k| { let t = views.add(k).read_unaligned(); (t.BufferLocation, t.SizeInBytes, t.StrideInBytes) }).collect();
     with_bindings(this, |b| {
         for (k, view) in kept.into_iter().enumerate() {
             b.vertex_buffers.insert(start + k as u32, view);
+            b.vertex_titles.insert(start + k as u32, titles[k]);
         }
     });
     f(this, start, n, v.as_ptr())
@@ -1397,6 +1506,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
         return set_index_buffer(this, None);
     }
     let mut v = view.read_unaligned();
+    s.bindings.index_title = Some((v.BufferLocation, v.SizeInBytes, v.Format.0));
     v.BufferLocation = pc_va(v.BufferLocation);
     s.index_buffer = Some(v);
     drop(g);
@@ -1493,6 +1603,15 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
+        if super::present::trace_frame() && ty == 0 {
+            let r = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+            if super::present::is_watched(r) {
+                static W: AtomicU64 = AtomicU64::new(0);
+                if W.fetch_add(1, Ordering::Relaxed) < 24 {
+                    crate::xlog_info!("frame trace: ResourceBarrier on a watched target {r:#x}: subresource {:#x}, {:#x} → {:#x}, flags {flags:#x}", b[4], b[5], b[6]);
+                }
+            }
+        }
         if ty > 2 || flags > 3 {
             if N.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!("D3D12.X: ResourceBarrier: console barrier type {ty} flags {flags:#x} dropped ({:x?})", b);
@@ -1586,6 +1705,30 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
+/// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
+/// object, or another at its title address (the first 16)
+unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
+    let Some(w) = super::present::watched_rt() else { return };
+    let addr = |r: usize| real::title_address(r).or_else(|| super::title_textures::address(r));
+    if !super::present::is_watched(src) && (addr(src).is_none() || addr(src) != addr(w)) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return;
+    }
+    if !super::present::is_presented(dst) {
+        super::present::follow(dst);
+    }
+    let d = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0) });
+    crate::xlog_info!(
+        "frame trace: {what} out of a watched target {src:#x} {:?} into {dst:#x} {:?}{}",
+        d(src),
+        d(dst),
+        if super::present::is_presented(dst) { " (presented)" } else { "" }
+    );
+}
+
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
     if let Some(d) = dst.as_ref() {
@@ -1624,6 +1767,40 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
             }
         }
     }
+    if super::present::trace_frame() {
+        if let (Some(d), Some(sl)) = (dst.as_ref(), src.as_ref()) {
+            trace_watched_copy("CopyTextureRegion", transmute_copy(&d.pResource), transmute_copy(&sl.pResource));
+            // footprints the PC's copy rules do not allow (row pitch: 256 bytes, offset: 512)
+            if sl.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+                let f = sl.Anonymous.PlacedFootprint;
+                if f.Footprint.RowPitch % 256 != 0 || f.Offset % 512 != 0 {
+                    // each (format, pitch alignment, offset alignment) once
+                    static SEEN: Mutex<Vec<(i32, u32, u64)>> = Mutex::new(Vec::new());
+                    let key = (f.Footprint.Format.0, f.Footprint.RowPitch % 256, f.Offset % 512);
+                    let new = {
+                        let mut g = SEEN.lock().unwrap();
+                        let n = !g.contains(&key) && g.len() < 24;
+                        if n {
+                            g.push(key);
+                        }
+                        n
+                    };
+                    if new {
+                        crate::xlog_info!(
+                            "frame trace: CopyTextureRegion from a footprint the PC does not take: offset {:#x}, format {}, {}x{}x{}, row pitch {} (box {:?}, to ({x}, {y}, {z}))",
+                            f.Offset,
+                            f.Footprint.Format.0,
+                            f.Footprint.Width,
+                            f.Footprint.Height,
+                            f.Footprint.Depth,
+                            f.Footprint.RowPitch,
+                            bx.as_ref().map(|b| (b.left, b.top, b.right, b.bottom))
+                        );
+                    }
+                }
+            }
+        }
+    }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
     std::mem::forget((d, s)); // borrowed resource pointers
@@ -1641,9 +1818,14 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
+        static W: AtomicU64 = AtomicU64::new(0);
         let k = N.fetch_add(1, Ordering::Relaxed);
-        if k < 8 || k.is_power_of_two() {
-            crate::xlog_info!("frame trace: ClearDepthStencilView #{k} {dsv:#x}: flags {flags:#x} (1 depth, 2 stencil), depth {depth}, stencil {stencil}, {n} rects");
+        let watched = WATCHED_DSVS.lock().unwrap().contains(&dsv);
+        if k < 8 || k.is_power_of_two() || (watched && W.fetch_add(1, Ordering::Relaxed) < 12) {
+            crate::xlog_info!(
+                "frame trace: ClearDepthStencilView #{k} {dsv:#x}{}: flags {flags:#x} (1 depth, 2 stencil), depth {depth}, stencil {stencil}, {n} rects",
+                if watched { " (bound by a draw reading a watched target)" } else { "" }
+            );
         }
     }
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
@@ -1700,6 +1882,9 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
+    if super::present::trace_frame() {
+        trace_watched_copy("CopyResource", dst, src);
+    }
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);

@@ -352,8 +352,17 @@ fn data_subdir(name: &str) -> PathBuf {
     p
 }
 
+/// Host folder behind the title's persistent local storage.
+fn pls_dir() -> PathBuf {
+    data_subdir("pls")
+}
+
+/// The PLS path the title is given. On the console PLS is a folder mounted at the root of a
+/// drive, and titles rely on it: Minecraft keeps only the drive name and builds
+/// "<drive>:/Users/<xuid>/games/com.mojang" from it. So the title gets the VFS drive that
+/// mounts `{data}\pls` ("S:\"); without such a mount, the host folder itself.
 fn pls_path() -> String {
-    data_subdir("pls").to_string_lossy().into_owned()
+    crate::state::config().pls_drive().unwrap_or_else(|| pls_dir().to_string_lossy().into_owned())
 }
 
 pub unsafe extern "system" fn XPersistentLocalStorageGetPathSize(size: *mut usize) -> HRESULT {
@@ -420,7 +429,7 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
     if info.is_null() {
         return E_INVALIDARG;
     }
-    let pls = pls_path();
+    let pls = pls_dir().to_string_lossy().into_owned();
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = GetDiskFreeSpaceExW(crate::util::wide(&pls).as_ptr(), &mut avail, &mut total, &mut free);
     // the title's quota (MicrosoftGame.Config <PersistentLocalStorage><SizeMB>, else 4 GiB)
@@ -435,7 +444,24 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
         avail = quota;
         free = quota;
     }
-    *info = pls_space_info(quota, used, avail, free);
+    let out = pls_space_info(quota, used, avail, free);
+    // titles judge "storage low/full" from these figures: log each new answer
+    static LAST: std::sync::Mutex<Option<(u64, u64, u64, u64)>> = std::sync::Mutex::new(None);
+    let now = (out.available_free_bytes, out.total_free_bytes, out.used_bytes, out.total_bytes);
+    if let Ok(mut last) = LAST.lock() {
+        if *last != Some(now) {
+            *last = Some(now);
+            crate::xlog_info!(
+                "XPersistentLocalStorageGetSpaceInfo: {} MiB available, {} MiB free, {} MiB used of {} MiB (host {})",
+                now.0 >> 20,
+                now.1 >> 20,
+                now.2 >> 20,
+                now.3 >> 20,
+                if ok == 0 { "unavailable" } else { "ok" }
+            );
+        }
+    }
+    *info = out;
     S_OK
 }
 

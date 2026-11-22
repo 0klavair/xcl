@@ -109,6 +109,22 @@ impl Config {
     }
 }
 
+/// Mount target of the persistent local storage drive (`XPersistentLocalStorageGetPath`).
+pub const PLS_MOUNT_TARGET: &str = "{data}\\pls";
+
+impl Config {
+    /// The console drive the title is given as its persistent local storage root ("S:\"):
+    /// the drive-letter mount onto `{data}\pls`. None when the mounts have no such drive.
+    pub fn pls_drive(&self) -> Option<String> {
+        self.mounts.iter().find_map(|(prefix, target)| {
+            let b = prefix.as_bytes();
+            let target = target.replace('/', "\\");
+            let is_drive = b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+            (is_drive && target.trim_end_matches('\\').eq_ignore_ascii_case(PLS_MOUNT_TARGET)).then(|| format!("{}\\", prefix.to_ascii_uppercase()))
+        })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut mounts = BTreeMap::new();
@@ -117,6 +133,8 @@ impl Default for Config {
         // the package drive of the XDK days, still used by GDK titles (XDefiant: d:\hunter\...)
         mounts.insert("D:".into(), "{game}".into());
         mounts.insert("T:".into(), "{data}\\temp".into());
+        // persistent local storage: on the console a folder mounted at the root of a drive
+        mounts.insert("S:".into(), PLS_MOUNT_TARGET.into());
         Config {
             device_type: "anaconda".into(),
             console_type_raw: 6,
@@ -248,6 +266,21 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+    }
+
+    #[test]
+    fn pls_drive_is_the_mount_onto_the_pls_folder() {
+        let mut c = Config::default();
+        assert_eq!(c.pls_drive().as_deref(), Some("S:\\"));
+        // a user-moved drive (any spelling of the target) is followed
+        c.mounts.remove("S:");
+        assert_eq!(c.pls_drive(), None);
+        c.mounts.insert("p:".into(), "{data}/PLS\\".into());
+        assert_eq!(c.pls_drive().as_deref(), Some("P:\\"));
+        // directory-style prefixes are not drives
+        c.mounts.remove("p:");
+        c.mounts.insert("PLS:".into(), PLS_MOUNT_TARGET.into());
+        assert_eq!(c.pls_drive(), None);
     }
 
     #[test]

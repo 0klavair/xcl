@@ -1113,6 +1113,27 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     }
 }
 
+/// WriteToSubresource(subresource, box, data, row pitch, depth pitch): the CPU writing texels.
+/// Every console resource is CPU-visible memory, a PC texture only in a CPU-visible heap.
+unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
+    let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if hr < 0 && FAILED.fetch_add(1, Ordering::Relaxed) < 8 {
+        let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+        let b = dst_box.as_ref().map(|b| (b.left, b.top, b.right, b.bottom));
+        crate::xlog_warn!(
+            "D3D12.X: WriteToSubresource({sub}, box {b:?}, row pitch {row_pitch}) of {:?} → {:#x} (call #{n})",
+            d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Layout.0, d.Flags.0)),
+            hr as u32
+        );
+    }
+    hr
+}
+
 /// resources the title placed at its own address that got a PC resource of their own: on the
 /// console Map gives that address (the CPU's view of the resource)
 static TITLE_ADDRESS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
@@ -1182,6 +1203,13 @@ static TRANSLATED_GRAPHICS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 /// Whether `pso` is a graphics pipeline of translated console shaders.
 /// `XCL_TRACE_FRAME`: the console VS and PS (their dump names' hashes) of a translated PSO.
 static PSO_SHADERS: Mutex<Option<HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+
+/// translated pipeline → its input layout as text (`XCL_TRACE_FRAME`)
+static PSO_LAYOUTS: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+
+pub fn pso_layout(pso: usize) -> Option<String> {
+    PSO_LAYOUTS.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
 
 pub fn pso_shaders(pso: usize) -> Option<(u64, u64)> {
     PSO_SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
@@ -1592,7 +1620,12 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         ]),
         Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
-        Kind::Resource => v.extend_from_slice(&[("Release", res_release as usize), ("Map", res_map as usize), ("Unmap", res_unmap as usize)]),
+        Kind::Resource => v.extend_from_slice(&[
+            ("Release", res_release as usize),
+            ("Map", res_map as usize),
+            ("Unmap", res_unmap as usize),
+            ("WriteToSubresource", res_write_to_subresource as usize),
+        ]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
@@ -1792,15 +1825,61 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     let d = super::device_x::pc_resource_desc(&x);
     let st = state as u32 & PC_RESOURCE_STATES;
     let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let heap_desc = pc_heap_desc(heap);
+    let pc_size = pc_allocation_size(this, &d);
+    // A texture the title placed by the console's size (`get_resource_allocation_info_x`
+    // answers with XG's) can be larger on the PC and run past the end of its heap, which the
+    // PC refuses – Minecraft then ended (0xC0000409). It gets memory of its own, of the
+    // heap's kind; the console's aliasing of that one placement is lost.
+    let is_texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+    let hr3 = match heap_desc {
+        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv)),
+        _ => None,
+    };
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        let sizes = format!(
+            "heap {:#x} bytes, PC size {:#x}{}",
+            heap_desc.map_or(0, |h| h.SizeInBytes),
+            pc_size,
+            if heap_desc.is_some_and(|h| offset as u64 + pc_size > h.SizeInBytes) { " – past the heap's end" } else { "" }
+        );
+        let own = hr3.map_or(String::new(), |h| format!("; memory of its own: {h:#x}"));
         crate::xlog_info!(
-            "D3D12.X: CreatePlacedResource(dimension {}, {}x{}, format {}, layout {:#x}, flags {:#x}, state {state:#x}) at {offset:#x} refused ({hr:#x}); the PC's way: {hr2:#x}",
+            "D3D12.X: CreatePlacedResource(dimension {}, {}x{}, format {}, layout {:#x}, flags {:#x}, state {state:#x}) at {offset:#x} refused ({hr:#x}); the PC's way: {hr2:#x} ({sizes}){own}",
             u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x2C), u(0x30)
         );
     }
-    hr2
+    hr3.unwrap_or(hr2)
+}
+
+/// `XCL_DEBUG_NO_STENCIL` / `XCL_DEBUG_NO_CULL` `=hash,…` (pixel shader dump hashes, hex):
+/// pipelines with those pixel shaders draw without their stencil test / culling – diagnostics
+/// for draws the fixed-function stages reject.
+fn debug_pso_switch(var: &str, ps: u64) -> bool {
+    ps != 0 && std::env::var(var).is_ok_and(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).any(|h| h == ps))
+}
+
+/// The PC description of a heap XCL adopted (ID3D12Heap::GetDesc, slot 8).
+unsafe fn pc_heap_desc(heap: usize) -> Option<D3D12_HEAP_DESC> {
+    if !is_adopted(heap as *mut c_void) {
+        return None;
+    }
+    type F = unsafe extern "system" fn(*mut c_void, *mut D3D12_HEAP_DESC) -> *mut D3D12_HEAP_DESC;
+    let f: F = std::mem::transmute(orig_fn(heap as *mut c_void, 8));
+    let mut h = D3D12_HEAP_DESC::default();
+    f(heap as *mut c_void, &mut h);
+    Some(h)
+}
+
+/// The PC driver's size for a (PC) resource description (GetResourceAllocationInfo, slot 25).
+unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
+    type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
+    let f: F = std::mem::transmute(orig_fn(device, 25));
+    let mut r = [0u64; 2];
+    f(device, &mut r, 0, 1, d);
+    r[0]
 }
 creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
@@ -2278,6 +2357,13 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     copy.VS = bytecode(&vs_dxil);
     copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+    if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
+        copy.DepthStencilState.StencilEnable = false.into();
+    }
+    if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
+        copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
     let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the PSO with the translated shaders ({hr:#x})"));
@@ -2289,8 +2375,19 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        // the input layout (semantic index, format, slot, offset) – what the vertices are read as
+        let il = &d.InputLayout;
+        let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
+            std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize)
+                .iter()
+                .map(|e| format!("{}{} fmt {} slot {} @{}", e.SemanticName.to_string().unwrap_or_default(), e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset as i32))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        PSO_LAYOUTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, elems.join(", "));
         static N: AtomicU64 = AtomicU64::new(0);
-        if N.fetch_add(1, Ordering::Relaxed) < 24 {
+        if N.fetch_add(1, Ordering::Relaxed) < 400 {
             let b = &d.BlendState.RenderTarget[0];
             let z = &d.DepthStencilState;
             crate::xlog_info!(

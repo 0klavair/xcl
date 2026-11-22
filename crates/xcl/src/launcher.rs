@@ -266,6 +266,11 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         eprintln!("xcl: writing {}: {e}", boot_path.display());
         return 2;
     }
+    // the previous run's log and report stay as *.prev.*: a failure that a retry does not
+    // repeat is still there to read
+    let logs = boot.logs_dir();
+    let _ = std::fs::rename(logs.join("xcl.log"), logs.join("xcl.prev.log"));
+    let _ = std::fs::rename(boot.report_path(), logs.join("report.prev.json"));
     let _ = std::fs::remove_file(boot.report_path());
 
     println!("XCL {} – starting '{title}'", env!("CARGO_PKG_VERSION"));

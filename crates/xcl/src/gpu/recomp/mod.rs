@@ -88,6 +88,28 @@ pub struct VsInterface {
     pub params: Option<Vec<u32>>,
 }
 
+impl VsInterface {
+    /// The first VGPR the fetch shader puts ISG1 register `register` in (None: not fetched).
+    pub fn input_vgpr(&self, register: u32) -> Option<u64> {
+        fetched_registers(&self.inputs).iter().position(|&r| r == register).map(|k| self.attr_base + 4 * k as u64)
+    }
+}
+
+/// The ISG1 registers the console's fetch shader loads, in the order of their VGPRs (four
+/// each from the first attribute VGPR): those the program reads (an element's ReadWriteMask).
+/// An input the program never reads gets no VGPRs – Minecraft's UI vertex shader declares
+/// COLOR0 r0, NORMAL0 r1 (unread), POSITION0 r2, TEXCOORD0 r3 and reads POSITION in v8, not
+/// in v[4 + 4·2]: counting the unread register put NORMAL where the position is read, and
+/// every vertex of those draws on one point (the create-world screen drew nothing). A
+/// signature that marks nothing as read (no such information) keeps every register.
+pub fn fetched_registers(inputs: &[SigElement]) -> Vec<u32> {
+    let any_read = inputs.iter().any(|e| e.rw_mask != 0);
+    let mut regs: Vec<u32> = inputs.iter().filter(|e| !any_read || e.rw_mask != 0).map(|e| e.register).collect();
+    regs.sort_unstable();
+    regs.dedup();
+    regs
+}
+
 /// Pixel shader interface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PsInterface {
@@ -1376,6 +1398,22 @@ mod attribute_tests {
         // no table: the attr-th register
         let ps = PsInterface { inputs, ..Default::default() };
         assert_eq!(ps_attribute_slot(&ps, 1, 0), Some(1));
+    }
+
+    /// Minecraft's UI vertex shader: an ISG1 input the program never reads (NORMAL0, r1) gets
+    /// no fetch-shader VGPRs – POSITION0 (r2) is read in v8, TEXCOORD0 (r3) in v12.
+    #[test]
+    fn unread_inputs_take_no_fetch_vgprs() {
+        let inputs = vec![input("COLOR", 0, 0, 0xF), input("NORMAL", 0, 1, 0), input("POSITION", 0, 2, 7), input("TEXCOORD", 0, 3, 3)];
+        assert_eq!(fetched_registers(&inputs), [0, 2, 3]);
+        let vs = VsInterface { inputs: inputs.clone(), attr_base: 4, ..Default::default() };
+        assert_eq!([0, 1, 2, 3].map(|r| vs.input_vgpr(r)), [Some(4), None, Some(8), Some(12)]);
+        // the ES variant starts at v9
+        let es = VsInterface { inputs, attr_base: 9, ..Default::default() };
+        assert_eq!(es.input_vgpr(3), Some(17));
+        // a signature without read masks keeps every register (v[base + 4r])
+        let unmarked = vec![input("COLOR", 0, 0, 0), input("NORMAL", 0, 1, 0), input("POSITION", 0, 2, 0)];
+        assert_eq!(fetched_registers(&unmarked), [0, 1, 2]);
     }
 
     /// Elements packed into one register (XDefiant: UV1 in .xy, UV0 in .zw) share a param /

@@ -153,6 +153,13 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuota(p: *mut Provider, quota
     }
     let used: u64 = std::fs::read_dir(&pr.root).into_iter().flatten().flatten().flat_map(|e| blobs_of(&e.path())).map(|b| b.2).sum();
     *quota = (QUOTA - used as i64).max(0);
+    static LAST: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+    if let Ok(mut last) = LAST.lock() {
+        if *last != Some(*quota) {
+            *last = Some(*quota);
+            crate::xlog_info!("XGameSaveGetRemainingQuota: {} KiB left of {} MiB", *quota >> 10, QUOTA >> 20);
+        }
+    }
     S_OK
 }
 

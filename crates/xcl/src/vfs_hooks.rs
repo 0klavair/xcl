@@ -211,6 +211,125 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------------------
+// Free space: a console drive (T:\, G:\, …) reports the host volume its mount lives on.
+// Untranslated, a console drive letter does not exist on the PC, the query fails and
+// titles read it as a full disk (Minecraft then refuses to create a world).
+// ---------------------------------------------------------------------------------------
+
+type FnDiskFreeExW = unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
+type FnDiskFreeExA = unsafe extern "system" fn(*const u8, *mut u64, *mut u64, *mut u64) -> i32;
+type FnDiskFreeW = unsafe extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32;
+type FnDiskFreeA = unsafe extern "system" fn(*const u8, *mut u32, *mut u32, *mut u32, *mut u32) -> i32;
+static O_DISK_FREE_EX_W: AtomicUsize = AtomicUsize::new(0);
+static O_DISK_FREE_EX_A: AtomicUsize = AtomicUsize::new(0);
+static O_DISK_FREE_W: AtomicUsize = AtomicUsize::new(0);
+static O_DISK_FREE_A: AtomicUsize = AtomicUsize::new(0);
+
+// A NULL directory (the current directory's volume) has no path to translate and passes through.
+
+static SPACE_LOGGED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// What a title learned about free space, once per queried directory: titles act on these
+/// figures (a failed or tiny answer reads as a full disk), so the log shows what they saw.
+/// Call right after the API: the title's last-error value survives the logging.
+fn log_space(api: &str, path: &str, real: Option<&str>, answer: Option<(u64, u64)>) {
+    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if let Ok(mut g) = SPACE_LOGGED.lock() {
+        let seen = g.get_or_insert_with(HashSet::new);
+        if seen.len() < 64 && seen.insert(format!("{api}|{}", path.to_lowercase())) {
+            let host = match real {
+                Some(r) if r != path => format!(" (host {r})"),
+                _ => String::new(),
+            };
+            match answer {
+                Some((avail, total)) => crate::xlog_info!("{api}({path}){host}: {} MiB available of {} MiB", avail >> 20, total >> 20),
+                None => crate::xlog_warn!("{api}({path}){host} failed (error {err})"),
+            }
+        }
+    }
+    unsafe { SetLastError(err) };
+}
+
+/// `GetDiskFreeSpaceW` figures in bytes: (free clusters, total clusters) × bytes per cluster.
+unsafe fn clusters_to_bytes(spc: *const u32, bps: *const u32, nfree: *const u32, ntotal: *const u32) -> Option<(u64, u64)> {
+    if spc.is_null() || bps.is_null() || nfree.is_null() || ntotal.is_null() {
+        return None;
+    }
+    let cluster = *spc as u64 * *bps as u64;
+    Some((*nfree as u64 * cluster, *ntotal as u64 * cluster))
+}
+
+unsafe fn ex_answer(ok: i32, avail: *const u64, total: *const u64) -> Option<(u64, u64)> {
+    (ok != 0).then(|| (avail.as_ref().copied().unwrap_or(0), total.as_ref().copied().unwrap_or(0)))
+}
+
+unsafe extern "system" fn hk_disk_free_ex_w(n: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_W as FnDiskFreeExW);
+    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
+    let Some(path) = from_wide_ptr(n) else { return orig(n, avail, total, free) };
+    let (r, real) = match read_target(&path) {
+        None => (orig(n, avail, total, free), None),
+        Some(Ok(p)) => (orig(wide(&p).as_ptr(), avail, total, free), Some(p)),
+        Some(Err(e)) => {
+            SetLastError(e);
+            (0, None)
+        }
+    };
+    log_space("GetDiskFreeSpaceExW", &path, real.as_deref(), ex_answer(r, avail, total));
+    r
+}
+
+unsafe extern "system" fn hk_disk_free_ex_a(n: *const u8, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32 {
+    let orig = orig!(O_DISK_FREE_EX_A as FnDiskFreeExA);
+    let Some(_g) = Guard::enter() else { return orig(n, avail, total, free) };
+    let Some(path) = from_ansi_ptr(n) else { return orig(n, avail, total, free) };
+    let (r, real) = match read_target(&path) {
+        None => (orig(n, avail, total, free), None),
+        Some(Ok(p)) => (orig!(O_DISK_FREE_EX_W as FnDiskFreeExW)(wide(&p).as_ptr(), avail, total, free), Some(p)),
+        Some(Err(e)) => {
+            SetLastError(e);
+            (0, None)
+        }
+    };
+    log_space("GetDiskFreeSpaceExA", &path, real.as_deref(), ex_answer(r, avail, total));
+    r
+}
+
+unsafe extern "system" fn hk_disk_free_w(n: *const u16, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
+    let orig = orig!(O_DISK_FREE_W as FnDiskFreeW);
+    let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
+    let Some(path) = from_wide_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
+    let (r, real) = match read_target(&path) {
+        None => (orig(n, spc, bps, nfree, ntotal), None),
+        Some(Ok(p)) => (orig(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
+        Some(Err(e)) => {
+            SetLastError(e);
+            (0, None)
+        }
+    };
+    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
+    log_space("GetDiskFreeSpaceW", &path, real.as_deref(), answer);
+    r
+}
+
+unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut u32, nfree: *mut u32, ntotal: *mut u32) -> i32 {
+    let orig = orig!(O_DISK_FREE_A as FnDiskFreeA);
+    let Some(_g) = Guard::enter() else { return orig(n, spc, bps, nfree, ntotal) };
+    let Some(path) = from_ansi_ptr(n) else { return orig(n, spc, bps, nfree, ntotal) };
+    let (r, real) = match read_target(&path) {
+        None => (orig(n, spc, bps, nfree, ntotal), None),
+        Some(Ok(p)) => (orig!(O_DISK_FREE_W as FnDiskFreeW)(wide(&p).as_ptr(), spc, bps, nfree, ntotal), Some(p)),
+        Some(Err(e)) => {
+            SetLastError(e);
+            (0, None)
+        }
+    };
+    let answer = if r != 0 { clusters_to_bytes(spc, bps, nfree, ntotal) } else { None };
+    log_space("GetDiskFreeSpaceA", &path, real.as_deref(), answer);
+    r
+}
+
+// ---------------------------------------------------------------------------------------
 // Directory / delete / move / copy
 // ---------------------------------------------------------------------------------------
 
@@ -605,6 +724,10 @@ pub fn install() -> Result<(), String> {
         ("GetFileAttributesExW", hk_get_attr_ex_w as usize, &O_GET_ATTR_EX_W),
         ("GetFileAttributesExA", hk_get_attr_ex_a as usize, &O_GET_ATTR_EX_A),
         ("SetFileAttributesW", hk_set_attr_w as usize, &O_SET_ATTR_W),
+        ("GetDiskFreeSpaceExW", hk_disk_free_ex_w as usize, &O_DISK_FREE_EX_W),
+        ("GetDiskFreeSpaceExA", hk_disk_free_ex_a as usize, &O_DISK_FREE_EX_A),
+        ("GetDiskFreeSpaceW", hk_disk_free_w as usize, &O_DISK_FREE_W),
+        ("GetDiskFreeSpaceA", hk_disk_free_a as usize, &O_DISK_FREE_A),
         ("CreateDirectoryW", hk_create_dir_w as usize, &O_CREATE_DIR_W),
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),

@@ -1151,6 +1151,17 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   helper lanes, so they never stop. Ballots (v_cmp) still leave helper lanes out (matters for branches inside
   whole-quad sections). The console sets IASetPrimitiveTopology 17 (rectangle lists) for these quads; the AMD driver
   draws them as two triangles here – rectangle lists are not modelled otherwise.
+- **Helper lanes of other quads (fixed, 2026-11-22)**: Minecraft's Ore UI (create-world screen) had white dashed
+  bands along the shared diagonal and the edges of its image and text quads, in runs as wide as a wave. Its UI pixel
+  shader (Renoir) reads the draw type with `v_readfirstlane` after `s_wqm`; the first lane of EXEC is often a helper
+  lane on a primitive's edge, and a wave read of another quad's helper lane is undefined before SM 6.7 (0 in
+  practice): the wave's other quads took the type-0 branch (a solid quad in the vertex colour). `rla` now takes
+  such a lane's value with a quad read inside its own quad and a wave read from a live lane of that quad. Also from
+  this work: an ISG1 input the VS never reads gets no fetch-shader VGPRs (`fetched_registers` – the create-world
+  screen drew nothing); a placed texture larger on the PC than its console size gets memory of its own (Minecraft
+  ended with 0xC0000409); PLS is a drive root (`S:\`) and the disk-space APIs answer for console paths ("very little
+  free space"). Diagnostics: `XCL_TRACE_SHADERS`, `XCL_TRACE_MANY`, `XCL_FRAME_DUMP_FULL`, `XCL_DEBUG_PS_SUB`,
+  `XCL_DEBUG_PS_EXPR`, `XCL_DEBUG_MAGENTA`, `XCL_DEBUG_LOD0`, `XCL_DEBUG_NO_STENCIL` / `NO_CULL`, `XCL_PRESS_AT`.
 - **Why every frame was black: descriptors are values.** XDefiant makes its views in a CPU-only heap (131 072
   slots) and copies them into its shader-visible heap (442 368 slots) as memory – the console header's inline
   CopyDescriptorsSimple; only sampler copies reach the device. T# word 0 was an index into each heap's own PC heap,

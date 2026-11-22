@@ -54,6 +54,16 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if !PRESENTX.swap(true, Ordering::Relaxed) {
         crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
+    {
+        // a change in the number of planes (the console's display composes them – a UI
+        // plane over the game's): logged with the planes' raw words
+        static LAST: AtomicU64 = AtomicU64::new(1);
+        if LAST.swap(plane_count as u64, Ordering::Relaxed) != plane_count as u64 {
+            let n = 8 * plane_count as usize;
+            let words: Vec<u64> = if crate::gpu::shader::readable(planes as usize, 8 * n) { (0..n).map(|k| (planes as *const u64).add(k).read_unaligned()).collect() } else { Vec::new() };
+            crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
+        }
+    }
     let count = (planes.add(8) as *const u32).read_unaligned();
     let list = (planes.add(0x10) as *const usize).read_unaligned();
     if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
@@ -68,6 +78,9 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
         if !p.contains(&res) {
             p.push(res);
         }
+    }
+    if trace_frame() {
+        super::list_x::dump_pending_geometry();
     }
     if trace_frame() {
         static K: AtomicU64 = AtomicU64::new(0);
@@ -500,15 +513,20 @@ unsafe fn present_now(min_interval: Duration) {
     let due = frame_dump_due();
     let dump = due.then(|| readback_copy(&p.list, src, &desc)).flatten();
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
-    let rt_dump = if due && trace_frame() {
-        busiest_rt().and_then(|r| {
-            let rr = r as *mut c_void;
-            let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
-            let d = res.GetDesc();
-            readback_copy(&p.list, &res, &d).map(|x| (x, d.Format))
-        })
+    // (and the targets the watched one's contents went on to: rt_<n>_<k>)
+    let rt_dump: Vec<_> = if due && trace_frame() {
+        busiest_rt()
+            .into_iter()
+            .chain(FOLLOWED.lock().unwrap().iter().copied())
+            .filter_map(|r| {
+                let rr = r as *mut c_void;
+                let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
+                let d = res.GetDesc();
+                (d.SampleDesc.Count <= 1).then(|| readback_copy(&p.list, &res, &d).map(|x| (x, d.Format))).flatten()
+            })
+            .collect()
     } else {
-        None
+        Vec::new()
     };
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
@@ -530,8 +548,8 @@ unsafe fn present_now(min_interval: Duration) {
         }
         write_frame(&rb, &fp, desc.Format, "frame");
     }
-    if let Some(((rb, fp), f)) = rt_dump {
-        write_frame(&rb, &fp, f, "rt");
+    for (k, ((rb, fp), f)) in rt_dump.into_iter().enumerate() {
+        write_frame(&rb, &fp, f, &if k == 0 { "rt".to_string() } else { format!("rt{k}") });
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
@@ -540,7 +558,7 @@ unsafe fn present_now(min_interval: Duration) {
 }
 
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder
-/// (`frame_<n>.bmp`, a quarter of each side) – what the title presented, before the window.
+/// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 20
@@ -597,9 +615,52 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     })
 }
 
+/// the largest render target the draws `XCL_TRACE_SHADERS` picked drew into (AddRef'd): the
+/// one the `XCL_TRACE_FRAME` dumps show instead of the busiest
+static WATCHED_RT: Mutex<Option<usize>> = Mutex::new(None);
+/// targets that what the watched one holds went on to (drawn or copied from it; AddRef'd)
+static FOLLOWED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub fn watched_rt() -> Option<usize> {
+    *WATCHED_RT.lock().unwrap()
+}
+
+/// The watched target or one its contents went on to.
+pub fn is_watched(r: usize) -> bool {
+    watched_rt() == Some(r) || FOLLOWED.lock().unwrap().contains(&r)
+}
+
+/// `r` now holds (some of) what the watched target held: its readers are traced too.
+pub unsafe fn follow(r: usize) {
+    let mut g = FOLLOWED.lock().unwrap();
+    if r == 0 || g.contains(&r) || g.len() >= 6 || watched_rt() == Some(r) {
+        return;
+    }
+    add_ref(r);
+    g.push(r);
+}
+
+pub unsafe fn watch_rt(rt: usize) {
+    let area = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map_or(0, |x| {
+        let d = x.GetDesc();
+        if d.SampleDesc.Count > 1 { 0 } else { d.Width * d.Height as u64 }
+    });
+    let mut g = WATCHED_RT.lock().unwrap();
+    if *g == Some(rt) || area(rt) <= g.map_or(0, area) {
+        return;
+    }
+    add_ref(rt);
+    if let Some(old) = g.replace(rt) {
+        release(old);
+    }
+}
+
 /// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
 /// multisampled one cannot be copied to a buffer – the present list would not close)
 fn busiest_rt() -> Option<usize> {
+    if let Some(r) = *WATCHED_RT.lock().unwrap() {
+        return Some(r);
+    }
     let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
     USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
 }
@@ -621,7 +682,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         return;
     }
     let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
-    let (ow, oh) = ((w / 4).max(1), (h / 4).max(1));
+    // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
+    let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { 4 };
+    let (ow, oh) = ((w / step).max(1), (h / step).max(1));
     let row = (ow * 3).div_ceil(4) * 4;
     let mut bmp = Vec::with_capacity(54 + row * oh);
     let size = (54 + row * oh) as u32;
@@ -639,7 +702,7 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     for y in (0..oh).rev() {
         let start = bmp.len();
         for x in 0..ow {
-            let t = ((p as *const u8).add(fp.Offset as usize + 4 * y * pitch + 16 * x) as *const u32).read_unaligned();
+            let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
             *raw.entry(t).or_default() += 1;
             let c = rgb(format, t).unwrap_or_else(|| {
                 decoded = false;

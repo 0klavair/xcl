@@ -60,6 +60,13 @@ extern "system" {
     fn LoadLibraryW(name: *const u16) -> usize;
 }
 
+// The API set console titles import these from (Minecraft does), not kernel32.
+#[link(name = "api-ms-win-core-file-l1-1-0", kind = "raw-dylib")]
+extern "system" {
+    fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    fn GetDiskFreeSpaceW(root: *const u16, spc: *mut u32, bps: *mut u32, free: *mut u32, total: *mut u32) -> i32;
+}
+
 #[link(name = "gameinput", kind = "raw-dylib")]
 extern "system" {
     fn GameInputCreate(out: *mut *mut c_void) -> HRESULT;
@@ -451,6 +458,17 @@ fn main() {
         Ok(())
     });
 
+    check("files: T:\\ free space (the host volume behind the mount)", || unsafe {
+        let t = wide("T:\\");
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        ensure!(GetDiskFreeSpaceExW(t.as_ptr(), &mut avail, &mut total, &mut free) != 0, "GetDiskFreeSpaceExW(T:\\) failed");
+        ensure!(total > 0 && avail > 0 && avail <= total && free <= total, "avail {avail} free {free} total {total}");
+        let (mut spc, mut bps, mut nfc, mut tnc) = (0u32, 0u32, 0u32, 0u32);
+        ensure!(GetDiskFreeSpaceW(t.as_ptr(), &mut spc, &mut bps, &mut nfc, &mut tnc) != 0, "GetDiskFreeSpaceW(T:\\) failed");
+        ensure!(spc > 0 && bps > 0 && tnc > 0, "spc {spc} bps {bps} total clusters {tnc}");
+        Ok(())
+    });
+
     check("XGameRuntime: initialize + package identity", || unsafe {
         ensure!(XGameRuntimeInitialize() == 0, "init");
         let mut buf = [0u8; 256];
@@ -566,6 +584,22 @@ fn main() {
         let mut used = 0usize;
         ensure!(XPersistentLocalStorageGetPath(512, pls.as_mut_ptr(), &mut used) == 0, "pls");
         ensure!(std::path::Path::new(&cstr(&pls)).is_dir(), "pls dir {}", cstr(&pls));
+        Ok(())
+    });
+
+    check("XPersistentLocalStorage: a drive root, as on the console", || unsafe {
+        let mut pls = [0u8; 512];
+        let mut used = 0usize;
+        ensure!(XPersistentLocalStorageGetPath(512, pls.as_mut_ptr(), &mut used) == 0, "pls");
+        let root = cstr(&pls);
+        ensure!(root.len() == 3 && root.ends_with(":\\"), "PLS path {root:?} is not a drive root");
+        // Minecraft keeps only the drive name and builds "<drive>:/Users/<xuid>/games/com.mojang"
+        let dir = format!("{}:/Users/xcl/games", &root[..1]);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {dir}: {e}"))?;
+        std::fs::write(format!("{dir}/world.dat"), b"blocks").map_err(|e| format!("write {dir}/world.dat: {e}"))?;
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        ensure!(GetDiskFreeSpaceExW(wide(&dir).as_ptr(), &mut avail, &mut total, &mut free) != 0, "GetDiskFreeSpaceExW({dir}) failed");
+        ensure!(avail > 0 && avail <= total, "avail {avail} total {total}");
         Ok(())
     });
 

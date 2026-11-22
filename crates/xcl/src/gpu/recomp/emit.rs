@@ -3556,8 +3556,8 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
                     // SV_VertexID / SV_InstanceID listed in ISG1 come through the fetch shader like an
-                    // attribute: v[base + 4r] (retail VInstanced* read the instance id in v8 = r1)
-                    let sv_at = vs.inputs.iter().find(|e| matches!(e.system_value, 6 | 8) && v == vs.attr_base + 4 * e.register as u64);
+                    // attribute (retail VInstanced* read the instance id in v8 = r1)
+                    let sv_at = vs.inputs.iter().find(|e| matches!(e.system_value, 6 | 8) && vs.input_vgpr(e.register) == Some(v));
                     let init = if v == 0 {
                         "xi.xcl_vid".to_string()
                     } else if v == 3 {
@@ -3565,10 +3565,10 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     } else if let Some(e) = sv_at {
                         if e.system_value == 6 { "xi.xcl_vid" } else { "xi.xcl_iid" }.to_string()
                     } else {
+                        // the fetch shader's VGPRs: four per register the program reads (`fetched_registers`)
                         inputs
                             .iter()
-                            .find(|e| v >= vs.attr_base + 4 * e.register as u64 && v < vs.attr_base + 4 * e.register as u64 + 4)
-                            .map(|e| format!("asuint(xi.a{}[{}])", e.register, v - vs.attr_base - 4 * e.register as u64))
+                            .find_map(|e| vs.input_vgpr(e.register).filter(|&b| v >= b && v < b + 4).map(|b| format!("asuint(xi.a{}[{}])", e.register, v - b)))
                             .unwrap_or_else(|| "0u".into())
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
@@ -3647,6 +3647,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                     let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
                     let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                     let nreg = g.input_registers();
+                    let fetched = super::fetched_registers(&g.es_inputs);
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                     h.push_str("[WaveSize(64)]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{\n");
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
@@ -3669,8 +3670,10 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                             1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
                             2 => "xcl_p0 + lane_id".to_string(),
                             5 => "xcl_p0 * 3u + lane_id".to_string(),
-                            v if v >= 9 && v < 9 + 4 * nreg as u64 => {
-                                let (r, c) = ((v - 9) / 4, (v - 9) % 4);
+                            // the fetch shader's VGPRs: four per register the ES reads (`fetched_registers`);
+                            // the pre-fetched vertices hold one float4 per register
+                            v if v >= 9 && ((v - 9) / 4) < fetched.len() as u64 && fetched[((v - 9) / 4) as usize] < nreg => {
+                                let (r, c) = (fetched[((v - 9) / 4) as usize], (v - 9) % 4);
                                 format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
                             }
                             _ => "0u".to_string(),
@@ -3705,6 +3708,7 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                 let (maxv, maxp) = (rec.max_vertices, rec.max_primitives);
                 let maxt = g.max_vertex_count.saturating_sub(2).max(1);
                 let nreg = g.input_registers();
+                let fetched = super::fetched_registers(&g.es_inputs);
                 let native_lanes = if self.opt.geometry_wave32 { 32 } else { 64 };
                 h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads(64, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
@@ -3738,8 +3742,10 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
                             1 => format!("(lane_id < xcl_np) ? ((lane_id * 3u + 2u) * {item}u) : 0u"),
                             2 => "xcl_p0 + lane_id".to_string(),
                             5 => "xcl_p0 * 3u + lane_id".to_string(),
-                            v if v >= 9 && v < 9 + 4 * nreg as u64 => {
-                                let (r, c) = ((v - 9) / 4, (v - 9) % 4);
+                            // the fetch shader's VGPRs: four per register the ES reads (`fetched_registers`);
+                            // the pre-fetched vertices hold one float4 per register
+                            v if v >= 9 && ((v - 9) / 4) < fetched.len() as u64 && fetched[((v - 9) / 4) as usize] < nreg => {
+                                let (r, c) = (fetched[((v - 9) / 4) as usize], (v - 9) % 4);
                                 format!("(lane_id < xcl_nv) ? mem.Load(xcl_vin + ((xcl_p0 * 3u + lane_id) * {nreg}u + {r}u) * 16u + {}u) : 0u", c * 4)
                             }
                             _ => "0u".to_string(),
@@ -4455,6 +4461,19 @@ uint rla(uint v, uint l) {
     // helper pixels of a quad a primitive's edge splits.
     uint q0 = QuadReadLaneAt(v, 0u), q1 = QuadReadLaneAt(v, 1u), q2 = QuadReadLaneAt(v, 2u), q3 = QuadReadLaneAt(v, 3u);
     uint q = (l & 2u) != 0u ? ((l & 1u) != 0u ? q3 : q2) : ((l & 1u) != 0u ? q1 : q0);
+    // A helper lane of another quad: after s_wqm the console's v_readfirstlane often picks
+    // one (the first lane of EXEC on a primitive's edge), and a wave read of it is undefined
+    // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
+    // draw type, and took the wrong branch). Its own quad sees it through a quad read; the
+    // reader takes that from a live lane of the same quad.
+    uint h = xcl_logical_wave64 ? (l & 31u) : l + 32u * xcl_half;
+    uint4 xcl_lv = WaveActiveBallot(true);
+    uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
+    uint src = (h & ~3u) + firstbitlow(nib);
+    uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
+    uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
+    bool same_half = !xcl_logical_wave64 || (l >> 5) == xcl_half;
+    if (same_half && nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
     if ((l >> 2) == (lane_id >> 2)) w = q;
 #endif
     return w;

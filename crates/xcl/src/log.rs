@@ -44,6 +44,11 @@ static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static ECHO: AtomicBool = AtomicBool::new(true);
 static START: OnceLock<Instant> = OnceLock::new();
 
+/// Seconds since the log started (the host's start) – the times log lines carry.
+pub fn uptime() -> f64 {
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 pub fn init(path: Option<&Path>, level: Level, echo_stderr: bool) {
     START.get_or_init(Instant::now);
     LEVEL.store(level as u8, Ordering::Relaxed);

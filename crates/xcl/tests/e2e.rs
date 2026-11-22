@@ -147,6 +147,8 @@ fn test_title_runs_and_game_folder_is_untouched() {
     assert!(wo.lines().any(|l| l == "data\\delete_me.txt"), "whiteouts: {wo}");
     assert!(tdata.join("temp").join("scratch.tmp").is_file());
     assert!(tdata.join("saves").join("test-scid").join("slot0.sav").is_file());
+    // the PLS drive (S:\) is the data folder's pls
+    assert_eq!(std::fs::read(tdata.join("pls").join("Users").join("xcl").join("games").join("world.dat")).unwrap(), b"blocks");
 
     // (4) report
     let report: serde_json::Value =

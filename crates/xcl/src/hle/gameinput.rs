@@ -150,12 +150,48 @@ fn start() -> Instant {
     *T.get_or_init(Instant::now)
 }
 
-/// `XCL_PRESS_A_AT`: seconds after start at which A is held for 200 ms
-fn scripted_a() -> bool {
-    static AT: OnceLock<Vec<f64>> = OnceLock::new();
-    let at = AT.get_or_init(|| std::env::var("XCL_PRESS_A_AT").ok().map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect()).unwrap_or_default());
-    let t = start().elapsed().as_secs_f64();
-    at.iter().any(|&s| t >= s && t < s + 0.2)
+/// A button by its name in `XCL_PRESS_AT`.
+fn button_named(name: &str) -> Option<u32> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "A" => A,
+        "B" => B,
+        "X" => X,
+        "Y" => Y,
+        "UP" => DPAD_UP,
+        "DOWN" => DPAD_DOWN,
+        "LEFT" => DPAD_LEFT,
+        "RIGHT" => DPAD_RIGHT,
+        "MENU" => MENU,
+        "VIEW" => VIEW,
+        "LB" => LEFT_SHOULDER,
+        "RB" => RIGHT_SHOULDER,
+        _ => return None,
+    })
+}
+
+/// `XCL_PRESS_AT=s:BUTTON,…` ("14:A,18.5:DOWN,20:A"; buttons A B X Y UP DOWN LEFT RIGHT MENU
+/// VIEW LB RB) and `XCL_PRESS_A_AT=s,…`: buttons held for 200 ms at those seconds after the
+/// host started (the log's times) – a title's menus walked without a person at the controls.
+fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
+    let mut v: Vec<(f64, u32)> = a_only.split(',').filter_map(|s| s.trim().parse().ok()).map(|s| (s, A)).collect();
+    for item in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match item.split_once(':').and_then(|(s, b)| Some((s.trim().parse::<f64>().ok()?, button_named(b.trim())?))) {
+            Some(p) => v.push(p),
+            None => crate::xlog_warn!("GameInput: XCL_PRESS_AT entry {item:?} not understood (seconds:BUTTON)"),
+        }
+    }
+    v
+}
+
+fn scripted() -> u32 {
+    static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
+    let at = AT.get_or_init(|| {
+        let var = |n: &str| std::env::var(n).unwrap_or_default();
+        parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
+    });
+    // seconds since the host started, as the log's times (not since the title first polled)
+    let t = crate::log::uptime();
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
 }
 
 #[link(name = "user32")]
@@ -203,9 +239,7 @@ pub fn poll() -> GamepadState {
         }
     }
     s.buttons |= unsafe { keyboard() };
-    if scripted_a() {
-        s.buttons |= A;
-    }
+    s.buttons |= scripted();
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -371,17 +405,31 @@ fn reading_vtable() -> *const usize {
             (4, reading_sequence as usize),
             (5, reading_timestamp as usize),
             (6, reading_device as usize),
-            (7, no_state as usize),
+            (7, no_state::<7> as usize),
             (22, reading_gamepad as usize),
             (24, reading_ui_navigation as usize),
         ];
-        // counts and array states: none
-        for i in [8, 9, 10, 11, 12, 13, 14, 15, 17, 18] {
-            set.push((i, zero_count as usize));
+        // counts and array states: none (each logged on its first call – which views of
+        // the device a title reads)
+        let counts: [usize; 10] = [
+            zero_count::<8> as usize,
+            zero_count::<9> as usize,
+            zero_count::<10> as usize,
+            zero_count::<11> as usize,
+            zero_count::<12> as usize,
+            zero_count::<13> as usize,
+            zero_count::<14> as usize,
+            zero_count::<15> as usize,
+            zero_count::<17> as usize,
+            zero_count::<18> as usize,
+        ];
+        for (i, f) in [8, 9, 10, 11, 12, 13, 14, 15, 17, 18].into_iter().zip(counts) {
+            set.push((i, f));
         }
         // mouse, motion, arcade / flight stick, racing wheel: not this device
-        for i in [16, 19, 20, 21, 23] {
-            set.push((i, no_state as usize));
+        let states: [usize; 5] = [no_state::<16> as usize, no_state::<19> as usize, no_state::<20> as usize, no_state::<21> as usize, no_state::<23> as usize];
+        for (i, f) in [16, 19, 20, 21, 23].into_iter().zip(states) {
+            set.push((i, f));
         }
         vtable("IGameInputReading", 32, &set) as usize
     }) as *const usize
@@ -447,7 +495,23 @@ fn ours(device: *mut c_void) -> bool {
     device.is_null() || device == self::device() as *mut c_void
 }
 
+/// A GameInput query of a kind not seen before: worth a line (which input a title reads how).
+fn note_query(what: &str, kind: u32) {
+    static SEEN: Mutex<Vec<(&'static str, u32)>> = Mutex::new(Vec::new());
+    let what: &'static str = match what {
+        "GetCurrentReading" => "GetCurrentReading",
+        "GetNext/PreviousReading" => "GetNext/PreviousReading",
+        _ => "RegisterReadingCallback",
+    };
+    let mut g = SEEN.lock().unwrap();
+    if g.len() < 32 && !g.contains(&(what, kind)) {
+        g.push((what, kind));
+        crate::xlog_info!("GameInput: {what} for kinds {kind:#x} first asked");
+    }
+}
+
 unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+    note_query("GetCurrentReading", kind);
     if out.is_null() {
         return E_POINTER;
     }
@@ -460,7 +524,8 @@ unsafe extern "system" fn get_current_reading(_this: *mut Object, kind: u32, dev
 }
 
 /// the readings before and after one are not kept
-unsafe extern "system" fn other_reading(_this: *mut Object, _reference: *mut c_void, _kind: u32, _dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+unsafe extern "system" fn other_reading(_this: *mut Object, _reference: *mut c_void, kind: u32, _dev: *mut c_void, out: *mut *mut Reading) -> HRESULT {
+    note_query("GetNext/PreviousReading", kind);
     if !out.is_null() {
         *out = std::ptr::null_mut();
     }
@@ -481,6 +546,7 @@ static READING_CALLBACKS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new(
 
 /// RegisterReadingCallback(device, kind, analog threshold, context, callback, &token)
 unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _threshold: f32, context: *mut c_void, cb: Option<ReadingCallback>, token: *mut u64) -> HRESULT {
+    note_query("RegisterReadingCallback", kind);
     let t = TOKENS.fetch_add(1, Ordering::Relaxed) + 1;
     if !token.is_null() {
         *token = t;
@@ -619,10 +685,42 @@ unsafe extern "system" fn reading_device(_this: *mut Reading, out: *mut *mut Obj
         *out = device();
     }
 }
-unsafe extern "system" fn zero_count(_this: *mut Reading, _a: u32, _b: *mut c_void) -> u32 {
+/// IGameInputReading method names by slot (the logged ones)
+fn reading_method(slot: usize) -> &'static str {
+    match slot {
+        7 => "GetRawReport",
+        8 => "GetControllerAxisCount",
+        9 => "GetControllerAxisState",
+        10 => "GetControllerButtonCount",
+        11 => "GetControllerButtonState",
+        12 => "GetControllerSwitchCount",
+        13 => "GetControllerSwitchState",
+        14 => "GetKeyCount",
+        15 => "GetKeyState",
+        16 => "GetMouseState",
+        17 => "GetTouchCount",
+        18 => "GetTouchState",
+        19 => "GetMotionState",
+        20 => "GetArcadeStickState",
+        21 => "GetFlightStickState",
+        23 => "GetRacingWheelState",
+        _ => "?",
+    }
+}
+
+fn note_reading_call(slot: usize) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_or(1 << slot, Ordering::Relaxed) & (1 << slot) == 0 {
+        crate::xlog_info!("GameInput: IGameInputReading::{} first called (answered: none)", reading_method(slot));
+    }
+}
+
+unsafe extern "system" fn zero_count<const SLOT: usize>(_this: *mut Reading, _a: u32, _b: *mut c_void) -> u32 {
+    note_reading_call(SLOT);
     0
 }
-unsafe extern "system" fn no_state(_this: *mut Reading, _out: *mut c_void) -> bool {
+unsafe extern "system" fn no_state<const SLOT: usize>(_this: *mut Reading, _out: *mut c_void) -> bool {
+    note_reading_call(SLOT);
     false
 }
 unsafe extern "system" fn reading_gamepad(this: *mut Reading, out: *mut GamepadState) -> bool {
@@ -683,5 +781,12 @@ mod tests {
             assert_eq!(reading_release(r), 0);
             assert_eq!(get_current_reading(g, 0x10, std::ptr::null_mut(), &mut r), GAMEINPUT_E_READING_NOT_FOUND, "keyboard kind");
         }
+    }
+
+    #[test]
+    fn press_script_parses_buttons_and_times() {
+        let v = parse_presses("14:A, 18.5:down,20:Rb,junk,3:NOPE", "1,2.5");
+        assert_eq!(v, vec![(1.0, A), (2.5, A), (14.0, A), (18.5, DPAD_DOWN), (20.0, RIGHT_SHOULDER)]);
+        assert!(parse_presses("", "").is_empty());
     }
 }

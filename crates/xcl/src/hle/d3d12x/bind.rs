@@ -192,13 +192,20 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
 
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+    DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
         list.DrawInstanced(vertices, instances, first_vertex, first_instance);
     }
 }
 
+thread_local! {
+    /// the draw being bound: (indexed, count, instances, first index / vertex, base vertex) – for the frame trace
+    static DRAW_ARGS: std::cell::Cell<(bool, u32, u32, u32, i32)> = const { std::cell::Cell::new((false, 0, 0, 0, 0)) };
+}
+
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
     if let Some(list) = graphics_bound(this) {
         list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
     }
@@ -255,20 +262,23 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
 /// `XCL_TRACE_FRAME`, after 300 presents: one line per distinct (VS, PS, render target) drawn –
 /// the shaders' dump hashes, the target and the textures of the first descriptor table.
 unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
-    static SEEN: Mutex<Vec<(u64, u64, usize)>> = Mutex::new(Vec::new());
+    // keyed by the target's shape, not the object: a UI library's transient targets (Renoir's
+    // layers) are new objects every frame and would fill the list at once
+    static SEEN: Mutex<Vec<(u64, u64, Option<(u64, u32, i32, u32)>)>> = Mutex::new(Vec::new());
     if super::present::activity().0 < 300 {
         return;
     }
     let Some((vs, ps)) = super::real::pso_shaders(super::pso_async::resolve(pso)) else { return };
     let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
+    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
     {
         let mut g = SEEN.lock().unwrap();
-        if g.len() >= 80 || g.contains(&(vs, ps, rt)) {
+        let key = (vs, ps, desc(rt));
+        if g.len() >= 160 || g.contains(&key) {
             return;
         }
-        g.push((vs, ps, rt));
+        g.push(key);
     }
-    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
     let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     let mut tex = Vec::new();
@@ -296,21 +306,139 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
     );
 }
 
-unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
-    trace_draw_kinds(this, pso);
-    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if super::present::activity().0 < 300 || N.load(std::sync::atomic::Ordering::Relaxed) >= 24 {
-        return;
-    }
-    // draws into a presented target, or – `XCL_TRACE_UI_ANY` – into any target
-    let Some(rt) = super::present::rt0_resource(this as usize) else { return };
-    if !super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none() {
-        return;
-    }
-    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// `XCL_TRACE_SHADERS=hash,…` (dump hashes, hex): the draws traced with their root arguments
+/// are those whose vertex or pixel shader is listed – into any target, at any time (the first
+/// 24); without it, draws into a presented target (or any – `XCL_TRACE_UI_ANY`) after 300
+/// presents.
+fn traced_shaders() -> &'static [u64] {
+    static S: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::env::var("XCL_TRACE_SHADERS").unwrap_or_default().split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).collect())
+}
+
+/// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): draws whose descriptor
+/// tables name it – that object, or another at its title address (the first 16).
+unsafe fn trace_reads_of_watched(this: *mut c_void, pso: usize) {
+    let Some(w) = super::present::watched_rt() else { return };
+    let w_addr = super::real::title_address(w).or_else(|| super::title_textures::address(w));
     let Some(u) = crate::gpu::uma::get() else { return };
     let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
     let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let t = word(at as usize) as usize;
+        for k in 0..16usize {
+            let Some(r) = super::console_heap::resource_at(u.base() + t + 32 * k) else { continue };
+            let addr = super::real::title_address(r).or_else(|| super::title_textures::address(r));
+            if super::present::is_watched(r) || (addr.is_some() && addr == w_addr) {
+                let rt = super::present::rt0_resource(this as usize).unwrap_or(0);
+                // each (source, target, shaders) once
+                static SEEN: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+                {
+                    let mut g = SEEN.lock().unwrap();
+                    if g.len() >= 32 || g.contains(&(r, rt, pso)) {
+                        return;
+                    }
+                    g.push((r, rt, pso));
+                }
+                if !super::present::is_presented(rt) {
+                    super::present::follow(rt);
+                }
+                if let Some(dsv) = super::list_x::bound_dsv(this) {
+                    super::list_x::watch_dsv(dsv);
+                }
+                let d = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.Flags.0) });
+                crate::xlog_info!(
+                    "frame trace: a draw (shaders {:x?}, {}) reads a watched target {r:#x} {:?} at {addr:x?} (slot {k}), drawing into {rt:#x} {:?}{} – {}",
+                    super::real::pso_shaders(super::pso_async::resolve(pso)),
+                    super::list_x::state_summary(this),
+                    d(r),
+                    d(rt),
+                    if super::present::is_presented(rt) { " (presented)" } else { "" },
+                    root_args_summary(this, 32)
+                );
+                let args = DRAW_ARGS.with(|d| d.get());
+                crate::xlog_info!(
+                    "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
+                    super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+                    super::list_x::geometry_summary(this, args)
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// `XCL_TRACE_FRAME`: render targets a draw into the watched target samples (a UI library's
+/// layers) are dumped with it (`present::follow`).
+unsafe fn follow_layer_sources(this: *mut c_void) {
+    let (Some(w), Some(rt)) = (super::present::watched_rt(), super::present::rt0_resource(this as usize)) else { return };
+    if rt != w {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let Some(layout) = layout else { return };
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    for p in layout.params.iter() {
+        let Param::Table { at } = *p else { continue };
+        let t = word(at as usize) as usize;
+        for k in 0..4usize {
+            let Some(r) = super::console_heap::resource_at(u.base() + t + 32 * k) else { continue };
+            let layer = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| {
+                let d = x.GetDesc();
+                d.Flags.0 & 1 != 0 && d.Width >= 64 && d.Height >= 32 && d.SampleDesc.Count == 1
+            });
+            if layer && r != w {
+                super::present::follow(r);
+            }
+        }
+    }
+}
+
+unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
+    trace_draw_kinds(this, pso);
+    trace_reads_of_watched(this, pso);
+    follow_layer_sources(this);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // `XCL_TRACE_MANY=n`: n draws instead of 24 (a whole frame of a UI)
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| std::env::var("XCL_TRACE_MANY").ok().and_then(|v| v.parse().ok()).unwrap_or(24));
+    if N.load(std::sync::atomic::Ordering::Relaxed) >= cap {
+        return;
+    }
+    let Some(rt) = super::present::rt0_resource(this as usize) else { return };
+    let wanted = traced_shaders();
+    if wanted.is_empty() {
+        // draws into a presented target, or – `XCL_TRACE_UI_ANY` – into any target
+        if super::present::activity().0 < 300 || (!super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none()) {
+            return;
+        }
+    } else if !super::real::pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
+        return;
+    } else {
+        super::present::watch_rt(rt);
+    }
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
+    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), root_args_summary(this, 16));
+    if !wanted.is_empty() {
+        // the picked shaders' geometry too (vertices dumped at the next present)
+        let args = DRAW_ARGS.with(|d| d.get());
+        crate::xlog_info!(
+            "frame trace: … that draw: {args:?} (indexed, count, instances, first, base vertex); input layout [{}]; {}",
+            super::real::pso_layout(super::pso_async::resolve(pso)).unwrap_or_default(),
+            super::list_x::geometry_summary(this, args)
+        );
+    }
+}
+
+/// A draw's root arguments for the frame trace: constants, root buffers (their first words, as
+/// the CPU sees them), the first slots of descriptor tables (the PC resources they name).
+unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
+    let Some(u) = crate::gpu::uma::get() else { return String::new() };
+    let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
+    let Some(layout) = layout else { return String::new() };
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     let mut what = Vec::new();
     for (i, p) in layout.params.iter().enumerate() {
@@ -318,7 +446,7 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
             Param::Constants { at, count } => what.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
             Param::Descriptor { at } => {
                 let va = (word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32) as usize;
-                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 32) { (0..8).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
+                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 4 * buffer_words) { (0..buffer_words).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
                 what.push(format!("p{i} buffer {va:#x} {w:x?}"));
             }
             Param::Table { at } => {
@@ -343,8 +471,7 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
             }
         }
     }
-    let sh = super::real::pso_shaders(super::pso_async::resolve(pso)).map(|(v, p)| format!("vs {v:016x} ps {p:016x}"));
-    crate::xlog_info!("frame trace: UI draw (pipeline {pso:#x}, {}): {}", sh.unwrap_or_default(), what.join("; "));
+    what.join("; ")
 }
 
 /// #33 SetComputeRootSignature (PC #29)

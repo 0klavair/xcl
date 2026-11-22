@@ -1,16 +1,27 @@
 # XCL – Xbox Series X|S → Windows compatibility layer
 
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/yB5tstRHrn)
+**Discord: <https://discord.gg/yB5tstRHrn>**
+
 XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
 x64 code runs natively and XCL stands in for the console libraries the PC does not have
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
-**Project state:** the foundation is in place and tested against real data from a retail game
-(its shader pack, texture archive, movies and the 16 console DLLs it ships). What remains before a
-game shows its first frame is the graphics submission path – draws and present use the console's
-own D3D12.X command format, which can only be worked out from a game executable. Details,
-measurements and next steps:
+**Project state:** retail games run their menus – see [Games](#games). The foundation is tested
+against real data from retail games (shader packs, texture archives, movies and the console DLLs
+they ship). Details, measurements and next steps:
 [`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
+
+## Games
+
+| Game | Package (version) | State | What works | Limits |
+|---|---|---|---|---|
+| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ menus | the whole menu, sound and controller input – fully | offline: no Xbox Live sign-in, Realms or Marketplace |
+| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ menus | everything up to the point where the game needs its online services – fully | the game itself needs multiplayer (online servers), so it cannot be tested further |
+| **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ menus | the menu – fully | the game's servers are shut down, so it cannot be tested further |
+
+XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 
 ## Highlights
 

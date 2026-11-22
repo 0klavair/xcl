@@ -41,9 +41,91 @@ pub struct Compiled {
 /// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
 pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<Compiled, String> {
-    let (t, profile) = console_translation(blob, stage, sampler_base)?;
+    let (mut t, profile) = console_translation(blob, stage, sampler_base)?;
+    if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
+        t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
+    }
+    // `XCL_DEBUG_LOD0=hash,…`: those pixel shaders sample at LOD 0 instead of with implicit
+    // derivatives – tells derivative (helper lane) trouble apart from the rest
+    if stage == Stage::Pixel && std::env::var("XCL_DEBUG_LOD0").is_ok_and(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).any(|h| h == crate::gpu::shader::fnv64(blob))) {
+        t.hlsl = sample_at_lod0(&t.hlsl);
+    }
+    // `XCL_DEBUG_PS_SUB=hash:from=>to||from=>to…` (one pixel shader): every `from` in its HLSL
+    // becomes `to`
+    if let Some(subs) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_SUB").ok()).flatten().and_then(|v| {
+        let (h, rest) = v.split_once(':')?;
+        (u64::from_str_radix(h.trim(), 16).ok()? == crate::gpu::shader::fnv64(blob)).then(|| rest.to_string())
+    }) {
+        for sub in subs.split("||") {
+            let Some((from, to)) = sub.split_once("=>") else { continue };
+            let n = t.hlsl.matches(from).count();
+            crate::xlog_info!("[SHADER] XCL_DEBUG_PS_SUB: {n} occurrence(s) of {from:?} replaced");
+            t.hlsl = t.hlsl.replace(from, to);
+        }
+    }
+    // `XCL_DEBUG_PS_EXPR=hash:expression` (one pixel shader): its target 0 gets that HLSL
+    // expression, e.g. `float4(xi.a1.rgb, 1)` – an input or a register made visible
+    if let Some(expr) = (stage == Stage::Pixel).then(|| std::env::var("XCL_DEBUG_PS_EXPR").ok()).flatten().and_then(|v| {
+        let (h, e) = v.split_once(':')?;
+        (u64::from_str_radix(h.trim(), 16).ok()? == crate::gpu::shader::fnv64(blob)).then(|| e.to_string())
+    }) {
+        t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
+    }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
     Ok(Compiled { dxil, samplers: t.static_samplers })
+}
+
+/// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.
+fn sample_at_lod0(hlsl: &str) -> String {
+    let mut out = String::with_capacity(hlsl.len());
+    let mut rest = hlsl;
+    while let Some(at) = rest.find("_T.Sample(") {
+        let open = at + "_T.Sample(".len();
+        out.push_str(&rest[..at]);
+        out.push_str("_T.SampleLevel(");
+        let mut depth = 1;
+        let mut end = open;
+        for (k, ch) in rest[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&rest[open..end]);
+        out.push_str(", 0.0f)");
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `XCL_DEBUG_MAGENTA=hash[:rrggbb],…` (dump hashes, hex; magenta without a colour): those
+/// pixel shaders write that opaque colour to target 0 wherever they run – where a draw lands,
+/// told apart from what it shades (a colour per shader: which one drew a pixel).
+fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
+    static S: std::sync::OnceLock<Vec<(u64, [f32; 3])>> = std::sync::OnceLock::new();
+    let wanted = S.get_or_init(|| {
+        std::env::var("XCL_DEBUG_MAGENTA")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|item| {
+                let item = item.trim();
+                let (h, c) = item.split_once(':').unwrap_or((item, "ff00ff"));
+                let c = u32::from_str_radix(c, 16).ok()?;
+                let ch = |shift: u32| ((c >> shift) & 0xFF) as f32 / 255.0;
+                Some((u64::from_str_radix(h, 16).ok()?, [ch(16), ch(8), ch(0)]))
+            })
+            .collect()
+    });
+    let h = crate::gpu::shader::fnv64(blob);
+    wanted.iter().find(|(w, _)| *w == h).map(|(_, c)| *c)
 }
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
