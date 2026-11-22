@@ -517,7 +517,11 @@ pub unsafe extern "system" fn XUserAddResult(b: *mut XAsyncBlock, out: *mut *mut
     if out.is_null() {
         return E_INVALIDARG;
     }
-    XAsyncGetResult(b, &USER_ADD_IDENTITY as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut())
+    let hr = XAsyncGetResult(b, &USER_ADD_IDENTITY as *const u8 as *const c_void, 8, out as *mut c_void, std::ptr::null_mut());
+    if hr >= 0 {
+        user_signed_in();
+    }
+    hr
 }
 
 pub unsafe extern "system" fn XUserDuplicateHandle(h: *mut c_void, out: *mut *mut c_void) -> HRESULT {
@@ -804,6 +808,91 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Result(
         *ptr_to_buffer = buffer as *mut XUserGetTokenAndSignatureUtf16Data;
     }
     hr
+}
+
+/// XUserDeviceAssociationChange: the device and the users it was / is now associated with
+/// (local ids; 0 is XUserNullUserLocalId)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceAssociationChange {
+    pub device_id: [u8; 32],
+    pub old_user: u64,
+    pub new_user: u64,
+}
+
+/// device association callbacks the title registered: (token, queue, context, callback)
+static ASSOCIATION_CALLBACKS: std::sync::Mutex<Vec<(u64, usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// the local user was handed to the title (XUserAddResult): the input devices are associated
+/// with it from then on
+static USER_SIGNED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The association a device gets when it becomes the signed-in user's: none → the user.
+pub fn gamepad_association() -> DeviceAssociationChange {
+    DeviceAssociationChange { device_id: crate::hle::gameinput::gamepad_device_id(), old_user: 0, new_user: LOCAL_ID }
+}
+
+struct AssociationCall {
+    cb: usize,
+    ctx: usize,
+    change: DeviceAssociationChange,
+}
+
+unsafe extern "system" fn association_call(rec: *mut c_void, _canceled: bool) {
+    let r = Box::from_raw(rec as *mut AssociationCall);
+    let f: unsafe extern "system" fn(*mut c_void, *const DeviceAssociationChange) = std::mem::transmute(r.cb);
+    f(r.ctx as *mut c_void, &r.change);
+}
+
+/// The title's association callback gets the gamepad → user association, on its queue's
+/// completion port.
+unsafe fn notify_association(queue: usize, ctx: usize, cb: usize) {
+    let rec = Box::into_raw(Box::new(AssociationCall { cb, ctx, change: gamepad_association() }));
+    let hr = xasync::submit_callback(queue as *mut c_void, PORT_COMPLETION, rec as *mut c_void, association_call as usize);
+    if hr < 0 {
+        drop(Box::from_raw(rec));
+        crate::xlog_warn!("XUser: the device association callback could not be queued ({:#x})", hr as u32);
+        return;
+    }
+    crate::xlog_info!("XUser: the gamepad is now associated with the local user (device association callback)");
+}
+
+/// XUserRegisterForDeviceAssociationChanged(queue, context, callback, &token). On a console a
+/// device the title sees comes associated with the signed-in user it belongs to, and the
+/// title hears of it here: Minecraft marks its controller "connected" only from this
+/// callback (device arrival alone just attaches the device to the user's player), and its
+/// Ore UI screens take gamepad input only from a connected controller.
+pub unsafe extern "system" fn XUserRegisterForDeviceAssociationChanged(queue: *mut c_void, ctx: *mut c_void, cb: usize, token: *mut u64) -> HRESULT {
+    if token.is_null() || cb == 0 {
+        return E_INVALIDARG;
+    }
+    let t = NEXT_ASSOCIATION_TOKEN.fetch_add(1, Ordering::Relaxed);
+    *token = t;
+    ASSOCIATION_CALLBACKS.lock().unwrap().push((t, queue as usize, ctx as usize, cb));
+    crate::xlog_info!("XUser: device association callback #{t:#x} registered (queue {queue:?}){}", if USER_SIGNED_IN.load(Ordering::Acquire) { "" } else { " – before the user is signed in" });
+    if USER_SIGNED_IN.load(Ordering::Acquire) {
+        notify_association(queue as usize, ctx as usize, cb);
+    }
+    S_OK
+}
+
+static NEXT_ASSOCIATION_TOKEN: AtomicU64 = AtomicU64::new(0x4153_0001);
+
+pub unsafe extern "system" fn XUserUnregisterForDeviceAssociationChanged(token: u64, _wait: bool) -> bool {
+    ASSOCIATION_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
+    true
+}
+
+/// The local user reached the title: the gamepad becomes its device (each registered
+/// association callback hears of it once).
+fn user_signed_in() {
+    if USER_SIGNED_IN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
+    let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
+    for (_, q, ctx, cb) in calls {
+        unsafe { notify_association(q, ctx, cb) };
+    }
 }
 
 /// Associate every input device with the local signed-in user.

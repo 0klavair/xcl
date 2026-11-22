@@ -8,6 +8,7 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
     RtlAddFunctionTable, SetUnhandledExceptionFilter, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY,
@@ -515,6 +516,158 @@ pub fn watch_writes(addr: usize) {
                 windows_sys::Win32::Foundation::CloseHandle(snap);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------------------
+// call probes (diagnostics): `XCL_PROBE=rva,…` – what the title's code at those addresses
+// is called with
+// ---------------------------------------------------------------------------------------
+
+/// probed addresses (DR1..DR3; DR0 stays the write watchpoint's)
+static PROBES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static PROBE_HITS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+/// the last logged values of each probe (a hit that repeats them is only counted)
+static PROBE_LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+static PROBE_LINES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+unsafe fn probe_bytes(at: u64, n: usize) -> Option<Vec<u8>> {
+    (at > 0x10000 && crate::gpu::shader::readable(at as usize, n)).then(|| std::slice::from_raw_parts(at as *const u8, n).to_vec())
+}
+
+/// the exception `arm_current_thread` raises: the handler arms the raising thread
+const PROBE_ARM: u32 = 0xE0C1_A7E0;
+
+/// The probes in the calling thread at once (XCL's own short-lived threads that run title
+/// callbacks end before the arming loop sees them).
+pub fn arm_current_thread() {
+    if PROBES[0].load(Ordering::Acquire) != 0 {
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::RaiseException(PROBE_ARM, 0, 0, std::ptr::null()) };
+    }
+}
+
+unsafe fn arm_context(c: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) {
+    for k in 0..3 {
+        let a = PROBES[k].load(Ordering::Acquire) as u64;
+        if a == 0 {
+            continue;
+        }
+        match k {
+            0 => c.Dr1 = a,
+            1 => c.Dr2 = a,
+            _ => c.Dr3 = a,
+        }
+        // L(k+1) enabled; RW = 00 (execution), LEN = 00
+        let i = k as u32 + 1;
+        c.Dr7 = (c.Dr7 & !(0xF_u64 << (16 + 4 * i)) & !(3_u64 << (2 * i))) | (1 << (2 * i));
+    }
+}
+
+unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    const SINGLE_STEP: u32 = 0x8000_0004;
+    let rec = &*(*info).ExceptionRecord;
+    let ctx = &mut *(*info).ContextRecord;
+    if rec.ExceptionCode as u32 == PROBE_ARM {
+        arm_context(ctx);
+        ctx.ContextFlags |= windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
+        return -1;
+    }
+    if rec.ExceptionCode as u32 != SINGLE_STEP {
+        return 0;
+    }
+    let Some(k) = (0..3).find(|&k| ctx.Dr6 & (2 << k) != 0 && PROBES[k].load(Ordering::Relaxed) == ctx.Rip as usize) else { return 0 };
+    ctx.Dr6 = 0;
+    // resume flag: the instruction runs without breaking again
+    ctx.EFlags |= 0x1_0000;
+    let n = PROBE_HITS[k].fetch_add(1, Ordering::Relaxed) + 1;
+    // at a function's entry: arguments 5 and 6 above the return address and the home area
+    let stack = |i: u64| probe_bytes(ctx.Rsp + 8 * i, 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let (s5, s6) = (stack(5), stack(6));
+    let at_r8 = probe_bytes(ctx.R8, 24);
+    let at_rcx = probe_bytes(ctx.Rcx, 48);
+    // values that tell calls apart (pointers left out: they differ per call)
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(ctx.Rax as u32, ctx.Rdx as u32 & 0xFF, ctx.R9 as u32, s5 as u8, s6 as u8, &at_r8, &at_rcx), &mut h);
+    let key = std::hash::Hasher::finish(&h);
+    let new = {
+        let mut g = PROBE_LAST.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut g[k], key) != key
+    };
+    if (new || n.is_power_of_two()) && PROBE_LINES[k].fetch_add(1, Ordering::Relaxed) < 200 {
+        crate::xlog_info!(
+            "probe {}: hit #{n} (thread {}): rcx {:#x} rdx {:#x} r8 {:#x} r9 {:#x} rax {:#x}, stack args 5/6 {s5:#x} {s6:#x}; at r8 {:x?}; at rcx {:x?}; from {}",
+            modules::describe_address(ctx.Rip as usize),
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            ctx.Rcx,
+            ctx.Rdx,
+            ctx.R8,
+            ctx.R9,
+            ctx.Rax,
+            at_r8,
+            at_rcx,
+            modules::describe_address(stack(0) as usize)
+        );
+    }
+    -1
+}
+
+/// `XCL_PROBE=rva,…` (hex, up to three, in the title's exe): hardware breakpoints on those
+/// instructions in every thread; each hit with new argument values is logged (registers,
+/// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
+/// title's code runs, with what, without changing it.
+pub fn start_probes() {
+    let rvas: Vec<usize> = std::env::var("XCL_PROBE").unwrap_or_default().split(',').filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).take(3).collect();
+    if rvas.is_empty() {
+        return;
+    }
+    use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_DEBUG_REGISTERS_AMD64};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
+    unsafe {
+        AddVectoredExceptionHandler(1, Some(probe_handler));
+    }
+    let _ = std::thread::Builder::new().name("xcl-probe".into()).spawn(move || {
+        let base = loop {
+            if let Some(m) = modules::main_module() {
+                break m.base;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        for (k, rva) in rvas.iter().enumerate() {
+            PROBES[k].store(base + rva, Ordering::Release);
+            crate::xlog_info!("probe: {}", modules::describe_address(base + rva));
+        }
+        let me = unsafe { GetCurrentThreadId() };
+        let mut armed = std::collections::HashSet::new();
+        loop {
+            unsafe {
+                let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                let mut e: THREADENTRY32 = std::mem::zeroed();
+                e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                let mut ok = Thread32First(snap, &mut e) != 0;
+                while ok {
+                    if e.th32OwnerProcessID == GetCurrentProcessId() && e.th32ThreadID != me && armed.insert(e.th32ThreadID) {
+                        let h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, 0, e.th32ThreadID);
+                        if !h.is_null() {
+                            #[repr(align(16))]
+                            struct Aligned(CONTEXT);
+                            let mut c: Aligned = std::mem::zeroed();
+                            c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+                            SuspendThread(h);
+                            if GetThreadContext(h, &mut c.0) != 0 {
+                                arm_context(&mut c.0);
+                                SetThreadContext(h, &c.0);
+                            }
+                            ResumeThread(h);
+                            windows_sys::Win32::Foundation::CloseHandle(h);
+                        }
+                    }
+                    ok = Thread32Next(snap, &mut e) != 0;
+                }
+                windows_sys::Win32::Foundation::CloseHandle(snap);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
 }

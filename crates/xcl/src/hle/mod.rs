@@ -16,6 +16,7 @@ pub mod d3d12x;
 pub mod dstorage;
 pub mod dxcompiler;
 pub mod gameinput;
+pub mod kbm;
 pub mod kernelx;
 pub mod mfplat;
 pub mod opus;

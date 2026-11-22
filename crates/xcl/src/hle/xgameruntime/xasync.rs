@@ -70,6 +70,16 @@ unsafe fn pc(slot: usize) -> Option<(usize, usize)> {
     (o != 0).then(|| (o, *(*(o as *const *const usize)).add(slot)))
 }
 
+/// XTaskQueueSubmitCallback on whichever runtime owns the title's task queues (the PC's
+/// XAsync object when in use – its queue handles mean nothing to XCL's – else XCL's).
+pub unsafe fn submit_callback(queue: *mut c_void, port: u32, ctx: *mut c_void, cb: usize) -> HRESULT {
+    if let Some((o, f)) = pc(18) {
+        let f: unsafe extern "system" fn(usize, *mut c_void, u32, *mut c_void, usize) -> HRESULT = std::mem::transmute(f);
+        return f(o, queue, port, ctx, cb);
+    }
+    super::taskqueue::XTaskQueueSubmitCallback(queue, port, ctx, cb)
+}
+
 pub type XAsyncWork = unsafe extern "system" fn(*mut XAsyncBlock) -> HRESULT;
 type Completion = unsafe extern "system" fn(*mut XAsyncBlock);
 

@@ -60,6 +60,13 @@ pub struct Config {
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
     /// services would reject the placeholder anyway (Minecraft retried its sign-in forever).
     pub xbox_live_tokens: bool,
+    /// Keyboard and mouse play as the gamepad while the XCL window has the focus: WASD the
+    /// left stick, the mouse the right stick (the cursor is held in the window), the mouse
+    /// buttons the triggers, the wheel the bumpers (see `hle::kbm`).
+    pub keyboard_mouse: bool,
+    /// How far the right stick goes for a mouse speed: 1.0 = full deflection at 4000 mouse
+    /// counts a second.
+    pub mouse_sensitivity: f32,
 }
 
 impl Config {
@@ -162,6 +169,8 @@ impl Default for Config {
             window_width: 1280,
             window_height: 720,
             xbox_live_tokens: false,
+            keyboard_mouse: true,
+            mouse_sensitivity: 1.0,
         }
     }
 }

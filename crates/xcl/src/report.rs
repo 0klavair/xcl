@@ -141,6 +141,8 @@ pub fn build() -> Report {
 
 /// Write `report.json` (host side). `crash` is remembered for later writes.
 pub fn write_final(crash: Option<String>) {
+    // the process ends: a cursor held in the XCL window is let go
+    crate::hle::kbm::release();
     let Ok(_g) = WRITE_LOCK.try_lock() else { return };
     if let Some(c) = crash {
         if let Ok(mut g) = CRASH.lock() {

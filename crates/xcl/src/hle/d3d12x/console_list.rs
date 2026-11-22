@@ -266,6 +266,8 @@ struct ListState {
     chunks: Vec<(Box<[u8]>, usize)>,
     /// unified-memory blocks owned by the list (upload memory, argument tables, io)
     uma: Vec<usize>,
+    /// where the next draw's argument table and io go (blocks in `uma`)
+    arena: crate::gpu::uma::Arena,
 }
 
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
@@ -379,6 +381,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     let obj = this as usize;
     let Some((pc, old_alloc, blocks)) = with_list(obj, |st| {
         st.chunks.clear();
+        st.arena = Default::default();
         (st.pc, std::mem::replace(&mut st.allocator, allocator as usize), std::mem::take(&mut st.uma))
     }) else {
         return crate::util::E_FAIL;
@@ -547,7 +550,7 @@ pub unsafe fn create(pc: *mut c_void) -> *mut c_void {
 pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> *mut c_void {
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
-    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new() };
+    let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
     new_chunk(obj, &mut st);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
@@ -579,9 +582,9 @@ unsafe fn free_uma(blocks: &[usize]) {
 
 unsafe fn uma_copy(st: &mut ListState, bytes: &[u8]) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
-    let p = u.alloc_in(0, bytes.len().max(16), 256)?; // 32-bit console addresses: window 0
+    // 32-bit console addresses: window 0; a piece of the list's arena
+    let p = st.arena.take(u, bytes.len().max(16), 256, &mut st.uma)?;
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
-    st.uma.push(p as usize);
     Some(p as usize)
 }
 

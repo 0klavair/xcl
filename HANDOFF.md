@@ -1162,6 +1162,24 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   ended with 0xC0000409); PLS is a drive root (`S:\`) and the disk-space APIs answer for console paths ("very little
   free space"). Diagnostics: `XCL_TRACE_SHADERS`, `XCL_TRACE_MANY`, `XCL_FRAME_DUMP_FULL`, `XCL_DEBUG_PS_SUB`,
   `XCL_DEBUG_PS_EXPR`, `XCL_DEBUG_MAGENTA`, `XCL_DEBUG_LOD0`, `XCL_DEBUG_NO_STENCIL` / `NO_CULL`, `XCL_PRESS_AT`.
+- **Minecraft is playable (2026-11-22)**: a world is created, loads and runs; the Ore UI screens take the gamepad.
+  - Ore UI ignored the gamepad: Minecraft marks a controller connected only from
+    `XUserRegisterForDeviceAssociationChanged` (device arrival through GameInput just attaches it to the user's
+    player), and Ore UI's `GameControllerInputHandler` drops events of a controller it never saw connect. XCL now
+    calls that callback (gamepad: no user → the local user) when the user reaches the title, on the title's task
+    queue – through the PC XAsync object when that owns the queues (`xasync::submit_callback`).
+  - The world flickered: `bind_abi` put each draw's io / argument table / res in three `Uma::alloc_in` blocks, and
+    every block is a 64 KiB grain – thousands of draws a frame filled the 2 GB in seconds, then most draws were
+    skipped ("unified memory is full"). Per-draw data now comes from an `uma::Arena` (256 KiB blocks cut into
+    256-byte pieces, freed with the command allocator as before); 16.7 M draws, 0 skipped.
+  - Keyboard and mouse play as the gamepad (`hle::kbm`, `keyboard_mouse` / `mouse_sensitivity` in `xcl.toml`):
+    WASD left stick, mouse (Raw Input on the XCL window, cursor held there; Alt+Tab frees it) right stick by speed,
+    mouse buttons triggers, wheel bumpers, Shift / Ctrl stick clicks, E / Q Y / X.
+  - Diagnostic: `XCL_PROBE=rva,…` (up to three) – hardware breakpoints on the title's code, each call with new
+    arguments logged; XCL's own short-lived threads that call into the title arm themselves
+    (`eh::arm_current_thread`). This is how the controller path above was found without changing the game.
+  - Open: small magenta / black "missing texture" quads on the loading screen's logo (a texture the game did not
+    load – trace file opens next).
 - **Why every frame was black: descriptors are values.** XDefiant makes its views in a CPU-only heap (131 072
   slots) and copies them into its shader-visible heap (442 368 slots) as memory – the console header's inline
   CopyDescriptorsSimple; only sampler copies reach the device. T# word 0 was an index into each heap's own PC heap,

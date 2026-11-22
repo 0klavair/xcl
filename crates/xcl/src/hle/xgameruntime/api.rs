@@ -718,8 +718,8 @@ fn xuser() -> Vec<(&'static str, usize)> {
 /// device association: every controller belongs to the single local signed-in user
 fn xuser_devices() -> Vec<(&'static str, usize)> {
     vec![
-        ("XUserRegisterForDeviceAssociationChanged", register_token4 as usize),
-        ("XUserUnregisterForDeviceAssociationChanged", yes as usize),
+        ("XUserRegisterForDeviceAssociationChanged", XUserRegisterForDeviceAssociationChanged as usize),
+        ("XUserUnregisterForDeviceAssociationChanged", XUserUnregisterForDeviceAssociationChanged as usize),
         ("XUserRegisterForDefaultAudioEndpointUtf16Changed", register_token4 as usize),
         ("XUserUnregisterForDefaultAudioEndpointUtf16Changed", yes as usize),
         ("XUserFindForDevice", XUserFindForDevice as usize),
@@ -1625,6 +1625,38 @@ mod tests {
         assert!(own(&XSYSTEM, &XSYSTEM_V2_IID).unwrap().iface.iids.contains(&XSYSTEM_V2_IID));
         assert!(own(&XGAME, &XGAME_V1_IID).unwrap().iface.iids.contains(&XGAME_V1_IID));
         assert!(own(&XPLS, &XPLS_V1_IID).unwrap().iface.iids.contains(&XPLS_V1_IID));
+    }
+
+    /// A device association callback hears once that the gamepad belongs to the signed-in
+    /// user (none → the local user), on its queue's completion port – whether it was
+    /// registered before or after the user reached the title (Minecraft marks its controller
+    /// connected only from this callback).
+    #[test]
+    fn device_association_reaches_the_title() {
+        use crate::hle::xgameruntime as rt;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static GOT: Mutex<Vec<rt::DeviceAssociationChange>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn heard(ctx: *mut c_void, change: *const rt::DeviceAssociationChange) {
+            assert_eq!(ctx as usize, 7);
+            GOT.lock().unwrap().push(*change);
+        }
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(rt::taskqueue::XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let mut token = 0u64;
+            assert_eq!(rt::XUserRegisterForDeviceAssociationChanged(q, 7 as *mut c_void, heard as usize, &mut token), S_OK);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XUserAddAsync(1, &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut user = std::ptr::null_mut();
+            assert_eq!(XUserAddResult(&mut b, &mut user), S_OK);
+            XUserCloseHandle(user);
+            while rt::taskqueue::XTaskQueueDispatch(q, rt::taskqueue::PORT_COMPLETION, 0) {}
+            let want = rt::DeviceAssociationChange { device_id: crate::hle::gameinput::gamepad_device_id(), old_user: 0, new_user: 1 };
+            assert_eq!(*GOT.lock().unwrap(), vec![want]);
+            assert!(rt::XUserUnregisterForDeviceAssociationChanged(token, true));
+            rt::taskqueue::XTaskQueueCloseHandle(q);
+        }
     }
 
     #[test]

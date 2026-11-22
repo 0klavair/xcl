@@ -17,9 +17,9 @@ they ship). Details, measurements and next steps:
 
 | Game | Package (version) | State | What works | Limits |
 |---|---|---|---|---|
-| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ menus | the whole menu, sound and controller input – fully | offline: no Xbox Live sign-in, Realms or Marketplace |
-| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ menus | everything up to the point where the game needs its online services – fully | the game itself needs multiplayer (online servers), so it cannot be tested further |
-| **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ menus | the menu – fully | the game's servers are shut down, so it cannot be tested further |
+| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ | fully playable | – |
+| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
+| **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
 
 XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 
@@ -53,7 +53,7 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput → the system GameInput | – |
+| **Input** | ✅ | GameInput: one gamepad – an XInput controller, and keyboard and mouse as a gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers; `keyboard_mouse`, `mouse_sensitivity` in `xcl.toml`) | unit tests |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics

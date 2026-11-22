@@ -292,6 +292,46 @@ impl Drop for Uma {
     }
 }
 
+/// Small pieces of window 0 for XCL's own per-draw data (argument tables, user SGPRs): a
+/// block of `ARENA_BLOCK` bytes cut into aligned pieces, a new block when one is used up.
+/// `Uma::alloc` hands out whole 64 KiB grains – three of those per draw filled 2 GB within
+/// seconds in a scene of thousands of draws (Minecraft's world), and the draws that found
+/// no room were skipped (the world flickered). The blocks go to `blocks`; their owner frees
+/// them when the GPU is done (a command allocator's reset) and starts a fresh arena.
+#[derive(Default)]
+pub struct Arena {
+    at: usize,
+    end: usize,
+}
+
+/// block size of an `Arena`
+pub const ARENA_BLOCK: usize = 4 * GRAIN;
+
+impl Arena {
+    /// `n` bytes at an `align`-aligned address of window 0 (not zeroed), or None when
+    /// unified memory is full.
+    pub fn take(&mut self, u: &Uma, n: usize, align: usize, blocks: &mut Vec<usize>) -> Option<*mut u8> {
+        let align = align.max(16).next_power_of_two();
+        let n = n.max(1);
+        let at = (self.at + align - 1) & !(align - 1);
+        if self.at != 0 && at + n <= self.end {
+            self.at = at + n;
+            return Some(at as *mut u8);
+        }
+        if n > ARENA_BLOCK / 2 {
+            // a large piece: a block of its own (the current one stays in use)
+            let p = u.alloc_in(0, n, align)?;
+            blocks.push(p as usize);
+            return Some(p);
+        }
+        let p = u.alloc_in(0, ARENA_BLOCK, GRAIN)? as usize;
+        blocks.push(p);
+        self.at = p + n;
+        self.end = p + ARENA_BLOCK;
+        Some(p as *mut u8)
+    }
+}
+
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
@@ -312,6 +352,31 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Many small pieces share a block (aligned, disjoint); a large one gets its own.
+    #[test]
+    fn arena_cuts_blocks_into_aligned_pieces() {
+        let u = Uma::with_windows(1, 4 << 20).unwrap();
+        let (mut a, mut blocks) = (Arena::default(), Vec::new());
+        let mut got = Vec::new();
+        for k in 0..1000usize {
+            let n = 16 + (k % 7) * 40;
+            let p = a.take(&u, n, 256, &mut blocks).unwrap() as usize;
+            assert_eq!(p % 256, 0);
+            assert_eq!(u.window_of(p), Some(0));
+            got.push((p, n));
+        }
+        got.sort_unstable();
+        assert!(got.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0), "pieces overlap");
+        // 1000 pieces of at most 256 aligned bytes: 1000 · 256 B = 4 blocks, not 1000 grains
+        assert_eq!(blocks.len(), (1000 * 256usize).div_ceil(ARENA_BLOCK));
+        let big = a.take(&u, ARENA_BLOCK, 256, &mut blocks).unwrap() as usize;
+        assert_eq!(blocks.last(), Some(&big));
+        for b in blocks {
+            assert!(u.free(b));
+        }
+        assert_eq!(u.used(), 0);
+    }
 
     #[test]
     fn windows_are_4_gib_apart_and_allocations_stay_inside() {

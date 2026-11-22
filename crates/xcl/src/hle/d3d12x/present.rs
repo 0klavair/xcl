@@ -298,6 +298,10 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
 // ---------------------------------------------------------------------------------------
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // keyboard and mouse as the gamepad: raw mouse input, the cursor held in the window
+    if crate::hle::kbm::on_message(hwnd.0, msg, wp.0, lp.0) {
+        return LRESULT(0);
+    }
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
@@ -349,6 +353,7 @@ fn window_thread() {
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::hle::kbm::attach(hwnd.0);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);

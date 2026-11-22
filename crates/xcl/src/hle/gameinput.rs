@@ -239,6 +239,7 @@ pub fn poll() -> GamepadState {
         }
     }
     s.buttons |= unsafe { keyboard() };
+    super::kbm::apply(&mut s);
     s.buttons |= scripted();
     {
         // the first presses of each button: worth a line (is input arriving at all?)
@@ -301,6 +302,11 @@ struct DeviceInfo {
 }
 
 const DEVICE_ID: [u8; 32] = *b"XCL gamepad 0                   ";
+
+/// The gamepad's APP_LOCAL_DEVICE_ID (XUser's device association names it).
+pub fn gamepad_device_id() -> [u8; 32] {
+    DEVICE_ID
+}
 
 fn device_info() -> &'static DeviceInfo {
     static I: OnceLock<Box<DeviceInfo>> = OnceLock::new();
@@ -563,6 +569,7 @@ fn start_poller() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         let _ = std::thread::Builder::new().name("xcl-gameinput".into()).spawn(|| {
+            crate::eh::arm_current_thread();
             let mut last = GamepadState::default();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(4));
@@ -601,6 +608,7 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
         let (ctx, f) = (context as usize, cb as usize);
         let _ = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
             let f: DeviceCallback = unsafe { std::mem::transmute(f) };
+            crate::eh::arm_current_thread();
             unsafe { f(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
         });
     }

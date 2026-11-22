@@ -29,6 +29,8 @@ struct State {
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
+    /// where the next draw's io and argument table go (blocks in `uma`)
+    arena: crate::gpu::uma::Arena,
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -66,6 +68,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 pub(super) fn reset(list: *mut c_void, allocator: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
+        s.arena = Default::default();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -646,11 +649,10 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let windows = super::real::uma_window_vas();
     let first = *windows.first().ok_or("unified memory is not open on the GPU")?;
     let (layout, args) = with(this, |s| if gfx { (s.layout_gfx.clone(), s.args_gfx.clone()) } else { (s.layout.clone(), s.args.clone()) });
-    let mut owned = Vec::new();
-    let mut copy = |bytes: &[u8]| -> Result<usize, String> {
-        let p = u.alloc_in(0, bytes.len().max(16), 256).ok_or("unified memory is full")?; // 32-bit console addresses: window 0
+    // 32-bit console addresses: window 0; pieces of the list's arena (not a 64 KiB grain each)
+    let copy = |bytes: &[u8]| -> Result<usize, String> {
+        let p = with(this, |s| s.arena.take(u, bytes.len().max(16), 256, &mut s.uma)).ok_or("unified memory is full")?;
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
-        owned.push(p as usize);
         Ok(p as usize)
     };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
@@ -663,7 +665,6 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
-    with(this, |s| s.uma.extend(owned));
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
     // a pipeline still being built in the background is waited for
     let real = super::pso_async::resolve_wait(pso);
