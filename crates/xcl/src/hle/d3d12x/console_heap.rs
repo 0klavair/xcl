@@ -41,6 +41,8 @@ struct Heap {
     first: Option<(u32, u64, u64)>,
     /// shader visible as the title made it
     visible: bool,
+    /// backed by a sparse VRAM allocation in window 0 (rather than committed system RAM)
+    sparse: bool,
 }
 
 impl Heap {
@@ -169,15 +171,26 @@ pub fn in_global(obj: usize) -> bool {
 pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler: bool, first: Option<u32>, visible: bool) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     let bytes = n.max(1) * if sampler { SAMPLER_SLOT } else { SLOT };
-    // descriptor tables are 32-bit console addresses: window 0
-    let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
-    unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
+    // Descriptor tables are 32-bit console addresses (high dword 0): must live in window 0.
+    // On the sparse-window path, `sparse::alloc_in(0, ...)` commits fresh zeroed pages so we
+    // avoid touching unused pages with `write_bytes` (which would mark them dirty for write-watch).
+    let (p, sparse) = if u.is_sparse_window(0) {
+        let Some((addr, _)) = (unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }) else {
+            return false;
+        };
+        (addr as *mut u8, true)
+    } else {
+        let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
+        unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
+        (p, false)
+    };
     {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
             crate::xlog_info!(
-                "console descriptor heap {obj:#x}: {n} {} slots at UMA {:#x}, {}",
+                "console descriptor heap {obj:#x}: {n} {} slots at {} {:#x}, {}",
                 if sampler { "sampler" } else { "view" },
+                if sparse { "sparse VRAM" } else { "UMA" },
                 p as usize - u.base(),
                 if visible { "shader visible" } else { "CPU only" }
             );
@@ -187,7 +200,7 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
         let g = GLOBAL.lock().unwrap();
         g.as_ref().map(|s| (f, s.cpu + f as u64 * s.inc as u64, s.gpu + f as u64 * s.inc as u64))
     });
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, first, visible });
+    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, first, visible, sparse });
     true
 }
 
@@ -201,7 +214,9 @@ pub fn unregister(obj: usize) {
         if let Some((f, _, _)) = h.first {
             release_global(f, 2 * h.n);
         }
-        if let Some(u) = crate::gpu::uma::get() {
+        if h.sparse {
+            unsafe { super::sparse::free(h.shadow) };
+        } else if let Some(u) = crate::gpu::uma::get() {
             u.free(h.shadow);
         }
     }
@@ -407,6 +422,9 @@ mod tests {
         assert!(register(0xA1, 4, 0x1000, 0x5000, 32, false, None, true));
         assert!(register(0xA2, 2, 0x9000, 0, 16, true, None, true));
         let (v, sm) = (start(0xA1).unwrap(), start(0xA2).unwrap());
+        assert_eq!(u.window_of(v as usize), Some(0), "view heap must live in window 0 (32-bit table addressing)");
+        assert_eq!(u.window_of(sm as usize), Some(0), "sampler heap must live in window 0");
+        assert!(u.is_sparse(v as usize) && u.is_sparse(sm as usize), "descriptor heaps backed by sparse VRAM");
         let s1 = slot(v + 32).unwrap();
         assert_eq!((s1.index, s1.pc_srv, s1.pc_uav, s1.pc_gpu_uav), (2, 0x1040, 0x1060, 0x5060));
         // a 2D T# from slot 1 to slot 3: word 0 = the destination's SRV index

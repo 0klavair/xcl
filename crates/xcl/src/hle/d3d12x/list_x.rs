@@ -487,6 +487,9 @@ struct ListState {
     occlusion: Occlusion,
     /// UMA address ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
+    /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
+    /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
+    sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
     /// state a PC Reset clears (restored after KickoffX)
@@ -505,6 +508,20 @@ impl ListState {
             last.0 = last.0.min(va);
             last.1 = last.1.max(end);
         }
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+            if self.sparse_writes.is_empty() {
+                SPARSE_WRITE_LISTS.fetch_add(1, Ordering::AcqRel);
+            }
+            self.sparse_writes.push((va as usize, size as usize));
+        }
+    }
+
+    fn clear_sparse_writes(&mut self) -> Vec<(usize, usize)> {
+        if self.sparse_writes.is_empty() {
+            return Vec::new();
+        }
+        SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
+        std::mem::take(&mut self.sparse_writes)
     }
 
     fn has_prior_write(&self, va: u64, size: u64) -> bool {
@@ -538,6 +555,8 @@ static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 /// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
+/// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
+static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
 static DEPTH_BIAS_USED: AtomicBool = AtomicBool::new(false);
 
@@ -604,6 +623,9 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
             if !old.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
+            if !old.sparse_writes.is_empty() {
+                SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
+            }
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
     }
@@ -625,6 +647,9 @@ pub(super) fn on_release(list: usize) {
     if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
+        }
+        if !old.sparse_writes.is_empty() {
+            SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -785,6 +810,31 @@ unsafe fn wait_all(waits: &[PendingWait]) {
                 w.mask
             );
         }
+    }
+}
+
+/// Copy any GPU memory writes into sparse VRAM windows recorded by `lists` back into their
+/// CPU view after `queue.ExecuteCommandLists` so CPU reads and `Wait32/64BitValueX` see them.
+pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_void]) {
+    if SPARSE_WRITE_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
+        return;
+    }
+    let ranges: Vec<(usize, usize)> = {
+        let g = LISTS.lock().unwrap();
+        let Some(m) = g.as_ref() else { return };
+        let mut out = Vec::new();
+        for &l in lists {
+            if let Some(s) = m.get(&(l as usize)) {
+                out.extend_from_slice(&s.sparse_writes);
+            }
+        }
+        out
+    };
+    if ranges.is_empty() {
+        return;
+    }
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        super::sparse::readback_after_execute(q, &ranges);
     }
 }
 
@@ -957,13 +1007,6 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
-    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
-        static S: AtomicU64 = AtomicU64::new(0);
-        let k = S.fetch_add(1, Ordering::Relaxed);
-        if k < 4 || k.is_power_of_two() {
-            crate::xlog_info!("D3D12.X: {what} #{k} into a sparse window ({va:#x}): the CPU's view does not see it");
-        }
-    }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -1146,7 +1189,7 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return;
     }
     let dev_raw = device_of(this).map_or(0, |d| d.as_raw() as usize);
-    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, active_query, waits) = {
+    let (alloc, queue, bound_pso, depth_bias, index_buffer, depth_bounds, active_query, waits, sparse_writes) = {
         let mut g = LISTS.lock().unwrap();
         let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(this as usize))) else {
             if once(&NO_QUEUE, 4) {
@@ -1173,8 +1216,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             std::mem::take(&mut s.pending_waits)
         };
+        let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
-        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits)
+        (s.allocator, q, s.bound_pso, s.depth_bias, s.index_buffer, s.depth_bounds, active_query, waits, sparse_writes)
     };
 
     // End any active occlusion query before Close (PC forbids closing with an open query).
@@ -1197,6 +1241,11 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    if !sparse_writes.is_empty() {
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
+            super::sparse::readback_after_execute(q, &sparse_writes);
+        }
+    }
 
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
     let ext = *(this as *const usize);
@@ -1564,6 +1613,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        s.clear_sparse_writes();
         s.clear_waits();
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)

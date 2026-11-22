@@ -1380,3 +1380,125 @@ pub fn dynamic_depth_bias() -> Result<(), String> {
         Ok(())
     }
 }
+
+/// D3D12 buffer heaps + committed upload/default buffers on the sparse-window VRAM path:
+/// persistent `Map()` pointer coherence across multiple submits, sub-64 KiB aliased placement
+/// offsets, and explicit `Map(Some(range))` GPU→CPU readback.
+pub fn sparse_buffer_heap_coherence() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+
+        // 1. D3D12 DEFAULT buffer heap + two placed buffers (one at non-64KiB aliased offset 0x200)
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: 0x4_0000,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0x1_0000,
+            Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        dev.CreateHeap(&heap_desc, &mut heap).map_err(e)?;
+        let heap = heap.ok_or("CreateHeap")?;
+
+        let buf_desc = |bytes: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buf_a: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&heap, 0, &buf_desc(0x1_0000), D3D12_RESOURCE_STATE_COMMON, None, &mut buf_a).map_err(e)?;
+        let buf_a = buf_a.ok_or("placed buf_a")?;
+
+        let mut buf_b: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&heap, 0x200, &buf_desc(0x1000), D3D12_RESOURCE_STATE_COMMON, None, &mut buf_b).map_err(e)?;
+        let buf_b = buf_b.ok_or("placed buf_b")?;
+
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc(0x1000),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(e)?;
+        let rb = rb.ok_or("readback")?;
+
+        // Persistent Map() on buf_a: address must match GetGPUVirtualAddress(), and buf_b aliases at +0x200
+        let mut ptr_a = std::ptr::null_mut();
+        buf_a.Map(0, None, Some(&mut ptr_a)).map_err(e)?;
+        ensure!(!ptr_a.is_null(), "buf_a Map null");
+        ensure!(buf_a.GetGPUVirtualAddress() == ptr_a as u64, "buf_a VA != Map ptr");
+        ensure!(buf_b.GetGPUVirtualAddress() == ptr_a as u64 + 0x200, "buf_b aliased VA mismatch");
+
+        let mut ptr_rb = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut ptr_rb)).map_err(e)?;
+        ensure!(!ptr_rb.is_null(), "rb Map null");
+
+        // Submit 1: write pattern 1 via persistent pointer, copy buf_a[0..16] and buf_b[0..16] to rb
+        let wa = ptr_a as *mut u32;
+        *wa.add(0) = 0x1122_3344;
+        *wa.add(1) = 0x5566_7788;
+        *wa.add(0x200 / 4) = 0xCAFE_BABE;
+        list.CopyBufferRegion(&rb, 0, &buf_a, 0, 16);
+        list.CopyBufferRegion(&rb, 64, &buf_b, 0, 16);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 1)?;
+        let wrb = ptr_rb as *const u32;
+        ensure!(*wrb.add(0) == 0x1122_3344 && *wrb.add(1) == 0x5566_7788, "submit 1 buf_a readback mismatch");
+        ensure!(*wrb.add(16) == 0xCAFE_BABE, "submit 1 aliased buf_b readback mismatch: {:#x}", *wrb.add(16));
+
+        // Submit 2: mutate the SAME persistent pointer without re-mapping
+        *wa.add(0) = 0xAABB_CCDD;
+        *wa.add(0x200 / 4) = 0xDEAD_BEEF;
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        list.CopyBufferRegion(&rb, 0, &buf_a, 0, 16);
+        list.CopyBufferRegion(&rb, 64, &buf_b, 0, 16);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 2)?;
+        ensure!(*wrb.add(0) == 0xAABB_CCDD, "persistent Map mutation did not reach GPU: {:#x}", *wrb.add(0));
+        ensure!(*wrb.add(16) == 0xDEAD_BEEF, "persistent Map aliased mutation did not reach GPU: {:#x}", *wrb.add(16));
+
+        // Submit 3: committed UPLOAD buffer (sparse VRAM) -> GPU copy into buf_a -> explicit Map(read range) on buf_a
+        let mut up: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc(0x1000),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut up,
+        )
+        .map_err(e)?;
+        let up = up.ok_or("upload buf")?;
+        let mut ptr_up = std::ptr::null_mut();
+        up.Map(0, None, Some(&mut ptr_up)).map_err(e)?;
+        *(ptr_up as *mut u32) = 0x4242_1337;
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        list.CopyBufferRegion(&buf_a, 0x100, &up, 0, 64);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 3)?;
+
+        let mut ptr_a2 = std::ptr::null_mut();
+        let read_range = D3D12_RANGE { Begin: 0x100, End: 0x140 };
+        buf_a.Map(0, Some(&read_range), Some(&mut ptr_a2)).map_err(e)?;
+        ensure!(ptr_a2 == ptr_a, "re-Map returned a different pointer");
+        let got = *(ptr_a2 as *const u32).add(0x100 / 4);
+        ensure!(got == 0x4242_1337, "explicit Map(read_range) readback mismatch: {got:#x}");
+        Ok(())
+    }
+}

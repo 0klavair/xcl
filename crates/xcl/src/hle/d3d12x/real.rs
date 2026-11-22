@@ -161,8 +161,8 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
 /// lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
-/// the UMA windows opened as D3D12 heaps (console buffers are placed in them)
-static UMA_HEAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
+static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);
@@ -233,21 +233,40 @@ unsafe fn open_uma(device: &ID3D12Device) {
         let va = buf.GetGPUVirtualAddress();
         Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
     };
-    let r: Result<Vec<(usize, u64, usize)>, String> = (0..u.windows()).map(open).collect();
-    match r {
-        Ok(w) => {
-            crate::xlog_info!("D3D12.X: UMA ({} MB, {} window(s)) opened as GPU heaps, window 0 buffer at VA {:#x}", u.size() >> 20, w.len(), w[0].1);
-            *UMA_HEAPS.lock().unwrap() = w.iter().map(|x| x.2).collect();
-            *UMA_BUFFER.lock().unwrap() = w.iter().map(|x| (x.0, x.1)).collect();
-            // the title's own reservations: sparse windows after these
-            let sparse = super::sparse::init(device);
-            UMA_BUFFER.lock().unwrap().extend(sparse);
+    let n = u.shader_windows();
+    let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
+    let mut heaps: Vec<Option<usize>> = vec![None; n];
+    for k in 0..n {
+        if !u.is_committed_window(k) {
+            continue;
         }
-        Err(e) => {
-            crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
-            *UMA_ERROR.lock().unwrap() = e;
+        match open(k) {
+            Ok((buf_raw, va, heap_raw)) => {
+                bufs[k] = (buf_raw, va);
+                heaps[k] = Some(heap_raw);
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
+                *UMA_ERROR.lock().unwrap() = e;
+                return;
+            }
         }
     }
+    let sparse = super::sparse::init(device);
+    for (k, buf_raw, va) in &sparse {
+        if let Some(slot) = bufs.get_mut(*k) {
+            *slot = (*buf_raw, *va);
+        }
+    }
+    let w0_va = bufs.first().map_or(0, |b| b.1);
+    crate::xlog_info!(
+        "D3D12.X: UMA opened ({} sparse VRAM window(s), {} MB coherent window), window 0 buffer at VA {:#x}",
+        sparse.len(),
+        u.size() >> 20,
+        w0_va
+    );
+    *UMA_HEAPS.lock().unwrap() = heaps;
+    *UMA_BUFFER.lock().unwrap() = bufs;
 }
 
 pub fn stats() -> D3d12Stats {
@@ -994,23 +1013,49 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
     Some(hr)
 }
 
-unsafe fn place_console_buffer(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+/// Whether `props` asks for CPU-cached readback memory (`D3D12_HEAP_TYPE_READBACK`, or
+/// `D3D12_HEAP_TYPE_CUSTOM` with `D3D12_CPU_PAGE_PROPERTY_WRITE_BACK`), which stays on the
+/// coherent committed window so CPU reads after a fence wait need no copy-back.
+fn is_readback_heap(props: &D3D12_HEAP_PROPERTIES) -> bool {
+    props.Type == D3D12_HEAP_TYPE_READBACK
+        || (props.Type == D3D12_HEAP_TYPE_CUSTOM && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)
+}
+
+unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
-    if UMA_HEAPS.lock().unwrap().is_empty() || ppv.is_null() {
+    if UMA_BUFFER.lock().unwrap().is_empty() || ppv.is_null() {
         return None;
     }
     let mut d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
     if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 {
         return None;
     }
+    let bytes = d.Width as usize;
+    let readback = props != 0
+        && crate::gpu::shader::readable(props, std::mem::size_of::<D3D12_HEAP_PROPERTIES>())
+        && is_readback_heap(&std::ptr::read_unaligned(props as *const D3D12_HEAP_PROPERTIES));
+    // Non-readback committed console buffers live in sparse VRAM windows (write-watched CPU
+    // view + tiled VRAM backing); readback / write-back buffers stay on coherent committed RAM.
+    if !readback && u.has_sparse() {
+        if let Some((p, _)) = super::sparse::alloc(bytes, 0x1_0000) {
+            let st = state as u32 & PC_RESOURCE_STATES;
+            if let Some((hr, delta)) = super::sparse::place_buffer(this, p, &d, st, riid, ppv) {
+                UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+                if delta != 0 {
+                    BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+                }
+                return Some(hr);
+            }
+            super::sparse::free(p);
+        }
+    }
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + this flag
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
-    let bytes = d.Width as usize;
     let p = u.alloc((bytes + 0xFFFF) & !0xFFFF, 0x1_0000)? as usize;
     let k = u.window_of(p)?;
-    let heap = UMA_HEAPS.lock().unwrap()[k];
+    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, state, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
@@ -1065,7 +1110,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         }
         return Some(hr);
     }
-    let heap = *UMA_HEAPS.lock().unwrap().get(k)?;
+    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
@@ -1096,7 +1141,17 @@ pub fn buffer_delta(res: usize) -> u64 {
 unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
     // the start of the PC resource, before the address for a buffer placed below it)
-    if let Some((p, _)) = console_buffer(this as usize) {
+    if let Some((p, bytes)) = console_buffer(this as usize) {
+        if !range.is_null() && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+            let r = *(range as *const D3D12_RANGE);
+            if r.End > r.Begin {
+                let begin = r.Begin.min(bytes);
+                let end = r.End.min(bytes);
+                if end > begin {
+                    super::sparse::readback_now(p + begin, end - begin);
+                }
+            }
+        }
         if !data.is_null() {
             *data = p as *mut c_void;
         }
@@ -1189,7 +1244,11 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
-            u.free(p);
+            if u.is_sparse(p) {
+                super::sparse::free(p);
+            } else {
+                u.free(p);
+            }
         }
     }
     n
@@ -1549,7 +1608,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         }
     }
     if desc != 0 {
-        if let Some(hr) = place_console_buffer(this, desc, state, clear, riid, ppv) {
+        if let Some(hr) = place_console_buffer(this, props, desc, state, clear, riid, ppv) {
             return hr;
         }
         if let Some(hr) = place_console_texture(this, console_desc, state, clear, riid, ppv) {
@@ -1947,10 +2006,26 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
     }
     hr2
 }
-creator!(dev_create_heap1, "CreateHeap1", Kind::Heap, [a1, a2]);
+creator!(dev_create_heap1_pc, "CreateHeap1", Kind::Heap, [a1, a2]);
 
-/// heap → (its size, the block of unified memory its buffers live in once one is placed)
-static HEAP_UMA: Mutex<Option<HashMap<usize, (usize, Option<usize>)>>> = Mutex::new(None);
+pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: usize, session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_heap1_pc(this, desc, session, riid, ppv);
+    if hr >= 0 {
+        note_heap_uma(desc, ppv);
+    }
+    hr
+}
+
+struct HeapUma {
+    size: usize,
+    align: usize,
+    readback: bool,
+    block: Option<usize>,
+}
+
+/// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
+/// DEFAULT/UPLOAD/write-combine heaps, coherent committed window for READBACK/write-back)
+static HEAP_UMA: Mutex<Option<HashMap<usize, HeapUma>>> = Mutex::new(None);
 
 /// A heap the title made that may hold buffers: a block of unified memory as large stands for
 /// it. On the console every heap is memory the CPU and the GPU address alike, and console code
@@ -1963,38 +2038,81 @@ static HEAP_UMA: Mutex<Option<HashMap<usize, (usize, Option<usize>)>>> = Mutex::
 /// none when unified memory is full (the PC heap as before).
 unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
     const DENY_BUFFERS: i32 = 0x4;
-    if desc == 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
+    if super::title_textures::is_own_work() || desc == 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
         return;
     }
     let d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
-    if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_HEAPS.lock().unwrap().is_empty() {
+    if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
         return;
     }
-    HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (d.SizeInBytes as usize, None));
+    HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        *ppv as usize,
+        HeapUma {
+            size: d.SizeInBytes as usize,
+            align: (d.Alignment as usize).max(0x1_0000),
+            readback: is_readback_heap(&d.Properties),
+            block: None,
+        },
+    );
 }
 
 /// The block of unified memory standing for `heap` (taken now if it has none yet; None: not a
 /// heap that takes one, or unified memory is full).
 fn heap_block(heap: usize) -> Option<usize> {
-    let mut g = HEAP_UMA.lock().unwrap();
-    let e = g.as_mut()?.get_mut(&heap)?;
-    if let Some(p) = e.1 {
-        return Some(p);
-    }
+    let (size, align, readback) = {
+        let g = HEAP_UMA.lock().unwrap();
+        let e = g.as_ref()?.get(&heap)?;
+        if let Some(p) = e.block {
+            return Some(p);
+        }
+        (e.size, e.align, e.readback)
+    };
     let u = crate::gpu::uma::get()?;
-    let Some(p) = u.alloc(e.0.div_ceil(0x1_0000) * 0x1_0000, 0x1_0000) else {
+    let p = if !readback && u.has_sparse() {
+        unsafe { super::sparse::alloc(size, align) }
+            .map(|(a, _)| a)
+            .or_else(|| u.alloc(size.div_ceil(0x1_0000) * 0x1_0000, align).map(|a| a as usize))
+    } else {
+        u.alloc(size.div_ceil(0x1_0000) * 0x1_0000, align).map(|a| a as usize)
+    };
+    let Some(p) = p else {
         static FULL: AtomicU64 = AtomicU64::new(0);
         if FULL.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::xlog_warn!("D3D12.X: heap of {:#x} bytes: unified memory is full ({} MB used) – its buffers stay PC-only", e.0, u.used() >> 20);
+            crate::xlog_warn!(
+                "D3D12.X: heap of {size:#x} bytes: unified memory is full ({} MB sparse, {} MB coherent used) – its buffers stay PC-only",
+                u.sparse_used() >> 20,
+                u.used() >> 20
+            );
         }
         return None;
     };
-    e.1 = Some(p as usize);
+    let mut g = HEAP_UMA.lock().unwrap();
+    let Some(e) = g.as_mut().and_then(|m| m.get_mut(&heap)) else {
+        drop(g);
+        if u.is_sparse(p) {
+            unsafe { super::sparse::free(p) };
+        } else {
+            u.free(p);
+        }
+        return None;
+    };
+    if let Some(existing) = e.block {
+        drop(g);
+        if u.is_sparse(p) {
+            unsafe { super::sparse::free(p) };
+        } else {
+            u.free(p);
+        }
+        return Some(existing);
+    }
+    e.block = Some(p);
+    drop(g);
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::xlog_info!("D3D12.X: heap {heap:#x} ({:#x} bytes) holds buffers: in unified memory at {:#x}", e.0, p as usize);
+        let kind = if u.is_sparse(p) { "sparse VRAM" } else { "coherent RAM" };
+        crate::xlog_info!("D3D12.X: heap {heap:#x} ({size:#x} bytes) holds buffers: in {kind} at {p:#x}");
     }
-    Some(p as usize)
+    Some(p)
 }
 
 /// ID3D12Heap::Release: its block of unified memory goes with it.
@@ -2002,9 +2120,13 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.1);
+        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
-            u.free(p);
+            if u.is_sparse(p) {
+                super::sparse::free(p);
+            } else {
+                u.free(p);
+            }
         }
     }
     n
@@ -3366,7 +3488,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
         .collect();
     super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| f(this, chunk.len() as u32, chunk.as_ptr()));
+    super::list_x::execute_with_waits(&mapped, |chunk| {
+        f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::readback_sparse_writes(this, chunk);
+    });
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
