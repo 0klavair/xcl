@@ -179,11 +179,6 @@ pub struct TwoPass {
     pub samplers: Vec<StaticSampler>,
 }
 
-fn two_pass(code: &[u8], mode: Mode, wave64: bool, geometry_wave32: bool, mesh_wave32: bool, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
-    let t = translate(code, &Options { mode, wave64, geometry_wave32, mesh_wave32, ..Default::default() })?;
-    finish_two_pass(t, record, ps)
-}
-
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
@@ -206,7 +201,7 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, mesh_wave32: bool) -> Result
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    two_pass(code, mode.clone(), super::detect_wave64(code), false, mesh_wave32, record, ps)
+    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), mesh_wave32)?, record, ps)
 }
 
 /// Whether the adapter's supported wave range requires split geometry execution.
