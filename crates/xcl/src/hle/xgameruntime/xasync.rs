@@ -230,11 +230,13 @@ pub unsafe extern "system" fn XAsyncBegin(
         cv: Condvar::new(),
     });
     register_state(b, s.clone());
+    // A failing Begin fails the async call, not XAsyncBegin (libHttpClient): the caller gets
+    // the error once, through the block, and not also as this return value.
     let hr = call_provider(&s, OP_BEGIN, b, std::ptr::null_mut(), 0);
     if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
-    hr
+    S_OK
 }
 
 pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32) -> HRESULT {
@@ -257,6 +259,10 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, HRESULT, usize) = std::mem::transmute(f);
         return f(o, b, result, required);
     }
+    // E_PENDING is not a completion: the provider still has work to do (libHttpClient).
+    if result == E_PENDING {
+        return;
+    }
     let Lookup::Active(s) = lookup(b) else { return };
     // Snapshot callback/queue before publishing completion so a waiter woken from
     // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
@@ -267,7 +273,7 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         if g.done {
             return;
         }
-        status = if result == E_PENDING { crate::util::E_FAIL } else { result };
+        status = result;
         g.status = status;
         g.result_size = if status >= 0 { required } else { 0 };
         g.done = true;
@@ -444,7 +450,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     if hr < 0 {
         XAsyncComplete(b, hr, 0);
     }
-    hr
+    S_OK
 }
 
 // ---------------------------------------------------------------------------------------
@@ -615,6 +621,42 @@ mod tests {
             assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);
             assert_eq!(XAsyncGetStatus(&mut b, true), 7);
             assert!(!active_map().lock().unwrap().contains_key(&(&mut b as *mut XAsyncBlock as usize)));
+        }
+    }
+
+    /// Begin fails (or completes) without scheduling anything; the test completes it.
+    unsafe extern "system" fn fails_to_begin(op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+        if op == OP_BEGIN { crate::util::E_FAIL } else { S_OK }
+    }
+    unsafe extern "system" fn begins_without_work(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+        S_OK
+    }
+
+    #[test]
+    fn a_failing_begin_fails_the_call_not_xasyncbegin() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), fails_to_begin as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, false), crate::util::E_FAIL);
+            // an XAsyncRun on a queue handle XCL does not know: failed through the block too
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = 0x10 as *mut c_void;
+            assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, false), E_INVALIDARG);
+        }
+    }
+
+    #[test]
+    fn completing_with_e_pending_does_not_complete() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize), S_OK);
+            XAsyncComplete(&mut b, E_PENDING, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
+            XAsyncComplete(&mut b, 3, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), 3);
         }
     }
 }
