@@ -708,6 +708,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (15, l::copy_buffer_region_x as usize),
                 (16, l::copy_texture_region_x as usize),
                 (17, l::copy_resource_x as usize),
+                (19, l::resolve_subresource_x as usize),
+                (51, l::clear_depth_stencil_x as usize),
+                (108, l::resolve_subresource_region_x as usize),
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
                 (48, l::ia_set_vertex_buffers_x as usize),
@@ -1592,6 +1595,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::Resource => v.extend_from_slice(&[("Release", res_release as usize), ("Map", res_map as usize), ("Unmap", res_unmap as usize)]),
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
+        Kind::Heap => v.push(("Release", mem_heap_release as usize)),
         _ => {}
     }
     v
@@ -1768,6 +1772,18 @@ const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x8
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
+    if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+        let is_buffer = u32::from_le_bytes(x[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
+        if let Some(block) = is_buffer.then(|| heap_block(heap)).flatten() {
+            let d = super::device_x::pc_resource_desc(&x);
+            let st = state as u32 & PC_RESOURCE_STATES;
+            if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
+                return hr;
+            }
+        }
+    }
     let hr = dev_create_placed_resource(this, heap, offset, desc, state, clear, riid, ppv);
     if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
         return hr;
@@ -1803,6 +1819,9 @@ const PC_HEAP_FLAGS: u32 = 0x3FED;
 /// covers it, an unknown type as DEFAULT. Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let hr = dev_create_heap_pc(this, desc, riid, ppv);
+    if hr >= 0 {
+        note_heap_uma(desc, ppv);
+    }
     if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
         return hr;
     }
@@ -1815,6 +1834,9 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
     }
     d.SizeInBytes = d.SizeInBytes.div_ceil(0x1_0000) * 0x1_0000;
     let hr2 = dev_create_heap_pc(this, &d as *const _ as usize, riid, ppv);
+    if hr2 >= 0 {
+        note_heap_uma(desc, ppv);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         crate::xlog_info!(
@@ -1825,6 +1847,67 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
     hr2
 }
 creator!(dev_create_heap1, "CreateHeap1", Kind::Heap, [a1, a2]);
+
+/// heap → (its size, the block of unified memory its buffers live in once one is placed)
+static HEAP_UMA: Mutex<Option<HashMap<usize, (usize, Option<usize>)>>> = Mutex::new(None);
+
+/// A heap the title made that may hold buffers: a block of unified memory as large stands for
+/// it. On the console every heap is memory the CPU and the GPU address alike, and console code
+/// reads buffers (root descriptors, V#s) from that memory – a PC heap's buffer has a GPU
+/// address only (Minecraft's constant and vertex buffers: a heap of its own; its UI drew
+/// nothing – the constants read as zero). Buffers placed in the heap are placed in the block
+/// (`dev_create_placed_resource_x`); textures stay in the PC heap. The block is taken when the
+/// first buffer is placed (most heaps hold textures only: a block for each filled the 2 GiB of
+/// unified memory, and draws then found no room for their arguments – the image flickered);
+/// none when unified memory is full (the PC heap as before).
+unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
+    const DENY_BUFFERS: i32 = 0x4;
+    if desc == 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
+        return;
+    }
+    let d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+    if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_HEAPS.lock().unwrap().is_empty() {
+        return;
+    }
+    HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (d.SizeInBytes as usize, None));
+}
+
+/// The block of unified memory standing for `heap` (taken now if it has none yet; None: not a
+/// heap that takes one, or unified memory is full).
+fn heap_block(heap: usize) -> Option<usize> {
+    let mut g = HEAP_UMA.lock().unwrap();
+    let e = g.as_mut()?.get_mut(&heap)?;
+    if let Some(p) = e.1 {
+        return Some(p);
+    }
+    let u = crate::gpu::uma::get()?;
+    let Some(p) = u.alloc(e.0.div_ceil(0x1_0000) * 0x1_0000, 0x1_0000) else {
+        static FULL: AtomicU64 = AtomicU64::new(0);
+        if FULL.fetch_add(1, Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("D3D12.X: heap of {:#x} bytes: unified memory is full ({} MB used) – its buffers stay PC-only", e.0, u.used() >> 20);
+        }
+        return None;
+    };
+    e.1 = Some(p as usize);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_info!("D3D12.X: heap {heap:#x} ({:#x} bytes) holds buffers: in unified memory at {:#x}", e.0, p as usize);
+    }
+    Some(p as usize)
+}
+
+/// ID3D12Heap::Release: its block of unified memory goes with it.
+unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
+    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+    let n = f(this);
+    if n == 0 {
+        let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.1);
+        if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+            u.free(p);
+        }
+    }
+    n
+}
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
 /// fences created through the device (AddRef'd: they are released at the end only)
@@ -2206,6 +2289,44 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 24 {
+            let b = &d.BlendState.RenderTarget[0];
+            let z = &d.DepthStencilState;
+            crate::xlog_info!(
+                "frame trace: PSO vs {:016x} ps {ps:016x}: RTs {} {:?} DSV {} samples {}, depth (enable {}, write {}, func {}), stencil {}, blend0 (enable {}, src {} dst {} op {}, alpha src {} dst {}, mask {:#x}), cull {} fill {} depth clip {}, sample mask {:#x}",
+                crate::gpu::shader::fnv64(vs),
+                d.NumRenderTargets,
+                &d.RTVFormats[..d.NumRenderTargets.min(8) as usize].iter().map(|f| f.0).collect::<Vec<_>>(),
+                d.DSVFormat.0,
+                d.SampleDesc.Count,
+                z.DepthEnable.as_bool(),
+                z.DepthWriteMask.0,
+                z.DepthFunc.0,
+                z.StencilEnable.as_bool(),
+                b.BlendEnable.as_bool(),
+                b.SrcBlend.0,
+                b.DestBlend.0,
+                b.BlendOp.0,
+                b.SrcBlendAlpha.0,
+                b.DestBlendAlpha.0,
+                b.RenderTargetWriteMask,
+                d.RasterizerState.CullMode.0,
+                d.RasterizerState.FillMode.0,
+                d.RasterizerState.DepthClipEnable.as_bool(),
+                d.SampleMask
+            );
+            if z.StencilEnable.as_bool() {
+                let f = |o: &D3D12_DEPTH_STENCILOP_DESC| (o.StencilFunc.0, o.StencilPassOp.0, o.StencilFailOp.0, o.StencilDepthFailOp.0);
+                crate::xlog_info!(
+                    "frame trace: … its stencil: read mask {:#x} write mask {:#x}, front (func, pass, fail, depth fail) {:?}, back {:?}",
+                    z.StencilReadMask,
+                    z.StencilWriteMask,
+                    f(&z.FrontFace),
+                    f(&z.BackFace)
+                );
+            }
+        }
     }
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: graphics PSO from translated console shaders (#{})", n + 1);

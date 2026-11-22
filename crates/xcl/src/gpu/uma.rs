@@ -193,6 +193,23 @@ impl Uma {
         self.window_of(p).is_some()
     }
 
+    /// Whether `p` is memory the title has here: a block handed out in a committed window, or
+    /// one of its reservations in a sparse window. The windows' ranges are wide (4 GiB each) and
+    /// a PC resource's GPU address can fall in one by number – that address is not the
+    /// window's memory (Minecraft's dynamic vertex buffer, a PC upload buffer, was read from an
+    /// empty sparse window: nothing drew).
+    pub fn is_title_address(&self, p: usize) -> bool {
+        if self.is_sparse(p) {
+            return self.sparse_reservation(p).is_some();
+        }
+        if !self.is_committed(p) {
+            return false;
+        }
+        let off = p - self.base;
+        let g = self.inner.lock().unwrap();
+        g.used.range(..=off).next_back().is_some_and(|(&o, &l)| off < o + l)
+    }
+
     /// Zeroed block of `size` bytes aligned to `align` (at least 64 KiB), first fit (window 0
     /// first).
     pub fn alloc(&self, size: usize, align: usize) -> Option<*mut u8> {
@@ -336,5 +353,18 @@ mod tests {
         assert_eq!(u.used(), 0);
         // everything merged back into one range
         assert!(u.alloc(16 << 20, 0).is_some());
+    }
+
+    /// Only handed-out blocks are the title's memory: an address in a window's range that is
+    /// not one (a PC GPU address by number) is not.
+    #[test]
+    fn title_addresses_are_blocks_handed_out() {
+        let u = Uma::new(16 << 20).unwrap();
+        let a = u.alloc(0x2_0000, 0).unwrap() as usize;
+        assert!(u.is_title_address(a) && u.is_title_address(a + 0x1_FFFF));
+        assert!(!u.is_title_address(a + 0x2_0000) && !u.is_title_address(u.base() + (8 << 20)));
+        assert!(!u.is_title_address(u.base() - 1) && !u.is_title_address(u.base() + (32 << 20)));
+        assert!(u.free(a));
+        assert!(!u.is_title_address(a));
     }
 }

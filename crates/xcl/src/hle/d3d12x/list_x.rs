@@ -245,6 +245,25 @@ struct Bindings {
     render_targets: Option<(Vec<usize>, i32, Option<usize>)>,
 }
 
+/// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
+/// scissor, render targets) as text.
+pub(super) fn state_summary(list: *mut c_void) -> String {
+    let mut out = String::new();
+    with_bindings(list, |b| {
+        let vp = b.viewports.first().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth));
+        let sc = b.scissors.first().map(|r| (r.left, r.top, r.right, r.bottom));
+        out = format!(
+            "topology {:?}, stencil ref {:?}, viewport {vp:?} ({} set), scissor {sc:?} ({} set), render targets {:?}",
+            b.topology,
+            b.stencil,
+            b.viewports.len(),
+            b.scissors.len(),
+            b.render_targets.as_ref().map(|(h, _, d)| (h.len(), d.is_some()))
+        );
+    });
+    out
+}
+
 fn with_bindings(list: *mut c_void, f: impl FnOnce(&mut Bindings)) {
     let mut g = LISTS.lock().unwrap();
     f(&mut g.get_or_insert_with(HashMap::new).entry(list as usize).or_default().bindings);
@@ -1270,7 +1289,12 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
 // ---------------------------------------------------------------------------------------
 
 /// a console GPU address as the PC's (unified memory: the window buffer's)
+/// A GPU address the title gave: its memory's PC address when it is the title's memory, else
+/// as it is (a PC resource's GPU address – it may lie in a window's range by number).
 fn pc_va(va: u64) -> u64 {
+    if !crate::gpu::uma::get().is_some_and(|u| u.is_title_address(va as usize)) {
+        return va;
+    }
     real::uma_va_of(va as usize).unwrap_or(va)
 }
 
@@ -1329,7 +1353,28 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
     let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = (0..n as usize)
         .map(|k| {
             let mut v = views.add(k).read_unaligned();
+            let title = v.BufferLocation;
             v.BufferLocation = pc_va(v.BufferLocation);
+            if super::present::trace_frame() {
+                static N: AtomicU64 = AtomicU64::new(0);
+                let i = N.fetch_add(1, Ordering::Relaxed);
+                if i < 12 || (i.is_power_of_two() && i < 1 << 16) {
+                    let n = (v.SizeInBytes as usize).min(256);
+                    let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
+                    let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
+                    let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    let q = windows_sys::Win32::System::Memory::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
+                    crate::xlog_info!(
+                        "frame trace: vertex buffer #{i} slot {}: title {title:#x} → PC {:#x}, {} bytes, stride {}; non-zero in the first {n} bytes (CPU view): {data:?}; window (index, (base, size), sparse) {win:x?}; memory state {:#x} protect {:#x} (query {q})",
+                        start + k as u32,
+                        v.BufferLocation,
+                        v.SizeInBytes,
+                        v.StrideInBytes,
+                        mbi.State,
+                        mbi.Protect
+                    );
+                }
+            }
             v
         })
         .collect();
@@ -1468,6 +1513,13 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             }
             b[5] &= PC_STATES;
             b[6] &= PC_STATES;
+            // VERTEX_AND_CONSTANT_BUFFER / INDEX_BUFFER are buffer states on the PC; the console
+            // takes them for textures too (Minecraft moves a texture to a generic-read
+            // combination) – the PC list then fails to close
+            if (b[5] | b[6]) & BUFFER_ONLY_STATES != 0 && !is_buffer((b[2] as u64 | (b[3] as u64) << 32) as usize) {
+                b[5] &= !BUFFER_ONLY_STATES;
+                b[6] &= !BUFFER_ONLY_STATES;
+            }
             if b[5] == b[6] {
                 continue;
             }
@@ -1477,6 +1529,15 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
     }
+}
+
+/// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER: valid for buffers only
+const BUFFER_ONLY_STATES: u32 = 0x1 | 0x2;
+
+/// Whether `res` is a buffer (null / unknown: taken as one – its states are left alone).
+unsafe fn is_buffer(res: usize) -> bool {
+    let r = res as *mut c_void;
+    ID3D12Resource::from_raw_borrowed(&r).is_none_or(|x| x.GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
 }
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
@@ -1572,6 +1633,66 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
 /// console copy flags (the title's texture streaming calls it where the DMA list gets #12)
 pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, _flags: u32) {
     copy_texture_region_x(this, dst, x, y, z, src, bx)
+}
+
+const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
+
+/// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
+pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    if super::present::trace_frame() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k < 8 || k.is_power_of_two() {
+            crate::xlog_info!("frame trace: ClearDepthStencilView #{k} {dsv:#x}: flags {flags:#x} (1 depth, 2 stencil), depth {depth}, stencil {stencil}, {n} rects");
+        }
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+}
+
+const PC_RESOLVE_SUBRESOURCE: usize = 19;
+const PC_RESOLVE_SUBRESOURCE_REGION: usize = 64;
+
+/// `XCL_TRACE_FRAME`: a resolve (first 12 and powers of two) – what goes where
+unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: &str) {
+    if !super::present::trace_frame() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k >= 12 && !k.is_power_of_two() {
+        return;
+    }
+    let desc = |r: usize| {
+        let p = r as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&p).map(|x| {
+            let d = x.GetDesc();
+            (d.Width, d.Height, d.Format.0, d.SampleDesc.Count)
+        })
+    };
+    crate::xlog_info!(
+        "frame trace: {what} #{k} {src:#x} {:?} → {dst:#x} {:?}{} format {format}{extra}",
+        desc(src),
+        desc(dst),
+        if super::present::is_presented(dst) { " (presented)" } else { "" }
+    );
+}
+
+/// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
+pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    super::present::note_use(dst, super::present::USE_COPY);
+    trace_resolve("ResolveSubresource", dst, src, format, "");
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+}
+
+/// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
+/// mode) (PC #64)
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    super::present::note_use(dst, super::present::USE_COPY);
+    if super::present::trace_frame() {
+        trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
+    }
+    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address

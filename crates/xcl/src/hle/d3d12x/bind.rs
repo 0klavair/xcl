@@ -268,7 +268,7 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
         }
         g.push((vs, ps, rt));
     }
-    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) });
+    let desc = |r: usize| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0, d.SampleDesc.Count) });
     let (layout, args) = with(this, |s| (s.layout_gfx.clone(), s.args_gfx.clone()));
     let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
     let mut tex = Vec::new();
@@ -288,10 +288,11 @@ unsafe fn trace_draw_kinds(this: *mut c_void, pso: usize) {
         }
     }
     crate::xlog_info!(
-        "frame trace: draws vs {vs:016x} ps {ps:016x} into {:?}{} – textures {}",
+        "frame trace: draws vs {vs:016x} ps {ps:016x} into {:?}{} – textures {}; {}",
         desc(rt),
         if super::present::is_presented(rt) { " (presented)" } else { "" },
-        tex.join(", ")
+        tex.join(", "),
+        super::list_x::state_summary(this)
     );
 }
 
@@ -301,8 +302,9 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
     if super::present::activity().0 < 300 || N.load(std::sync::atomic::Ordering::Relaxed) >= 24 {
         return;
     }
+    // draws into a presented target, or – `XCL_TRACE_UI_ANY` – into any target
     let Some(rt) = super::present::rt0_resource(this as usize) else { return };
-    if !super::present::is_presented(rt) {
+    if !super::present::is_presented(rt) && std::env::var_os("XCL_TRACE_UI_ANY").is_none() {
         return;
     }
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

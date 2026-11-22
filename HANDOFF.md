@@ -1141,6 +1141,28 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `sparse::mapped_ranges`). Use the release build for game runs: the debug build hashes the dirty chunks ~10×
   slower (and the queues then wait on each other for the sparse lock). The log has
   "sparse windows timing: write-watch / lock wait / chunk scan / upload" lines.
+- **Minecraft (Microsoft.MinecraftBeta 1.18.30.64) reaches its main menu (2026-11-22, latest)**: panorama, logo,
+  buttons, the character, music and Enter work; it offers the trial (XStore is refused – no fake licences) and
+  stops at the Microsoft-account sign-in (Xbox Live). Run `Minecraft.Windows.exe.original`: the `Minecraft.Windows.exe`
+  next to it is a 29-byte patch that makes licence checks return true – not run by XCL work. Fixed (all general):
+  - the title's top-level window is the console's screen (`hle/user.rs`): frameless, 1920x1080, client = window
+    (WM_NCCALCSIZE), cloaked – a PC overlapped window gave a 1904x1041 client area, Minecraft sized its back buffer
+    from it and resolved 1920x1080 into it: the list failed to close, the device was removed;
+  - ResourceBarrier: VERTEX_AND_CONSTANT_BUFFER / INDEX_BUFFER bits are dropped for non-buffers (the console takes a
+    generic-read combination for textures; the PC list fails to close);
+  - kernelx `FreeLibraryWhenCallbackReturns`: a no-op for XCL-mapped modules (msvcp140's thread-pool callbacks:
+    0xC000070E in 20 workers, then a fail-fast);
+  - `Uma::is_title_address` / `list_x::pc_va`: a GPU address the title gives is translated only when it is the
+    title's memory – a PC resource's GPU address can fall in a window's range by number (Minecraft's 4 MB dynamic
+    vertex buffer was read from an empty sparse window);
+  - buffers in the title's heaps live in unified memory (`real::note_heap_uma` / `heap_block` /
+    `dev_create_placed_resource_x`): the heap gets a block when its first buffer is placed, the buffer is placed
+    at block + offset. Console code reads root CBVs and V#s from unified memory only – Minecraft's constant buffers
+    were PC-only and every draw read a zero transform (nothing drew). Eager blocks for every heap filled the 2 GiB and
+    draws were skipped for want of argument space (the image flickered).
+  Diagnostics: `XCL_TRACE_FRAME` logs PSO states (depth / stencil / blend), resolves, ClearDepthStencilView,
+  vertex-buffer bindings (address, window, memory state) and the fixed-function state per draw kind;
+  `XCL_TRACE_UI_ANY=1` traces draws into any target; `XCL_TRACE_MEM=1` also logs graphics reservations.
 - **PS attributes / VS params are registers (2026-11-22, latest)**: Fortnite's loading art ("ŁĄCZENIE"), title
   screen (FORTNITE logo, "press to start", version, Epic/Unreal logos) and UI text now draw. Cause: `exp param N`
   (VS, MS) and `v_interp attrN` (PS) name a signature *register*, not an element, and the console's compiler

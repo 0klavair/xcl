@@ -597,9 +597,11 @@ fn rgb(format: DXGI_FORMAT, t: u32) -> Option<[u8; 3]> {
     })
 }
 
-/// the resource bound as a render target most often (`XCL_TRACE_FRAME`)
+/// the single-sampled resource bound as a render target most often (`XCL_TRACE_FRAME`; a
+/// multisampled one cannot be copied to a buffer – the present list would not close)
 fn busiest_rt() -> Option<usize> {
-    USES.lock().unwrap().as_ref()?.iter().filter(|(_, u)| u[USE_RT] > 0).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
+    let single = |r: usize| unsafe { ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).is_some_and(|x| x.GetDesc().SampleDesc.Count <= 1) };
+    USES.lock().unwrap().as_ref()?.iter().filter(|(&r, u)| u[USE_RT] > 0 && single(r)).max_by_key(|(_, u)| u[USE_RT]).map(|(&r, _)| r)
 }
 
 /// an 11- / 10-bit unsigned float (5-bit exponent) -> f32

@@ -89,6 +89,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         GetModuleFileNameW,
         GetModuleFileNameA,
         FreeLibrary,
+        FreeLibraryWhenCallbackReturns,
         DisableThreadLibraryCalls,
     ]
 }
@@ -164,7 +165,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     let uma = crate::gpu::uma::get();
     // committing inside one of the title's reservations in a sparse window
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
-        return commit_sparse(addr as usize, size, p);
+        let q = commit_sparse(addr as usize, size, p);
+        trace_mem("VirtualAlloc (sparse commit)", addr as usize, size, t as u64, p, q as usize);
+        return q;
     }
     // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
     if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
@@ -173,11 +176,13 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
                 uma.map(|u| u.sparse_release(q));
                 return std::ptr::null_mut();
             }
+            trace_mem("VirtualAlloc (64K pages, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
     }
     if addr.is_null() && t & MEM_GRAPHICS != 0 && t & 0x1000 != 0 {
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.alloc(size, 0)) {
+            trace_mem("VirtualAlloc (graphics, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
     }
@@ -186,9 +191,11 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // reserve a range, then commit or map pages and place resources in it): a range of
         // unified memory, which is committed already
         if let Some(q) = crate::gpu::uma::get().and_then(|u| u.reserve(size, 0x1_0000)) {
+            trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
             return q as *mut c_void;
         }
         if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
+            trace_mem("VirtualAlloc (graphics reserve, sparse)", 0, size, t as u64, p, q);
             return q as *mut c_void;
         }
         let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
@@ -1115,6 +1122,18 @@ pub unsafe extern "system" fn FreeLibrary(h: usize) -> BOOL {
         return 1;
     }
     fnd::FreeLibrary(h as _)
+}
+
+/// A thread-pool callback asks for its module to be freed when it returns (the title's
+/// msvcp140 does, for the reference it took on itself). A module XCL mapped is not in Windows'
+/// loader – the pool's FreeLibrary fails and raises 0xC000070E in the worker (Minecraft: 20
+/// workers at once, then a fail-fast). XCL's modules are never unloaded: nothing to do for them.
+pub unsafe extern "system" fn FreeLibraryWhenCallbackReturns(instance: *mut c_void, h: usize) {
+    let main = modules::main_module().is_some_and(|m| m.base == h);
+    if main || modules::find_mapped_by_base(h).is_some() || modules::hle_name_by_handle(h).is_some() {
+        return;
+    }
+    thr::FreeLibraryWhenCallbackReturns(instance as _, h as _)
 }
 
 pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
