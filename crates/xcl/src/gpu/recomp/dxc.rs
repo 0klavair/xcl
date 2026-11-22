@@ -281,7 +281,7 @@ pub fn cache_dir() -> PathBuf {
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CacheStats {
-    /// Initial cache hits, including cached-only requests.
+    /// Immediate cache hits in memory or on disk, including cached-only requests.
     pub hits: u64,
     /// Initial misses, excluding cached-only requests.
     pub misses: u64,
@@ -337,6 +337,10 @@ fn cache_counters() -> &'static CacheCounters {
 
 pub fn cache_stats() -> CacheStats {
     cache_counters().snapshot()
+}
+
+pub(super) fn note_memory_hit() {
+    cache_counters().hits.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
