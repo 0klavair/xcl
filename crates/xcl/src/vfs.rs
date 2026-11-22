@@ -56,6 +56,8 @@ const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 pub struct Vfs {
     game_root: String,
     game_root_lc: String,
+    /// XCL's data folder for the title, absolute and lower-case.
+    data_root_lc: String,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -142,8 +144,11 @@ impl Vfs {
             .collect();
         // longest prefix first ("GAME:" before "G:")
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let data_root = data_dir.to_string_lossy();
+        let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
         Vfs {
             game_root_lc: game_root.to_lowercase(),
+            data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
@@ -162,22 +167,10 @@ impl Vfs {
     fn apply_mounts(&self, p: &str) -> Option<String> {
         // to_ascii_lowercase keeps byte offsets, so slicing `p` with prefix.len() is safe
         let l = p.to_ascii_lowercase();
-        for (prefix, target) in &self.mounts {
-            if !l.starts_with(prefix.as_str()) {
-                continue;
-            }
-            let rest = &p[prefix.len()..];
-            // "G:" / "GAME:" accept anything after the colon ("G:foo" == "G:\foo");
-            // directory-style prefixes need a separator boundary.
-            if !(prefix.ends_with(':') || rest.is_empty() || rest.starts_with('\\')) {
-                continue;
-            }
-            let tail = rest.trim_start_matches('\\');
-            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
-        }
         // Embedded "...\GAME:\rest": some runtimes treat "GAME:\x" as a relative path and
         // prepend the current directory. A component ending in ':' is never a valid file
-        // name, so it can only be a console mount.
+        // name, so it can only be a console mount – checked first, so that a drive mount
+        // ("D:") does not take the path when the current directory is on that drive.
         for (prefix, target) in &self.mounts {
             if !prefix.ends_with(':') {
                 continue;
@@ -194,6 +187,19 @@ impl Vfs {
                 }
                 from = after;
             }
+        }
+        for (prefix, target) in &self.mounts {
+            if !l.starts_with(prefix.as_str()) {
+                continue;
+            }
+            let rest = &p[prefix.len()..];
+            // "G:" / "GAME:" accept anything after the colon ("G:foo" == "G:\foo");
+            // directory-style prefixes need a separator boundary.
+            if !(prefix.ends_with(':') || rest.is_empty() || rest.starts_with('\\')) {
+                continue;
+            }
+            let tail = rest.trim_start_matches('\\');
+            return Some(if tail.is_empty() { target.clone() } else { format!("{target}\\{tail}") });
         }
         None
     }
@@ -212,8 +218,8 @@ impl Vfs {
             return Target::Pass; // UNC
         }
         let (p, translated) = match self.apply_mounts(&p) {
-            Some(t) => (t, true),
-            None => (p, false),
+            Some(t) if !self.in_own_folders(&p, &full) => (t, true),
+            _ => (p, false),
         };
         if !translated {
             let b = p.as_bytes();
@@ -244,6 +250,21 @@ impl Vfs {
         } else {
             Target::Pass
         }
+    }
+
+    /// A path that already names the game folder or XCL's data folder on the PC. A console
+    /// drive mount ("D:") must not translate it when the PC has its folders on that drive.
+    /// Only a plain drive path counts: "<game>\GAME:\x" still names a console mount.
+    fn in_own_folders(&self, p: &str, full: impl Fn(&str) -> Option<String>) -> bool {
+        let b = p.as_bytes();
+        if !(b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()) || p[2..].contains(':') {
+            return false;
+        }
+        let Some(abs) = full(p) else { return false };
+        let lc = trim_sep(&strip_verbatim(&norm(&abs))).to_lowercase();
+        [&self.game_root_lc, &self.data_root_lc].iter().any(|root| {
+            lc.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('\\'))
+        })
     }
 
     pub fn classify(&self, path: &str) -> Target {
@@ -553,6 +574,33 @@ mod tests {
         assert_eq!(v.classify("CONOUT$"), Target::Pass);
         assert_eq!(v.classify("\\\\.\\pipe\\x"), Target::Pass);
         assert_eq!(v.classify("C:\\Windows\\notepad.exe"), Target::Pass);
+    }
+
+    /// The console's "D:" mount on a PC whose game and XCL data are on its D: drive: paths
+    /// already inside those folders are the PC's, everything else on the drive is the console's.
+    #[test]
+    fn a_console_drive_mount_leaves_the_pcs_own_folders_on_that_drive() {
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_drive_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        let data = dir.join("xcldata");
+        std::fs::create_dir_all(game.join("data")).unwrap();
+        let game_s = full_path(&game.to_string_lossy()).unwrap();
+        let drive = game_s[..2].to_string(); // the drive the PC keeps the game on
+        let v = Vfs::new(Path::new(&game_s), &data, vec![(drive.clone(), game_s.clone())]);
+
+        let exe = format!("{game_s}\\xcl_testtitle.exe");
+        assert_eq!(v.classify(&exe), Target::Game { rel: "xcl_testtitle.exe".into() });
+        assert_eq!(v.classify(&game_s), Target::Game { rel: String::new() });
+        let log = full_path(&data.join("logs").join("xcl.log").to_string_lossy()).unwrap();
+        assert_eq!(v.classify(&log), Target::Pass);
+        // a console path on that drive still goes to the game folder
+        assert_eq!(v.classify(&format!("{drive}\\data\\hello.txt")), Target::Game { rel: "data\\hello.txt".into() });
+        // "GAME:\x" made relative to a current directory on that drive
+        let v = Vfs::new(Path::new(&game_s), &data, vec![(drive.clone(), game_s.clone()), ("GAME:".into(), game_s.clone())]);
+        let mangled = format!("{drive}\\cwd\\GAME:\\data\\hello.txt");
+        assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
