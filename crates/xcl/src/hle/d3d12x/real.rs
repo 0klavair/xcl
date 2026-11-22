@@ -316,13 +316,15 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
-fn geometry_wave32_required(device: *mut c_void) -> bool {
+/// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
+/// split form (`Options::split_wave64`). Unknown device: assume so.
+fn wave32_only(device: *mut c_void) -> bool {
     if device.is_null() {
         return true;
     }
     unsafe {
         let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
-        crate::gpu::recomp::pso::geometry_uses_wave32_for_device(dev)
+        crate::gpu::recomp::pso::wave32_only_for_device(dev)
     }
 }
 
@@ -2532,7 +2534,7 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -2541,7 +2543,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
-    let compiled = match console_to_dxil(cs, Stage::Compute, 0) {
+    let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
@@ -3102,7 +3104,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, geometry_wave32_required(this)), two_pass_ps(ps)) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps)) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -3135,7 +3137,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let (tp, (ps, ps_samplers)) = match (
-        crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), geometry_wave32_required(this)),
+        crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
         two_pass_ps(shader_bytes(&d.PS)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),

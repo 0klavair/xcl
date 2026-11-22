@@ -41,7 +41,14 @@ pub struct Compiled {
 /// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
 pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<Compiled, String> {
-    let (mut t, profile) = console_translation(blob, stage, sampler_base)?;
+    console_to_dxil_for(blob, stage, sampler_base, false)
+}
+
+/// `console_to_dxil` for a GPU that runs only 32-lane waves when `split_wave64`
+/// (`wave32_only_for_device`): a wave64 compute program gets the split form
+/// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
+pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
+    let (mut t, profile) = console_translation(blob, stage, sampler_base, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
     }
@@ -130,10 +137,10 @@ fn debug_color(blob: &[u8]) -> Option<[f32; 3]> {
 
 /// The HLSL (and its DXC profile) `console_to_dxil` compiles.
 pub fn console_to_hlsl(blob: &[u8], stage: Stage) -> Result<(String, &'static str), String> {
-    console_translation(blob, stage, 0).map(|(t, p)| (t.hlsl, p))
+    console_translation(blob, stage, 0, false).map(|(t, p)| (t.hlsl, p))
 }
 
-fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(super::Translation, &'static str), String> {
+fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
@@ -155,7 +162,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<(
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: mem_windows(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -193,7 +200,7 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
 /// the pixel shader `ps` (its container: console or PC) reads.
-pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, mesh_wave32: bool) -> Result<TwoPass, String> {
+pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
     let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
@@ -201,15 +208,16 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, mesh_wave32: bool) -> Result
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), mesh_wave32)?, record, ps)
+    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64)?, record, ps)
 }
 
-/// Whether the adapter's supported wave range requires split geometry execution.
-pub fn geometry_uses_wave32(wave_min: u32, wave_max: u32) -> bool {
+/// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
+/// mesh and geometry programs then need the split form.
+pub fn wave32_only(wave_min: u32, wave_max: u32) -> bool {
     !(wave_min <= 64 && wave_max >= 64)
 }
 
-pub fn geometry_uses_wave32_for_device(device: &ID3D12Device) -> bool {
+pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
     if unsafe {
         device.CheckFeatureSupport(
@@ -222,14 +230,14 @@ pub fn geometry_uses_wave32_for_device(device: &ID3D12Device) -> bool {
     {
         return true;
     }
-    geometry_uses_wave32(options.WaveLaneCountMin, options.WaveLaneCountMax)
+    wave32_only(options.WaveLaneCountMin, options.WaveLaneCountMax)
 }
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
-pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, geometry_wave32: bool) -> Result<TwoPass, String> {
+pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
-    let translation = super::translate_geometry(&code, g, geometry_wave32)?;
+    let translation = super::translate_geometry(&code, g, split_wave64)?;
     finish_two_pass(translation, record, ps)
 }
 
