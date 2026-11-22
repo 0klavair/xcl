@@ -1,6 +1,7 @@
 //! Instruction semantics checked on the real GPU: small RDNA2 programs are assembled,
 //! recompiled to HLSL, compiled with DXC and run as kernels. Skipped (with a note) when
-//! there is no D3D12 GPU with SM 6.6 + wave64 or no DXC.
+//! there is no D3D12 GPU with SM 6.6 + wave64 or no DXC. Tests that use `gpu_waves` also run
+//! as wave32 programs, and only need a GPU and DXC.
 
 use super::runner::{self, KernelState};
 use super::{translate, Mode, Options};
@@ -38,6 +39,30 @@ fn mesh_ready() -> bool {
             false
         }
     }
+}
+
+/// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
+/// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
+fn gpu_waves() -> Vec<bool> {
+    if !gpu_ready_wave32() {
+        return Vec::new();
+    }
+    if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] }
+}
+
+/// A kernel compiled as a wave64 or wave32 program, and the code as memory from address 0,
+/// where `runner::run_program` puts it.
+fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
+    let t = translate(code, &Options { wave64, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    (dxil, code.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
+/// `runner::run_program` as a wave64 or wave32 program, with the number of lanes that ran.
+fn run_wave(code: &[u8], st: &KernelState, wave64: bool) -> (runner::KernelResult, usize) {
+    let (dxil, mem) = kernel_wave(code, wave64);
+    (runner::run(&dxil, st, &mem).unwrap(), if wave64 { 64 } else { 32 })
 }
 
 /// Assemble a program from (name, encoding, fields, literal).
@@ -689,9 +714,12 @@ fn pair(v: &[u32], i: usize) -> f64 {
 /// the CPU's IEEE results, bit for bit, including the sign of zero, |x| ≥ 2^63, ±inf and NaN.
 #[test]
 fn gpu_f64_rounding_and_conversions() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        f64_rounding_and_conversions(wave64);
     }
+}
+
+fn f64_rounding_and_conversions(wave64: bool) {
     let p = prog(&[
         ("V_FLOOR_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
         ("V_CEIL_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
@@ -704,10 +732,10 @@ fn gpu_f64_rounding_and_conversions() {
     ]);
     let mut st = KernelState::default();
     f64_lanes(&mut st, &F64_EDGES);
-    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let (r, lanes) = run_wave(&p, &st, wave64);
     let same = |got: f64, want: f64| got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan());
     let mut bad = Vec::new();
-    for (l, v) in r.vgpr.iter().enumerate() {
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
         let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
         // V_FRACT_F64 is x − floor(x) kept below 1.0, +0 for ±0, and NaN for ±inf and NaN
         let fract = if x.is_finite() { (x - x.floor()).min(f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)) } else { f64::NAN };
@@ -734,24 +762,27 @@ fn gpu_f64_rounding_and_conversions() {
     }
     bad.sort();
     bad.dedup();
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
 /// v_sqrt_f64 and v_rsq_f64 over the whole f64 range. Denormals and values outside the f32
 /// range get real roots within an ulp of the CPU's, a negative x gives NaN and −0 gives −0.
 #[test]
 fn gpu_f64_roots() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        f64_roots(wave64);
     }
+}
+
+fn f64_roots(wave64: bool) {
     let p = prog(&[
         ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
         ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
     ]);
     let mut st = KernelState::default();
     f64_lanes(&mut st, &F64_EDGES);
-    let r = runner::run_program(&p, &st, &[]).unwrap().0;
-    let ulps = |got: f64, want: f64| -> u64 {
+    let (r, lanes) = run_wave(&p, &st, wave64);
+    let ulps =|got: f64, want: f64| -> u64 {
         if got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()) {
             0
         } else if got.is_nan() || want.is_nan() || got.is_sign_negative() != want.is_sign_negative() {
@@ -761,7 +792,7 @@ fn gpu_f64_roots() {
         }
     };
     let mut bad = Vec::new();
-    for (l, v) in r.vgpr.iter().enumerate() {
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
         let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
         for (name, got, want, tol) in [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2)] {
             if ulps(got, want) > tol {
@@ -771,16 +802,19 @@ fn gpu_f64_roots() {
     }
     bad.sort();
     bad.dedup();
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
 /// v_ldexp_f64 = x · 2^n, rounded once, for every i32 n: results that over- or underflow,
 /// denormal results, exponents beyond the f32 range of 2^n.
 #[test]
 fn gpu_ldexp_f64() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        ldexp_f64(wave64);
     }
+}
+
+fn ldexp_f64(wave64: bool) {
     let p = prog(&[("V_LDEXP_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)], None)]);
     // 2^e as f64 bits for a normal e
     const fn p2(e: i32) -> u64 {
@@ -815,9 +849,9 @@ fn gpu_ldexp_f64() {
         let (x, n, _) = CASES[l % CASES.len()];
         (r[0], r[1], r[2]) = (x as u32, (x >> 32) as u32, n as u32);
     }
-    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let (r, lanes) = run_wave(&p, &st, wave64);
     let mut bad = Vec::new();
-    for (l, v) in r.vgpr.iter().enumerate() {
+    for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
         let (x, n, want) = CASES[l % CASES.len()];
         let (got, want, x) = (pair(v, 4), f64::from_bits(want), f64::from_bits(x));
         if !(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())) {
@@ -826,7 +860,7 @@ fn gpu_ldexp_f64() {
     }
     bad.sort();
     bad.dedup();
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
 #[test]
@@ -4285,9 +4319,12 @@ fn mesh_wave32_rejects_cross_half_operations() {
 /// when unordered, bit for bit against IEEE.
 #[test]
 fn gpu_f64_compares_with_nan() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        f64_compares_with_nan(wave64);
     }
+}
+
+fn f64_compares_with_nan(wave64: bool) {
     const OPS: [&str; 8] = ["O", "U", "NEQ", "NLT", "NGE", "EQ", "LT", "LG"];
     let insts: Vec<(String, u64)> = OPS.iter().enumerate().map(|(i, op)| (format!("V_CMP_{op}_F64"), 20 + 2 * i as u64)).collect();
     let fields: Vec<[(&str, u64); 3]> = insts.iter().map(|(_, d)| [("VDST", *d), ("SRC0", V), ("SRC1", V + 2)]).collect();
@@ -4301,11 +4338,11 @@ fn gpu_f64_compares_with_nan() {
         let (a, b): (f64, f64) = pairs[l % pairs.len()];
         (r[0], r[1], r[2], r[3]) = (a.to_bits() as u32, (a.to_bits() >> 32) as u32, b.to_bits() as u32, (b.to_bits() >> 32) as u32);
     }
-    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let (r, lanes) = run_wave(&p, &st, wave64);
     let mut bad = Vec::new();
     for (i, op) in OPS.iter().enumerate() {
         let mask = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
-        for l in 0..64 {
+        for l in 0..lanes {
             let (a, b) = pairs[l % pairs.len()];
             let want = match *op {
                 "O" => !a.is_nan() && !b.is_nan(),
@@ -4324,7 +4361,7 @@ fn gpu_f64_compares_with_nan() {
     }
     bad.sort();
     bad.dedup();
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
 /// Every f32 compare with NaN operands against IEEE. Before the explicit NaN tests, lt, ge
@@ -4332,9 +4369,12 @@ fn gpu_f64_compares_with_nan() {
 /// gave lt the result of the nge before it, as `float_compare` describes.
 #[test]
 fn gpu_f32_compares_with_nan() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        f32_compares_with_nan(wave64);
     }
+}
+
+fn f32_compares_with_nan(wave64: bool) {
     const OPS: [&str; 12] = ["O", "U", "NEQ", "NLT", "NGE", "EQ", "LT", "LG", "LE", "GT", "GE", "NLG"];
     let insts: Vec<(String, u64)> = OPS.iter().enumerate().map(|(i, op)| (format!("V_CMP_{op}_F32"), 20 + 2 * i as u64)).collect();
     let fields: Vec<[(&str, u64); 3]> = insts.iter().map(|(_, d)| [("VDST", *d), ("SRC0", V), ("SRC1", V + 1)]).collect();
@@ -4348,11 +4388,11 @@ fn gpu_f32_compares_with_nan() {
         let (a, b) = pairs[l % pairs.len()];
         (r[0], r[1]) = (a.to_bits(), b.to_bits());
     }
-    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let (r, lanes) = run_wave(&p, &st, wave64);
     let mut bad = Vec::new();
     for (i, op) in OPS.iter().enumerate() {
         let mask = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
-        for l in 0..64 {
+        for l in 0..lanes {
             let (a, b) = pairs[l % pairs.len()];
             let want = match *op {
                 "O" => !a.is_nan() && !b.is_nan(),
@@ -4375,7 +4415,7 @@ fn gpu_f32_compares_with_nan() {
     }
     bad.sort();
     bad.dedup();
-    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
 /// xorshift64, the fixed-seed generator of the randomized GPU tests
@@ -4425,15 +4465,18 @@ fn ldexp_ref(x: f64, n: i32) -> Option<f64> {
     None
 }
 
-/// The f64 math against the CPU on random inputs, 64 per dispatch in 50 dispatches, or n
-/// dispatches with XCL_FUZZ_ITERS=n. floor, ceil, trunc, fract and the i32 and u32
+/// The f64 math against the CPU on random inputs, one wave per dispatch in 50 dispatches, or
+/// n dispatches with XCL_FUZZ_ITERS=n, as wave64 and as wave32. floor, ceil, trunc, fract and the i32 and u32
 /// conversions must match bit for bit, and so must ldexp wherever the CPU can compute it with
 /// one rounding. sqrt must be within 1 ulp and rsq within 2.
 #[test]
 fn gpu_f64_math_random() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        f64_math_random(wave64);
     }
+}
+
+fn f64_math_random(wave64: bool) {
     let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
     let p = prog(&[
         ("V_FLOOR_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
@@ -4448,10 +4491,8 @@ fn gpu_f64_math_random() {
         ("V_TRUNC_F64", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("NEG", 1)], None),
         ("V_FLOOR_F64", "ENC_VOP3", &[("VDST", 24), ("SRC0", V), ("ABS", 1)], None),
     ]);
-    let t = translate(&p, &Options::default()).unwrap();
-    assert!(t.complete());
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
-    let mem: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let (dxil, mem) = kernel_wave(&p, wave64);
+    let lanes = if wave64 { 64 } else { 32 };
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let same = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
     let ulps = |g: f64, w: f64| -> u64 {
@@ -4475,7 +4516,7 @@ fn gpu_f64_math_random() {
             xs.push((x, n));
         }
         let r = runner::run(&dxil, &st, &mem).unwrap();
-        for (l, v) in r.vgpr.iter().enumerate() {
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
             let (x, n) = xs[l];
             checked += 1;
             let fract = if x.is_finite() { (x - x.floor()).min(f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)) } else { f64::NAN };
@@ -4497,7 +4538,7 @@ fn gpu_f64_math_random() {
             }
         }
     }
-    println!("lanes {checked}, ldexp checked {ldexp_checked}, sqrt exact {sqrt_exact} / 1 ulp {sqrt_1ulp}, rsq ulps 0/1/2/>2 {rsq_hist:?}");
+    println!("wave{lanes}: lanes {checked}, ldexp checked {ldexp_checked}, sqrt exact {sqrt_exact} / 1 ulp {sqrt_1ulp}, rsq ulps 0/1/2/>2 {rsq_hist:?}");
     bad.sort(); bad.dedup();
     println!("{} distinct failures", bad.len());
     for b in bad.iter().take(40) { println!("  {b}"); }
@@ -4517,14 +4558,18 @@ fn f16_to_f64(h: u16) -> f64 {
 
 /// All 16 float compares of f32, f64 and f16 and v_cmpx_lt against the CPU on random operand
 /// pairs, a quarter of them equal. The VOP3 forms write SGPR pairs and the VOPC forms VCC.
-/// 64 pairs per dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n. An f32
+/// One wave of pairs per dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n,
+/// as wave64 and as wave32. An f32
 /// result that only matches with f32 denormals flushed to zero is counted and does not fail
 /// the test. That comes from the shader's denormal mode, not from the compare.
 #[test]
 fn gpu_float_compares_random() {
-    if !gpu_ready() {
-        return;
+    for wave64 in gpu_waves() {
+        float_compares_random(wave64);
     }
+}
+
+fn float_compares_random(wave64: bool) {
     let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
     const OPS: [&str; 16] = ["F", "LT", "EQ", "LE", "GT", "LG", "GE", "O", "U", "NGE", "NLG", "NGT", "NLE", "NEQ", "NLT", "TRU"];
     let want_of = |op: &str, a: f64, b: f64| match op {
@@ -4547,10 +4592,8 @@ fn gpu_float_compares_random() {
         for i in 0..16 { list.push((names[i].as_str(), "ENC_VOPC", &fc[i][..], None)); list.push(("S_MOV_B64", "ENC_SOP1", &fm[i][..], None)); }
         list.push((cmpx.as_str(), "ENC_VOPC", &fx[..], None));
         let p = prog(&list);
-        let t = translate(&p, &Options::default()).unwrap();
-        assert!(t.complete(), "{ty}: {:?}", t.unsupported_why);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
-        let mem: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let (dxil, mem) = kernel_wave(&p, wave64);
+        let n = if wave64 { 64 } else { 32 };
         let mut bad: Vec<String> = Vec::new();
         let mut lanes = 0usize;
         let mut denorm = 0usize;
@@ -4585,7 +4628,8 @@ fn gpu_float_compares_random() {
                 ab.push((a, b));
             }
             let r = runner::run(&dxil, &st, &mem).unwrap();
-            lanes += 64;
+            ab.truncate(n);
+            lanes += n;
             for (i, op) in OPS.iter().enumerate() {
                 let m3 = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
                 let mc = r.sgpr[60 + 2 * i] as u64 | (r.sgpr[61 + 2 * i] as u64) << 32;
@@ -4607,7 +4651,7 @@ fn gpu_float_compares_random() {
             }
         }
         bad.sort(); bad.dedup();
-        println!("{ty}: {lanes} lanes x 33 compares, {} distinct failures, {denorm} results that match only a flush of f32 denormals", bad.len());
+        println!("wave{n} {ty}: {lanes} lanes x 33 compares, {} distinct failures, {denorm} results that match only a flush of f32 denormals", bad.len());
         for b in bad.iter().take(15) { println!("  {b}"); }
         total_bad += bad.len();
     }
