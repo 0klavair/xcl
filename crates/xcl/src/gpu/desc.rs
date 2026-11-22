@@ -637,6 +637,10 @@ mod view_tests {
         let v = buffer(&buffer_words(0x5_1234_5670, 16, 100, 77));
         assert_eq!((v.address, v.stride, v.num_records, v.format, v.dst_sel), (0x5_1234_5670, 16, 100, 77, [4, 5, 6, 7]));
         assert_eq!((format_bytes(22), format_bytes(29), format_bytes(71), format_bytes(77)), (4, 4, 8, 16));
+        let b = bvh_words(0x12_3456_789A_00, true);
+        assert_eq!(b, [0x3456_789A, 0x8000_0012, u32::MAX, 0]);
+        assert!(b[3] >> 28 < 8, "BVH descriptor must not look like a T# image to CopyDescriptors");
+        assert_eq!(bvh_words(0x12_3456_789A_00, false)[1], 0x12);
     }
 }
 
@@ -658,4 +662,12 @@ pub fn format_bytes(f: u32) -> u32 {
 pub fn buffer_words(address: u64, stride: u32, num_records: u32, format: u32) -> [u32; 4] {
     let oob = if stride == 0 { 3 } else { 0 };
     [address as u32, (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16, num_records, 0xFAC | (format & 0x7F) << 12 | 1 << 24 | oob << 28]
+}
+
+/// An RDNA2 BVH resource descriptor (SRSRC, 4 dwords) for `image_bvh(64)_intersect_ray`:
+/// word 0 = base address bits 39:8 (256-byte units), word 1 = bits 47:40 | box_sort << 31,
+/// word 2 = size / max bounds, word 3 = 0 (type bits 31:28 < 8 so descriptor copies leave it
+/// verbatim instead of treating it as a T# image).
+pub fn bvh_words(address: u64, box_sort: bool) -> [u32; 4] {
+    [(address >> 8) as u32, ((address >> 40) as u32 & 0xFF) | (u32::from(box_sort) << 31), u32::MAX, 0]
 }

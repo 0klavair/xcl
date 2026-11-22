@@ -49,6 +49,10 @@ pub struct Config {
     pub d3d12_debug: bool,
     /// "auto" (show the title's frames in an XCL window) or "off".
     pub present: String,
+    /// Raytracing tier reported by `CheckFeatureSupport(D3D12_OPTIONS5)`:
+    /// "auto" (host GPU tier), "tier1_1" (11), "tier1_0" (10), or "off" (0).
+    /// `XCL_RAYTRACING` overrides.
+    pub raytracing: String,
     pub window_width: u32,
     pub window_height: u32,
 }
@@ -131,6 +135,7 @@ impl Default for Config {
             d3d12_adapter: "auto".into(),
             d3d12_debug: false,
             present: "auto".into(),
+            raytracing: "auto".into(),
             window_width: 1280,
             window_height: 720,
         }
@@ -168,6 +173,27 @@ impl Config {
 
     pub fn is_series_s(&self) -> bool {
         self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
+    }
+
+    /// Configured `D3D12_RAYTRACING_TIER` override for `CheckFeatureSupport(D3D12_OPTIONS5)`:
+    /// `None` keeps the host GPU tier ("auto"), `Some(0 / 10 / 11)` forces NOT_SUPPORTED /
+    /// TIER_1_0 / TIER_1_1. `XCL_RAYTRACING` overrides `xcl.toml`.
+    pub fn raytracing_tier_override(&self) -> Option<u32> {
+        let env = std::env::var("XCL_RAYTRACING").ok();
+        let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
+        parse_raytracing_tier(mode)
+    }
+}
+
+pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
+    if mode.eq_ignore_ascii_case("off") || mode.eq_ignore_ascii_case("none") || mode == "0" {
+        Some(0)
+    } else if mode.eq_ignore_ascii_case("tier1_0") || mode.eq_ignore_ascii_case("1.0") || mode == "10" {
+        Some(10)
+    } else if mode.eq_ignore_ascii_case("tier1_1") || mode.eq_ignore_ascii_case("1.1") || mode == "11" {
+        Some(11)
+    } else {
+        None
     }
 }
 
@@ -215,5 +241,21 @@ mod tests {
         let c: Config = toml::from_str("device_type = \"lockhart\"\n").unwrap();
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
+        assert_eq!(c.raytracing, "auto");
+    }
+
+    #[test]
+    fn raytracing_tier_parsing() {
+        assert_eq!(parse_raytracing_tier("auto"), None);
+        assert_eq!(parse_raytracing_tier(""), None);
+        assert_eq!(parse_raytracing_tier("off"), Some(0));
+        assert_eq!(parse_raytracing_tier("none"), Some(0));
+        assert_eq!(parse_raytracing_tier("0"), Some(0));
+        assert_eq!(parse_raytracing_tier("tier1_0"), Some(10));
+        assert_eq!(parse_raytracing_tier("1.0"), Some(10));
+        assert_eq!(parse_raytracing_tier("10"), Some(10));
+        assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
+        assert_eq!(parse_raytracing_tier("1.1"), Some(11));
+        assert_eq!(parse_raytracing_tier("11"), Some(11));
     }
 }

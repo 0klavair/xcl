@@ -498,6 +498,74 @@ pub fn console_list_methods() -> Result<(), String> {
     }
 }
 
+/// Raytracing D3D12.X surface: CheckFeatureSupport(D3D12_OPTIONS5), console heap SRV for a
+/// raytracing acceleration structure (writes an RDNA2 BVH descriptor instead of zeros), and
+/// the command list extensions `XboxBvhBuilder.dll` uses on default title lists (#148
+/// AllocateUploadMemory, #146 UAV barrier).
+pub fn raytracing_surface() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        // 1. CheckFeatureSupport(D3D12_OPTIONS5) — both PC size (12 B) and oversized console probe (16 B)
+        let mut opts5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &mut opts5 as *mut _ as *mut c_void, std::mem::size_of_val(&opts5) as u32)
+            .map_err(e)?;
+        let mut wide = [0xAAu8; 16];
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, wide.as_mut_ptr() as *mut c_void, wide.len() as u32)
+            .map_err(e)?;
+        ensure!(wide[12..16] == [0, 0, 0, 0], "oversized OPTIONS5 tail not zeroed: {:?}", &wide[12..16]);
+
+        // 2. Acceleration-structure SRV in a console CBV/SRV/UAV descriptor heap (pResource = NULL)
+        let graphics = 1u64 << 29;
+        let tlas = crate::XMemAlloc(0x1_0000, graphics);
+        ensure!(!tlas.is_null(), "graphics memory for TLAS");
+        let tlas_va = tlas as u64;
+        let heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .map_err(e)?;
+        // console heap start handle returns in rax
+        let start: unsafe extern "system" fn(*mut c_void) -> usize = transmute_copy(&(*(*(heap.as_raw() as *const *const usize)).add(9)));
+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV { Location: tlas_va },
+            },
+        };
+        dev.CreateShaderResourceView(None, Some(&srv), cpu);
+        let words = std::slice::from_raw_parts(cpu.ptr as *const u32, 4);
+        let expected = [(tlas_va >> 8) as u32, (((tlas_va >> 40) as u32) & 0xFF) | (1 << 31), u32::MAX, 0];
+        ensure!(words == expected, "AS SRV slot {words:x?} != expected {expected:x?}");
+        crate::XMemFree(tlas, graphics);
+
+        // 3. Default title command list: #148 AllocateUploadMemory + #146 UAV barrier
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let l = list.as_raw();
+        let slot = |i: usize| *(*(l as *const *const usize)).add(i);
+        let alloc_upload: unsafe extern "system" fn(*mut c_void, usize, usize) -> *mut u8 = std::mem::transmute(slot(148));
+        let uav_barrier: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(slot(146));
+        let up = alloc_upload(l, 256, 256);
+        ensure!(!up.is_null() && (up as usize).is_multiple_of(256), "AllocateUploadMemory (#148) returned {up:?}");
+        *(up as *mut u32) = 0x5A5A_1234;
+        ensure!(*(up as *const u32) == 0x5A5A_1234, "upload memory not writable");
+        uav_barrier(l, 1, std::ptr::null());
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+        alloc.Reset().map_err(e)?;
+        Ok(())
+    }
+}
+
 /// The console's DirectStorage as a title uses it: a file queue reads the start of the title's
 /// own executable into memory, a status array entry reports it and a D3D12 fence is signalled.
 pub fn direct_storage() -> Result<(), String> {

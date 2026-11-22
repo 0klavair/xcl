@@ -2650,6 +2650,90 @@ fn gpu_triangle_pair_and_box16_nodes() {
     assert!(checked > 5, "{checked} triangle hits");
 }
 
+/// Multi-window `image_bvh64_intersect_ray` (full 64-bit node pointer into UMA window 1 with
+/// base = 0, plus 48-bit base in window 1) and axis-aligned grazing ray / NaN-disabled box.
+#[test]
+fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    assert_eq!(w1 - w0, 1 << 32);
+    let write_words = |addr: u64, vals: &[u32]| unsafe {
+        let p = addr as *mut u32;
+        for (k, &v) in vals.iter().enumerate() {
+            *p.add(k) = v;
+        }
+    };
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let base_off = 0x1000u64;
+    let bvh_addr = w1 + base_off;
+    let tri_rel = 0x80u32 >> 3;
+    let nan_child = 0xC0u32 >> 3;
+    let inv_child = 0x100u32 >> 3;
+    // Window 1 root box32 at bvh_addr: child 0 = normal box [-1..1, -1..1, 5..6],
+    // child 1 = NaN-disabled box, child 2 = inverted box (mn > mx), child 3 = invalid
+    write_words(bvh_addr, &[tri_rel, nan_child, inv_child, u32::MAX]);
+    write_words(bvh_addr + 16, &ff(&[-1.0, -1.0, 5.0, 1.0, 1.0, 6.0]));
+    write_words(bvh_addr + 40, &ff(&[f32::NAN, -1.0, 2.0, 1.0, 1.0, 3.0]));
+    write_words(bvh_addr + 64, &ff(&[2.0, -1.0, 2.0, -2.0, 1.0, 3.0]));
+    // Triangle at bvh_addr + 0x80 in z = 5
+    write_words(bvh_addr + 0x80, &ff(&[-1.0, -1.0, 5.0, 1.0, -1.0, 5.0, -1.0, 1.0, 5.0]));
+    write_words(bvh_addr + 0x80 + 60, &[9]);
+    // Poison window 0 at the same low offset: reading window 0 would return bogus child 0xDEAD_BEEF
+    write_words(w0 + base_off, &[0xDEAD_BEEF, u32::MAX, u32::MAX, u32::MAX]);
+    write_words(w0 + base_off + 16, &ff(&[-100.0, -100.0, 1.0, 100.0, 100.0, 2.0]));
+
+    let mimg = |n: &'static str, vdata: u64, vaddr: u64, srsrc: u64| encode(n, "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", srsrc), ("DMASK", 15)], None).unwrap();
+    let mut code = Vec::new();
+    // s[8:11] = base 0 (box sort enabled), v[0:1] = full 64-bit node pointer into window 1
+    code.extend(mimg("IMAGE_BVH64_INTERSECT_RAY", 100, 0, 2));
+    // s[8:11] = base 0, v[20:21] = full 64-bit triangle node pointer in window 1
+    code.extend(mimg("IMAGE_BVH64_INTERSECT_RAY", 104, 20, 2));
+    // s[12:15] = 48-bit base pointing at window 1 (`bvh_words(bvh_addr, true)`), v40 = 32-bit root
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 40, 3));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let t = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
+    st.sgpr[12..16].copy_from_slice(&crate::gpu::desc::bvh_words(bvh_addr, true));
+    let root64 = (bvh_addr >> 3) | 5;
+    let tri64 = (bvh_addr + 0x80) >> 3;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        // Even lanes graze the box edge (o.x = -1.0 == mn.x, dx = 0, inv.x = +inf);
+        // odd lanes fire through the center (0, 0, 0) along +z.
+        let ox = if l % 2 == 0 { -1.0f32 } else { 0.0f32 };
+        let ray = [100.0f32, ox, 0.0, 0.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY, 1.0];
+        let put_ray = |r: &mut Vec<u32>, at: usize| {
+            for (k, x) in ray.iter().enumerate() {
+                r[at + k] = x.to_bits();
+            }
+        };
+        r[0] = root64 as u32;
+        r[1] = (root64 >> 32) as u32;
+        put_ray(r, 2);
+        r[20] = tri64 as u32;
+        r[21] = (tri64 >> 32) as u32;
+        put_ray(r, 22);
+        r[40] = 5; // relative root box32 at bvh_addr
+        put_ray(r, 41);
+    }
+    let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    const F: u32 = u32::MAX;
+    for l in 0..64usize {
+        let v = &res.vgpr[l];
+        let q = |at: usize| [v[at], v[at + 1], v[at + 2], v[at + 3]];
+        assert_eq!(q(100), [tri_rel, F, F, F], "lane {l}: 64-bit box32 in window 1 (grazing/NaN/inverted)");
+        assert_eq!(q(108), [tri_rel, F, F, F], "lane {l}: 48-bit base box32 in window 1");
+        let tri = q(104).map(f32::from_bits);
+        assert!(!tri[0].is_infinite() && ((tri[0] / tri[1]) - 5.0).abs() < 1e-4, "lane {l}: 64-bit triangle in window 1 → {tri:?}");
+    }
+}
+
 /// Instructions first met in XboxBvhBuilder.dll's shaders: global atomics (float min / max by
 /// a CAS loop), 8 / 16-bit buffer loads / stores and 8 / 16-bit LDS accesses – neighbouring
 /// lanes share dwords, so a non-atomic read-modify-write would lose writes.

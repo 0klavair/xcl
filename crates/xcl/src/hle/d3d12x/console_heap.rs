@@ -394,6 +394,11 @@ mod tests {
         write(&s1, &[0x1234, 0, 64, 0x3101_6FAC, 0, 0, 0, 0]);
         copy_words(&s1, &s3);
         assert_eq!(words_at(rel(v + 96)).unwrap()[0], 0x1234);
+        // a raytracing BVH SRSRC keeps its base address and box-sort flag verbatim
+        let bvh = crate::gpu::desc::bvh_words(0x12_3456_7800, true);
+        write(&s1, &[bvh[0], bvh[1], bvh[2], bvh[3], 0, 0, 0, 0]);
+        copy_words(&s1, &s3);
+        assert_eq!(words_at(rel(v + 96)).unwrap()[..4], bvh);
         // samplers: 16-byte slots, S# word 3 [11:0] = sampler index
         let (q0, q1) = (slot(sm).unwrap(), slot(sm + 16).unwrap());
         assert!(q1.sampler && q1.index == 1 && q1.pc_srv == 0x9010);

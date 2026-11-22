@@ -365,6 +365,22 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
     crate::xlog_info!("frame trace: … its indices name: {}", if res.is_empty() { "nothing".to_string() } else { res.join("; ") });
 }
 
+/// #148 AllocateUploadMemory(size, alignment) → CPU/GPU pointer in unified memory (used by
+/// `XboxBvhBuilder.dll` and other console middleware on default title command lists).
+/// Freed automatically when the list's command allocator is reset.
+pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
+    let Some(u) = crate::gpu::uma::get() else {
+        return std::ptr::null_mut();
+    };
+    match u.alloc(size.max(16), align.max(16)) {
+        Some(p) => {
+            with(this, |s| s.uma.push(p as usize));
+            p
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
