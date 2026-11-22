@@ -110,6 +110,12 @@ pub unsafe extern "system" fn D3D12CreateDevice(adapter: *mut c_void, fl: u32, r
 }
 
 pub unsafe extern "system" fn D3D12XboxCreateDevice(adapter: *mut c_void, params: *const c_void, riid: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
+    // D3D12XBOX_CREATE_DEVICE_PARAMETERS: the first word is the SDK version the title was
+    // built with (the console's vtable layouts follow it)
+    if !params.is_null() && crate::gpu::shader::readable(params as usize, 32) {
+        let w: Vec<u32> = (0..8).map(|k| (params as *const u32).add(k).read_unaligned()).collect();
+        crate::xlog_info!("D3D12XboxCreateDevice: parameters {w:x?} (SDK version {})", w[0]);
+    }
     if backend() == Backend::Real {
         return real::create_device(riid, ppv);
     }

@@ -444,11 +444,21 @@ pub fn dump_threads() {
 static WATCHED: AtomicUsize = AtomicUsize::new(0);
 static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
 
+/// the exception `watch_writes` raises: the handler arms the raising thread at once
+const WATCH_ARM: u32 = 0xE0C1_A7E1;
+
 unsafe extern "system" fn watch_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     const SINGLE_STEP: u32 = 0x8000_0004;
     let rec = &*(*info).ExceptionRecord;
     let ctx = &mut *(*info).ContextRecord;
     let addr = WATCHED.load(Ordering::Acquire);
+    if rec.ExceptionCode as u32 == WATCH_ARM {
+        ctx.Dr0 = addr as u64;
+        // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
+        ctx.Dr7 = (ctx.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
+        ctx.ContextFlags |= windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
+        return -1;
+    }
     if rec.ExceptionCode as u32 != SINGLE_STEP || addr == 0 || ctx.Dr6 & 1 == 0 {
         return 0; // EXCEPTION_CONTINUE_SEARCH
     }
@@ -479,6 +489,8 @@ pub fn watch_writes(addr: usize) {
     }
     unsafe {
         AddVectoredExceptionHandler(1, Some(watch_handler));
+        // the calling thread now (the others below, as the arming loop reaches them)
+        windows_sys::Win32::System::Diagnostics::Debug::RaiseException(WATCH_ARM, 0, 0, std::ptr::null());
     }
     crate::xlog_warn!("watch: write watchpoint on {addr:#x}");
     std::thread::spawn(move || {
@@ -617,6 +629,17 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
 /// title's code runs, with what, without changing it.
 pub fn start_probes() {
+    // `XCL_WATCH=rva` (hex, in the title's exe): every write to those 8 bytes is logged with
+    // the writing code (`watch_writes`) – who fills a field the title later trips over
+    if let Some(rva) = std::env::var("XCL_WATCH").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+        let _ = std::thread::Builder::new().name("xcl-watch".into()).spawn(move || loop {
+            if let Some(m) = modules::main_module() {
+                watch_writes(m.base + rva);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        });
+    }
     let rvas: Vec<usize> = std::env::var("XCL_PROBE").unwrap_or_default().split(',').filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).take(3).collect();
     if rvas.is_empty() {
         return;

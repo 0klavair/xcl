@@ -52,9 +52,11 @@ fn count(k: usize) {
     let n = COUNTS[k].fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() && n >= 64 {
         let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let (allocators, blocks) = console_list::pending_blocks();
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped)",
-            c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED]
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); unified memory {} MB used, {blocks} blocks held for {allocators} allocators",
+            c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
+            crate::gpu::uma::get().map_or(0, |u| u.used() >> 20)
         );
     }
 }

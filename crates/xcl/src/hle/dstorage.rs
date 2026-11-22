@@ -533,6 +533,24 @@ fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), H
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
+    {
+        // the first requests: where a title's data goes and how it is packed
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = N.fetch_add(1, Ordering::Relaxed);
+        if k < 16 || k.is_power_of_two() {
+            crate::xlog_info!(
+                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+                r.options,
+                if r.memory_source() { "memory" } else { "file" },
+                if r.zlib() { ", zlib" } else { "" },
+                r.destination,
+                if r.dest_physical_pages() { " (physical pages)" } else { "" },
+                r.destination_page_offset,
+                r.source_size,
+                r.intermediate_size
+            );
+        }
+    }
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }

@@ -62,10 +62,29 @@ static O_CREATE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_A: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_2: AtomicUsize = AtomicUsize::new(0);
 
+/// The first opens with their flags (how a title reads: overlapped / unbuffered I/O writes
+/// memory without the CPU – write-watch does not see it).
+fn log_open(api: &str, path: &str, flags: u32) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    // the title's own data, not drivers' caches, system files or DLLs
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".dll") || lower.ends_with(".exe") || lower.contains(r"\appdata\") || lower.contains(r"\windows\") || lower.starts_with(r"\\") {
+        return;
+    }
+    if N.fetch_add(1, Ordering::Relaxed) < 24 {
+        crate::xlog_info!(
+            "VFS: {api}({path}) flags {flags:#x}{}{}",
+            if flags & 0x2000_0000 != 0 { " NO_BUFFERING" } else { "" },
+            if flags & 0x4000_0000 != 0 { " OVERLAPPED" } else { "" }
+        );
+    }
+}
+
 unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
     let orig = orig!(O_CREATE_FILE_W as FnCreateFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    log_open("CreateFileW", &path, fl);
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
         Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
@@ -80,6 +99,7 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let orig = orig!(O_CREATE_FILE_A as FnCreateFileA);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
+    log_open("CreateFileA", &path, fl);
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
         Decision::Use(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
@@ -96,6 +116,7 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, disp, params) };
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
+    log_open("CreateFile2", &path, flags);
     match v.open_decision(&path, acc, disp, flags) {
         Decision::Pass => orig(n, acc, sh, disp, params),
         Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, disp, params),

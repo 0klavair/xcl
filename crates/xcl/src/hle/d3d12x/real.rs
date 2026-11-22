@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
@@ -572,6 +572,18 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + i] = super::guard::make_split(stub, v[1 + i]);
         }
     }
+    // methods the newer console layout keeps at other slots: picked at each call
+    if kind == Kind::CommandList {
+        let older_handlers = console_slots(kind);
+        for (newer, older) in NEWER_LIST_SLOTS {
+            let Some(&(_, f)) = older_handlers.iter().find(|e| e.0 == older) else { continue };
+            if newer >= total {
+                continue;
+            }
+            let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+        }
+    }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
@@ -694,7 +706,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
-        Kind::CommandQueue => vec![(23, q_signal_x as usize), (30, super::present::present_x as usize)],
+        // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
+        // its runtime's layout (`queue_dispatch`)
+        Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
         Kind::DmaList => {
             use super::list_x as l;
             vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
@@ -1542,7 +1556,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             return hr;
         }
     }
-    let hr = dev_create_committed_resource(this, props, flags, desc, state, clear, riid, ppv);
+    // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
+    let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -1777,6 +1792,13 @@ macro_rules! creator {
             if hr == E_NOINTERFACE {
                 let iid = pc_iid($kind);
                 hr = f(this, $($a,)* &iid, ppv);
+                // an interface the PC does not have (a console one): which, once per method
+                static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+                let asked = riid.as_ref().map(super::layout::guid_string).unwrap_or_default();
+                let new = { let mut g = SEEN.lock().unwrap(); let n = !g.contains(&asked); if n { g.push(asked.clone()); } n };
+                if new {
+                    crate::xlog_info!("D3D12.X: {} for interface {asked} (not on the PC) – made as {}", $method, super::layout::guid_string(&iid));
+                }
             }
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 adopt(*ppv, $kind);
@@ -1798,7 +1820,7 @@ creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resou
 creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
-const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
+pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
 
 /// device #29 CreatePlacedResource(heap, offset, desc, state, clear, riid, resource) for console
 /// code: a description the PC refuses (console layouts and flags – Fortnite's buffer in a
@@ -1990,7 +2012,9 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
 /// fences created through the device (AddRef'd: they are released at the end only)
-static FENCES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// (a read-write lock: `is_fence` reads it on every queue call, and `end_title` reads it with
+/// the title's threads suspended – a reader that holds it then blocks no other reader)
+static FENCES: std::sync::RwLock<Vec<usize>> = std::sync::RwLock::new(Vec::new());
 
 /// CreateFence: as on the PC; the fence is remembered for `end_title`
 unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flags: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -1998,7 +2022,16 @@ unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flag
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         let add: RefFn = std::mem::transmute(*vt(*ppv).add(1));
         add(*ppv);
-        FENCES.lock().unwrap().push(*ppv as usize);
+        let n = {
+            let mut g = FENCES.write().unwrap();
+            g.push(*ppv as usize);
+            g.len()
+        };
+        // `XCL_WATCH_FENCE=n`: writes over the n-th fence's first 8 bytes (its vtable) are logged
+        if std::env::var("XCL_WATCH_FENCE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(n) {
+            crate::xlog_info!("D3D12.X: fence #{n} {:p} (initial value {value:#x}, flags {flags:#x}) watched", *ppv);
+            crate::eh::watch_writes(*ppv as usize);
+        }
     }
     hr
 }
@@ -2022,7 +2055,7 @@ pub fn end_title(code: u32) -> ! {
         // the GPU is done and resets command allocators the GPU still runs (Fortnite: a device
         // hang at the end of a run)
         suspend_other_threads(watchdog);
-        for &f in FENCES.lock().unwrap().iter() {
+        for &f in FENCES.read().unwrap_or_else(|e| e.into_inner()).iter() {
             let fr = f as *mut c_void;
             if let Some(f) = ID3D12Fence::from_raw_borrowed(&fr) {
                 let _ = f.Signal(u64::MAX);
@@ -3196,6 +3229,116 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     }
     hr
 }
+
+// ---------------------------------------------------------------------------------------
+// command queue layouts
+// ---------------------------------------------------------------------------------------
+//
+// Each console title runs on the game OS it ships with, and the D3D12 runtime there sets the
+// queue's vtable. Two layouts are known, with the same D3D12 SDK version (0x20004) and the
+// same slots up to ExecuteCommandLists (#10):
+// * the older (XDefiant, Minecraft, Fortnite): the PC's #11–#18 (SetMarker … Signal #14, Wait
+//   #15, GetTimestampFrequency #16, GetClockCalibration #17, GetDesc #18), SignalX #23,
+//   PresentX #30;
+// * a newer one (Unicorn Overlord): two more methods before Signal – Signal #16, Wait #17,
+//   GetTimestampFrequency #18, GetClockCalibration #19, GetDesc #20, SignalX #25, PresentX #32.
+// Nothing the title passes at device creation tells them apart, but its calls do: Signal and
+// Wait take a fence, the older layout's #16 / #17 (GetTimestampFrequency / GetClockCalibration)
+// never do. A title calling #16 / #17 with one of its fences uses the newer layout, and the
+// slots that differ follow that from then on.
+//
+// The same runtime moves the command list's console methods too: Unicorn Overlord records its
+// texture uploads with CopyTextureRegionX at #85 (the older layout's #83; its #85 is
+// SetPredicationBufferX, which dropped them – every texture stayed zero). From #85 on the
+// list's console methods sit two slots later (`NEWER_LIST_SLOTS`); where the shift starts
+// below #83 is not known (no title seen calling those slots on the newer layout).
+
+/// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
+/// console methods from CopyTextureRegionX on two slots later)
+pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
+
+/// command list slots of the newer layout → the older layout's slot of the same method
+const NEWER_LIST_SLOTS: [(usize, usize); 8] = [(85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
+
+/// Whether `p` is a fence the title created.
+fn is_fence(p: usize) -> bool {
+    p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
+}
+
+/// first queue slot `queue_dispatch` handles
+const QUEUE_FIRST: usize = 14;
+
+/// A title's call of queue slot `slot` (arguments as integers; Signal / Wait / SignalX /
+/// PresentX / GetTimestampFrequency / GetClockCalibration / GetDesc all fit).
+unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+    const PC_SIGNAL: usize = 14;
+    const PC_WAIT: usize = 15;
+    const PC_TIMESTAMP_FREQUENCY: usize = 16;
+    const PC_CLOCK_CALIBRATION: usize = 17;
+    const PC_GET_DESC: usize = 18;
+    if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
+    }
+    let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    // the method in the older layout's numbering
+    let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
+    let pc = |s: usize| orig_fn(this, s);
+    match older {
+        // Signal / Wait take a fence: anything else is not one of them
+        14 | 15 if is_fence(a1) => {
+            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
+            f(this, a1, a2) as u32 as usize
+        }
+        16 => {
+            let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
+            f(this, a1) as u32 as usize
+        }
+        17 => {
+            let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_CLOCK_CALIBRATION));
+            f(this, a1, a2) as u32 as usize
+        }
+        // GetDesc returns its structure through the hidden pointer, and that pointer
+        18 => {
+            let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
+            f(this, a1)
+        }
+        23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
+        _ => {
+            // a console method not modelled: logged once, S_OK (as the stubs it replaces; frame
+            // pacing on queue methods keeps working for titles without PresentX)
+            static INFOS: Mutex<Vec<(usize, &'static stubs::StubInfo)>> = Mutex::new(Vec::new());
+            let info = {
+                let mut g = INFOS.lock().unwrap();
+                match g.iter().find(|e| e.0 == slot) {
+                    Some(e) => e.1,
+                    None => {
+                        let i = stubs::new_info(DLL, &format!("ID3D12CommandQueue::#{slot} ({} layout)", if shifted { "newer" } else { "older" }), 0);
+                        i.hook.store(super::present::on_queue_console_method as usize, Ordering::Release);
+                        g.push((slot, i));
+                        i
+                    }
+                }
+            };
+            let _ = a4;
+            stubs::record_call(info, 0);
+            0
+        }
+    }
+}
+
+macro_rules! queue_slots {
+    ($($slot:literal),*) => {
+        /// the title's entry for each queue slot from `QUEUE_FIRST`
+        static QUEUE_SLOTS: &[unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> usize] = &[$({
+            unsafe extern "system" fn f(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> usize {
+                queue_dispatch($slot, this, a1, a2, a3, a4)
+            }
+            f
+        }),*];
+    };
+}
+queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34);
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled

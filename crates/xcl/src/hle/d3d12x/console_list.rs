@@ -282,6 +282,11 @@ pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
     }
 }
 
+/// Unified-memory blocks recordings hold until their allocators reset: (allocators, blocks).
+pub fn pending_blocks() -> (usize, usize) {
+    PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))
+}
+
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));

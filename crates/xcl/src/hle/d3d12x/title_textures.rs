@@ -181,6 +181,35 @@ unsafe fn refresh_once(queue: *mut c_void) {
     }
     dirty.sort_unstable();
     super::sparse::note_watch(watch_t0.elapsed(), dirty.len());
+    if super::present::trace_frame() {
+        // every 600th look: what the CPU's view of a few textures holds now (does the title's
+        // data reach the address at all, and is the texture still kept in step?)
+        static LOOKS: AtomicU64 = AtomicU64::new(0);
+        if LOOKS.fetch_add(1, Ordering::Relaxed) % 600 == 599 {
+            let t = TEXTURES.lock().unwrap();
+            // 16 samples of 4 KiB over the whole texture (GFX10 keeps the small levels first,
+            // level 0 last)
+            let content = |e: &Entry| -> usize {
+                let size = e.tex.size() as usize;
+                (0..16usize)
+                    .map(|k| e.va + (size.saturating_sub(4096)) * k / 15)
+                    .filter(|&a| crate::gpu::shader::readable(a, 4096))
+                    .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
+                    .sum()
+            };
+            let (mut with, mut without) = (0, 0);
+            let mut shown = 0;
+            for e in t.values() {
+                let c = content(e);
+                if c > 0 { with += 1 } else { without += 1 }
+                if c > 0 && shown < 4 {
+                    shown += 1;
+                    crate::xlog_info!("frame trace: title texture at {:#x} ({} bytes) has data in memory ({c} of 65536 sampled bytes); GPU-written {}", e.va, e.tex.size(), e.gpu_written);
+                }
+            }
+            crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {} dirty pages this look", dirty.len());
+        }
+    }
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::sparse::before_execute(q, &dirty, page as usize);

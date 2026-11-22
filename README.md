@@ -8,9 +8,9 @@ x64 code runs natively and XCL stands in for the console libraries the PC does n
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
-**Project state:** retail games run – Minecraft Preview is fully playable (worlds, sound,
-controller), Fortnite and XDefiant work as far as each game goes without its online
-services; see [Games](#games). The foundation is tested against real data from retail games
+**Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
+playable, Fortnite and XDefiant work as far as each game goes without its online services;
+see [Games](#games). The foundation is tested against real data from retail games
 (shader packs, texture archives, movies and the console DLLs they ship). Details, measurements and
 next steps:
 [`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
@@ -20,6 +20,7 @@ next steps:
 | Game | Package (version) | State | What works | Limits |
 |---|---|---|---|---|
 | **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ | fully playable | – |
+| **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
 
@@ -74,7 +75,7 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) | a game movie decodes frame by frame, picture checked |
+| **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf`; `tools/ttpf-viewer` (texture archive viewer) | – |
 
 ## What is missing
@@ -82,9 +83,8 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 | Not done yet | Not planned |
 |---|---|
 | MSAA textures in the console's tiled layout | Xbox Live, Store licensing (offline by design) |
-| Bink GPU decoding | decrypting XVC packages or any DRM |
-| hull / domain / amplification shaders (none in the games so far) | console SDK headers / binaries in the repository |
-| performance work (GPU buffers live in system memory) | |
+| performance work (GPU buffers live in system memory) | decrypting XVC packages or any DRM |
+| | console SDK headers / binaries in the repository |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
 classes asked for, shader statistics, audio formats, crash) – the to-do list for the next step.

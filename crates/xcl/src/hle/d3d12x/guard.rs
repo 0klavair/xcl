@@ -46,6 +46,35 @@ pub fn make_split(console: usize, pc: usize) -> usize {
     thunk(Tail::JumpToResult, Box::leak(Box::new([console, pc])) as *const [usize; 2] as u64, pick as usize)
 }
 
+/// The targets of a slot whose console method depends on the title's runtime layout.
+pub struct LayoutTargets {
+    /// a title on the older layout
+    pub older: usize,
+    /// a title on the newer layout
+    pub newer: usize,
+    /// everything else (the runtime itself)
+    pub pc: usize,
+    pub newer_layout: &'static std::sync::atomic::AtomicBool,
+}
+
+unsafe extern "system" fn pick_layout(caller: usize, t: *const LayoutTargets) -> usize {
+    let t = &*t;
+    if crate::modules::image_base_for_addr(caller).is_none() {
+        t.pc
+    } else if t.newer_layout.load(std::sync::atomic::Ordering::Acquire) {
+        t.newer
+    } else {
+        t.older
+    }
+}
+
+/// A slot whose console method differs between the title runtimes' layouts: chosen at each
+/// call (the layout is found out while the title runs), the argument registers untouched
+/// (floating-point ones too).
+pub fn make_layout_split(t: LayoutTargets) -> usize {
+    thunk(Tail::JumpToResult, Box::leak(Box::new(t)) as *const LayoutTargets as u64, pick_layout as usize)
+}
+
 enum Tail {
     /// decide ≠ 0 → `xor eax, eax; ret`, 0 → jump to the original
     GuardOr(usize),
@@ -124,6 +153,25 @@ mod tests {
         let s = make_split(console as usize, original as usize);
         let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(s) };
         assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+    }
+
+    extern "system" fn newer(a: u64, b: u64, c: u64, d: u64, e: u64, f: f64) -> u64 {
+        original(a, b, c, d, e, f) + 9
+    }
+
+    /// Non-game callers reach the PC method whatever the layout, with every argument (stack
+    /// and floating-point ones too) intact; the layout flag is read at each call.
+    #[test]
+    fn layout_split_keeps_the_runtime_on_the_pc_method() {
+        static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let s = make_layout_split(LayoutTargets { older: console as usize, newer: newer as usize, pc: original as usize, newer_layout: &NEWER });
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(s) };
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+        NEWER.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+        // the choice itself
+        let t = LayoutTargets { older: 1, newer: 2, pc: 3, newer_layout: &NEWER };
+        assert_eq!(unsafe { pick_layout(0, &t) }, 3, "not from a game image");
     }
 
     #[test]

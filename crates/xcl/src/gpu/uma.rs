@@ -40,7 +40,14 @@ pub struct Uma {
     sparse: bool,
     /// free ranges of the sparse windows (address → length) and the reservations in them
     sparse_free: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
+    /// XCL's own pool in window 0 for `Arena` blocks: (start, end, free blocks). The title
+    /// cannot take it – a title that commits all of unified memory at start (Unicorn
+    /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
+    pool: Mutex<(usize, usize, Vec<usize>)>,
 }
+
+/// bytes of XCL's arena pool (`Uma::new`)
+pub const POOL: usize = 64 << 20;
 
 #[derive(Default)]
 struct Inner {
@@ -58,7 +65,44 @@ impl Uma {
         let n = size.div_ceil(MAX_SIZE).clamp(1, MAX_WINDOWS);
         let mut u = Uma::with_windows(n, (size.div_ceil(n) + GRAIN - 1) & !(GRAIN - 1))?;
         u.reserve_sparse_windows();
+        u.reserve_pool(POOL);
         Some(u)
+    }
+
+    /// XCL's arena pool: `bytes` at the end of window 0 taken now, before the title can (a
+    /// quarter of the window at most); the title's allocations still start at the window's
+    /// start.
+    pub fn reserve_pool(&self, bytes: usize) {
+        let bytes = (bytes.min(self.size / 4) / ARENA_BLOCK) * ARENA_BLOCK;
+        if bytes == 0 {
+            return;
+        }
+        let at = {
+            let mut g = self.inner.lock().unwrap();
+            // the free range of window 0 that reaches furthest, its last `bytes`
+            let Some((start, len)) = g.free.iter().filter(|(&o, &l)| o / WINDOW == 0 && l >= bytes).max_by_key(|(&o, &l)| o + l).map(|(&o, &l)| (o, l)) else { return };
+            let at = (start + len - bytes) & !(GRAIN - 1);
+            if at < start {
+                return;
+            }
+            g.free.remove(&start);
+            if at > start {
+                g.free.insert(start, at - start);
+            }
+            if at + bytes < start + len {
+                g.free.insert(at + bytes, start + len - at - bytes);
+            }
+            g.used.insert(at, bytes);
+            at
+        };
+        let p = self.base + at;
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0, bytes) };
+        *self.pool.lock().unwrap() = (p, p + bytes, (p..p + bytes).step_by(ARENA_BLOCK).rev().collect());
+    }
+
+    /// A block of `ARENA_BLOCK` bytes from XCL's pool (None: the pool is used up or absent).
+    fn pool_block(&self) -> Option<usize> {
+        self.pool.lock().unwrap().2.pop()
     }
 
     /// The windows after the committed ones as one write-watched reservation (sparse windows).
@@ -156,7 +200,7 @@ impl Uma {
                 for k in 0..windows {
                     inner.free.insert(k * WINDOW, size);
                 }
-                return Some(Uma { base, windows, size, inner: Mutex::new(inner), sparse: false, sparse_free: Mutex::new(Default::default()) });
+                return Some(Uma { base, windows, size, inner: Mutex::new(inner), sparse: false, sparse_free: Mutex::new(Default::default()), pool: Mutex::new((0, 0, Vec::new())) });
             }
             for p in got {
                 unsafe { VirtualFree(p, 0, MEM_RELEASE) };
@@ -257,6 +301,14 @@ impl Uma {
         if !self.contains(p) {
             return false;
         }
+        {
+            // a block of XCL's pool goes back to the pool
+            let mut g = self.pool.lock().unwrap();
+            if p >= g.0 && p < g.1 {
+                g.2.push(p);
+                return true;
+            }
+        }
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
         let Some(orig) = g.used.remove(&off) else { return false };
@@ -324,7 +376,11 @@ impl Arena {
             blocks.push(p as usize);
             return Some(p);
         }
-        let p = u.alloc_in(0, ARENA_BLOCK, GRAIN)? as usize;
+        // XCL's pool first, then any free part of window 0
+        let p = match u.pool_block() {
+            Some(p) => p,
+            None => u.alloc_in(0, ARENA_BLOCK, GRAIN)? as usize,
+        };
         blocks.push(p);
         self.at = p + n;
         self.end = p + ARENA_BLOCK;
@@ -352,6 +408,34 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
+    /// back to it when freed.
+    #[test]
+    fn arena_blocks_come_from_the_pool_when_the_title_took_the_rest() {
+        let u = Uma::with_windows(1, 8 << 20).unwrap();
+        u.reserve_pool(4 * ARENA_BLOCK);
+        // the pool is the window's end: the title's first allocation is still its start
+        assert_eq!(u.pool.lock().unwrap().1, u.base() + (8 << 20));
+        assert_eq!(u.alloc(GRAIN, GRAIN).map(|p| p as usize), Some(u.base()));
+        // the title takes everything else
+        let mut title = Vec::new();
+        while let Some(p) = u.alloc(GRAIN, GRAIN) {
+            title.push(p as usize);
+        }
+        assert!(u.alloc_in(0, ARENA_BLOCK, GRAIN).is_none());
+        let (mut a, mut blocks) = (Arena::default(), Vec::new());
+        for _ in 0..4 * (ARENA_BLOCK / 256) {
+            a.take(&u, 200, 256, &mut blocks).expect("a piece from the pool");
+        }
+        assert_eq!(blocks.len(), 4);
+        assert!(a.take(&u, 200, 256, &mut blocks).is_none(), "pool used up, the rest is the title's");
+        for b in blocks.drain(..) {
+            assert!(u.free(b));
+        }
+        let mut a = Arena::default();
+        assert!(a.take(&u, 200, 256, &mut blocks).is_some(), "freed blocks are back in the pool");
+    }
 
     /// Many small pieces share a block (aligned, disjoint); a large one gets its own.
     #[test]
@@ -398,7 +482,8 @@ mod tests {
 
     #[test]
     fn alloc_free_coalesce() {
-        let u = Uma::new(16 << 20).unwrap();
+        // without XCL's arena pool (`Uma::new` takes it at the start of window 0)
+        let u = Uma::with_windows(1, 16 << 20).unwrap();
         assert_eq!(u.base() & 0xFFFF_FFFF, 0, "4 GiB alignment");
         let a = u.alloc(100, 0).unwrap() as usize;
         let b = u.alloc(0x2_0000, 0).unwrap() as usize;

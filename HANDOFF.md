@@ -1180,6 +1180,25 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
     (`eh::arm_current_thread`). This is how the controller path above was found without changing the game.
   - Open: small magenta / black "missing texture" quads on the loading screen's logo (a texture the game did not
     load – trace file opens next).
+- **Unicorn Overlord (SEGAofAmericaInc.Pa253b0c1Y 1.0.0.6) is playable (2026-11-22)**: logos, movies, menus and play
+  with the right picture. It runs on a **newer console D3D12 runtime** (its own game OS) with the same SDK version
+  (0x20004) as XDefiant / Minecraft but other vtable layouts:
+  - command queue: two more methods before Signal – Signal #16, Wait #17, GetTimestampFrequency #18, SignalX #25,
+    PresentX #32 (older: #14, #15, #16, #23, #30). Its Signal landed on GetTimestampFrequency, which wrote 100 MHz
+    over the fence's vtable (crash). `real::queue_dispatch` handles the title's queue slots from #14; a fence passed
+    to #16 / #17 (never to the older layout's GetTimestampFrequency / GetClockCalibration) marks the newer layout.
+  - command list: console methods from CopyTextureRegionX on two slots later (#85, older #83; `NEWER_LIST_SLOTS`,
+    picked at each call by `guard::make_layout_split`, xmm arguments intact). Its texture uploads hit
+    SetPredicationBufferX ("not 8-byte aligned … not done") and every texture stayed zero (shapes, gradients).
+    Where the shift starts below #83 is not known.
+  - the device layout is unchanged (#73 CreateCommandListX, #78 SetFrameIntervalX …).
+  - Also: console-only resource state bits (0x100000 on its 4K display target) are masked off at creation (the PC
+    refused the resource, the title threw); the title commits 2046 of 2048 MB of unified memory at start, so XCL's
+    per-draw arena has its own 64 MB pool at the end of window 0 (`Uma::reserve_pool`), draws are no longer skipped;
+    `FENCES` is a read-write lock (`end_title` reads it with the title's threads suspended).
+  - Diagnostics: `XCL_WATCH=rva` (write watchpoint in the exe, the calling thread armed at once), `XCL_WATCH_FENCE=n`,
+    the device's SDK version and console-only interface requests logged, the title's file opens with their flags,
+    DirectStorage requests, unified-memory use, and (trace) whether title textures hold data in memory.
 - **Why every frame was black: descriptors are values.** XDefiant makes its views in a CPU-only heap (131 072
   slots) and copies them into its shader-visible heap (442 368 slots) as memory – the console header's inline
   CopyDescriptorsSimple; only sampler copies reach the device. T# word 0 was an index into each heap's own PC heap,
