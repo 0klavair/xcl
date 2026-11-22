@@ -592,6 +592,7 @@ fn main() {
     check("D3D12.X: frame clock + PresentX of the title's back buffer", gpu::present_x_frame);
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
     check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy)", gpu::console_list_methods);
+    check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);
     check("D3D12.X: a texture in title memory (XG layout, #44) follows CPU writes", gpu::title_texture);
     check("D3D12.X: a texture in a streaming pool gets its texels once pages are mapped in", gpu::streamed_texture);

@@ -1489,6 +1489,7 @@ impl Em {
             let r = |s: &mut Self, j: u64| s.vreg(addr_reg(j));
             let wide = base == "bvh64_intersect_ray";
             let node = r(self, 0);
+            let node_hi = if wide { Some(r(self, 1)) } else { None };
             let k = if wide { 2 } else { 1 };
             let fl = |s: &mut Self, j: u64| format!("asfloat({})", r(s, j));
             let extent = fl(self, k);
@@ -1507,11 +1508,18 @@ impl Em {
                 )
             };
             let (d0, d1) = (self.sreg(srsrc), self.sreg(srsrc + 1));
+            let a = self.t();
             let t = self.t();
             let act = self.act();
-            // descriptor: base address in 256-byte units (word 0), box sorting = word 1 bit 31
-            self.window(&format!("{d0} >> 24"));
-            self.line(&format!("uint4 {t} = bvh_intersect({node}, {d0} << 8, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
+            // descriptor: 48-bit base address in 256-byte units (word 0 + word 1 [7:0]),
+            // box sorting = word 1 bit 31; node offset is 32-bit (bvh) or 64-bit (bvh64) in 8-byte units
+            let off = match node_hi {
+                Some(hi) => format!("((((uint64_t){hi} << 32) | (uint64_t)({node} & ~7u)) << 3)"),
+                None => format!("((uint64_t)({node} & ~7u) << 3)"),
+            };
+            self.line(&format!("uint64_t {a} = ((((uint64_t)({d1} & 0xFFu) << 32) | (uint64_t){d0}) << 8) + {off};"));
+            self.window(&format!("(uint)({a} >> 32)"));
+            self.line(&format!("uint4 {t} = bvh_intersect({node} & 7u, (uint){a}, {extent}, {origin}, {dir}, {inv}, ({d1} >> 31) != 0u);"));
             let st: Vec<String> = (0..4).map(|c| format!("{} = {t}.{};", self.vreg(vdata + c), ["x", "y", "z", "w"][c as usize])).collect();
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
             return Ok(());
@@ -4274,24 +4282,27 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
     return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
-// image_bvh(64)_intersect_ray: node = id (low 3 bits: type), at base + (id & ~7) * 8.
+// image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
 // misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
 // instance / AABB nodes are left to the shader (all 0xFFFFFFFF).
-uint4 bvh_intersect(uint node, uint base, float tmax, float3 o, float3 d, float3 inv, bool sort) {
-    uint type = node & 7u;
-    uint at = base + ((node & ~7u) << 3);
+uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 inv, bool sort) {
     if (type == 4u || type == 5u) {
         uint4 child = mem.Load4(at);
         float tn[4]; uint id[4];
+        float3 ninf = asfloat(0xFF800000u), pinf = asfloat(0x7F800000u);
         [unroll] for (uint k = 0u; k < 4u; k++) {
             float3 mn, mx;
             if (type == 5u) { mn = asfloat(mem.Load3(at + 16u + 24u * k)); mx = asfloat(mem.Load3(at + 28u + 24u * k)); }
             else { uint3 h = mem.Load3(at + 16u + 12u * k); mn = float3(f16tof32(h.x), f16tof32(h.x >> 16), f16tof32(h.y)); mx = float3(f16tof32(h.y >> 16), f16tof32(h.z), f16tof32(h.z >> 16)); }
             float3 t1 = (mn - o) * inv, t2 = (mx - o) * inv;
-            float a = max(max(min(t1.x, t2.x), min(t1.y, t2.y)), min(t1.z, t2.z));
-            float b = min(min(max(t1.x, t2.x), max(t1.y, t2.y)), max(t1.z, t2.z));
-            bool hit = child[k] != 0xFFFFFFFFu && a <= b && b >= 0.0f && a <= tmax;
+            bool3 in_slab = and(o >= mn, o <= mx);
+            float3 lo = select(isinf(inv), select(in_slab, ninf, pinf), min(t1, t2));
+            float3 hi = select(isinf(inv), select(in_slab, pinf, ninf), max(t1, t2));
+            float a = max(max(lo.x, lo.y), lo.z);
+            float b = min(min(hi.x, hi.y), hi.z);
+            bool valid = and(child[k] != 0xFFFFFFFFu, all(mn <= mx));
+            bool hit = and(and(valid, a <= b), and(b >= 0.0f, a <= tmax));
             tn[k] = hit ? a : asfloat(0x7F800000u);
             id[k] = hit ? child[k] : 0xFFFFFFFFu;
         }

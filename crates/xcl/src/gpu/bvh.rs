@@ -65,6 +65,22 @@ pub struct Instance {
     pub blas_bounds: Aabb,
 }
 
+/// Worst-case console acceleration structure size (bytes) matching `XboxBvhBuilder.dll`'s
+/// `GetRaytracingAccelerationStructurePrebuildInfo`: 256-byte header, `leaf_count` leaves
+/// (64 B triangles for BLAS, 128 B instances for TLAS), `max(leaf_count, 2) - 1` box32 nodes
+/// (128 B), plus 4 bytes of parent pointers per 64 bytes of nodes, rounded up to 1 KiB.
+pub fn prebuild_size(leaf_count: u64, top_level: bool) -> u64 {
+    let leaf = if top_level { INSTANCE_BYTES as u64 } else { TRI_BYTES as u64 };
+    let nodes = leaf_count * leaf + (leaf_count.max(2) - 1) * BOX_BYTES as u64;
+    (HEADER_BYTES as u64 + nodes + nodes / 64 * 4).div_ceil(1024) * 1024
+}
+
+/// Whether a console BVH header has bit 24 ("compressed / dehydrated", as stored in
+/// `*_bvh4.rpf` before `XboxBvhBuilder::Rehydrate*`) set in dword 0.
+pub fn is_compressed_header(data: &[u8]) -> bool {
+    data.len() >= 4 && ((word(data, 0) >> 24) & 1) != 0
+}
+
 /// Bottom level over `tris`; `geometry` goes to every triangle node.
 pub fn build(tris: &[Triangle], geometry: u32) -> Bvh {
     let bounds: Vec<Aabb> = tris.iter().map(|t| bounds(t.iter().copied())).collect();
@@ -277,11 +293,24 @@ pub fn intersect_node(data: &[u8], node: u32, tmax: f32, o: [f32; 3], d: [f32; 3
                     let w = [0, 1, 2].map(|j| word(data, at + 16 + 12 * k + 4 * j));
                     ([half(w[0]), half(w[0] >> 16), half(w[1])], [half(w[1] >> 16), half(w[2]), half(w[2] >> 16)])
                 };
-                let t1 = [0, 1, 2].map(|a| (mn[a] - o[a]) * inv[a]);
-                let t2 = [0, 1, 2].map(|a| (mx[a] - o[a]) * inv[a]);
-                let a = t1[0].min(t2[0]).max(t1[1].min(t2[1])).max(t1[2].min(t2[2]));
-                let b = t1[0].max(t2[0]).min(t1[1].max(t2[1])).min(t1[2].max(t2[2]));
-                if child != INVALID && a <= b && b >= 0.0 && a <= tmax {
+                let valid = child != INVALID && (0..3).all(|a| mn[a] <= mx[a]);
+                let (mut a, mut b) = (f32::NEG_INFINITY, f32::INFINITY);
+                for axis in 0..3 {
+                    let (lo, hi) = if inv[axis].is_infinite() {
+                        if o[axis] >= mn[axis] && o[axis] <= mx[axis] {
+                            (f32::NEG_INFINITY, f32::INFINITY)
+                        } else {
+                            (f32::INFINITY, f32::NEG_INFINITY)
+                        }
+                    } else {
+                        let t1 = (mn[axis] - o[axis]) * inv[axis];
+                        let t2 = (mx[axis] - o[axis]) * inv[axis];
+                        (t1.min(t2), t1.max(t2))
+                    };
+                    a = a.max(lo);
+                    b = b.min(hi);
+                }
+                if valid && a <= b && b >= 0.0 && a <= tmax {
                     *h = (a, child);
                 }
             }
@@ -540,5 +569,40 @@ pub(crate) mod tests {
             }
         }
         assert!(hits > 100, "{hits} hits");
+    }
+
+    #[test]
+    fn prebuild_size_and_compressed_header() {
+        // matches XboxBvhBuilder.dll's GetRaytracingAccelerationStructurePrebuildInfo formula
+        assert_eq!(prebuild_size(1, false), 1024);
+        assert_eq!(prebuild_size(64, false), 13312);
+        assert_eq!(prebuild_size(16, true), 5120);
+        let compressed = 0x8102_0006u32.to_le_bytes();
+        let rehydrated = 0x8002_0006u32.to_le_bytes();
+        assert!(is_compressed_header(&compressed));
+        assert!(!is_compressed_header(&rehydrated));
+        assert!(!is_compressed_header(&[]));
+    }
+
+    #[test]
+    fn grazing_axis_aligned_ray_and_nan_box() {
+        let mut data = vec![0u8; 256];
+        let (c0, c1, c2, c3) = (0x10u32, 0x20u32, 0x30u32, 0x40u32);
+        put(&mut data, 0, &[c0, c1, c2, c3]);
+        let box_f = |mn: [f32; 3], mx: [f32; 3]| [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]].map(f32::to_bits);
+        // child 0: normal box [-1..1, -1..1, 5..6]; ray origin lies right on x = -1.0 with dx = 0
+        put(&mut data, 16, &box_f([-1.0, -1.0, 5.0], [1.0, 1.0, 6.0]));
+        // child 1: NaN-disabled box (GPURT convention)
+        put(&mut data, 40, &box_f([f32::NAN, -1.0, 2.0], [1.0, 1.0, 3.0]));
+        // child 2: inverted empty box (mn.x > mx.x)
+        put(&mut data, 64, &box_f([2.0, -1.0, 2.0], [-2.0, 1.0, 3.0]));
+        // child 3: box missed along x (x in [0..1] while o.x = -1.0)
+        put(&mut data, 88, &box_f([0.0, -1.0, 5.0], [1.0, 1.0, 6.0]));
+
+        let o = [-1.0, 0.0, 0.0];
+        let d = [0.0, 0.0, 1.0];
+        let inv = [f32::INFINITY, f32::INFINITY, 1.0];
+        let got = intersect_node(&data, BOX32, 100.0, o, d, inv, true);
+        assert_eq!(got, [c0, INVALID, INVALID, INVALID]);
     }
 }

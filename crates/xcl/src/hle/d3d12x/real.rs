@@ -509,7 +509,13 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
         scanned += 1;
     }
     let scanned = scanned.max(public);
-    let total = scanned + EXTRA_SLOTS;
+    let max_console = console_slots(kind)
+        .iter()
+        .map(|e| e.0 + 1)
+        .chain(console_remap(kind).iter().map(|e| e.0 + 1))
+        .max()
+        .unwrap_or(0);
+    let total = (scanned + EXTRA_SLOTS).max(max_console);
     let mut v: Vec<usize> = Vec::with_capacity(total + 1);
     v.push(orig);
     for i in 0..scanned {
@@ -740,6 +746,9 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (88, l::write32_top_x as usize),
                 (89, l::write64_top_x as usize),
                 (90, l::write32_bottom_of_shader_x as usize),
+                // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
+                (146, l::uav_barrier_x as usize),
+                (148, b::allocate_upload_memory as usize),
             ]
         }
         _ => vec![],
@@ -1266,6 +1275,22 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
+    // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
+    // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
+    // so write the RDNA2 BVH descriptor directly and skip forwarding the console VA to PC.
+    if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) {
+        let va = v.Anonymous.RaytracingAccelerationStructure.Location;
+        let in_uma = va != 0 && crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
+        if in_uma {
+            let w = crate::gpu::desc::bvh_words(va, true);
+            return super::console_heap::write(&slot, &[w[0], w[1], w[2], w[3], 0, 0, 0, 0]);
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: CreateShaderResourceView(RAYTRACING_ACCELERATION_STRUCTURE) at {va:#x} is not in unified memory – writing empty BVH descriptor");
+        }
+        return super::console_heap::write(&slot, &[0; 8]);
+    }
     f(this, res, desc, slot.pc_srv);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
@@ -1565,6 +1590,23 @@ fn pc_feature_size(feature: i32) -> Option<usize> {
     })
 }
 
+/// Apply `config.raytracing` / `XCL_RAYTRACING` override (if any) to a successful
+/// `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5)` result and log the reported tier once.
+unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
+    if D3D12_FEATURE(feature) != D3D12_FEATURE_D3D12_OPTIONS5 || data.is_null() || (size as usize) < std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() {
+        return;
+    }
+    let opts = &mut *(data as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5);
+    let host = opts.RaytracingTier.0;
+    if let Some(tier) = crate::state::config().raytracing_tier_override() {
+        opts.RaytracingTier = D3D12_RAYTRACING_TIER(tier as i32);
+    }
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: CheckFeatureSupport(D3D12_OPTIONS5) → RaytracingTier {} (host {})", opts.RaytracingTier.0, host);
+    }
+}
+
 /// CheckFeatureSupport(feature, data, size): console structures can be larger than the PC's
 /// (XDefiant: D3D12_OPTIONS with 0x40 bytes, 0x3C on the PC – and the title stops on the
 /// error). A size the PC refuses is retried with the PC's, the console's extra bytes zero.
@@ -1572,7 +1614,11 @@ unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: 
     type F = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
     let hr = f(this, feature, data, size);
-    let Some(pc) = pc_feature_size(feature).filter(|&pc| hr < 0 && !data.is_null() && pc != size as usize) else { return hr };
+    if hr >= 0 {
+        adjust_raytracing_options5(feature, data, size);
+        return hr;
+    }
+    let Some(pc) = pc_feature_size(feature).filter(|&pc| !data.is_null() && pc != size as usize) else { return hr };
     let n = pc.min(size as usize);
     let mut tmp = vec![0u8; pc];
     std::ptr::copy_nonoverlapping(data, tmp.as_mut_ptr(), n); // input fields (format, sample count …)
@@ -1580,6 +1626,7 @@ unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: 
     if hr2 >= 0 {
         std::ptr::write_bytes(data, 0, size as usize);
         std::ptr::copy_nonoverlapping(tmp.as_ptr(), data, n);
+        adjust_raytracing_options5(feature, data, size);
     }
     static SEEN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap();

@@ -395,8 +395,13 @@ unsafe extern "system" fn Device_CreateCommandList(_t: *mut NullObj, _m: u32, _t
 unsafe extern "system" fn Device_CreateCommandList1(_t: *mut NullObj, _m: u32, _ty: u32, _f: u32, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
     out_obj(ppv, Kind::CommandList)
 }
-unsafe extern "system" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u32, _d: *mut c_void, _s: u32) -> HRESULT {
+unsafe extern "system" fn Device_CheckFeatureSupport(_t: *mut NullObj, feature: u32, data: *mut c_void, size: u32) -> HRESULT {
     crate::xlog_debug!("D3D12.X null: CheckFeatureSupport({feature})");
+    // D3D12_FEATURE_D3D12_OPTIONS5 = 27: RaytracingTier sits at +8
+    if feature == 27 && !data.is_null() && size >= 12 {
+        let tier = crate::state::config().raytracing_tier_override().unwrap_or(0);
+        *((data as *mut u8).add(8) as *mut u32) = tier;
+    }
     S_OK
 }
 unsafe extern "system" fn Device_CreateDescriptorHeap(_t: *mut NullObj, desc: *const u8, _r: *const c_void, ppv: *mut *mut c_void) -> HRESULT {
