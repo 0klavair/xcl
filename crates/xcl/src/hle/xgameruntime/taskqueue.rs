@@ -524,6 +524,22 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
             qi.queue.execute(qi.item);
         }
     }
+    // Delayed callbacks of `q` still waiting for their time are canceled too, before the
+    // termination callback (libHttpClient: CancelPendingEntries when a port terminates). They
+    // only count as in flight once due, so the wait below would not hold the callback for them,
+    // and they would run (canceled) after it – when the title may already have freed its context.
+    let delayed: Vec<Timed> = {
+        let (m, cv) = timer();
+        let mut heap = m.lock().unwrap();
+        let (mine, keep): (Vec<Timed>, Vec<Timed>) = std::mem::take(&mut *heap).into_vec().into_iter().partition(|t| Arc::ptr_eq(&t.queue, &q));
+        *heap = BinaryHeap::from(keep);
+        cv.notify_all();
+        mine
+    };
+    for t in delayed {
+        t.queue.inflight.fetch_add(1, Ordering::AcqRel);
+        t.queue.execute(t.item);
+    }
     let ctx = ctx as usize; // raw pointers are not Send
     let finish = move || {
         let (m, cv) = &q.idle;
@@ -740,6 +756,25 @@ mod tests {
                 assert_eq!(HITS.load(Ordering::SeqCst), b + 50);
                 XTaskQueueCloseHandle(t);
             }
+        }
+    }
+
+    #[test]
+    fn terminate_cancels_delayed_callbacks_before_its_own_callback() {
+        static ORDER: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn delayed(_ctx: *mut c_void, canceled: bool) {
+            ORDER.lock().unwrap().push(if canceled { "delayed, canceled" } else { "delayed, ran" });
+        }
+        unsafe extern "system" fn terminated(_ctx: *mut c_void) {
+            ORDER.lock().unwrap().push("terminated");
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            assert_eq!(XTaskQueueSubmitDelayedCallback(h, PORT_WORK, 60_000, std::ptr::null_mut(), delayed as usize), S_OK);
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), terminated as usize), S_OK);
+            assert_eq!(*ORDER.lock().unwrap(), ["delayed, canceled", "terminated"]);
+            XTaskQueueCloseHandle(h);
         }
     }
 
