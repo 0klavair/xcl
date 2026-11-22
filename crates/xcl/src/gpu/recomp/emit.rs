@@ -3280,16 +3280,7 @@ impl Em {
                 let cmp = self.vreg(f("DATA") + 1);
                 format!("mem.InterlockedCompareExchange({t}_a, {cmp}, {v}, {t}_old);")
             }
-            // float min / max as one integer atomic: non-negative floats order like signed
-            // ints, negative ones like unsigned ints in reverse (no CAS loop – a program with
-            // 168 such loops was too much for the driver's compiler)
-            "fmin" | "fmax" => {
-                let (pos, neg) = if op == "fmin" { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
-                format!(
-                    "if (asfloat({v}) >= 0.0f) {{ int {t}_s; mem.{pos}({t}_a, asint({v}), {t}_s); {t}_old = asuint({t}_s); }} \
-else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
-                )
-            }
+            "fmin" | "fmax" => float_minmax_mem(op == "fmin", false, &format!("{t}_a"), &v, &format!("{t}_old"), &t),
             _ => return Err("FLAT atomic"),
         };
         self.line(&format!("if ({act}) {{ {body} }}"));
@@ -4102,16 +4093,10 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         },
         "smin" | "min_i32" => signed("InterlockedMin", "min"),
         "smax" | "max_i32" => signed("InterlockedMax", "max"),
-        // float min / max in memory as one integer atomic: non-negative floats order like
-        // signed ints, negative ones like unsigned ints in reverse (no CAS loop – a program
-        // with 168 such loops was too much for the driver's compiler)
         "fmin" | "fmax" | "min_f32" | "max_f32" => {
             let min = op == "fmin" || op == "min_f32";
             match at {
-                At::Mem(a) => {
-                    let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
-                    format!("if (asfloat({v}) >= 0.0f) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
-                }
+                At::Mem(a) => float_minmax_mem(min, false, a, v, old, t),
                 At::Ref(_) => cas(format!("asuint({}(asfloat({c}), asfloat({v})))", if min { "min" } else { "max" })),
             }
         }
@@ -4154,10 +4139,29 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
         // float compare-swap compares the whole 64-bit payload bitwise (like rmw32's
         // fcmpswap): differs from a numeric f64 compare only for -0 / NaN
         "cmpswap" | "fcmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, a, v, old, t)),
         _ => return None,
     };
     let val = if op == "sub" { format!("((uint64_t)0 - {v})") } else { v.to_string() };
     Some(format!("mem.{f}({a}, {val}, {old});"))
+}
+
+/// Float min / max at byte address `a` of the flat memory as one integer atomic (no CAS loop:
+/// a program with 168 such loops was too much for the driver's compiler). Non-negative floats
+/// order like signed ints, negative ones like unsigned ints in reverse. The operand takes the
+/// signed path iff its bits are at most those of +inf: +0.0 … +inf. -0.0 (sign bit set)
+/// compares equal to 0.0 as a float but orders below every non-negative value here, so it
+/// takes the unsigned path, as do negative values and NaNs. `x2`: f64 (`v`, `old` are
+/// uint64_t), else f32 (uint).
+fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -> String {
+    let (pos, neg) = if min { ("InterlockedMin", "InterlockedMax") } else { ("InterlockedMax", "InterlockedMin") };
+    if x2 {
+        format!(
+            "if ({v} <= 0x7FF0000000000000ull) {{ int64_t {t}_s = 0; mem.{pos}64({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s; }} else {{ mem.{neg}64({a}, {v}, {old}); }}"
+        )
+    } else {
+        format!("if ({v} <= 0x7F800000u) {{ int {t}_s = 0; mem.{pos}({a}, asint({v}), {t}_s); {old} = asuint({t}_s); }} else {{ mem.{neg}({a}, {v}, {old}); }}")
+    }
 }
 
 /// Placeholder where the memory window accessors go (after the `mem` declarations).

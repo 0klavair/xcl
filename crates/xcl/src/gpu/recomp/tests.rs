@@ -325,6 +325,37 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     }
 }
 
+/// *_atomic_fmin_x2 / fmax_x2 (buffer / flat / global): f64 min / max as one native 64-bit
+/// integer atomic picked by the operand's sign, like the f32 forms – no CAS loop.
+#[test]
+fn atomic_fmin_fmax_x2_are_native_64_bit_atomics() {
+    let code = prog(&[
+        ("BUFFER_ATOMIC_FMIN_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
+        ("BUFFER_ATOMIC_FMAX_X2", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1)], None),
+        ("FLAT_ATOMIC_FMIN_X2", "ENC_FLAT", &[("VDST", 10), ("ADDR", 12), ("DATA", 14), ("GLC", 1)], None),
+        ("FLAT_ATOMIC_FMAX_X2", "ENC_FLAT", &[("VDST", 16), ("ADDR", 12), ("DATA", 18)], None),
+        ("GLOBAL_ATOMIC_FMIN_X2", "ENC_FLAT_GLBL", &[("VDST", 20), ("ADDR", 22), ("DATA", 24), ("SADDR", 2), ("GLC", 1)], None),
+        ("GLOBAL_ATOMIC_FMAX_X2", "ENC_FLAT_GLBL", &[("VDST", 26), ("ADDR", 22), ("DATA", 28), ("SADDR", 2)], None),
+    ]);
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+    assert!(!t.hlsl.contains("InterlockedCompareExchange64"), "{}", t.hlsl);
+    // one signed and one unsigned branch per instruction, chosen at +inf's bits
+    assert_eq!(t.hlsl.matches("<= 0x7FF0000000000000ull)").count(), 6, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("mem.InterlockedMin64(").count(), 6, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("mem.InterlockedMax64(").count(), 6, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("& ~7u;").count(), 6, "{}", t.hlsl);
+    // memory above 4 GiB: the program's atomics go through the window accessors (whose own
+    // bodies call mem / mem1)
+    let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedMin64(t").count(), 6, "{}", w.hlsl);
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedMax64(t").count(), 6, "{}", w.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
+    }
+}
+
 #[test]
 fn unary_f64_math_vop1_and_vop3() {
     let code = prog(&[
@@ -3055,6 +3086,130 @@ fn gpu_atomic_fcmpswap_x2() {
         let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
         assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
         assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
+    }
+}
+
+/// 32-bit float atomic min / max in memory with a -0.0 operand. The translation turns them
+/// into integer atomics chosen by the operand's sign; -0.0 has its sign bit set, so it has to
+/// take the negative path: fmin(-5, -0) = -5, fmax(-5, -0) = -0, fmin(3, -0) = -0,
+/// fmax(3, -0) = 3. Both code paths: global (flat / global) and buffer.
+#[test]
+fn gpu_atomic_fmin_fmax_negative_zero() {
+    if !gpu_ready() {
+        return;
+    }
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap();
+    let mubuf = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_MUBUF", f, None).unwrap();
+    let mut code = Vec::new();
+    // global: s2 + v30 (= 0) + offset; buffer: V# s[8:11], raw base 0x700, + offset
+    for (op, off) in [("FMIN", 0u64), ("FMAX", 4), ("FMIN", 8), ("FMAX", 12)] {
+        let (g, b) = match op {
+            "FMIN" => ("GLOBAL_ATOMIC_FMIN", "BUFFER_ATOMIC_FMIN"),
+            _ => ("GLOBAL_ATOMIC_FMAX", "BUFFER_ATOMIC_FMAX"),
+        };
+        code.extend(glbl(g, &[("ADDR", 30), ("DATA", 32), ("SADDR", 2), ("OFFSET", off)]));
+        code.extend(mubuf(b, &[("VDATA", 32), ("VADDR", 30), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", off)]));
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0x600;
+    st.sgpr[8..12].copy_from_slice(&[0x700, 0, 0x200, 0]);
+    for r in st.vgpr.iter_mut() {
+        r[30] = 0;
+        r[32] = (-0.0f32).to_bits();
+    }
+    let mut mem = vec![0u32; 0x800 / 4];
+    for base in [0x600usize, 0x700] {
+        mem[base / 4] = (-5.0f32).to_bits();
+        mem[base / 4 + 1] = (-5.0f32).to_bits();
+        mem[base / 4 + 2] = 3.0f32.to_bits();
+        mem[base / 4 + 3] = 3.0f32.to_bits();
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for (family, base) in [("global", 0x600usize), ("buffer", 0x700)] {
+        let cell = |k: usize| r.mem[base / 4 + k];
+        assert_eq!(cell(0), (-5.0f32).to_bits(), "{family}: fmin(-5, -0) = -5");
+        assert_eq!(cell(1), (-0.0f32).to_bits(), "{family}: fmax(-5, -0) = -0");
+        assert_eq!(cell(2), (-0.0f32).to_bits(), "{family}: fmin(3, -0) = -0");
+        assert_eq!(cell(3), 3.0f32.to_bits(), "{family}: fmax(3, -0) = 3");
+    }
+}
+
+/// *_atomic_fmin_x2 / fmax_x2 on hardware, all three families. Six cells each: 64 lanes
+/// race on a max (from -inf) and a min (from +inf) of lane - 20.5, then the -0.0 cases of
+/// the f32 test. A seventh, per-lane cell checks the GLC return (global).
+#[test]
+fn gpu_atomic_fmin_fmax_x2() {
+    if !gpu_ready() {
+        return;
+    }
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // (op, data VGPR, cell offset): the lane values at v[32:33], -0.0 at v[34:35]
+    let ops = [("FMAX", 32u64, 0u64), ("FMIN", 32, 8), ("FMIN", 34, 16), ("FMAX", 34, 24), ("FMIN", 34, 32), ("FMAX", 34, 40)];
+    for (op, data, off) in ops {
+        let x2 = |family: &str| -> &'static str {
+            match (family, op) {
+                ("BUFFER", "FMIN") => "BUFFER_ATOMIC_FMIN_X2",
+                ("BUFFER", _) => "BUFFER_ATOMIC_FMAX_X2",
+                ("FLAT", "FMIN") => "FLAT_ATOMIC_FMIN_X2",
+                ("FLAT", _) => "FLAT_ATOMIC_FMAX_X2",
+                (_, "FMIN") => "GLOBAL_ATOMIC_FMIN_X2",
+                _ => "GLOBAL_ATOMIC_FMAX_X2",
+            }
+        };
+        // buffer: V# s[8:11], raw base 0x800; flat: address v[36:37] = 0x900; global: s2 = 0xA00
+        code.extend(enc(x2("BUFFER"), "ENC_MUBUF", &[("VDATA", data), ("VADDR", 30), ("SRSRC", 2), ("SOFFSET", 128), ("OFFSET", off)]));
+        code.extend(enc(x2("FLAT"), "ENC_FLAT", &[("ADDR", 36), ("DATA", data), ("OFFSET", off)]));
+        code.extend(enc(x2("GLOBAL"), "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", data), ("SADDR", 2), ("OFFSET", off)]));
+    }
+    // per-lane cell at s3 + v38 (0xB00 + 8·lane): max(1.0, 2.0), the old 1.0 back in v[40:41]
+    code.extend(enc("GLOBAL_ATOMIC_FMAX_X2", "ENC_FLAT_GLBL", &[("VDST", 40), ("ADDR", 38), ("DATA", 42), ("SADDR", 3), ("GLC", 1)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+    let mut st = KernelState::default();
+    st.sgpr[2] = 0xA00;
+    st.sgpr[3] = 0xB00;
+    st.sgpr[8..12].copy_from_slice(&[0x800, 0, 0x100, 0]);
+    let put = |r: &mut Vec<u32>, at: usize, v: u64| {
+        r[at] = v as u32;
+        r[at + 1] = (v >> 32) as u32;
+    };
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[30] = 0;
+        put(r, 32, (l as f64 - 20.5).to_bits());
+        put(r, 34, (-0.0f64).to_bits());
+        put(r, 36, 0x900);
+        r[38] = 8 * l as u32;
+        put(r, 42, 2.0f64.to_bits());
+    }
+    let init = [f64::NEG_INFINITY, f64::INFINITY, -5.0, -5.0, 3.0, 3.0];
+    let mut mem = vec![0u32; 0xE00 / 4];
+    let set = |mem: &mut Vec<u32>, a: usize, v: f64| {
+        mem[a / 4] = v.to_bits() as u32;
+        mem[a / 4 + 1] = (v.to_bits() >> 32) as u32;
+    };
+    for base in [0x800usize, 0x900, 0xA00] {
+        for (k, v) in init.iter().enumerate() {
+            set(&mut mem, base + 8 * k, *v);
+        }
+    }
+    for l in 0..64usize {
+        set(&mut mem, 0xB00 + 8 * l, 1.0);
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
+    let want = [42.5f64.to_bits(), (-20.5f64).to_bits(), (-5.0f64).to_bits(), (-0.0f64).to_bits(), (-0.0f64).to_bits(), 3.0f64.to_bits()];
+    let what = ["max of the lanes", "min of the lanes", "fmin(-5, -0) = -5", "fmax(-5, -0) = -0", "fmin(3, -0) = -0", "fmax(3, -0) = 3"];
+    for (family, base) in [("buffer", 0x800usize), ("flat", 0x900), ("global", 0xA00)] {
+        for k in 0..6 {
+            assert_eq!(f64::from_bits(cell(base + 8 * k)), f64::from_bits(want[k]), "{family}: {}", what[k]);
+            assert_eq!(cell(base + 8 * k), want[k], "{family}: {} (bits)", what[k]);
+        }
+    }
+    for (l, v) in r.vgpr.iter().enumerate() {
+        assert_eq!(cell(0xB00 + 8 * l), 2.0f64.to_bits(), "lane {l}: per-lane fmax_x2");
+        let old = v[40] as u64 | (v[41] as u64) << 32;
+        assert_eq!(old, 1.0f64.to_bits(), "lane {l}: GLC returns the old f64");
     }
 }
 
