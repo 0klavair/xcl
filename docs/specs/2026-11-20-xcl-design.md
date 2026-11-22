@@ -289,7 +289,8 @@ Stages:
    console containers (unknown parts) — hence stage 1 comes first.
 
 **Console container format (done 2026-11-20, `gpu/xbox.rs`)** — determined on
-a real game's shader archive (23 869 shaders: PS 12 101, MS 9 282, VS 2 236, GS 195, CS 55):
+a real game's shader archive (26 503 shaders: PS 12 101, MS 9 282, VS 2 236, GS 195, CS 2 689;
+until 2026-11-22 the record scan missed the 2 634 compute shaders with effect-qualified names):
 
 - DXBC: SFI0, ISG1, OSG1, PSV0, HASH, DXIL, PRIV. The DXIL part has an ordinary
   `DxilProgramHeader` (SM 6.6), bitcode = a 4-byte `NOBC`; between the header and the bitcode sits

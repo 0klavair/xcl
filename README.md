@@ -14,7 +14,7 @@ measurements and next steps:
 
 ## Highlights
 
-- **100 % of a retail game's shaders translate** – all 24 064 RDNA2 programs of its shader pack
+- **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs (26 503 records) of its shader pack
   become HLSL; random samples compile to DXIL with 0 errors.
 - **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
   movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
@@ -49,7 +49,7 @@ measurements and next steps:
 
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
-| **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 24 064 / 24 064 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
+| **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
 | **D3D12.X graphics** | 🟡 | device, resources, heaps and pipelines are in place | draw submission and present need the game exe |

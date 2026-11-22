@@ -142,6 +142,44 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
     })
 }
 
+/// The lane `lane` of a 32-lane half reads with `ds_swizzle_b32` (the RDNA ISA's DS_SWIZZLE_B32):
+/// offset ≥ 0xE000 FFT, ≥ 0xC000 rotate, bit 15 quad permute, otherwise the and/or/xor bit
+/// mode (xor = offset[14:10], so 0x401F swaps the 16-lane halves).
+pub(crate) fn swizzle_lane(offset: u64, lane: u32) -> u32 {
+    let i = lane & 0x1F;
+    let mask = (offset & 0x1F) as u32;
+    if offset >= 0xE000 {
+        // FFT: the lane's five bits reversed, shifted right by the mask's population, masked bits kept
+        ((i.reverse_bits() >> 27) >> mask.count_ones()) | (i & mask)
+    } else if offset >= 0xC000 {
+        // rotate by offset[9:5] lanes, left (offset[10] = 0) or right; masked bits stay
+        let r = ((offset >> 5) & 0x1F) as u32;
+        let r = if offset & 0x400 != 0 { r.wrapping_neg() } else { r };
+        ((i & mask) | (i.wrapping_add(r) & !mask)) & 0x1F
+    } else if offset & 0x8000 != 0 {
+        (i & !3) | ((offset as u32 >> (2 * (i & 3))) & 3)
+    } else {
+        let (or, xor) = (((offset >> 5) & 0x1F) as u32, ((offset >> 10) & 0x1F) as u32);
+        ((i & mask) | or) ^ xor
+    }
+}
+
+/// `ds_swizzle_b32`'s source lane as an HLSL expression of `lane_id` (`swizzle_lane`; the
+/// upper 32 lanes of a wave64 swizzle among themselves), and the declaration it needs first:
+/// FFT and rotate (rare) read the permutation from a constant table named `table`.
+fn swizzle_source(offset: u64, table: &str) -> (Option<String>, String) {
+    if offset >= 0xC000 {
+        let lanes: Vec<String> = (0..32).map(|i| format!("{}u", swizzle_lane(offset, i))).collect();
+        let decl = format!("static const uint {table}[32] = {{ {} }};", lanes.join(", "));
+        return (Some(decl), format!("(lane_id & 0x20u) | {table}[lane_id & 0x1Fu]"));
+    }
+    if offset & 0x8000 != 0 {
+        return (None, format!("(lane_id & ~3u) | (({offset}u >> (2u * (lane_id & 3u))) & 3u)"));
+    }
+    let (and, or, xor) = (offset & 0x1F, (offset >> 5) & 0x1F, (offset >> 10) & 0x1F);
+    (None, format!("(lane_id & 0x20u) | ((((lane_id & 0x1Fu) & {and}u) | {or}u) ^ {xor}u)"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BufKind {
     Load,
@@ -516,6 +554,10 @@ impl Em {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
+        // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
+        if let Some(t) = d.far_target {
+            return Flow::Jump(t);
+        }
         // geometry mode: the ES's s_setpc_b64 continues into the GS code (ES alone: the end)
         if name == "s_setpc_b64" {
             if let Mode::Geometry(g) = &self.opt.mode {
@@ -3267,16 +3309,11 @@ else {{ mem.{neg}({t}_a, {v}, {t}_old); }}"
         let off16 = o0 | o1 << 8;
         match name {
             "ds_swizzle_b32" => {
-                let pat = off16;
                 let a = self.vreg(f("ADDR"));
-                let src = if pat & 0x8000 != 0 {
-                    format!("(lane_id & ~3u) | (({pat}u >> (2u * (lane_id & 3u))) & 3u)")
-                } else if pat >> 14 == 0 {
-                    let (and, or, xor) = (pat & 0x1F, (pat >> 5) & 0x1F, (pat >> 10) & 0x1F);
-                    format!("(lane_id & 0x20u) | ((((lane_id & 0x1Fu) & {and}u) | {or}u) ^ {xor}u)")
-                } else {
-                    return Err("ds_swizzle: FFT/rotate mode");
-                };
+                let (decl, src) = swizzle_source(off16, &format!("{t}_lanes"));
+                if let Some(decl) = decl {
+                    self.line(&decl);
+                }
                 self.line(&format!("uint {t} = rla({a}, {src});"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);

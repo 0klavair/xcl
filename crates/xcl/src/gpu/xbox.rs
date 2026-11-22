@@ -1,6 +1,6 @@
 //! Xbox Series shader containers: precompiled console GPU code (RDNA2), no DXIL.
 //!
-//! Layout reverse-engineered from a retail title's shader pack (23 869 shaders, all
+//! Layout reverse-engineered from a retail title's shader pack (26 503 shaders, all
 //! stages, 2026-11-20). The outer DXBC container looks normal (SFI0, ISG1, OSG1, PSV0,
 //! HASH, DXIL, PRIV), but the DXIL part carries no LLVM bitcode:
 //!
@@ -350,20 +350,21 @@ fn analyze_fssm(f: &mut Fssm) {
     }
 }
 
-/// Static branch targets of a code segment (PCs in the same space as `pc`).
+/// Static branch targets of a code segment (PCs in the same space as `pc`), far jumps included.
 fn branch_targets(seg: &[u8], pc: u64) -> Vec<u64> {
-    let mut out = Vec::new();
+    let mut insts = Vec::new();
     let mut off = 0usize;
     while off + 4 <= seg.len() {
         match rdna2::decode(&seg[off..], pc + off as u64) {
             Ok(d) => {
-                out.extend(rdna2::branch_target(&d));
                 off += d.len;
+                insts.push(d);
             }
             Err(_) => off += 4,
         }
     }
-    out
+    rdna2::resolve_far_jumps(&mut insts);
+    insts.iter().filter_map(rdna2::branch_target).collect()
 }
 
 /// u32 N, N dwords, s_endpgm – the exact layout of constant data embedded in code.

@@ -221,6 +221,7 @@ pub fn analyze(code: &[u8]) -> MeshWaveReport {
     if undecoded_at.is_none() && offset != code.len() {
         undecoded_at = Some(offset as u64);
     }
+    rdna2::resolve_far_jumps(&mut decoded);
     let pcs: BTreeMap<u64, usize> = decoded
         .iter()
         .enumerate()

@@ -1000,6 +1000,33 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   then the mesh PSO with `DispatchMesh(groups · mesh_groups_per_record)`; for GS additionally fetching the ES vertices into `mem`
   (IO_GS_PRIMS / IO_GS_VERTICES as in `retail_es_gs_voxelize_geometry_mode`). D3D12.X draw records – from the exe.
 
+## Shader pack: every record, every program (2026-11-22, issues #34 / #36)
+- **`pack::scan` missed 2 634 of the 26 503 records of `shaders.rpf`**: 2 689 compute shaders have effect-qualified
+  names (`alphaResolve:CS_AlphaTransmissionDenoise_2871f2e9_Wrapped`) and the name filter allowed no `:`. 55 of them
+  were found anyway under a truncated name: once the real record was rejected, the scan went on byte by byte and where
+  the `:` byte (0x3A = 58) equalled the length of the rest of the name it parsed the tail as a record with the same
+  header (those were the "CS 55"). A name byte equal to its distance to the terminator always makes such a suffix
+  alias; skipping past an accepted record's payload is what discards them (216 in this pack). Test
+  `qualified_names_are_whole_records`. The other 21 archives (~150 GB) hold no shader records (`_Wrapped\0`, the end
+  of every record name, occurs 26 503 times in `shaders.rpf` and nowhere else).
+- **Translator on the new compute shaders** – three gaps, all general:
+  - `ds_swizzle_b32`: the modes were told apart wrongly – 0x4000..0x7FFF (the bit mode with xor ≥ 16: 0x401F swaps
+    the 16-lane halves, 56 programs) was rejected as "FFT/rotate", while real FFT (≥ 0xE000) and rotate (≥ 0xC000)
+    were silently treated as quad permute. Now as in the ISA (`emit::swizzle_lane`; FFT / rotate as a constant
+    table); tests `ds_swizzle_modes_follow_the_isa` (the ISA's FFT examples) and `gpu_ds_swizzle_modes`.
+  - **Far jumps**: a branch beyond the 16-bit `s_branch` range (±128 KB) is `s_getpc_b64; s_add_u32; s_addc_u32;
+    s_setpc_b64` with a constant offset – a direct jump, not an indirect one (12 programs; `ActivateRays` has 1 377).
+    `rdna2::resolve_far_jumps` gives such an `s_setpc_b64` its target (`Decoded::far_target`), so the CFG,
+    structuring, emission and the FSSM program extent treat it as `s_branch`. Test `far_jumps_are_direct_branches`.
+  - **Translation time**: `term()` and the block emission found a block's instructions by scanning all instructions
+    (`insts.iter().rev().find(…)`), called for every block of every candidate span – `ActivateRays` (76 699
+    instructions, 15 995 blocks, pc blocks) did not finish in 10 minutes; a binary search (`insts_in`): 4.7 s (debug).
+- **Survey of the whole pack: 26 698 / 26 698 FSSM variants in full** (PS 12 101, MS/NGG 9 282, VS 2 236, CS 2 689,
+  GS 195, ES 195), 44.4 million instructions, 0 errors; 90 s (debug, all cores – was 110 s for 24 064).
+  `XCL_SURVEY_FIND=text`, `XCL_SURVEY_SKIP=a|b`, `XCL_SURVEY_TRACE=1` (time and result per program); test
+  `retail_swizzle_and_setpc_census` lists the `ds_swizzle` offsets of the pack and the code around `s_setpc_b64`
+  (`XCL_NAMES`, `XCL_RAW_OUT` dumps the program).
+
 ## Translator survey over the whole pack (session 5, 2026-11-21)
 - Test `retail_translation_survey` (ignored; `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N`, `XCL_SURVEY_DXC=1`):
   - **translation: 24 064 / 24 064 FSSM variants in full** (PS 12 101, MS/NGG 9 282, VS 2 236, GS 195, ES 195,
@@ -1036,7 +1063,7 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
   - Unsuccessful (no gain, within noise): computing `lanebit(exec)` once per exec change, removing comments from the HLSL.
   - Helpers: `retail_shader_cost` (`XCL_NAMES=a,b`, `XCL_DXC_ARGS`, `XCL_HLSL_OUT`, 8 GB limit) and, in the survey,
     `XCL_SURVEY_TRACE`, time split structured / with `pc`, the 10 slowest, the smallest unstructured ones.
-- The game **does not use FSPX/ACCC**: all 23 869 shaders in `shaders.rpf` are XDAT/XBCH/FSSM – FSPX is only FSR4's own
+- The game **does not use FSPX/ACCC**: all 23 869 shaders in `shaders.rpf` found then (26 503 since the scan fix of 2026-11-22) are XDAT/XBCH/FSSM – FSPX is only FSR4's own
   pipelines (irrelevant for the game, possibly a test).
 
 ## Console shaders – open questions (from the analysis of `shaders.rpf`)

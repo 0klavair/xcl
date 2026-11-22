@@ -2330,9 +2330,7 @@ fn compute_abi_survey() {
     let data = std::fs::read(path).unwrap();
     let (mut n, mut threads_ok, mut sgpr_ok, mut vgpr_ok) = (0, 0, 0, 0);
     for r in crate::gpu::pack::scan(&data, 0x40) {
-        if !r.name.starts_with("CS_") && !r.name.starts_with("S_") {
-            continue;
-        }
+        // compute records are recognised by their hardware stage below, not by name
         let Some(blob) = crate::gpu::pack::inflate(&data, &r) else { continue };
         let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
         let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
@@ -3114,7 +3112,9 @@ fn raw_rdna2_listing() {
 
 /// Every FSSM variant of the pack through the translator (no GPU): how many translate
 /// completely, per stage, and which instructions are missing (weighted by shaders).
-/// `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N` (every N-th record, default 1);
+/// `XCL_SAMPLE_RPF=…\shaders.rpf`, `XCL_SURVEY_EVERY=N` (every N-th record, default 1),
+/// `XCL_SURVEY_FIND=text` (only records whose name contains it), `XCL_SURVEY_SKIP=a|b` (leave out
+/// records whose name contains one of these), `XCL_SURVEY_TRACE=1` (start / time / result per program);
 /// `XCL_SURVEY_DXC=1` also compiles each one with DXC (4 threads, process capped at 8 GB):
 /// failures and compile times.
 #[test]
@@ -3136,7 +3136,15 @@ fn retail_translation_survey() {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     };
-    let all = crate::gpu::pack::scan(&data, 0x40);
+    let mut all = crate::gpu::pack::scan(&data, 0x40);
+    if let Ok(find) = std::env::var("XCL_SURVEY_FIND") {
+        all.retain(|r| r.name.contains(&find));
+        println!("{} records whose name contains {find:?}", all.len());
+    }
+    if let Ok(skip) = std::env::var("XCL_SURVEY_SKIP") {
+        all.retain(|r| !skip.split('|').any(|s| !s.is_empty() && r.name.contains(s)));
+        println!("{} records after skipping {skip:?}", all.len());
+    }
     let records: Vec<_> = match seed {
         Some(sd) => {
             println!("random sample: seed {sd}");
@@ -3202,7 +3210,21 @@ fn retail_translation_survey() {
                         let code = &f.data[p.offset..p.offset + p.len];
                         // XCL_SURVEY_WINDOWS=N: translate for N memory windows (above 4 GiB)
                         let mem_windows = std::env::var("XCL_SURVEY_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-                        Ok((super::translate(code, &Options { mode, wave64: super::detect_wave64(code), mem_windows, ..Default::default() })?, profile))
+                        let trace = std::env::var_os("XCL_SURVEY_TRACE").is_some();
+                        if trace {
+                            eprintln!("translate start {} ({} B)", r.name, code.len());
+                        }
+                        let t1 = std::time::Instant::now();
+                        let t = super::translate(code, &Options { mode, wave64: super::detect_wave64(code), mem_windows, ..Default::default() });
+                        if trace {
+                            let state = match &t {
+                                Ok(t) if t.complete() => "complete".to_string(),
+                                Ok(t) => format!("partial {:?}", t.unsupported_why.keys().collect::<Vec<_>>()),
+                                Err(e) => format!("error {e}"),
+                            };
+                            eprintln!("translate done {} {:.2} s {state}", r.name, t1.elapsed().as_secs_f64());
+                        }
+                        Ok((t?, profile))
                     });
                     // DXC outside the lock
                     let guarded = matches!(&res, Ok(Ok((t, _))) if t.hlsl.contains("pc =="));
@@ -3339,6 +3361,8 @@ fn retail_shader_cost() {
         }
         let Some(blob) = crate::gpu::pack::inflate(&data, &r) else { continue };
         let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+        // effect-qualified names (`effect:CS_…`) are not file names (`:` opens an NTFS stream)
+        let stem = r.name.replace(['/', '\\', ':'], "_");
         for f in &sh.fssm {
             let Some(mode) = super::interface(&blob, &sh, f) else { continue };
             let profile = match &mode {
@@ -3352,14 +3376,14 @@ fn retail_shader_cost() {
             let owned = t.hlsl.clone();
             let h = &owned;
             if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.hlsl", r.name)), h);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}.hlsl")), h);
                 eprintln!("HLSL written: {} ({} KB)", r.name, h.len() / 1024);
             }
             let t0 = std::time::Instant::now();
             let r2 = super::dxc::compile(h, "main", profile, &extra);
             let secs = t0.elapsed().as_secs_f64();
             if let (Err(_), Ok(dir)) = (&r2, std::env::var("XCL_HLSL_OUT")) {
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.failed.hlsl", r.name)), h);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}.failed.hlsl")), h);
             }
             println!(
                 "{} [{profile}] instructions {}, HLSL {} KB, lines {}, pc-dispatch {}, if {}, for(;;) {}, select {} → DXC {:.2} s, {}",
@@ -3375,7 +3399,7 @@ fn retail_shader_cost() {
                 r2.as_ref().map(|b| format!("DXIL {} KB", b.len() / 1024)).unwrap_or_else(|e| e.lines().next().unwrap_or("").to_string())
             );
             if let Ok(dir) = std::env::var("XCL_HLSL_OUT") {
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.hlsl", r.name)), h);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}.hlsl")), h);
             }
         }
     }
@@ -3429,5 +3453,180 @@ fn isa_coverage() {
         let m: Vec<String> = missing.iter().map(|n| n.to_lowercase()).collect();
         let full = std::env::var_os("XCL_ISA_FULL").is_some();
         println!("  {enc:<12} {ok:>4} / {all:<4} missing: {}", if m.len() > 14 && !full { format!("{} … (+{})", m[..14].join(", "), m.len() - 14) } else { m.join(", ") });
+    }
+}
+
+/// Census of the cross-lane / control-flow forms the translator special-cases: every
+/// `ds_swizzle_b32` offset in the pack, and the instructions around each `s_setpc_b64` /
+/// `s_swappc_b64` of the records whose name contains one of `XCL_NAMES` (`a,b`).
+#[test]
+#[ignore]
+fn retail_swizzle_and_setpc_census() {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let Ok(path) = std::env::var("XCL_SAMPLE_RPF") else { return };
+    let names = std::env::var("XCL_NAMES").unwrap_or_default();
+    let data = std::fs::read(path).unwrap();
+    let records = crate::gpu::pack::scan(&data, 0x40);
+    let swz: Mutex<BTreeMap<u64, (usize, String)>> = Mutex::new(BTreeMap::new());
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(r) = records.get(i) else { break };
+                let Some(blob) = crate::gpu::pack::inflate(&data, r) else { continue };
+                let Some(sh) = crate::gpu::xbox::parse(&blob) else { continue };
+                let show = names.split(',').any(|n| !n.is_empty() && r.name.contains(n));
+                for f in &sh.fssm {
+                    for p in &f.programs {
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        if let (true, Ok(dir)) = (show, std::env::var("XCL_RAW_OUT")) {
+                            let stem = r.name.replace(['/', '\\', ':'], "_");
+                            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}.{:x}.bin", p.offset)), code);
+                        }
+                        let mut off = 0usize;
+                        let mut recent: Vec<usize> = Vec::new();
+                        while off + 4 <= code.len() {
+                            let Ok(d) = crate::gpu::rdna2::decode(&code[off..], off as u64) else { off += 4; continue };
+                            let name = d.inst.name;
+                            if name.eq_ignore_ascii_case("ds_swizzle_b32") {
+                                let v = |n: &str| crate::gpu::rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+                                let mut m = swz.lock().unwrap();
+                                m.entry(v("OFFSET0") | v("OFFSET1") << 8).or_insert((0, r.name.clone())).0 += 1;
+                            }
+                            if show && (name.eq_ignore_ascii_case("s_setpc_b64") || name.eq_ignore_ascii_case("s_swappc_b64")) {
+                                let from = recent.get(recent.len().saturating_sub(12)).copied().unwrap_or(off);
+                                let to = (off + 24).min(code.len());
+                                let text: Vec<String> = crate::gpu::rdna2::disassemble(&code[from..to], from as u64, false)
+                                    .iter()
+                                    .map(|l| format!("  {:06x}: {}", l.pc, l.text))
+                                    .collect();
+                                println!("{} @{off:#x}:
+{}", r.name, text.join("
+"));
+                            }
+                            recent.push(off);
+                            off += d.len;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    println!("ds_swizzle_b32 offsets (uses, example):");
+    for (o, (n, ex)) in swz.into_inner().unwrap() {
+        println!("  {o:#06x} {n:>6}  {ex}");
+    }
+}
+
+/// `ds_swizzle_b32`'s four modes against the RDNA ISA (its FFT examples, rotate, quad
+/// permute, and the bit mode with xor ≥ 16, which retail compute shaders use to swap the
+/// 16-lane halves: 0x401F).
+#[test]
+fn ds_swizzle_modes_follow_the_isa() {
+    use super::emit::swizzle_lane;
+    let lanes = |off: u64| (0..32).map(|i| swizzle_lane(off, i)).collect::<Vec<u32>>();
+    // ISA examples (inputs 1..0x20, so each value − 1 is the source lane)
+    let fft0 = [0x01, 0x11, 0x09, 0x19, 0x05, 0x15, 0x0d, 0x1d, 0x03, 0x13, 0x0b, 0x1b, 0x07, 0x17, 0x0f, 0x1f, 0x02, 0x12, 0x0a, 0x1a, 0x06, 0x16, 0x0e, 0x1e, 0x04, 0x14, 0x0c, 0x1c, 0x08, 0x18, 0x10, 0x20];
+    let fft10 = [0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b, 0x07, 0x0f, 0x02, 0x0a, 0x06, 0x0e, 0x04, 0x0c, 0x08, 0x10, 0x11, 0x19, 0x15, 0x1d, 0x13, 0x1b, 0x17, 0x1f, 0x12, 0x1a, 0x16, 0x1e, 0x14, 0x1c, 0x18, 0x20];
+    assert_eq!(lanes(0xE000), fft0.iter().map(|v| v - 1).collect::<Vec<u32>>());
+    assert_eq!(lanes(0xE010), fft10.iter().map(|v| v - 1).collect::<Vec<u32>>());
+    assert_eq!(lanes(0xE01F), (0..32).collect::<Vec<u32>>(), "FFT mask 0x1F: no swizzle");
+    // rotate left by 3 / right by 5 (offset[10]), whole 32 lanes
+    assert_eq!(lanes(0xC000 | 3 << 5), (0..32).map(|i| (i + 3) % 32).collect::<Vec<u32>>());
+    assert_eq!(lanes(0xC400 | 5 << 5), (0..32).map(|i| (i + 27) % 32).collect::<Vec<u32>>());
+    // quad permute [3, 2, 1, 0]
+    assert_eq!(lanes(0x8000 | 0x1B), (0..32).map(|i| (i & !3) | (3 - (i & 3))).collect::<Vec<u32>>());
+    // bit mode: and 0x1F, xor 16 (swap halves) / xor 18
+    assert_eq!(lanes(0x401F), (0..32).map(|i| i ^ 16).collect::<Vec<u32>>());
+    assert_eq!(lanes(0x481F), (0..32).map(|i| i ^ 18).collect::<Vec<u32>>());
+    assert_eq!(lanes(0x041F), (0..32).map(|i| i ^ 1).collect::<Vec<u32>>());
+}
+
+#[test]
+fn gpu_ds_swizzle_modes() {
+    if !gpu_ready() {
+        return;
+    }
+    let offsets = [0x401Fu64, 0x481F, 0xE000, 0xE010, 0xC000 | 3 << 5, 0xC400 | 5 << 5 | 0x3, 0x8000 | 0x1B];
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = offsets
+        .iter()
+        .enumerate()
+        .map(|(k, &o)| ("DS_SWIZZLE_B32", "ENC_DS", vec![("VDST", 16 + k as u64), ("ADDR", 0), ("OFFSET0", o & 0xFF), ("OFFSET1", o >> 8)], None))
+        .collect();
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(n, e, f, l)| (*n, *e, f.as_slice(), *l)).collect();
+    let code = prog(&list);
+    let t = super::translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = 100 + l as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64u32 {
+        for (k, &o) in offsets.iter().enumerate() {
+            let want = 100 + ((l & 0x20) | super::emit::swizzle_lane(o, l));
+            assert_eq!(r.vgpr[l as usize][16 + k], want, "lane {l} offset {o:#06x}");
+        }
+    }
+}
+
+/// The compiler's far jump (`s_getpc_b64`, add of a 64-bit constant, `s_setpc_b64`) out of
+/// `s_branch` range is a direct branch: it gets its target, the program stays structured and
+/// complete, and the code it jumps over does not run.
+#[test]
+fn far_jumps_are_direct_branches() {
+    let far = |sub: bool, offset: u32| -> Vec<u8> {
+        let (lo, hi) = if sub { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
+        prog(&[
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+            (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(offset)),
+            (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)], None), // 0x14: v1 = 7 (jumped over)
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 137)], None), // 0x18: v2 = 9
+        ])
+    };
+    let decoded = |code: &[u8]| {
+        let mut v = Vec::new();
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            v.push(d);
+        }
+        crate::gpu::rdna2::resolve_far_jumps(&mut v);
+        v
+    };
+    // s_getpc_b64 returns 0x4 (the next instruction): 0x4 + 0x14 = 0x18
+    let code = far(false, 0x14);
+    let insts = decoded(&code);
+    assert_eq!(insts[3].far_target, Some(0x18));
+    assert_eq!(crate::gpu::rdna2::branch_target(&insts[3]), Some(0x18));
+    // backward form: 0x4 − 4 = 0x0
+    assert_eq!(decoded(&far(true, 4))[3].far_target, Some(0));
+    // an s_setpc_b64 of another register pair stays indirect
+    let mut other = code.clone();
+    other[0x10..0x14].copy_from_slice(&encode("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None).unwrap());
+    assert_eq!(decoded(&other)[3].far_target, None);
+    let t = super::translate(&other, &Options::default()).unwrap();
+    assert!(!t.complete());
+
+    let t = super::translate(&code, &Options::default()).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    assert!(!t.hlsl.contains("pc =="), "far jump left the structured form:\n{}", t.hlsl);
+    if !gpu_ready() {
+        return;
+    }
+    let mut st = KernelState::default();
+    for r in st.vgpr.iter_mut() {
+        r[1] = 1;
+        r[2] = 2;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1, 9), "lane {l}");
     }
 }

@@ -1,14 +1,20 @@
 //! Extracting shader blobs from packed archives without a table of contents.
 //!
 //! RPF9 packs ("9FPR" magic) encrypt their TOC, but the shader packs inside store every
-//! shader as a plain record (found empirically, 23 869 records in a 411 MB pack):
+//! shader as a plain record (found empirically, 26 503 records in a 411 MB pack):
 //!
 //! ```text
-//! u8 len | name[len-1] (identifier) | 0x00 | u8 flag | u32 csize | u32 unk | u32 csize | u32 usize | deflate-raw[csize]
+//! u8 len | name[len-1] | 0x00 | u8 flag | u32 csize | u32 unk | u32 csize | u32 usize | deflate-raw[csize]
 //! ```
 //!
-//! The record payload inflates to a DXBC container. Names longer than 255 bytes do not
-//! fit the length byte, so a few names come out truncated.
+//! The record payload inflates to a DXBC container. A name is an identifier, optionally
+//! qualified by its effect: `alphaResolve:CS_AlphaTransmissionDenoise_2871f2e9_Wrapped`
+//! (2 689 of the records, all compute shaders; the longest name is 125 bytes).
+//!
+//! A name byte can happen to equal the distance to the terminator, so a suffix of a name
+//! also looks like a record with the same header and payload. Resuming after the payload of
+//! an accepted record skips those aliases; rejecting the real record (as the scanner once
+//! did for qualified names) lets the alias through under a truncated name.
 
 pub const RPF9_MAGIC: &[u8; 4] = b"9FPR";
 
@@ -24,8 +30,9 @@ pub struct Record {
     pub usize: usize,
 }
 
-fn ident(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+/// A name byte after the first: identifier characters and the `:` of a qualified name.
+fn name_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b':'
 }
 
 fn rd32(b: &[u8], o: usize) -> u32 {
@@ -44,7 +51,7 @@ pub fn scan(d: &[u8], from: usize) -> Vec<Record> {
             && header_end <= d.len()
             && d[p] == 0
             && (d[i + 1].is_ascii_alphabetic() || d[i + 1] == b'_')
-            && d[i + 2..p].iter().all(|&c| ident(c))
+            && d[i + 2..p].iter().all(|&c| name_char(c))
         {
             let (c1, c2, u) = (rd32(d, p + 2) as usize, rd32(d, p + 10) as usize, rd32(d, p + 14) as usize);
             let Some(data_end) = header_end.checked_add(c1) else {
@@ -83,9 +90,10 @@ pub fn inflate(d: &[u8], r: &Record) -> Option<Vec<u8>> {
     (unpacked.len() == r.usize).then_some(unpacked)
 }
 
-/// Stage prefix of a shader name (`PS_Foo` → `PS`).
+/// Stage prefix of a shader name (`PS_Foo` → `PS`, `effect:CS_Foo` → `CS`).
 pub fn name_stage(name: &str) -> Option<&'static str> {
-    let up = name.get(..2)?.to_ascii_uppercase();
+    let base = name.rsplit(':').next()?;
+    let up = base.get(..2)?.to_ascii_uppercase();
     ["PS", "VS", "MS", "GS", "CS", "HS", "DS", "AS"].into_iter().find(|s| *s == up)
 }
 
@@ -121,6 +129,33 @@ mod tests {
         assert_eq!(recs[0].flag, 50);
         assert_eq!(name_stage(&recs[0].name), Some("PS"));
         assert_eq!(name_stage("ptfx_x"), None);
+    }
+
+    /// An effect-qualified name is one record under its full name, also when the `:` byte
+    /// equals the length of the rest of the name (which makes the tail look like a record).
+    #[test]
+    fn qualified_names_are_whole_records() {
+        let tail = format!("CS_Trap{}_Wrapped", "a".repeat(42));
+        assert_eq!(tail.len() + 1, b':' as usize);
+        let qualified = format!("Autofocus:{tail}");
+        let mut pack = b"9FPR".to_vec();
+        pack.resize(0x40, 0xAA);
+        pack.extend(record(&qualified, b"DXBC-compute"));
+        pack.extend(record("alphaResolve:CS_Denoise_2871f2e9_Wrapped", b"DXBC-other"));
+        pack.extend(record("PS_Plain", b"DXBC-pixel"));
+        pack.extend_from_slice(&[0u8; 40]);
+        let recs = scan(&pack, 0x40);
+        let names: Vec<_> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec![qualified.as_str(), "alphaResolve:CS_Denoise_2871f2e9_Wrapped", "PS_Plain"]);
+        assert_eq!(inflate(&pack, &recs[0]).unwrap(), b"DXBC-compute");
+        assert_eq!(name_stage(&recs[0].name), Some("CS"));
+
+        // a qualifier still has to start like an identifier
+        let mut bare = b"9FPR".to_vec();
+        bare.resize(0x40, 0xAA);
+        bare.extend(record(":CS_NoEffect", b"DXBC"));
+        bare.extend_from_slice(&[0u8; 40]);
+        assert!(scan(&bare, 0x40).iter().all(|r| !r.name.starts_with(':')));
     }
 
     #[test]

@@ -88,6 +88,8 @@ pub struct Decoded {
     pub len: usize,
     pub literal: Option<u32>,
     pub variant: Variant,
+    /// constant target of an `s_setpc_b64` that ends a far jump (`resolve_far_jumps`)
+    pub far_target: Option<u64>,
 }
 
 struct Tables {
@@ -237,7 +239,7 @@ pub fn decode(code: &[u8], pc: u64) -> Result<Decoded, DecodeError> {
     }
     let words = read_words(code, len / 4);
     let literal = has_literal.then(|| words[base / 4]);
-    Ok(Decoded { pc, inst, ienc, enc, words, len, literal, variant })
+    Ok(Decoded { pc, inst, ienc, enc, words, len, literal, variant, far_target: None })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -487,12 +489,66 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
 /// Target of a direct branch (s_branch, s_cbranch_*), or None for anything else
 /// (including indirect jumps like s_setpc_b64).
 pub fn branch_target(d: &Decoded) -> Option<u64> {
+    if d.far_target.is_some() {
+        return d.far_target;
+    }
     if d.inst.flags & F_BRANCH == 0 || d.inst.flags & F_INDIRECT != 0 {
         return None;
     }
     let o = d.ienc.operands.iter().find(|o| o.ty == "OPR_LABEL")?;
     let v = field_value(d.enc, &d.words, o.field?)?;
     Some((d.pc as i64 + 4 + (v as u16 as i16 as i64) * 4) as u64)
+}
+
+/// Value of an integer scalar source operand that is a constant (inline or literal).
+fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
+    Some(match code {
+        128..=192 => (code - 128) as u32,
+        193..=208 => (-((code - 192) as i32)) as u32,
+        255 => d.literal?,
+        _ => return None,
+    })
+}
+
+/// Far jumps. A branch whose target is out of the 16-bit `s_branch` range (±128 KB) is
+/// built by the compiler as
+/// `s_getpc_b64 s[n:n+1]; s_add_u32 sn, sn, lo; s_addc_u32 sn+1, sn+1, hi; s_setpc_b64 s[n:n+1]`
+/// (`s_sub_u32` / `s_subb_u32` for a negative offset): a jump to the address after the
+/// `s_getpc_b64` plus the 64-bit constant hi:lo. Each such `s_setpc_b64` gets that target
+/// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
+/// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
+pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    for k in 3..insts.len() {
+        let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
+        if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
+            continue;
+        }
+        let sub = match (lo.inst.name, hi.inst.name) {
+            ("S_ADD_U32", "S_ADDC_U32") => false,
+            ("S_SUB_U32", "S_SUBB_U32") => true,
+            _ => continue,
+        };
+        let f = |d: &Decoded, n: &str| field_value(d.enc, &d.words, n);
+        let Some(r) = f(get, "SDST") else { continue };
+        if f(set, "SSRC0") != Some(r) {
+            continue;
+        }
+        // `s = s ± c` on one half of the address; the constant may be either source of an add
+        let half = |d: &Decoded, reg: u64| -> Option<u32> {
+            if f(d, "SDST")? != reg {
+                return None;
+            }
+            match (f(d, "SSRC0")?, f(d, "SSRC1")?) {
+                (a, c) if a == reg => scalar_int(d, c),
+                (c, a) if a == reg && !sub => scalar_int(d, c),
+                _ => None,
+            }
+        };
+        let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
+        let offset = (h as u64) << 32 | l as u64;
+        let base = get.pc + get.len as u64;
+        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+    }
 }
 
 pub fn mnemonic(d: &Decoded) -> String {

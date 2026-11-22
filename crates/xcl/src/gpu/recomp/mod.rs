@@ -509,15 +509,23 @@ enum Term {
     Other,
 }
 
+/// The instructions in [start, end) (`insts` is in address order: a binary search, not a scan –
+/// retail programs have tens of thousands of instructions and blocks).
+fn insts_in<'a>(c: &Ctx<'a>, start: u64, end: u64) -> &'a [Decoded] {
+    let a = c.insts.partition_point(|d| d.pc < start);
+    let b = c.insts.partition_point(|d| d.pc < end);
+    &c.insts[a..b.max(a)]
+}
+
 fn block_end(c: &Ctx, i: usize) -> u64 {
     c.leaders.get(i + 1).copied().unwrap_or(u64::MAX)
 }
 
 fn term(c: &Ctx, start: u64, end: u64) -> Term {
-    let Some(d) = c.insts.iter().rev().find(|d| d.pc >= start && d.pc < end) else { return Term::Next };
+    let Some(d) = insts_in(c, start, end).last() else { return Term::Next };
     match (rdna2::branch_target(d), d.inst.name) {
         (Some(t), n) if n.starts_with("S_CBRANCH") => Term::Cond(t),
-        (Some(t), "S_BRANCH") => Term::Jump(t),
+        (Some(t), "S_BRANCH" | "S_SETPC_B64") => Term::Jump(t),
         (Some(_), _) => Term::Other,
         (None, "S_ENDPGM") => Term::End,
         (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => Term::Other,
@@ -643,7 +651,7 @@ fn rotated_after(c: &Ctx, i: usize, lo: u64, hi: u64) -> Option<Item> {
 /// entered only by that jump: (a, b, latch).
 fn rotated_loop(c: &Ctx, start: u64, end: u64, u: u64, lo: u64, hi: u64) -> Option<(u64, u64, u64)> {
     // the loop starts right after the jump, past s_nop padding (dead code, not emitted)
-    let padding = |a: u64| c.insts.iter().filter(|d| d.pc >= end && d.pc < a).all(|d| d.inst.name == "S_NOP");
+    let padding = |a: u64| insts_in(c, end, a).iter().all(|d| d.inst.name == "S_NOP");
     let &(a, b) = c.loops.iter().find(|&&(a, b)| a >= end && u > a && u < b && b <= hi && (a, b) != (lo, hi) && padding(a))?;
     if c.edges.iter().any(|&(_, dst)| dst >= end && dst < a) {
         return None;
@@ -789,7 +797,7 @@ fn structurable_uncached(c: &Ctx, lo: u64, hi: u64, exit: Option<u64>, nest: usi
 fn emit_block(c: &Ctx, em: &mut emit::Em, body: &mut String, start: u64, end: u64, depth: usize, blocks: &mut usize) -> emit::Flow {
     em.indent = depth;
     let mut flow = emit::Flow::Next;
-    let block: Vec<&Decoded> = c.insts.iter().filter(|d| d.pc >= start && d.pc < end).collect();
+    let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
     for (k, d) in block.iter().enumerate() {
         let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
         flow = em.inst(d, next);
@@ -986,7 +994,7 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         body.push_str(&format!("{pad}if (pc == {start}u) {{\n"));
         em.indent = depth + 1;
         let mut flow = emit::Flow::Next;
-        let block: Vec<&Decoded> = c.insts.iter().filter(|d| d.pc >= start && d.pc < end).collect();
+        let block: Vec<&Decoded> = insts_in(c, start, end).iter().collect();
         for (k, d) in block.iter().enumerate() {
             let next = block.get(k + 1).map(|n| n.pc).unwrap_or(end);
             flow = em.inst(d, next);
@@ -1219,6 +1227,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         off += d.len;
         insts.push(d);
     }
+    rdna2::resolve_far_jumps(&mut insts);
     let starts: BTreeSet<u64> = insts.iter().map(|d| d.pc).collect();
     let mut leaders: BTreeSet<u64> = BTreeSet::from([0]);
     let mut branches = 0usize;
@@ -1229,7 +1238,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     };
     for d in &insts {
         let next = d.pc + d.len as u64;
-        if let (Some(target), "S_SETPC_B64") = (gs_jump, d.inst.name) {
+        if let (Some(target), "S_SETPC_B64", None) = (gs_jump, d.inst.name, d.far_target) {
             if let Some(t) = target.filter(|t| starts.contains(t)) {
                 leaders.insert(t);
                 branches += 1;
