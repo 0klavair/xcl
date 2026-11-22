@@ -1193,6 +1193,10 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
     and had the 512 MB window full in its first second (no room for readback heaps); it now stops at 384 MB, the
     picture unchanged. Putting them in the sparse windows instead made XDefiant render black (cache warm, no errors
     in the log) – not understood yet; the GPU-owned ones go to `vram` arenas either way.
+  - A committed console resource XCL does not place is created with the PC's description
+    (`device_x::pc_resource_desc`: the driver's alignment, its layout, console flag bits off). With the smaller
+    coherent window Fortnite's menu reached that path for its 3264x1836 scene targets; the console desc gave
+    E_INVALIDARG and the game crashed reading the missing resource.
   - XDefiant's menu runs at ~53 fps (~50 before PR #40). Its CPU cost of the sparse windows is the per-submit
     write-watch scan over the mapped tiles (~2 GB): ~0.8 ms per submit at ~800 submits a second, then ~0.3 ms of
     uploads (64-byte chunk runs of ~0.5 KB on average). Merging the runs or skipping scans would be faster, but a
