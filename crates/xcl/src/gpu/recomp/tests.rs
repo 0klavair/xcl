@@ -647,6 +647,188 @@ fn gpu_frexp_f64_exp_and_mant() {
     }
 }
 
+/// Edge inputs of the f64 operations: |x| ≥ 2^63, values outside the f32 range, denormals,
+/// signed zeros, ±inf and NaN.
+const F64_EDGES: [u64; 22] = [
+    0x0000_0000_0000_0000,       // +0
+    0x8000_0000_0000_0000,       // −0
+    0.5f64.to_bits(),
+    (-0.5f64).to_bits(),
+    (-1.5f64).to_bits(),
+    2.5f64.to_bits(),
+    4.0f64.to_bits(),
+    123456789.75f64.to_bits(),
+    (-4503599627370495.5f64).to_bits(),
+    9223372036854775808.0f64.to_bits(),     // 2^63
+    (-18446744073709551616.0f64).to_bits(), // −2^64
+    1e300f64.to_bits(),
+    (-1e300f64).to_bits(),
+    1e-300f64.to_bits(),
+    (-1e-300f64).to_bits(),
+    0x0000_0000_0000_0001,                  // smallest denormal
+    0x000F_FFFF_FFFF_FFFF,                  // largest denormal
+    f64::MAX.to_bits(),
+    f64::INFINITY.to_bits(),
+    f64::NEG_INFINITY.to_bits(),
+    0x7FF8_0000_0000_1234,                  // NaN
+    4294967295.0f64.to_bits(),
+];
+
+fn f64_lanes(st: &mut KernelState, inputs: &[u64]) {
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let x = inputs[l % inputs.len()];
+        (r[0], r[1]) = (x as u32, (x >> 32) as u32);
+    }
+}
+
+fn pair(v: &[u32], i: usize) -> f64 {
+    f64::from_bits(v[i] as u64 | (v[i + 1] as u64) << 32)
+}
+
+/// v_floor, v_ceil, v_trunc and v_fract_f64 and the f64 to i32 and u32 conversions against
+/// the CPU's IEEE results, bit for bit, including the sign of zero, |x| ≥ 2^63, ±inf and NaN.
+#[test]
+fn gpu_f64_rounding_and_conversions() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_FLOOR_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_CEIL_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("V_TRUNC_F64", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("V_FRACT_F64", "ENC_VOP1", &[("VDST", 8), ("SRC0", V)], None),
+        ("V_CVT_I32_F64", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_CVT_U32_F64", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        // the inline constant 0 compiles as a constant, where 0.0 − floor(0.0) gave −0
+        ("V_FRACT_F64", "ENC_VOP1", &[("VDST", 12), ("SRC0", 128)], None),
+    ]);
+    let mut st = KernelState::default();
+    f64_lanes(&mut st, &F64_EDGES);
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let same = |got: f64, want: f64| got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan());
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
+        // V_FRACT_F64 is x − floor(x) kept below 1.0, +0 for ±0, and NaN for ±inf and NaN
+        let fract = if x.is_finite() { (x - x.floor()).min(f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)) } else { f64::NAN };
+        for (name, got, want) in [
+            ("floor", pair(v, 2), x.floor()),
+            ("ceil", pair(v, 4), x.ceil()),
+            ("trunc", pair(v, 6), x.trunc()),
+            ("fract", pair(v, 8), fract),
+        ] {
+            if !same(got, want) {
+                bad.push(format!("v_{name}_f64({x:e}) = {got:e}, want {want:e}"));
+            }
+        }
+        if pair(v, 12).to_bits() != 0 {
+            bad.push(format!("v_fract_f64(inline 0) = {:e}, want +0", pair(v, 12)));
+        }
+        // saturating, and NaN gives 0, which is what Rust's `as` does
+        if v[10] as i32 != x as i32 {
+            bad.push(format!("v_cvt_i32_f64({x:e}) = {}, want {}", v[10] as i32, x as i32));
+        }
+        if v[11] != x as u32 {
+            bad.push(format!("v_cvt_u32_f64({x:e}) = {}, want {}", v[11], x as u32));
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// v_sqrt_f64 and v_rsq_f64 over the whole f64 range. Denormals and values outside the f32
+/// range get real roots within an ulp of the CPU's, a negative x gives NaN and −0 gives −0.
+#[test]
+fn gpu_f64_roots() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[
+        ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+    ]);
+    let mut st = KernelState::default();
+    f64_lanes(&mut st, &F64_EDGES);
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let ulps = |got: f64, want: f64| -> u64 {
+        if got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()) {
+            0
+        } else if got.is_nan() || want.is_nan() || got.is_sign_negative() != want.is_sign_negative() {
+            u64::MAX
+        } else {
+            got.to_bits().abs_diff(want.to_bits())
+        }
+    };
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let x = f64::from_bits(F64_EDGES[l % F64_EDGES.len()]);
+        for (name, got, want, tol) in [("sqrt", pair(v, 2), x.sqrt(), 1), ("rsq", pair(v, 4), 1.0 / x.sqrt(), 2)] {
+            if ulps(got, want) > tol {
+                bad.push(format!("v_{name}_f64({x:e}) = {got:e}, want {want:e}"));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// v_ldexp_f64 = x · 2^n, rounded once, for every i32 n: results that over- or underflow,
+/// denormal results, exponents beyond the f32 range of 2^n.
+#[test]
+fn gpu_ldexp_f64() {
+    if !gpu_ready() {
+        return;
+    }
+    let p = prog(&[("V_LDEXP_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)], None)]);
+    // 2^e as f64 bits for a normal e
+    const fn p2(e: i32) -> u64 {
+        ((e + 1023) as u64) << 52
+    }
+    const ONE: u64 = p2(0);
+    const CASES: [(u64, i32, u64); 21] = [
+        (ONE, 0, ONE),
+        (ONE, 1023, p2(1023)),
+        (ONE, 1024, 0x7FF0_0000_0000_0000),                 // overflows to inf
+        (ONE, -1022, p2(-1022)),                            // smallest normal
+        (ONE, -1074, 1),                                    // smallest denormal
+        (ONE, -1075, 0),                                    // half of it, a tie that rounds to even 0
+        (1.5f64.to_bits(), -1074, 2),                       // 1.5 · 2^−1074, a tie that rounds to even 2
+        (1.5f64.to_bits(), -1075, 1),                       // 0.75 · 2^−1074 rounds to 1
+        (1, 2000, p2(926)),                                 // 2^−1074 · 2^2000
+        (1, 1074, ONE),                                     // back to 1.0
+        (p2(1023), -2046, 1 << 51),                         // 2^−1023, a denormal
+        (1e300f64.to_bits(), -2000, 0x0137_E43C_8800_759C),  // only the exponent field moves
+        (1e300f64.to_bits(), -3000, 0),                     // underflows to 0
+        ((-2.0f64).to_bits(), 200, p2(201) | 1 << 63),      // −2^201
+        (2.0f64.to_bits(), -200, p2(-199)),
+        (ONE, i32::MAX, 0x7FF0_0000_0000_0000),             // inf
+        ((-1.0f64).to_bits(), i32::MIN, 1 << 63),           // −0
+        (1 << 63, 5, 1 << 63),                              // −0 stays −0
+        (0x7FF0_0000_0000_0000, -5000, 0x7FF0_0000_0000_0000), // inf stays inf
+        (0x7FF8_0000_0000_1234, 7, 0x7FF8_0000_0000_1234),  // NaN stays NaN
+        (0, 3000, 0),                                       // 0 stays 0
+    ];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (x, n, _) = CASES[l % CASES.len()];
+        (r[0], r[1], r[2]) = (x as u32, (x >> 32) as u32, n as u32);
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate() {
+        let (x, n, want) = CASES[l % CASES.len()];
+        let (got, want, x) = (pair(v, 4), f64::from_bits(want), f64::from_bits(x));
+        if !(got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())) {
+            bad.push(format!("v_ldexp_f64({x:e}, {n}) = {got:e} ({:#018x}), want {want:e}", got.to_bits()));
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_valu_float_and_int() {
     if !gpu_ready() {
@@ -4097,4 +4279,337 @@ fn mesh_wave32_rejects_cross_half_operations() {
     let split = super::translate_mesh(&plain, ms, true, true).unwrap();
     assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
     assert!(split.complete(), "{:?}", split.unsupported_why);
+}
+
+/// f64 compares with NaN operands, both the ordered ones and the negated ones that are true
+/// when unordered, bit for bit against IEEE.
+#[test]
+fn gpu_f64_compares_with_nan() {
+    if !gpu_ready() {
+        return;
+    }
+    const OPS: [&str; 8] = ["O", "U", "NEQ", "NLT", "NGE", "EQ", "LT", "LG"];
+    let insts: Vec<(String, u64)> = OPS.iter().enumerate().map(|(i, op)| (format!("V_CMP_{op}_F64"), 20 + 2 * i as u64)).collect();
+    let fields: Vec<[(&str, u64); 3]> = insts.iter().map(|(_, d)| [("VDST", *d), ("SRC0", V), ("SRC1", V + 2)]).collect();
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> =
+        insts.iter().zip(&fields).map(|((n, _), f)| (n.as_str(), "ENC_VOP3", &f[..], None)).collect();
+    let p = prog(&list);
+    let nan = f64::from_bits(0x7FF8_0000_0000_1234);
+    let pairs = [(1.0, 1.0), (nan, 1.0), (2.0, nan), (-0.0, 0.0), (f64::INFINITY, f64::INFINITY), (nan, nan), (1.0, 2.0)];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b): (f64, f64) = pairs[l % pairs.len()];
+        (r[0], r[1], r[2], r[3]) = (a.to_bits() as u32, (a.to_bits() >> 32) as u32, b.to_bits() as u32, (b.to_bits() >> 32) as u32);
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let mut bad = Vec::new();
+    for (i, op) in OPS.iter().enumerate() {
+        let mask = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
+        for l in 0..64 {
+            let (a, b) = pairs[l % pairs.len()];
+            let want = match *op {
+                "O" => !a.is_nan() && !b.is_nan(),
+                "U" => a.is_nan() || b.is_nan(),
+                "NEQ" => !(a == b),
+                "NLT" => !(a < b),
+                "NGE" => !(a >= b),
+                "EQ" => a == b,
+                "LT" => a < b,
+                _ => a < b || a > b,
+            };
+            if (mask >> l & 1 == 1) != want {
+                bad.push(format!("v_cmp_{}_f64({a:e}, {b:e}) = {}, want {want}", op.to_lowercase(), !want));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Every f32 compare with NaN operands against IEEE. Before the explicit NaN tests, lt, ge
+/// and lg came back true and nlg false for a NaN operand on an AMD RX 7900 XTX. The driver
+/// gave lt the result of the nge before it, as `float_compare` describes.
+#[test]
+fn gpu_f32_compares_with_nan() {
+    if !gpu_ready() {
+        return;
+    }
+    const OPS: [&str; 12] = ["O", "U", "NEQ", "NLT", "NGE", "EQ", "LT", "LG", "LE", "GT", "GE", "NLG"];
+    let insts: Vec<(String, u64)> = OPS.iter().enumerate().map(|(i, op)| (format!("V_CMP_{op}_F32"), 20 + 2 * i as u64)).collect();
+    let fields: Vec<[(&str, u64); 3]> = insts.iter().map(|(_, d)| [("VDST", *d), ("SRC0", V), ("SRC1", V + 1)]).collect();
+    let list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> =
+        insts.iter().zip(&fields).map(|((n, _), f)| (n.as_str(), "ENC_VOP3", &f[..], None)).collect();
+    let p = prog(&list);
+    let nan = f32::from_bits(0x7FC0_1234);
+    let pairs = [(1.0f32, 1.0f32), (nan, 1.0), (2.0, nan), (-0.0, 0.0), (f32::INFINITY, f32::INFINITY), (nan, nan), (1.0, 2.0)];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (a, b) = pairs[l % pairs.len()];
+        (r[0], r[1]) = (a.to_bits(), b.to_bits());
+    }
+    let r = runner::run_program(&p, &st, &[]).unwrap().0;
+    let mut bad = Vec::new();
+    for (i, op) in OPS.iter().enumerate() {
+        let mask = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
+        for l in 0..64 {
+            let (a, b) = pairs[l % pairs.len()];
+            let want = match *op {
+                "O" => !a.is_nan() && !b.is_nan(),
+                "U" => a.is_nan() || b.is_nan(),
+                "NEQ" => !(a == b),
+                "NLT" => !(a < b),
+                "NGE" => !(a >= b),
+                "EQ" => a == b,
+                "LT" => a < b,
+                "LG" => a < b || a > b,
+                "LE" => a <= b,
+                "GT" => a > b,
+                "GE" => a >= b,
+                _ => !(a < b || a > b),
+            };
+            if (mask >> l & 1 == 1) != want {
+                bad.push(format!("v_cmp_{}_f32({a:e}, {b:e}) = {}, want {want}", op.to_lowercase(), !want));
+            }
+        }
+    }
+    bad.sort();
+    bad.dedup();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// xorshift64, the fixed-seed generator of the randomized GPU tests
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 { self.next() % n }
+}
+
+/// A random f64 weighted towards the edges: specials, any bit pattern, values next to
+/// integers up to 2^64, denormals, magnitudes around 2^±65, small values on 1/8 steps.
+fn rand_f64(r: &mut Rng) -> f64 {
+    const SPECIAL: [u64; 12] = [0, 1 << 63, 0x7FF0_0000_0000_0000, 0xFFF0_0000_0000_0000, 0x7FF8_0000_0000_0000,
+        0x7FF0_0000_0000_0001, 0xFFF8_0000_0000_1234, 1, 0x000F_FFFF_FFFF_FFFF, 0x7FEF_FFFF_FFFF_FFFF, 0x0010_0000_0000_0000, 0x8000_0000_0000_0001];
+    match r.below(6) {
+        0 => f64::from_bits(SPECIAL[r.below(12) as usize]),
+        1 => f64::from_bits(r.next()),                                        // any bits
+        2 => { // near an integer of any size up to 2^64
+            let k = (r.next() >> r.below(64)) as f64;
+            let d = [0.0, 0.5, -0.5, 0.25, 1e-9, -1e-9, 0.9999999999][r.below(7) as usize];
+            let v = k + d;
+            if r.below(2) == 0 { -v } else { v }
+        }
+        3 => f64::from_bits(r.next() & 0x800F_FFFF_FFFF_FFFF),                 // denormal
+        4 => { let e = 1023 + r.below(130) - 65; f64::from_bits((e << 52) | (r.next() & 0x800F_FFFF_FFFF_FFFF)) } // |x| around 2^±65
+        _ => (r.below(2000) as f64 - 1000.0) / 8.0,                           // small values on 1/8 steps
+    }
+}
+
+/// 2^e for a normal e
+fn p2f(e: i32) -> f64 { f64::from_bits(((e + 1023) as u64) << 52) }
+
+/// x · 2^n on the CPU with a single rounding, since each step but the last is exact. None when
+/// that is not possible.
+fn ldexp_ref(x: f64, n: i32) -> Option<f64> {
+    if x.is_nan() || x.is_infinite() || x == 0.0 { return Some(x); }
+    if n > 4000 { return Some(f64::INFINITY.copysign(x)); }
+    if n < -4000 { return Some(x * 0.0); }
+    if (-1022..=1023).contains(&n) { return Some(x * p2f(n)); }
+    if n > 1023 && n <= 2046 { return Some((x * p2f(1023)) * p2f(n - 1023)); }
+    if (-2044..-1022).contains(&n) && (1.0..2.0).contains(&x.abs()) { return Some((x * p2f(-1022)) * p2f(n + 1022)); }
+    None
+}
+
+/// The f64 math against the CPU on random inputs, 64 per dispatch in 50 dispatches, or n
+/// dispatches with XCL_FUZZ_ITERS=n. floor, ceil, trunc, fract and the i32 and u32
+/// conversions must match bit for bit, and so must ldexp wherever the CPU can compute it with
+/// one rounding. sqrt must be within 1 ulp and rsq within 2.
+#[test]
+fn gpu_f64_math_random() {
+    if !gpu_ready() {
+        return;
+    }
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    let p = prog(&[
+        ("V_FLOOR_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("V_CEIL_F64", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)], None),
+        ("V_TRUNC_F64", "ENC_VOP1", &[("VDST", 6), ("SRC0", V)], None),
+        ("V_FRACT_F64", "ENC_VOP1", &[("VDST", 8), ("SRC0", V)], None),
+        ("V_CVT_I32_F64", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_CVT_U32_F64", "ENC_VOP1", &[("VDST", 11), ("SRC0", V)], None),
+        ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 12), ("SRC0", V)], None),
+        ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 14), ("SRC0", V)], None),
+        ("V_LDEXP_F64", "ENC_VOP3", &[("VDST", 16), ("SRC0", V), ("SRC1", V + 20)], None),
+        ("V_TRUNC_F64", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("NEG", 1)], None),
+        ("V_FLOOR_F64", "ENC_VOP3", &[("VDST", 24), ("SRC0", V), ("ABS", 1)], None),
+    ]);
+    let t = translate(&p, &Options::default()).unwrap();
+    assert!(t.complete());
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let mem: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let same = |g: f64, w: f64| g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
+    let ulps = |g: f64, w: f64| -> u64 {
+        if same(g, w) { 0 } else if g.is_nan() || w.is_nan() || g.is_sign_negative() != w.is_sign_negative() { u64::MAX } else { g.to_bits().abs_diff(w.to_bits()) }
+    };
+    let (mut checked, mut ldexp_checked, mut sqrt_exact, mut sqrt_1ulp, mut rsq_hist) = (0usize, 0usize, 0usize, 0usize, [0usize; 4]);
+    let mut bad: Vec<String> = Vec::new();
+    for _ in 0..iters {
+        let mut st = KernelState::default();
+        let mut xs = Vec::new();
+        for r in st.vgpr.iter_mut() {
+            let x = rand_f64(&mut rng);
+            let n: i32 = match rng.below(5) {
+                0 => rng.below(2047) as i32 - 1023,
+                1 => rng.below(1025) as i32 + 1023,
+                2 => -(rng.below(1023) as i32) - 1022,
+                3 => rng.next() as i32,
+                _ => rng.below(120) as i32 - 60,
+            };
+            (r[0], r[1], r[20]) = (x.to_bits() as u32, (x.to_bits() >> 32) as u32, n as u32);
+            xs.push((x, n));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        for (l, v) in r.vgpr.iter().enumerate() {
+            let (x, n) = xs[l];
+            checked += 1;
+            let fract = if x.is_finite() { (x - x.floor()).min(f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)) } else { f64::NAN };
+            for (name, g, w) in [("floor", pair(v, 2), x.floor()), ("ceil", pair(v, 4), x.ceil()), ("trunc", pair(v, 6), x.trunc()),
+                                 ("fract", pair(v, 8), fract), ("trunc(-x)", pair(v, 22), (-x).trunc()), ("floor(|x|)", pair(v, 24), x.abs().floor())] {
+                if !same(g, w) {
+                    bad.push(format!("{name}({x:e} / {:#018x}) = {g:e}, want {w:e}", x.to_bits()));
+                }
+            }
+            if v[10] as i32 != x as i32 { bad.push(format!("cvt_i32({x:e}) = {}, want {}", v[10] as i32, x as i32)); }
+            if v[11] != x as u32 { bad.push(format!("cvt_u32({x:e}) = {}, want {}", v[11], x as u32)); }
+            let (gs, ws) = (pair(v, 12), x.sqrt());
+            match ulps(gs, ws) { 0 => sqrt_exact += 1, 1 => sqrt_1ulp += 1, _ => bad.push(format!("sqrt({x:e} / {:#018x}) = {gs:e}, want {ws:e}", x.to_bits())) }
+            let u = ulps(pair(v, 14), 1.0 / x.sqrt());
+            if u <= 2 { rsq_hist[u as usize] += 1 } else { rsq_hist[3] += 1; bad.push(format!("rsq({x:e}) = {:e}, want {:e}", pair(v, 14), 1.0 / x.sqrt())) }
+            if let Some(w) = ldexp_ref(x, n) {
+                ldexp_checked += 1;
+                if !same(pair(v, 16), w) { bad.push(format!("ldexp({x:e} / {:#018x}, {n}) = {:e}, want {w:e}", x.to_bits(), pair(v, 16))); }
+            }
+        }
+    }
+    println!("lanes {checked}, ldexp checked {ldexp_checked}, sqrt exact {sqrt_exact} / 1 ulp {sqrt_1ulp}, rsq ulps 0/1/2/>2 {rsq_hist:?}");
+    bad.sort(); bad.dedup();
+    println!("{} distinct failures", bad.len());
+    for b in bad.iter().take(40) { println!("  {b}"); }
+    assert!(bad.is_empty());
+}
+
+fn f16_to_f64(h: u16) -> f64 {
+    let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = (h >> 10) & 0x1F;
+    let m = (h & 0x3FF) as f64;
+    match e {
+        0 => s * m * (2.0f64).powi(-24),
+        31 => if m == 0.0 { s * f64::INFINITY } else { f64::NAN },
+        _ => s * (1.0 + m / 1024.0) * (2.0f64).powi(e as i32 - 15),
+    }
+}
+
+/// All 16 float compares of f32, f64 and f16 and v_cmpx_lt against the CPU on random operand
+/// pairs, a quarter of them equal. The VOP3 forms write SGPR pairs and the VOPC forms VCC.
+/// 64 pairs per dispatch in 50 dispatches, or n dispatches with XCL_FUZZ_ITERS=n. An f32
+/// result that only matches with f32 denormals flushed to zero is counted and does not fail
+/// the test. That comes from the shader's denormal mode, not from the compare.
+#[test]
+fn gpu_float_compares_random() {
+    if !gpu_ready() {
+        return;
+    }
+    let iters: usize = std::env::var("XCL_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    const OPS: [&str; 16] = ["F", "LT", "EQ", "LE", "GT", "LG", "GE", "O", "U", "NGE", "NLG", "NGT", "NLE", "NEQ", "NLT", "TRU"];
+    let want_of = |op: &str, a: f64, b: f64| match op {
+        "F" => false, "LT" => a < b, "EQ" => a == b, "LE" => a <= b, "GT" => a > b, "LG" => a < b || a > b, "GE" => a >= b,
+        "O" => !a.is_nan() && !b.is_nan(), "U" => a.is_nan() || b.is_nan(), "NGE" => !(a >= b), "NLG" => !(a < b || a > b),
+        "NGT" => !(a > b), "NLE" => !(a <= b), "NEQ" => !(a == b), "NLT" => !(a < b), _ => true,
+    };
+    let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+    let mut total_bad = 0usize;
+    for ty in ["F32", "F64", "F16"] {
+        let (s0, s1) = if ty == "F64" { (V + 2, 4u64) } else { (V, 1u64) };
+        let names: Vec<String> = OPS.iter().map(|o| format!("V_CMP_{o}_{ty}")).collect();
+        let f3: Vec<[(&str, u64); 3]> = (0..16).map(|i| [("VDST", 20 + 2 * i as u64), ("SRC0", s0), ("SRC1", V + s1)]).collect();
+        let fc: Vec<[(&str, u64); 2]> = (0..16).map(|_| [("SRC0", s0), ("VSRC1", s1)]).collect();
+        let fm: Vec<[(&str, u64); 2]> = (0..16).map(|i| [("SDST", 60 + 2 * i as u64), ("SSRC0", 106)]).collect();
+        let cmpx = format!("V_CMPX_LT_{ty}");
+        let fx = [("SRC0", s0), ("VSRC1", s1)];
+        let mut list: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = Vec::new();
+        for i in 0..16 { list.push((names[i].as_str(), "ENC_VOP3", &f3[i][..], None)); }
+        for i in 0..16 { list.push((names[i].as_str(), "ENC_VOPC", &fc[i][..], None)); list.push(("S_MOV_B64", "ENC_SOP1", &fm[i][..], None)); }
+        list.push((cmpx.as_str(), "ENC_VOPC", &fx[..], None));
+        let p = prog(&list);
+        let t = translate(&p, &Options::default()).unwrap();
+        assert!(t.complete(), "{ty}: {:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let mem: Vec<u32> = p.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut bad: Vec<String> = Vec::new();
+        let mut lanes = 0usize;
+        let mut denorm = 0usize;
+        for _ in 0..iters {
+            let mut st = KernelState::default();
+            let mut ab = Vec::new();
+            for r in st.vgpr.iter_mut() {
+                let (a, b) = match ty {
+                    "F64" => {
+                        let a = rand_f64(&mut rng);
+                        let b = if rng.below(4) == 0 { a } else { rand_f64(&mut rng) };
+                        (r[2], r[3], r[4], r[5]) = (a.to_bits() as u32, (a.to_bits() >> 32) as u32, b.to_bits() as u32, (b.to_bits() >> 32) as u32);
+                        (a, b)
+                    }
+                    "F32" => {
+                        let g = |rng: &mut Rng| -> f32 { match rng.below(3) { 0 => rand_f64(rng) as f32, 1 => f32::from_bits(rng.next() as u32),
+                            _ => f32::from_bits([0u32, 0x8000_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0x7F80_0001, 0xFFC1_2345, 1][rng.below(8) as usize]) } };
+                        let a = g(&mut rng);
+                        let b = if rng.below(4) == 0 { a } else { g(&mut rng) };
+                        (r[0], r[1]) = (a.to_bits(), b.to_bits());
+                        (a as f64, b as f64)
+                    }
+                    _ => {
+                        let g = |rng: &mut Rng| -> u16 { if rng.below(3) == 0 { [0u16, 0x8000, 0x7C00, 0xFC00, 0x7E00, 0x7C01, 0xFE12, 1, 0x3C00][rng.below(9) as usize] } else { rng.next() as u16 } };
+                        let a = g(&mut rng);
+                        let b = if rng.below(4) == 0 { a } else { g(&mut rng) };
+                        // the high halves hold junk: compares read the low half
+                        (r[0], r[1]) = (a as u32 | (rng.next() as u32) << 16, b as u32 | (rng.next() as u32) << 16);
+                        (f16_to_f64(a), f16_to_f64(b))
+                    }
+                };
+                ab.push((a, b));
+            }
+            let r = runner::run(&dxil, &st, &mem).unwrap();
+            lanes += 64;
+            for (i, op) in OPS.iter().enumerate() {
+                let m3 = r.sgpr[20 + 2 * i] as u64 | (r.sgpr[21 + 2 * i] as u64) << 32;
+                let mc = r.sgpr[60 + 2 * i] as u64 | (r.sgpr[61 + 2 * i] as u64) << 32;
+                for (l, &(a, b)) in ab.iter().enumerate() {
+                    let w = want_of(op, a, b);
+                    let ftz = |x: f64| if ty == "F32" && x != 0.0 && x.abs() < f32::MIN_POSITIVE as f64 { 0.0f64.copysign(x) } else { x };
+                    let wz = want_of(op, ftz(a), ftz(b));
+                    for (enc, m) in [("VOP3", m3), ("VOPC", mc)] {
+                        let g = m >> l & 1 == 1;
+                        if g != w && g != wz { bad.push(format!("{ty} {enc} {op}({a:e}, {b:e}) = {g}")); } else if g != w { denorm += 1; }
+                    }
+                }
+            }
+            let ex = r.sgpr[126] as u64 | (r.sgpr[127] as u64) << 32;
+            for (l, &(a, b)) in ab.iter().enumerate() {
+                let ftz = |x: f64| if ty == "F32" && x != 0.0 && x.abs() < f32::MIN_POSITIVE as f64 { 0.0f64.copysign(x) } else { x };
+                let g = ex >> l & 1 == 1;
+                if g != (a < b) && g != (ftz(a) < ftz(b)) { bad.push(format!("{ty} CMPX LT({a:e}, {b:e}) = {g}")); } else if g != (a < b) { denorm += 1; }
+            }
+        }
+        bad.sort(); bad.dedup();
+        println!("{ty}: {lanes} lanes x 33 compares, {} distinct failures, {denorm} results that match only a flush of f32 denormals", bad.len());
+        for b in bad.iter().take(15) { println!("  {b}"); }
+        total_bad += bad.len();
+    }
+    assert_eq!(total_bad, 0);
 }
