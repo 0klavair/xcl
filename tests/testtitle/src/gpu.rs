@@ -1722,3 +1722,83 @@ pub fn sparse_async_ring_upload_stress() -> Result<(), String> {
         Ok(())
     }
 }
+
+/// A graphics reservation larger than the two upper sparse windows (8 GiB + 4 MiB, the first
+/// thing one retail title does) goes across window 0 – and the console descriptor heaps made
+/// after it still get window 0's descriptor range: their start handle (in rax, the console's
+/// convention) is a 32-bit-addressable console address, not a PC heap's.
+pub fn descriptor_heaps_after_a_large_graphics_reservation() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let big = 0x2_0041_0000usize;
+        let r = crate::XMemVirtualAlloc(std::ptr::null(), big, 0x2000, 1u64 << 29, 4);
+        ensure!(!r.is_null(), "graphics reservation of {big:#x} bytes refused");
+        let check = |ty: D3D12_DESCRIPTOR_HEAP_TYPE, n: u32| -> Result<(), String> {
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: n, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 })
+                .map_err(e)?;
+            let start: unsafe extern "system" fn(*mut c_void) -> u64 = transmute_copy(&(*(*(heap.as_raw() as *const *const usize)).add(9)));
+            let p = start(heap.as_raw());
+            ensure!(p >> 32 >= 4 && (p >> 32) & 3 == 0, "{ty:?} heap of {n} slots is not in unified memory window 0: start {p:#x}");
+            ensure!(p < r as u64 || p >= r as u64 + big as u64, "{ty:?} heap at {p:#x} inside the title's reservation {r:?}");
+            Ok(())
+        };
+        let views = check(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 442_368);
+        let samplers = check(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 512);
+        ensure!(crate::VirtualFree(r, 0, 0x8000) != 0, "VirtualFree of the reservation");
+        views?;
+        samplers
+    }
+}
+
+/// Committed console textures fill the coherent window only up to the room it keeps: more of
+/// them than fit (400 MB of 512x512 RGBA8, up to the room to the MB; one retail title makes
+/// 2.2 GB) are still created – as PC resources, also with console-only flag bits – and a
+/// readback buffer made afterwards still gets coherent memory (window 3).
+pub fn committed_textures_leave_room_for_readback() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let tex = |side: u64, flags: u32| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: side,
+            Height: side as u32,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAGS(flags as i32),
+            ..Default::default()
+        };
+        let default = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut kept = Vec::new();
+        for i in 0..400 {
+            let mut t: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&default, D3D12_HEAP_FLAG_NONE, &tex(512, 0), D3D12_RESOURCE_STATE_COMMON, None, &mut t).map_err(|x| format!("texture {i}: {x}"))?;
+            kept.push(t.ok_or("texture")?);
+        }
+        // past the room: a render target with a console-only flag bit (0x1000000) the PC refuses
+        let mut rt: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&default, D3D12_HEAP_FLAG_NONE, &tex(2048, 0x100_0001), D3D12_RESOURCE_STATE_COMMON, None, &mut rt)
+            .map_err(|x| format!("render target with console flag bits beyond the coherent room: {x}"))?;
+        kept.push(rt.ok_or("render target")?);
+        let buf = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1 << 20,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buf, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+            .map_err(e)?;
+        let rb = rb.ok_or("readback buffer")?;
+        let va = rb.GetGPUVirtualAddress();
+        ensure!((va >> 32) & 3 == 3, "readback buffer after the textures is not in the coherent window 3: {va:#x}");
+        drop(kept);
+        Ok(())
+    }
+}

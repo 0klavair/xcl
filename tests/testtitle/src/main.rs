@@ -67,6 +67,39 @@ extern "system" {
     fn GetDiskFreeSpaceW(root: *const u16, spc: *mut u32, bps: *mut u32, free: *mut u32, total: *mut u32) -> i32;
 }
 
+// the console's ntuser window API sets, as titles import them (Unicode and ANSI)
+#[repr(C)]
+struct WndClassW {
+    style: u32,
+    proc_: usize,
+    cls_extra: i32,
+    wnd_extra: i32,
+    instance: usize,
+    icon: usize,
+    cursor: usize,
+    background: usize,
+    menu: *const u16,
+    class: *const u16,
+}
+
+// user32 helpers; CreateWindowExW / A come from the console's API set names through
+// GetProcAddress (an import of the same name would be bound to user32 by the linker)
+#[link(name = "user32", kind = "raw-dylib")]
+extern "system" {
+    fn RegisterClassW(c: *const WndClassW) -> u16;
+    fn DestroyWindow(h: *mut c_void) -> i32;
+    fn GetWindowLongW(h: *mut c_void, index: i32) -> i32;
+    fn GetClientRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
+    fn DefWindowProcW(h: *mut c_void, m: u32, w: usize, l: isize) -> isize;
+}
+
+type CreateWindowExFn<C> = unsafe extern "system" fn(u32, *const C, *const C, u32, i32, i32, i32, i32, *mut c_void, *mut c_void, usize, *const c_void) -> *mut c_void;
+
+#[link(name = "dwmapi", kind = "raw-dylib")]
+extern "system" {
+    fn DwmGetWindowAttribute(h: *mut c_void, attr: u32, value: *mut c_void, size: u32) -> i32;
+}
+
 #[link(name = "gameinput", kind = "raw-dylib")]
 extern "system" {
     fn GameInputCreate(out: *mut *mut c_void) -> HRESULT;
@@ -321,6 +354,41 @@ fn main() {
         ensure!(!big.is_null() && (big as usize) % (4 << 20) == 0, "4MB page alloc not 4 MiB aligned: {big:?}");
         ensure!(*(big as *const u64) == 0 && *((big as usize + (4 << 20) - 8) as *const u64) == 0, "4MB page alloc not zeroed");
         XMemFree(big, attrs_4m);
+        Ok(())
+    });
+
+    check("user32: a top-level window made either way (CreateWindowExW / A) is the hidden 1920x1080 console screen", || unsafe {
+        let wide = |t: &str| t.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let class = wide("XclTestTitleWindow");
+        let wc = WndClassW { style: 0, proc_: DefWindowProcW as *const () as usize, cls_extra: 0, wnd_extra: 0, instance: GetModuleHandleW(std::ptr::null()), icon: 0, cursor: 0, background: 0, menu: std::ptr::null(), class: class.as_ptr() };
+        ensure!(RegisterClassW(&wc) != 0, "RegisterClassW");
+        // WS_OVERLAPPEDWINDOW | WS_VISIBLE, an ordinary PC frame of 1280x720
+        let style = 0x00CF_0000 | 0x1000_0000;
+        let title = wide("test title");
+        let lookup = |dll: &str, name: &[u8]| {
+            let h = LoadLibraryW(wide(dll).as_ptr());
+            if h == 0 { 0 } else { GetProcAddress(h, name.as_ptr()) }
+        };
+        let (fw, fa) = (lookup("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", b"CreateWindowExW "), lookup("ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", b"CreateWindowExA "));
+        ensure!(fw != 0 && fa != 0, "CreateWindowExW {fw:#x} / A {fa:#x} from the ntuser API sets");
+        let (cw, ca): (CreateWindowExFn<u16>, CreateWindowExFn<u8>) = (std::mem::transmute(fw), std::mem::transmute(fa));
+        let w = cw(0x4_0000, class.as_ptr(), title.as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
+        let a = ca(0, b"XclTestTitleWindow ".as_ptr(), b"test title ".as_ptr(), style, 100, 100, 1280, 720, std::ptr::null_mut(), std::ptr::null_mut(), wc.instance, std::ptr::null());
+        ensure!(!w.is_null() && !a.is_null(), "CreateWindowExW {w:?} / A {a:?}");
+        for (name, h) in [("W", w), ("A", a)] {
+            let ex = GetWindowLongW(h, -20) as u32;
+            let st = GetWindowLongW(h, -16) as u32;
+            let mut r = [0i32; 4];
+            GetClientRect(h, &mut r);
+            let mut cloaked = 0u32;
+            DwmGetWindowAttribute(h, 14, &mut cloaked as *mut u32 as *mut c_void, 4);
+            ensure!(ex & 0x80 != 0 && ex & 0x4_0000 == 0, "{name}: not a tool window (no taskbar button) – exstyle {ex:#x}");
+            ensure!(st & 0x8000_0000 != 0 && st & 0x00C0_0000 == 0, "{name}: not a frameless popup – style {st:#x}");
+            ensure!(r[2] - r[0] == 1920 && r[3] - r[1] == 1080, "{name}: client area {}x{}", r[2] - r[0], r[3] - r[1]);
+            ensure!(cloaked != 0, "{name}: not cloaked");
+        }
+        DestroyWindow(w);
+        DestroyWindow(a);
         Ok(())
     });
 
@@ -620,6 +688,8 @@ fn main() {
     check("D3D12.X: sparse VRAM buffer heaps (placed aliasing, persistent Map coherence, readback)", gpu::sparse_buffer_heap_coherence);
     check("D3D12.X: coherent window headroom (CUSTOM+WRITE_BACK & oversized READBACK in sparse VRAM)", gpu::coherent_window_headroom);
     check("D3D12.X: async ring-buffered sparse uploads (80 MiB across 20 submits + reused-tile zeroing)", gpu::sparse_async_ring_upload_stress);
+    check("D3D12.X: descriptor heaps still in window 0 after an 8 GiB+ graphics reservation", gpu::descriptor_heaps_after_a_large_graphics_reservation);
+    check("D3D12.X: committed textures beyond the coherent room are created; a readback buffer still gets coherent memory", gpu::committed_textures_leave_room_for_readback);
     check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
     check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);

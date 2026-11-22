@@ -1031,9 +1031,16 @@ const COHERENT_READBACK_MAX: usize = 64 << 20;
 /// Largest single `D3D12_HEAP_TYPE_CUSTOM` + `WRITE_BACK` `COPY_DEST` buffer kept on coherent RAM.
 const COHERENT_CUSTOM_WB_MAX: usize = 16 << 20;
 
+/// bytes of the coherent window readback heaps and buffers leave free (XCL's blocks outside its
+/// arena pool)
+const COHERENT_FLOOR: usize = 16 << 20;
+
+/// Whether a readback heap / buffer of `rounded` bytes may take coherent memory. The room
+/// committed textures leave (`COHERENT_KEPT`) is kept for these: with the textures at that
+/// limit (Unicorn Overlord's), a second 128 MB of headroom sent every readback buffer to the
+/// sparse windows.
 fn has_coherent_headroom(u: &crate::gpu::uma::Uma, rounded: usize) -> bool {
-    let headroom = COHERENT_KEPT.min(u.size() / 4);
-    u.size().saturating_sub(u.used()) >= headroom.saturating_add(rounded)
+    u.size().saturating_sub(u.used()) >= COHERENT_FLOOR.min(u.size() / 8).saturating_add(rounded)
 }
 
 /// Sparse-backed buffers whose `Map(0, NULL, ...)` should read back their full range from VRAM
