@@ -99,6 +99,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opt = |n: &str| args.iter().position(|a| a == n).and_then(|i| args.get(i + 1)).cloned();
     let top: usize = opt("--top").and_then(|v| v.parse().ok()).unwrap_or(30);
+    let force_full = args.iter().any(|arg| arg == "--full");
+    if args.iter().any(|arg| arg == "--probe") {
+        if let Some(conflict) = args.iter().find(|arg| matches!(arg.as_str(), "--full" | "--find" | "--extract" | "--out")) {
+            eprintln!("xcl rpf: --probe cannot be combined with {conflict}");
+            return 2;
+        }
+        return crate::rpf_probe::run(path, top);
+    }
     let find = opt("--find");
     let extract = opt("--extract");
     let out = opt("--out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("rpf_out"));
@@ -109,11 +117,6 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let explicit_probe = args.iter().any(|arg| arg == "--probe");
-    let force_full = args.iter().any(|arg| arg == "--full");
-    if explicit_probe {
-        return crate::rpf_probe::run(path, top);
-    }
     if len > AUTO_PROBE_SIZE && !force_full {
         if find.is_some() || extract.is_some() {
             eprintln!("xcl rpf: detailed options on archives larger than 1 GB require --full");

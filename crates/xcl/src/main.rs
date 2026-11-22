@@ -37,6 +37,7 @@ Usage:
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
+      Use --probe only for header summaries, without --find, --extract, --out or --full.
   xcl --version
 ";
 
