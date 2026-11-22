@@ -155,19 +155,28 @@ fn sanitize(s: &str) -> String {
     }
 }
 
-pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), String> {
+fn resolve_location(target: &Path) -> Result<(PathBuf, Option<PathBuf>, String), String> {
     let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
     let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
     let (root, exe) = if target.is_dir() {
-        (target.clone(), pick_exe(&target)?)
+        (target, None)
     } else {
         if is_xcl_copy(&target) {
             return Err(format!("{} is XCL itself, not a game – give the game exe or folder", target.display()));
         }
-        (target.parent().ok_or("no parent folder")?.to_path_buf(), target.clone())
+        (target.parent().ok_or("no parent folder")?.to_path_buf(), Some(target))
     };
     let (_, identity) = read_game_config(&root);
     let title = sanitize(&identity.unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+    Ok((root, exe, title))
+}
+
+pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), String> {
+    let (root, explicit_exe, title) = resolve_location(target)?;
+    let exe = match explicit_exe {
+        Some(exe) => exe,
+        None => pick_exe(&root)?,
+    };
     Ok((root, exe, title))
 }
 
@@ -198,7 +207,7 @@ fn quote(a: &str) -> String {
 }
 
 pub fn run(target: &Path, args: &[String]) -> i32 {
-    let (root, exe, title) = match resolve_target(target) {
+    let (root, explicit_exe, title) = match resolve_location(target) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("xcl: {e}");
@@ -206,9 +215,6 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         }
     };
     let data_dir = data_root().join(&title);
-    for d in ["logs", "cache", "overlay", "saves", "pls", "temp"] {
-        let _ = std::fs::create_dir_all(data_dir.join(d));
-    }
     let mut config = match Config::load_or_create(&data_dir.join("xcl.toml")) {
         Ok(c) => c,
         Err(e) => {
@@ -216,7 +222,23 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let exe = if !config.exe.is_empty() && root.join(&config.exe).is_file() { root.join(&config.exe) } else { exe };
+    let configured_exe = root.join(&config.exe);
+    let exe = if !config.exe.is_empty() && is_exe(&configured_exe) && !is_xcl_copy(&configured_exe) {
+        configured_exe
+    } else if let Some(exe) = explicit_exe {
+        exe
+    } else {
+        match pick_exe(&root) {
+            Ok(exe) => exe,
+            Err(error) => {
+                eprintln!("xcl: {error}");
+                return 2;
+            }
+        }
+    };
+    for d in ["logs", "cache", "overlay", "saves", "pls", "temp"] {
+        let _ = std::fs::create_dir_all(data_dir.join(d));
+    }
     config.exe = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let manifest = crate::manifest::load(&root);
     let from_manifest = config.resolve(manifest.as_ref());
