@@ -30,6 +30,18 @@ fn f(x: f32) -> u32 {
     x.to_bits()
 }
 
+/// Console GS and NGG programs are drawn through a mesh pass: they need mesh shaders, which
+/// not every adapter has (an integrated RDNA2 GPU reports none).
+fn mesh_shaders(dev: &ID3D12Device) -> bool {
+    let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    let ok = unsafe { dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32) }.is_ok()
+        && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
+    if !ok {
+        println!("GPU without mesh shaders – skipping");
+    }
+    ok
+}
+
 /// Console shader containers by record name (as a title passes them in
 /// D3D12_SHADER_BYTECODE) and the backend device. None: no sample pack / DXC / GPU.
 /// `setup` holds `SERIAL` for the test: they share the backend device and its global PSO
@@ -237,6 +249,9 @@ fn retail_pipelines_built_in_the_background_behind_a_stand_in() {
     assert!(!pso_async::is_pending(again.as_raw() as usize) && pso_async::resolve(again.as_raw() as usize) == again.as_raw() as usize);
 
     // a mesh pipeline (MS + PS of one pass) the same way
+    if !mesh_shaders(&dev) {
+        return;
+    }
     let data = std::fs::read(std::env::var("XCL_SAMPLE_RPF").unwrap()).unwrap();
     let recs = pack::scan(&data, 0x40);
     let (ms, ps) = recs
@@ -431,6 +446,9 @@ fn retail_textured_ps_decoded_descriptors_and_a_descriptor_change_between_draws(
 #[test]
 fn retail_es_gs_voxelize_geometry_mode() {
     let Some((blobs, _dev, _serial)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    if !mesh_shaders(&_dev) {
+        return;
+    }
     use xcl::gpu::recomp::{self, dxc, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
     let (code, g) = recomp::geometry_program(&blobs[0], &blobs[1]).expect("ES + GS pair");
     assert_eq!((g.max_vertex_count, g.vertex_bytes()), (3, 64));
@@ -539,6 +557,9 @@ fn pass_hash(name: &str) -> Option<&str> {
 #[test]
 fn retail_mesh_pipelines_through_the_hook() {
     let Some((_, dev, _serial)) = setup(&[]) else { return };
+    if !mesh_shaders(&dev) {
+        return;
+    }
     let data = std::fs::read(std::env::var("XCL_SAMPLE_RPF").unwrap()).unwrap();
     let recs = pack::scan(&data, 0x40);
     let every: usize = std::env::var("XCL_MS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
@@ -608,6 +629,9 @@ fn retail_mesh_pipelines_through_the_hook() {
 #[test]
 fn retail_gs_pipeline_through_the_hook() {
     let Some((blobs, dev, _serial)) = setup(&["VS_VoxelizeGeneric_6be01b34_Wrapped", "GS_VoxelizeGeneric_6be01b34_Wrapped"]) else { return };
+    if !mesh_shaders(&dev) {
+        return;
+    }
     let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
     let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         VS: code(&blobs[0]),
