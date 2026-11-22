@@ -4044,3 +4044,40 @@ fn far_jumps_are_direct_branches() {
         assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1, 9), "lane {l}");
     }
 }
+
+#[test]
+fn mesh_wave32_emits_wave32_logical_wave64() {
+    let code = 0xBF81_0000u32.to_le_bytes(); // s_endpgm
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let native = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_wave32: false, ..Default::default() }).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"));
+    assert!(native.hlsl.contains("[numthreads(128, 1, 1)]"));
+    assert!(!native.hlsl.contains("xcl_logical_wave64 = true"));
+
+    let split = translate(&code, &Options { mode: Mode::Mesh(ms), wave64: true, mesh_wave32: true, ..Default::default() }).unwrap();
+    assert!(split.hlsl.contains("[WaveSize(32)]"));
+    assert!(split.hlsl.contains("[numthreads(128, 1, 1)]"));
+    assert!(split.hlsl.contains("xcl_half = (gi >> 5) & 1u;"));
+    assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
+    assert!(split.hlsl.contains("lane_id = WaveGetLaneIndex() + 32u * xcl_half;"));
+    assert!(split.complete(), "{:?}", split.unsupported_why);
+}
+
+#[test]
+fn mesh_wave32_rejects_cross_half_operations() {
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
+    let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
+    for (code, hazard) in [(&lane, "cross-half lane exchange"), (&branch, "branch on a whole-wave mask")] {
+        let e = super::translate_mesh(code, ms.clone(), true, true).err().expect("split mesh must refuse");
+        assert!(e.contains("mesh program requires unsupported cross-half wave64 semantics") && e.contains(hazard), "{e}");
+        // native wave64 and wave32 programs are not split, so nothing is refused
+        assert!(super::translate_mesh(code, ms.clone(), true, false).is_ok());
+        assert!(super::translate_mesh(code, ms.clone(), false, true).is_ok());
+    }
+
+    let plain = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None)]);
+    let split = super::translate_mesh(&plain, ms, true, true).unwrap();
+    assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
+    assert!(split.complete(), "{:?}", split.unsupported_why);
+}

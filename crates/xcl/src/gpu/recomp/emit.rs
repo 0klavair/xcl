@@ -3606,13 +3606,19 @@ impl Em {
                 h.push_str("}\n");
             }
             Mode::Mesh(ms) => {
+                let split_wave32 = self.opt.wave64 && self.opt.mesh_wave32;
+                let native_lanes = if !self.opt.wave64 || split_wave32 { 32 } else { 64 };
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let t = ms.threads;
-                let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
-                h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
+                if split_wave32 {
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    lane_id = WaveGetLaneIndex() + 32u * xcl_half;\n");
+                } else {
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                }
                 // thread index in the group as the console numbers it: wave · lanes + lane
                 let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
                 let _ = writeln!(h, "    uint xcl_rec = gid.x * {}u;", ms.record_dwords());

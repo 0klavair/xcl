@@ -467,6 +467,8 @@ pub struct Options {
     pub hw_wave: u32,
     /// geometry mode: emulate one logical wave64 with two native wave32 phases
     pub geometry_wave32: bool,
+    /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
+    pub mesh_wave32: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -481,7 +483,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1074,8 +1076,8 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Split geometry translation rejects these rather than
-/// silently changing cross-half lane or mask semantics.
+/// preserving one logical wave64. Split geometry and split mesh translation reject these
+/// rather than silently changing cross-half lane or mask semantics.
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
@@ -1167,6 +1169,18 @@ pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: 
         }
     }
     translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, ..Default::default() })
+}
+
+/// Translate an NGG mesh program; a wave64 program split into wave32 halves is refused
+/// when it needs cross-half semantics, as for split geometry.
+pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: bool) -> Result<Translation, String> {
+    if wave64 && mesh_wave32 {
+        let hazards = geometry_wave32_hazards(code);
+        if !hazards.is_empty() {
+            return Err(format!("mesh program requires unsupported cross-half wave64 semantics: {hazards:?}"));
+        }
+    }
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
