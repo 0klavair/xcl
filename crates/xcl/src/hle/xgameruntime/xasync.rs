@@ -418,8 +418,11 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
     if s.inner.lock().unwrap().done {
         return;
     }
+    // Cancellation is the provider's to do, as in libHttpClient's XAsyncCancel: one that
+    // supports it completes with E_ABORT (now or later), one that does not (XAsyncRun, XCL's
+    // own `begin_with`) runs to its normal end. Completing here would run the provider's
+    // cleanup while its DoWork may still be running.
     let _ = call_provider(&s, OP_CANCEL, b, std::ptr::null_mut(), 0);
-    XAsyncComplete(b, E_ABORT, 0);
 }
 
 pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRESULT {
@@ -600,6 +603,71 @@ mod tests {
             begin_with(&mut b, 1, || Err(crate::util::E_FAIL));
             assert_eq!(XAsyncGetStatus(&mut b, true), crate::util::E_FAIL);
             assert!(!active_map().lock().unwrap().contains_key(&(&mut b as *mut XAsyncBlock as usize)));
+        }
+    }
+
+    /// A provider that does nothing on Cancel: the operation goes on and completes normally.
+    unsafe extern "system" fn ignores_cancel(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
+        S_OK
+    }
+
+    /// A provider that supports Cancel by completing with E_ABORT.
+    unsafe extern "system" fn aborts_on_cancel(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+        if op == OP_CANCEL {
+            XAsyncComplete((*data).async_, E_ABORT, 0);
+        }
+        S_OK
+    }
+
+    #[test]
+    fn cancel_is_the_providers_to_do() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), ignores_cancel as usize), S_OK);
+            XAsyncCancel(&mut b);
+            assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
+            XAsyncComplete(&mut b, S_OK, 0);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), aborts_on_cancel as usize), S_OK);
+            XAsyncCancel(&mut b);
+            assert_eq!(XAsyncGetStatus(&mut b, false), E_ABORT);
+        }
+    }
+
+    /// XCL's own operations ignore Cancel: work already running finishes and its result is
+    /// read, instead of the payload being freed under it.
+    #[test]
+    fn cancel_lets_running_work_finish() {
+        use std::sync::atomic::AtomicBool;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            let (s, r) = (started.clone(), release.clone());
+            let work = move || {
+                s.store(true, Ordering::SeqCst);
+                while !r.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(b"done".to_vec())
+            };
+            assert_eq!(begin_with(&mut b, 9, work), S_OK);
+            while !started.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            XAsyncCancel(&mut b);
+            let pending = XAsyncGetStatus(&mut b, false);
+            release.store(true, Ordering::SeqCst);
+            assert_eq!(pending, E_PENDING);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut buf = [0u8; 4];
+            let mut used = 0usize;
+            assert_eq!(XAsyncGetResult(&mut b, 9 as _, 4, buf.as_mut_ptr() as _, &mut used), S_OK);
+            assert_eq!(&buf, b"done");
         }
     }
 
