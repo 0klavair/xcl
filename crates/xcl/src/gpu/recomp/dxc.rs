@@ -119,16 +119,36 @@ struct Job {
 /// and a title compiles hundreds at once – the machine must not run out of memory.
 pub const MAX_COMPILE_THREADS: usize = 6;
 
-/// Wait (up to a minute) while the system has less than 6 GB of commit left: a compile that
-/// would push it to the limit waits for the others to finish.
-pub fn wait_for_memory() {
+/// Compiles running on the DXC workers (`wait_for_memory` lets them in).
+static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A compile let in by `wait_for_memory`, until it is dropped.
+pub struct MemorySlot;
+
+impl Drop for MemorySlot {
+    fn drop(&mut self) {
+        WORKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Before a compile: with 6 GB of commit left or more, at once; with less, one compile at a
+/// time – it goes when no other is running (and after a minute in any case). Each compile used
+/// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
+/// left, and its last cold-cache shaders came a few a minute.
+pub fn wait_for_memory() -> MemorySlot {
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 6 << 30 || start.elapsed().as_secs() >= 60 {
-            return;
+        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 6 << 30;
+        if plenty || start.elapsed().as_secs() >= 60 {
+            WORKING.fetch_add(1, Ordering::AcqRel);
+            return MemorySlot;
+        }
+        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return MemorySlot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -148,7 +168,7 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
                     Ok(j) => j,
                     Err(_) => return,
                 };
-                wait_for_memory();
+                let _slot = wait_for_memory();
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
@@ -411,7 +431,10 @@ where
     if file.is_file() {
         let _ = std::fs::remove_file(&file);
     }
-    let b = compile_one()?;
+    let b = {
+        let _active = Compiling::start();
+        compile_one()
+    }?;
     if !valid_dxil_container(&b) {
         return Err("DXIL cache: compiler returned an invalid DXIL container".into());
     }
@@ -423,6 +446,32 @@ where
         }
     }
     Ok((b, false))
+}
+
+/// DXC compiles of programs the disk cache did not have: (running now, finished) – the XCL
+/// window shows them (`present::show_compiling`), whatever path the pipeline took (built in
+/// the background, or in the title's call when it could not get a stand-in).
+static COMPILES: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+struct Compiling;
+
+impl Compiling {
+    fn start() -> Compiling {
+        COMPILES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Compiling
+    }
+}
+
+impl Drop for Compiling {
+    fn drop(&mut self) {
+        COMPILES[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        COMPILES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// (DXC compiles running now, finished so far) – cache misses only.
+pub fn compile_counts() -> (usize, usize) {
+    (COMPILES[0].load(std::sync::atomic::Ordering::Relaxed), COMPILES[1].load(std::sync::atomic::Ordering::Relaxed))
 }
 
 thread_local! {

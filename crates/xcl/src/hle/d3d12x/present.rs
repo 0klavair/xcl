@@ -343,17 +343,30 @@ fn window_name() -> String {
 /// the XCL window's timer for `show_compiling`
 const COMPILE_TIMER: usize = 0x5C0;
 
-/// While pipelines are built in the background (`pso_async`: the title then draws nothing with
-/// them – a black screen after an XCL update recompiles thousands), the window's title says so:
-/// "XCL – <title> | compiling shaders: N left, M done". The plain title comes back when the
-/// queue is empty.
+/// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
+/// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
+/// thousands recompile), the window's title says so:
+/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
+/// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
+/// then the plain title comes back.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
-    let (built, failed, pending) = super::pso_async::counts();
+    static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
+    let (_, failed, queued) = super::pso_async::counts();
+    let (running, done) = crate::gpu::recomp::dxc::compile_counts();
+    let active = running > 0 || queued > 0;
+    let recent = {
+        let mut last = LAST_ACTIVE.lock().unwrap();
+        if active {
+            *last = Some(Instant::now());
+        }
+        last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+    };
     let title = window_name();
-    let text = if pending > 0 {
+    let text = if recent {
+        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
         let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("XCL – {title} | compiling shaders: {pending} left, {built} done{failed}")
+        format!("XCL – {title} | compiling shaders: {running} running, {done} done{queued}{failed}")
     } else {
         format!("XCL – {title}")
     };

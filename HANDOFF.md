@@ -1180,6 +1180,16 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
     (`eh::arm_current_thread`). This is how the controller path above was found without changing the game.
   - Open: small magenta / black "missing texture" quads on the loading screen's logo (a texture the game did not
     load – trace file opens next).
+- **Shader compilation in the XCL window's title; DXC with little commit left (2026-11-22)**: while DXC compiles
+  programs the disk cache does not have, the title reads "XCL – <game> | compiling shaders: N running, M done"
+  (`present::show_compiling`, `dxc::compile_counts`: every cache miss, built in the background or in the title's
+  call; it stays 2 s after the last one). XDefiant from an empty cache: ~1750 shaders in ~2 min 15 s. Before,
+  `dxc::wait_for_memory` held each compile up to a minute while less than 6 GB of commit was left, and with
+  XDefiant's own ~10 GB committed only ~4 GB were: its last ~160 shaders came a few a minute (it looked hung at
+  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). Open: after a cold-cache run
+  XDefiant's logo was missing and "Witaj" flickered even once the compiles were done; the next run (warm) is right.
+  Suspected, not checked: what the title recorded with a stand-in pipeline in a list it replays keeps drawing
+  nothing.
 - **The title's graphics memory in video memory (PR #40, 2026-11-22)**: XMem graphics allocations, physical pages,
   D3D12 buffer heaps and the console descriptor heaps live in the sparse windows 0..2 (`Uma::for_runtime`); window 3
   is 512 MB of coherent system RAM (XCL's arena pool, readback / write-back heaps). GPU writes reach the CPU's view
