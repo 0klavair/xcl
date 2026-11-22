@@ -121,6 +121,9 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// DXIL cache and compiler statistics.
+    #[serde(default)]
+    pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -299,6 +302,7 @@ pub fn stats() -> D3d12Stats {
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
+        dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
 }
 
@@ -3676,6 +3680,22 @@ pub fn stop_if_device_removed() {
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_report_tests {
+    use super::*;
+
+    #[test]
+    fn reports_without_dxil_cache_statistics_still_deserialize() {
+        let mut old = serde_json::to_value(D3d12Stats::default()).unwrap();
+        old.as_object_mut().unwrap().remove("dxil_cache");
+        let decoded: D3d12Stats = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            decoded.dxil_cache,
+            crate::gpu::recomp::dxc::CacheStats::default()
+        );
     }
 }
 

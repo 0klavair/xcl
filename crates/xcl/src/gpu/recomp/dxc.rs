@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
@@ -276,6 +277,68 @@ pub fn cache_dir() -> PathBuf {
     base.join("xcl").join("dxil")
 }
 
+/// DXIL cache statistics for this process.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CacheStats {
+    /// Initial cache hits, including cached-only requests.
+    pub hits: u64,
+    /// Initial misses, excluding cached-only requests.
+    pub misses: u64,
+    /// Misses filled by another caller; included in `misses`.
+    pub coalesced_hits: u64,
+    /// Cached-only misses; no compilation attempted.
+    pub deferred_misses: u64,
+    /// Compilation attempts, including failures.
+    pub compilations: u64,
+    pub compilation_failures: u64,
+    /// First 20 distinct compiler errors.
+    pub compilation_errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct CacheCounters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    coalesced_hits: AtomicU64,
+    deferred_misses: AtomicU64,
+    compilations: AtomicU64,
+    compilation_failures: AtomicU64,
+    compilation_errors: Mutex<Vec<String>>,
+}
+
+impl CacheCounters {
+    fn snapshot(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            coalesced_hits: self.coalesced_hits.load(Ordering::Relaxed),
+            deferred_misses: self.deferred_misses.load(Ordering::Relaxed),
+            compilations: self.compilations.load(Ordering::Relaxed),
+            compilation_failures: self.compilation_failures.load(Ordering::Relaxed),
+            compilation_errors: self.compilation_errors.lock().unwrap().clone(),
+        }
+    }
+
+    fn failure(&self, error: String) -> String {
+        self.compilation_failures.fetch_add(1, Ordering::Relaxed);
+        let mut errors = self.compilation_errors.lock().unwrap();
+        if errors.len() < 20 && !errors.contains(&error) {
+            errors.push(error.clone());
+        }
+        error
+    }
+}
+
+fn cache_counters() -> &'static CacheCounters {
+    static COUNTERS: OnceLock<CacheCounters> = OnceLock::new();
+    COUNTERS.get_or_init(CacheCounters::default)
+}
+
+pub fn cache_stats() -> CacheStats {
+    cache_counters().snapshot()
+}
+
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
@@ -407,23 +470,41 @@ fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, 
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
+    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
+}
+
+fn compile_cached_in_observed<F>(
+    dir: &Path,
+    src: &str,
+    entry: &str,
+    profile: &str,
+    counters: &CacheCounters,
+    compile_one: F,
+) -> Result<(Vec<u8>, bool), String>
+where
+    F: FnOnce() -> Result<Vec<u8>, String>,
+{
     let key = cache_key(src, entry, profile);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
+        counters.hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
     // before the locks: a cached-only attempt (non-blocking pipeline creation) must not wait
     // for a worker compiling the same shader
     if CACHED_ONLY.with(|c| c.get()) {
+        counters.deferred_misses.fetch_add(1, Ordering::Relaxed);
         MISSED.with(|m| m.set(true));
         return Err("DXIL not compiled yet".into());
     }
+    counters.misses.fetch_add(1, Ordering::Relaxed);
     let flight = cache_flight((dir.clone(), key));
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     let _process_guard = process_cache_lock(&file)?;
     // Another caller may have populated the cache while this one waited.
     if let Some(b) = cached_file(&file) {
+        counters.coalesced_hits.fetch_add(1, Ordering::Relaxed);
         return Ok((b, true));
     }
     // A corrupt target must be removed before the atomic rename on Windows;
@@ -431,13 +512,25 @@ where
     if file.is_file() {
         let _ = std::fs::remove_file(&file);
     }
+    counters.compilations.fetch_add(1, Ordering::Relaxed);
     let b = {
         let _active = Compiling::start();
         compile_one()
-    }?;
-    if !valid_dxil_container(&b) {
-        return Err("DXIL cache: compiler returned an invalid DXIL container".into());
     }
+    .and_then(|b| {
+        if valid_dxil_container(&b) {
+            Ok(b)
+        } else {
+            Err("DXIL cache: compiler returned an invalid DXIL container".into())
+        }
+    })
+    .map_err(|e| {
+        counters.failure(format!(
+            "DXIL cache {} ({profile}, entry {entry:?}, {} B HLSL): {e}",
+            file.display(),
+            src.len()
+        ))
+    })?;
     if std::fs::create_dir_all(&dir).is_ok() {
         // write to a temporary name first: another thread / process may be reading
         let tmp = file.with_extension(format!("tmp{}", std::process::id()));
@@ -516,6 +609,85 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn cache_statistics_separate_deferred_misses_failures_and_hits() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters = CacheCounters::default();
+        let src = "cache diagnostics";
+        let request = |compile_one: fn() -> Result<Vec<u8>, String>| {
+            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one)
+        };
+
+        let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
+        assert!(r.is_err() && missed);
+        assert_eq!(
+            counters.snapshot(),
+            CacheStats {
+                deferred_misses: 1,
+                ..Default::default()
+            }
+        );
+
+        let error = request(|| Err("synthetic DXC diagnostic\nline 2".into())).unwrap_err();
+        assert!(
+            error.contains(&format!("{:016x}.dxil", cache_key(src, "shade", "ps_6_6"))),
+            "{error}"
+        );
+        assert!(
+            error.contains("ps_6_6, entry \"shade\", 17 B HLSL"),
+            "{error}"
+        );
+        assert!(
+            error.ends_with("synthetic DXC diagnostic\nline 2"),
+            "{error}"
+        );
+        let invalid = request(|| Ok(b"invalid DXIL".to_vec())).unwrap_err();
+        assert!(invalid.contains("invalid DXIL container"), "{invalid}");
+
+        let (dxil, hit) = request(|| Ok(synthetic_dxil(6))).unwrap();
+        assert!(!hit);
+        assert_eq!(dxil, synthetic_dxil(6));
+        let (_, hit) = request(|| panic!("a cache hit must not compile")).unwrap();
+        assert!(hit);
+        let (r, missed) = cached_only(|| request(|| panic!("a cached-only hit must not compile")));
+        assert!(r.unwrap().1 && !missed);
+
+        assert_eq!(
+            counters.snapshot(),
+            CacheStats {
+                hits: 2,
+                misses: 3,
+                deferred_misses: 1,
+                compilations: 3,
+                compilation_failures: 2,
+                compilation_errors: vec![error, invalid],
+                ..Default::default()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compilation_error_samples_are_bounded_and_distinct() {
+        let counters = CacheCounters::default();
+        for _ in 0..25 {
+            counters.failure("same shader failed".into());
+        }
+        assert_eq!(
+            counters.snapshot().compilation_errors,
+            ["same shader failed"]
+        );
+        for k in 0..25 {
+            counters.failure(format!("another shader {k}"));
+        }
+        let stats = counters.snapshot();
+        assert_eq!(stats.compilation_failures, 50);
+        assert_eq!(stats.compilation_errors.len(), 20);
+        assert_eq!(stats.compilation_errors[0], "same shader failed");
+        assert_eq!(stats.compilation_errors[19], "another shader 18");
     }
 
     #[test]
@@ -621,11 +793,12 @@ mod cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let calls = AtomicUsize::new(0);
         let hits = AtomicUsize::new(0);
+        let counters = CacheCounters::default();
         std::thread::scope(|s| {
             let mut threads = Vec::new();
             for _ in 0..8 {
                 threads.push(s.spawn(|| {
-                    let (dxil, hit) = compile_cached_in_with(&dir, "same source", "main", "cs_6_6", || {
+                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &counters, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(25));
                         Ok(synthetic_dxil(4))
@@ -641,6 +814,13 @@ mod cache_tests {
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(hits.load(Ordering::SeqCst), 7);
+        let stats = counters.snapshot();
+        assert_eq!(stats.compilations, 1);
+        assert_eq!(stats.compilation_failures, 0);
+        assert_eq!(stats.hits + stats.coalesced_hits, 7);
+        assert_eq!(stats.misses, 1 + stats.coalesced_hits);
+        assert_eq!(stats.hits + stats.misses, 8);
+        assert_eq!(stats.deferred_misses, 0);
 
         // A cached-only attempt (non-blocking pipeline creation on the title's thread) does not
         // wait for a worker compiling the same shader: it misses at once.
