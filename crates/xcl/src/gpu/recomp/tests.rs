@@ -61,6 +61,34 @@ fn geometry_wave32_rejects_cross_half_operations() {
     let mut scalar = one("S_AND_B64", "ENC_SOP2", &[("SDST", 8), ("SSRC0", 126), ("SSRC1", 106)]);
     scalar.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
     assert!(super::geometry_wave32_hazards(&scalar).contains("branch on a half-local scalar condition"));
+
+    // a prefix count over EXEC, VCC or a v_cmp result in an SGPR pair; the lane index is fine
+    for mask in [126, 107, 10] {
+        let count = one("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", mask), ("SRC1", 128)]);
+        assert!(super::geometry_wave32_hazards(&count).contains("prefix count over a whole-wave mask"), "SRC0 {mask}");
+    }
+    let mut lane = one("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 193), ("SRC1", 128)]);
+    lane.extend(one("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 193), ("SRC1", V + 1)]));
+    assert!(super::geometry_wave32_hazards(&lane).is_empty());
+
+    // a v_cmp into s[0:1]: a mask, its 32-bit words too
+    let cmp = one("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 0), ("SRC0", 168), ("SRC1", V)]);
+    let mut reduce = cmp.clone();
+    reduce.extend(one("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 0)]));
+    assert!(super::geometry_wave32_hazards(&reduce).contains("whole-wave mask reduction"));
+    let mut reduce = one("S_FF1_I32_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 106)]);
+    reduce.extend(one("S_FLBIT_I32_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 127)]));
+    assert!(super::geometry_wave32_hazards(&reduce).contains("whole-wave mask reduction"));
+    let mut branch = cmp.clone();
+    branch.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]));
+    branch.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+    assert!(super::geometry_wave32_hazards(&branch).contains("branch on a half-local scalar condition"));
+    // the same scalar work on a non-mask SGPR stays accepted
+    let mut plain = one("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 4)]);
+    plain.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)]));
+    plain.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+    plain.extend(one("S_ENDPGM", "ENC_SOPP", &[]));
+    assert!(super::geometry_wave32_hazards(&plain).is_empty());
 }
 
 #[test]
@@ -2381,6 +2409,88 @@ fn gpu_geometry_mode_es_gs_strip() {
     }
     let covered = px.iter().filter(|p| p[0] == 1.0).count();
     assert!(covered > 20, "pass-through drew the GS output: {covered} pixels");
+}
+
+/// v_mbcnt over a v_cmp mask in a geometry program (the compaction index of an ES / GS):
+/// lanes 32..63 count the active lanes of 0..31 too. The split wave32 form only has its own
+/// half of a mask, so it must refuse the program; whatever translates must give the logical
+/// wave64 counts (the compute pass alone: no mesh shaders needed).
+#[test]
+fn gpu_geometry_wave32_prefix_count_over_a_mask() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    use super::{dxc, translate_geometry, GsInterface, IO_GS_PRIMS};
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, enc, f, lit).unwrap();
+    let mut es = Vec::new();
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)], None));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", V + 20)], None)); // lane
+    es.extend(e("V_AND_B32", "ENC_VOP2", &[("VDST", 21), ("SRC0", 131), ("VSRC1", 20)], None));
+    es.extend(e("V_CMP_NE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 21)], None)); // vcc = lane & 3 != 0
+    es.extend(e("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 168), ("SRC1", V + 20)], None)); // s[10:11] = lane < 40
+    // v22: below this lane in VCC, v23: in s[10:11], v24: in EXEC (= VCC; the others keep 0xFFFF)
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", 106), ("SRC1", 128)], None));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", 107), ("SRC1", V + 22)], None));
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", 10), ("SRC1", 128)], None));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", 11), ("SRC1", V + 23)], None));
+    es.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", 255)], Some(0xFFFF)));
+    es.extend(e("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 106)], None));
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 24), ("SRC0", 126), ("SRC1", 128)], None));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 24), ("SRC0", 127), ("SRC1", V + 24)], None));
+    es.extend(e("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 12)], None));
+    // s[8:9] + lane · 4: v22 at +0, v23 at +256, v24 at +512
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 25), ("SRC0", 130), ("VSRC1", 20)], None));
+    for (k, d) in [22u64, 23, 24].into_iter().enumerate() {
+        es.extend(e("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 25), ("DATA", d), ("SADDR", 8), ("OFFSET", 256 * k as u64)], None));
+    }
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None));
+    let mut gs = Vec::new();
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x3)], None)); // GS done, nothing emitted
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let g = GsInterface {
+        es_inputs: vec![],
+        es_outputs: vec![sig("SV_Position", 1, 0)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es;
+    code.extend_from_slice(&gs);
+
+    // what one wave64 computes
+    let below = |m: u64, l: usize| (m & ((1u64 << l) - 1)).count_ones();
+    let (vcc, s10) = ((0..64).filter(|l| l & 3 != 0).fold(0u64, |m, l| m | 1 << l), (1u64 << 40) - 1);
+    let want: Vec<[u32; 3]> = (0..64).map(|l| [below(vcc, l), below(s10, l), if vcc >> l & 1 == 1 { below(vcc, l) } else { 0xFFFF }]).collect();
+    let mut io = vec![0u32; 128];
+    io[8] = 0x400;
+    io[IO_GS_PRIMS] = 21;
+    let run = |t: &super::Translation| {
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "lanes (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    match translate_geometry(&code, g.clone(), true) {
+        Ok(t) => run(&t),
+        Err(err) => assert!(err.contains("prefix count over a whole-wave mask"), "{err}"),
+    }
+    // the native wave64 form keeps the program, and computes the reference where it can run
+    let native = translate_geometry(&code, g, false).unwrap();
+    if runner::wave64_supported() == Ok(true) {
+        run(&native);
+    }
 }
 
 /// A DS read whose destination overlaps its address register reads the address first
