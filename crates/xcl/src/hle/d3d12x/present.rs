@@ -219,7 +219,15 @@ pub fn known_queues() -> Vec<usize> {
     QUEUES.lock().unwrap().clone()
 }
 
+static EXECUTES: AtomicU64 = AtomicU64::new(0);
+
+/// (PresentX calls, ExecuteCommandLists calls) so far
+pub fn activity() -> (u64, u64) {
+    (PRESENTS.load(Ordering::Relaxed), EXECUTES.load(Ordering::Relaxed))
+}
+
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
+    EXECUTES.fetch_add(1, Ordering::Relaxed);
     {
         let mut q = QUEUES.lock().unwrap();
         if !q.contains(&(queue as usize)) {

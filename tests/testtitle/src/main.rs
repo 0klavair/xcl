@@ -261,7 +261,9 @@ fn main() {
     check("xmem: working-set statistics, physical pages mapped and freed", || unsafe {
         let mut ws = [u64::MAX; 15];
         ensure!(XMemGetWorkingSetStatistics(0x1000_0001, ws.as_mut_ptr()) != 0, "XMemGetWorkingSetStatistics");
-        ensure!(ws[0] >= 8 << 30 && ws[1] > 0 && ws[1] <= ws[0] && ws[2..].iter().all(|&x| x == 0), "limit / used {:#x} / {:#x}", ws[0], ws[1]);
+        // only the limit and the use are written: the structure's size differs between GDK
+        // versions (an older one has less room than this buffer)
+        ensure!(ws[0] >= 8 << 30 && ws[1] > 0 && ws[1] <= ws[0] && ws[2..].iter().all(|&x| x == u64::MAX), "limit / used {:#x} / {:#x}", ws[0], ws[1]);
         let (mut n, mut pages) = (4usize, [0u64; 4]);
         ensure!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()) != 0 && n == 4, "XMemAllocatePhysicalPages");
         let p = XMemMapPhysicalPages(std::ptr::null_mut(), 4, pages.as_mut_ptr()) as *mut u32;

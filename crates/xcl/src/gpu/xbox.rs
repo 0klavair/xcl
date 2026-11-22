@@ -286,7 +286,12 @@ fn analyze_fssm(f: &mut Fssm) {
             let (off, len) = (off as usize, len as usize);
             let start = off.wrapping_add(0x10);
             if off < d.len() && len > 0 && start % 4 == 0 && start.checked_add(len).is_some_and(|e| e <= d.len()) {
-                let has_end = d[start..start + len].chunks_exact(4).any(|w| u32::from_le_bytes(w.try_into().unwrap()) == S_ENDPGM);
+                // a program ends with s_endpgm – or, an ES merged with its GS, with the
+                // s_setpc_b64 into the GS code (older kits: Fortnite)
+                let has_end = d[start..start + len].chunks_exact(4).any(|w| {
+                    let w = u32::from_le_bytes(w.try_into().unwrap());
+                    w == S_ENDPGM || is_setpc(w)
+                });
                 if has_end {
                     f.code = Some((start, len));
                     f.code_from_header = true;
@@ -394,6 +399,11 @@ pub fn is_data_block(seg: &[u8]) -> bool {
     bad * 4 >= words.max(1)
 }
 
+/// `s_setpc_b64 s[n:n+1]` (SOP1 op 0x20)
+fn is_setpc(w: u32) -> bool {
+    w & 0xFFFF_FF00 == 0xBE80_2000
+}
+
 /// Fallback when the header's code pointer does not check out: the code region ends
 /// with the last s_endpgm and starts after the metadata in front of the first one
 /// (walking back to 0xDEADBEEF filler or a run of zero dwords).
@@ -463,6 +473,11 @@ pub fn split_segments(code: &[u8]) -> Vec<Segment> {
                 Ok(d) => {
                     off += d.len;
                     if d.inst.flags & rdna2::F_TERMINATOR != 0 && word(off - d.len) == S_ENDPGM {
+                        ended = true;
+                        break;
+                    }
+                    // an ES that continues into its GS: the jump, then only padding
+                    if is_setpc(word(off - d.len)) && (off..code.len()).step_by(4).all(|o| o + 4 > code.len() || matches!(word(o), S_CODE_END | 0)) {
                         ended = true;
                         break;
                     }
@@ -804,5 +819,24 @@ pub(crate) mod tests {
         let mut st = InstStats::default();
         st.add_code(&code[8..24]);
         assert_eq!((st.instructions, st.undecoded), (3, 1));
+    }
+}
+
+#[cfg(test)]
+mod merged_es_tests {
+    use super::*;
+
+    /// An ES merged with its GS ends with the jump into the GS code, not s_endpgm: one
+    /// segment up to the jump, the padding after it left out.
+    #[test]
+    fn es_ending_in_setpc_is_a_program() {
+        let mut code: Vec<u8> = Vec::new();
+        for w in [0xBF8A_0000u32 /* s_barrier */, 0xBE80_2020 /* s_setpc_b64 s[32:33] */, S_CODE_END, S_CODE_END] {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+        let segs = split_segments(&code);
+        assert_eq!(segs.len(), 1);
+        assert_eq!((segs[0].offset, segs[0].len), (0, 8));
+        assert!(is_setpc(0xBE80_2020) && !is_setpc(S_ENDPGM));
     }
 }

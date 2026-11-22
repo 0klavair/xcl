@@ -219,11 +219,23 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     if ex.rva != 0 && ex.size != 0 {
         crate::eh::register_function_table(base, ex.rva, ex.size);
     }
+    // 8. stack-cookie failures reported before the process ends
+    for s in pe.sections.iter().filter(|s| s.characteristics & 0x2000_0000 != 0) {
+        let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
+        unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
+    }
     Ok(module)
 }
 
 unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
-    crate::tls::install(&m.name, template, len, total, index_ptr, &cache_dir()).map(|_| ())
+    let k = crate::tls::install(&m.name, template, len, total, index_ptr, &cache_dir())?;
+    // the title's executable: slot 0, as a process's executable has it
+    if !m.is_dll {
+        if let Err(e) = crate::tls::take_slot_zero(&m.name, index_ptr, k) {
+            crate::xlog_warn!("TLS: {} keeps slot {k} ({e}) – code built with /GA reads slot 0", m.name);
+        }
+    }
+    Ok(())
 }
 
 unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
@@ -369,6 +381,7 @@ pub fn on_tls_event(reason: u32) {
             }
         },
         3 => unsafe {
+            crate::tls::on_thread_detach();
             if !READY.load(Ordering::Acquire) {
                 return;
             }

@@ -830,6 +830,13 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
+    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(va as usize)) {
+        static S: AtomicU64 = AtomicU64::new(0);
+        let k = S.fetch_add(1, Ordering::Relaxed);
+        if k < 4 || k.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: {what} #{k} into a sparse window ({va:#x}): the CPU's view does not see it");
+        }
+    }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);

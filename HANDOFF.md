@@ -1141,6 +1141,48 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `sparse::mapped_ranges`). Use the release build for game runs: the debug build hashes the dirty chunks ~10×
   slower (and the queues then wait on each other for the sparse lock). The log has
   "sparse windows timing: write-watch / lock wait / chunk scan / upload" lines.
+- **Fortnite (XSX 2.0.1461.7919, an older GDK than XDefiant's) now (2026-11-22, later)**: loads (~60 s, its own
+  UE log in `[debug]` lines), hides its loading screen and shows the splash screen ("press to start") at ~50 fps –
+  2 850 draws and 4 700 dispatches every 2 s, all translated – but the image is one solid blue (0xed242424): the UI's
+  background without its text and images. A (GameInput) closes the splash and starts the login: it stops at once at
+  the console-privileges step (Xbox Live), shows its error box – a white rectangle, again without text. The login
+  is an Xbox Live sign-in (XCL does none), so that is as far as the title goes. Next for the image: why UI text and
+  images draw nothing (the title textures are not refused – only 1x1 / 3D defaults lack an XG layout). Note: the
+  title talks to Epic's services over WinHTTP from the start (MCP "Connected") – the network is the PC's.
+- Before that: the garbage collector ended the game at ~41 s – 3 639 textures waited for one render command fence
+  (all `IsReadyForFinishDestroy` false, `ReleaseFence` not complete) because the render thread spent its time in
+  CreatePlacedResourceX: every title texture was read, detiled and uploaded with a GPU wait as it was made. Now the
+  first upload is deferred to the title's next submit and all uploads go in batches (one list, one wait each,
+  256 MB of staging at most: `title_textures::upload_all`, `texture::upload_batch`); XCL's own submits do not
+  refresh (they read no title memory), and write-watch ranges closer than 1 MiB are scanned as one.
+  Fixed on the way (all general):
+  - **Run from `<Game>/Binaries/XSX/*.exe`**: the package root is the folder above whose MicrosoftGame.config
+    names the exe (`launcher::config_root`) – D: and the title's relative paths start there.
+  - **XMemGetWorkingSetStatistics wrote 0x78 bytes**: the structure differs between GDK versions; EOSSDK (older)
+    has ≤ 0x50 bytes before its stack cookie – its DllMain static initializer failed the cookie check
+    (0xC0000409). Only +0 limit / +8 used are written now.
+  - **TLS slot 0**: the process's executable has TLS slot 0 on Windows and code built with /GA reads
+    `ThreadLocalStoragePointer[0]` without `_tls_index` (Fortnite: the guard of its thread-safe statics – its
+    allocator GMalloc was never created). The title's executable now takes slot 0 and xcl.exe's own TLS moves to
+    the carrier's slot (all 78 TLS accesses in xcl.exe go through `_tls_index`): `tls::take_slot_zero` (running
+    threads get xcl's block in both slots first, then the title's in slot 0; new threads exchange in xcl's TLS
+    callback before anything reads TLS; TEBs come back, so the list is kept until thread exit).
+  - **Command queue #23 SignalX(fence, value, flags)** was a stub: the render fences never completed.
+  - **CreateHeap / CreatePlacedResource (#29)** with console values (heap flag 0x2, buffer flags 0x20004 and layout
+    1): refused by the PC – retried the PC's way (known heap flags 0x3FED, PC alignments, `pc_resource_desc`,
+    console state bits dropped); UE took the refusal for a lost device.
+  - **VS + GS of an older kit**: the VS container's ES variant ends with `s_setpc_b64` into the GS (merged ES+GS),
+    not `s_endpgm` – the FSSM parser found no program. Both the header check and the segment split take that end
+    now (`xbox::is_setpc`); the translator already continued ES into GS at the jump.
+  - **Ending a run hung the GPU** (AMD driver dialog, Fortnite under load): `end_title` set every title fence to its
+    maximum while the title ran on – UE then reset command allocators the GPU still ran. The title's threads are
+    suspended first now (a watchdog ends the process after 15 s if anything blocks).
+  Diagnostics added: stack-cookie failures are reported with the function (`eh::hook_gs_failure` – both the PC's
+  and the console's `bnd`-prefixed `__security_check_cookie`), the UCRT invalid-parameter handler logs its caller,
+  first-chance C++ exceptions thrown by title code (type, what(), stack), THREADNAME_INFO (0x406D1388) names
+  threads, `XCL_THREAD_DUMP_AT=s1,…` (every thread unwound with the unwind data), `XCL_ACTIVITY=1` (every 2 s:
+  presents, submits, draws, dispatches, frame-event waits, frame statistics), GPU value writes into sparse windows
+  logged (the CPU's view does not see them – not what stops Fortnite).
 - **Controllers** (`hle::gameinput`): GameInput.dll was Windows' own (other interfaces, reads only for its own
   foreground app) – the title never saw a button. Now XCL's: the GDK's v0 interfaces (IGameInput, IGameInputDevice,
   IGameInputReading in the public header's order), one gamepad always connected, read from the PC's first XInput

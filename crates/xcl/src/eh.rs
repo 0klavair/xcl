@@ -112,6 +112,163 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
 pub fn install_crash_handler() {
     unsafe {
         SetUnhandledExceptionFilter(Some(unhandled_filter));
+        install_invalid_parameter_handler();
+        windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler(0, Some(cpp_exception_logger));
+    }
+}
+
+/// MSVC's x64 `__security_check_cookie` (vcruntime): `cmp rcx, [__security_cookie]; jne fail;
+/// rol rcx, 16; test cx, 0xFFFF; jne restore; ret; restore: ror rcx, 16; fail: jmp
+/// __report_gsfailure` – fixed but for the cookie's address (`None`) and the jump. The
+/// console's vcruntime has `bnd` prefixes (F2) on the branches and the return.
+const GS_CHECKS: [&[Option<u8>]; 2] = [
+    &[Some(0x48), Some(0x3B), Some(0x0D), None, None, None, None, Some(0x75), Some(0x10), Some(0x48), Some(0xC1), Some(0xC1), Some(0x10), Some(0x66), Some(0xF7), Some(0xC1), Some(0xFF), Some(0xFF), Some(0x75), Some(0x01), Some(0xC3), Some(0x48), Some(0xC1), Some(0xC9), Some(0x10), Some(0xE9)],
+    &[
+        Some(0x48), Some(0x3B), Some(0x0D), None, None, None, None, Some(0xF2), Some(0x75), Some(0x12), Some(0x48), Some(0xC1), Some(0xC1), Some(0x10), Some(0x66), Some(0xF7), Some(0xC1), Some(0xFF), Some(0xFF), Some(0xF2), Some(0x75), Some(0x02),
+        Some(0xF2), Some(0xC3), Some(0x48), Some(0xC1), Some(0xC9), Some(0x10), Some(0xE9),
+    ],
+];
+
+/// The offset of `__security_check_cookie`'s jump to `__report_gsfailure` (E9 rel32) in
+/// `code` (None: not there).
+pub fn find_gs_check(code: &[u8]) -> Option<usize> {
+    for p in GS_CHECKS {
+        if code.len() < p.len() + 4 {
+            continue;
+        }
+        if let Some(i) = (0..code.len() - p.len() - 4).find(|&i| code[i] == 0x48 && p.iter().enumerate().all(|(k, b)| b.map_or(true, |b| code[i + k] == b))) {
+            return Some(i + p.len() - 1);
+        }
+    }
+    None
+}
+
+/// Executable memory `[at, at + len)` of a title image: its `__report_gsfailure` (the target of
+/// `__security_check_cookie`'s failure jump) is redirected to a report that names the
+/// function whose stack cookie did not match (the return address on the stack), then ends
+/// the process with the same code (0xC0000409) – a stack-cookie failure is a `__fastfail`,
+/// which no exception filter sees, and often means a function of XCL's wrote more into a
+/// title's buffer than the title expects.
+pub unsafe fn hook_gs_failure(at: usize, len: usize, image: &str) {
+    use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+    let code = std::slice::from_raw_parts(at as *const u8, len);
+    let Some(i) = find_gs_check(code) else { return };
+    let jmp = at + i;
+    let rel = (jmp as *const u8).add(1).cast::<i32>().read_unaligned();
+    let target = (jmp as isize + 5 + rel as isize) as usize;
+    // thunk: rdx = [rsp] (the checked function's return address), then the report
+    let t = crate::stubs::alloc_code(32);
+    let mut c: Vec<u8> = vec![0x48, 0x8B, 0x14, 0x24, 0x48, 0xB8];
+    c.extend_from_slice(&(gs_failure as usize).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xE0]);
+    std::ptr::copy_nonoverlapping(c.as_ptr(), t, c.len());
+    // __report_gsfailure: mov rax, thunk; jmp rax
+    let mut j: Vec<u8> = vec![0x48, 0xB8];
+    j.extend_from_slice(&(t as usize).to_le_bytes());
+    j.extend_from_slice(&[0xFF, 0xE0]);
+    let mut old = 0u32;
+    if VirtualProtect(target as *const std::ffi::c_void, j.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        return;
+    }
+    std::ptr::copy_nonoverlapping(j.as_ptr(), target as *mut u8, j.len());
+    VirtualProtect(target as *const std::ffi::c_void, j.len(), old, &mut old);
+    crate::xlog_info!("{image}: stack-cookie failures are reported (__report_gsfailure at {target:#x})");
+}
+
+unsafe extern "system" fn gs_failure(cookie: usize, ret: usize) {
+    let here = 0usize;
+    crate::xlog_error!(
+        "stack cookie check failed (cookie {cookie:#x}) in the function returning to {} – its stack frame was overwritten; on the stack: {}",
+        modules::describe_address(ret),
+        stack_callers(&here as *const usize as usize)
+    );
+    crate::log::flush();
+    windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), 0xC000_0409);
+}
+
+/// First-chance C++ exceptions (0xE06D7363), the first 16: type, what() and where they were
+/// thrown. One nobody catches ends the process through std::terminate → abort → __fastfail
+/// (0xC0000409), which leaves no other trace (a static initializer in a title DLL's DllMain).
+unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
+    const CPP: i32 = 0xE06D_7363_u32 as i32;
+    const THREAD_NAME: i32 = 0x406D_1388;
+    let rec = &*(*info).ExceptionRecord;
+    // the debugger's thread-name exception (THREADNAME_INFO: 0x1000, name, thread id, flags):
+    // the name goes to SetThreadDescription, where tools – and XCL's thread dump – see it
+    if rec.ExceptionCode == THREAD_NAME && rec.NumberParameters >= 3 && rec.ExceptionInformation[0] == 0x1000 {
+        let (name, tid) = (rec.ExceptionInformation[1], rec.ExceptionInformation[2] as u32);
+        if name != 0 && crate::gpu::shader::readable(name, 1) {
+            let n: Vec<u16> = std::ffi::CStr::from_ptr(name as *const std::ffi::c_char).to_string_lossy().encode_utf16().chain([0]).collect();
+            name_thread(tid, &n);
+        }
+        return 0;
+    }
+    if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
+        return 0;
+    }
+    // thrown by the title's code (its image holds the throw info), not by XCL's libraries
+    if !crate::modules::mapped_modules().iter().any(|m| m.base == rec.ExceptionInformation[3]) {
+        return 0;
+    }
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 16 {
+        return 0;
+    }
+    let (object, throw_info, base) = (rec.ExceptionInformation[1], rec.ExceptionInformation[2], rec.ExceptionInformation[3]);
+    let rd32 = |a: usize| if crate::gpu::shader::readable(a, 4) { (a as *const i32).read_unaligned() } else { 0 };
+    // ThrowInfo { attributes, unwind, forward compat, catchable type array } (image-relative)
+    let mut name = String::from("?");
+    if throw_info != 0 && base != 0 {
+        let cta = rd32(throw_info + 12);
+        if cta > 0 {
+            let first = rd32(base + cta as usize + 4);
+            if first > 0 {
+                let td = rd32(base + first as usize + 4);
+                if td > 0 {
+                    let p = base + td as usize + 16;
+                    if crate::gpu::shader::readable(p, 64) {
+                        name = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+    }
+    // std::exception { vfptr, const char* what, … }
+    let mut what = String::new();
+    if object != 0 && crate::gpu::shader::readable(object + 8, 8) {
+        let s = (object as *const usize).add(1).read_unaligned();
+        if s != 0 && crate::gpu::shader::readable(s, 1) {
+            what = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char).to_string_lossy().chars().take(200).collect();
+        }
+    }
+    let ctx = &*(*info).ContextRecord;
+    crate::xlog_warn!("C++ exception {name} \"{what}\" thrown; on the stack: {}", stack_callers(ctx.Rsp as usize));
+    0
+}
+
+/// The UCRT's invalid-parameter handler for the whole process (titles and their DLLs share the
+/// host's ucrtbase.dll): without one a CRT function given a bad argument ends the process with
+/// `__fastfail` (0xC0000409), which no exception filter sees – the log then just stops. With
+/// it the call is logged with the code that made it; functions that can return an error then
+/// return EINVAL, the `_noreturn` ones still end the process.
+unsafe fn install_invalid_parameter_handler() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    let h = GetModuleHandleA(b"ucrtbase.dll\0".as_ptr());
+    if h.is_null() {
+        return;
+    }
+    let Some(set) = GetProcAddress(h, b"_set_invalid_parameter_handler\0".as_ptr()) else { return };
+    type Handler = unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize);
+    let set: unsafe extern "C" fn(Option<Handler>) -> Option<Handler> = std::mem::transmute(set);
+    set(Some(invalid_parameter));
+}
+
+unsafe extern "C" fn invalid_parameter(_expr: *const u16, _function: *const u16, _file: *const u16, _line: u32, _reserved: usize) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 16 {
+        let here = 0usize;
+        let callers = stack_callers(&here as *const usize as usize);
+        crate::xlog_warn!("CRT: invalid parameter (the CRT would end the process with 0xC0000409); called from: {callers}");
     }
 }
 
@@ -134,6 +291,117 @@ unsafe fn stack_callers(rsp: usize) -> String {
         }
     }
     callers.join(", ")
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetThreadDescription(thread: *mut std::ffi::c_void, description: *mut *mut u16) -> i32;
+    fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+/// A thread's description (SetThreadDescription – engines name their threads).
+unsafe fn thread_name(h: *mut std::ffi::c_void) -> String {
+    let mut p: *mut u16 = std::ptr::null_mut();
+    if GetThreadDescription(h, &mut p) < 0 || p.is_null() {
+        return String::new();
+    }
+    let n = (0..256).take_while(|&i| *p.add(i) != 0).count();
+    let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+    LocalFree(p as *mut _);
+    s
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetThreadDescription(thread: *mut std::ffi::c_void, description: *const u16) -> i32;
+}
+
+/// Thread `tid` (u32::MAX: the current one) is called `name` (UTF-16, terminated).
+unsafe fn name_thread(tid: u32, name: &[u16]) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThread, THREAD_SET_LIMITED_INFORMATION};
+    if tid == u32::MAX || tid == windows_sys::Win32::System::Threading::GetCurrentThreadId() {
+        SetThreadDescription(GetCurrentThread(), name.as_ptr());
+        return;
+    }
+    let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, tid);
+    if !h.is_null() {
+        SetThreadDescription(h, name.as_ptr());
+        CloseHandle(h);
+    }
+}
+
+/// The return addresses of the frames from `ctx` on (its RIP first), unwound with the
+/// functions' unwind data (registered for the title's images too); up to `n`.
+unsafe fn unwind(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, n: usize) -> Vec<usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{RtlLookupFunctionEntry, RtlVirtualUnwind, UNW_FLAG_NHANDLER};
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let rip = ctx.Rip;
+        if rip == 0 {
+            break;
+        }
+        out.push(rip as usize);
+        let mut base = 0u64;
+        let f = RtlLookupFunctionEntry(rip, &mut base, std::ptr::null_mut());
+        if f.is_null() {
+            // a leaf function: the return address is at RSP
+            if !crate::gpu::shader::readable(ctx.Rsp as usize, 8) {
+                break;
+            }
+            ctx.Rip = (ctx.Rsp as *const u64).read_unaligned();
+            ctx.Rsp += 8;
+        } else {
+            let mut data = std::ptr::null_mut();
+            let mut frame = 0u64;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, rip, f, ctx, &mut data, &mut frame, std::ptr::null_mut());
+        }
+    }
+    out
+}
+
+/// `XCL_THREAD_DUMP_AT`: every other thread of the process stopped for a moment – where it is
+/// (RIP) and the calls on its stack that lead there, in the log.
+pub fn dump_threads() {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME};
+    unsafe {
+        let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut lines = Vec::new();
+        let mut te: THREADENTRY32 = std::mem::zeroed();
+        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut ok = Thread32First(snap, &mut te) != 0;
+        while ok {
+            if te.th32OwnerProcessID == pid && te.th32ThreadID != me {
+                let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
+                if !h.is_null() {
+                    if SuspendThread(h) != u32::MAX {
+                        // CONTEXT must be 16-byte aligned
+                        let mut buf = vec![0u8; std::mem::size_of::<CONTEXT>() + 16];
+                        let ctx = ((buf.as_mut_ptr() as usize + 15) & !15) as *mut CONTEXT;
+                        (*ctx).ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+                        if GetThreadContext(h, ctx) != 0 {
+                            let frames: Vec<String> = unwind(&mut *ctx, 14).into_iter().map(modules::describe_address).collect();
+                            lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
+                        }
+                        ResumeThread(h);
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Thread32Next(snap, &mut te) != 0;
+        }
+        CloseHandle(snap);
+        crate::xlog_info!("thread dump ({} threads):
+{}", lines.len(), lines.join("
+"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -217,4 +485,18 @@ pub fn watch_writes(addr: usize) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_both_cookie_checks() {
+        let pc = [0x48, 0x3B, 0x0D, 1, 2, 3, 4, 0x75, 0x10, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0x75, 0x01, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0, 0, 0, 0, 0xCC];
+        assert_eq!(find_gs_check(&pc), Some(25));
+        let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
+        assert_eq!(find_gs_check(&console), Some(29));
+        assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
 }

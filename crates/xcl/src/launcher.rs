@@ -155,6 +155,21 @@ fn sanitize(s: &str) -> String {
     }
 }
 
+/// The package folder of `exe`: the nearest folder above it (up to 4 levels) whose
+/// MicrosoftGame.config names it – Unreal titles keep theirs in `<Game>/Binaries/XSX`, and the
+/// package root is what the title's paths (and its D: drive) start from.
+fn config_root(exe: &Path) -> Option<PathBuf> {
+    let mut dir = exe.parent()?;
+    for _ in 0..5 {
+        let (exes, _) = read_game_config(dir);
+        if exes.iter().any(|e| std::fs::canonicalize(dir.join(e)).ok().is_some_and(|p| PathBuf::from(p.to_string_lossy().trim_start_matches("\\\\?\\")) == exe)) {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
 pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), String> {
     let target = std::fs::canonicalize(target).map_err(|e| format!("{}: {e}", target.display()))?;
     let target = PathBuf::from(target.to_string_lossy().trim_start_matches("\\\\?\\"));
@@ -164,7 +179,7 @@ pub fn resolve_target(target: &Path) -> Result<(PathBuf, PathBuf, String), Strin
         if is_xcl_copy(&target) {
             return Err(format!("{} is XCL itself, not a game – give the game exe or folder", target.display()));
         }
-        (target.parent().ok_or("no parent folder")?.to_path_buf(), target.clone())
+        (config_root(&target).unwrap_or(target.parent().ok_or("no parent folder")?.to_path_buf()), target.clone())
     };
     let (_, identity) = read_game_config(&root);
     let title = sanitize(&identity.unwrap_or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));

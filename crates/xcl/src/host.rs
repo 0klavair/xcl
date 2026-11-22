@@ -29,6 +29,42 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
+    if std::env::var_os("XCL_ACTIVITY").is_some() {
+        let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
+            let snap = || {
+                let (p, e) = crate::hle::d3d12x::present::activity();
+                let (d, x) = crate::hle::d3d12x::bind::activity();
+                let f = crate::hle::d3d12x::frame::activity();
+                [p, e, d, x, f[0], f[1], f[2], f[3]]
+            };
+            let mut last = snap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let now = snap();
+                let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
+                crate::xlog_info!(
+                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped)",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+                );
+                last = now;
+            }
+        });
+    }
+    // `XCL_THREAD_DUMP_AT=s1,s2…`: where every thread is at those seconds (a stalled title)
+    if let Ok(v) = std::env::var("XCL_THREAD_DUMP_AT") {
+        let at: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        let _ = std::thread::Builder::new().name("xcl-thread-dump".into()).spawn(move || {
+            let t0 = std::time::Instant::now();
+            for s in at {
+                let left = s - t0.elapsed().as_secs_f64();
+                if left > 0.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(left));
+                }
+                crate::eh::dump_threads();
+            }
+        });
+    }
     // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
     // report written (a process killed from outside with GPU work in flight can hang in the driver)
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {

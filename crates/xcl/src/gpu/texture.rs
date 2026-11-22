@@ -190,6 +190,42 @@ fn validate_subresource_count(rd: &D3D12_RESOURCE_DESC, count: usize) -> Result<
 /// Copy `subs` (all subresources, D3D12 order) into `res` on `queue` and wait; `res` is in
 /// `before` and ends in `after` (e.g. again after the title rewrote the memory).
 pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<(), String> {
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let staging = record_upload(dev, &list, res, subs, before, after)?;
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    let r = wait(dev, queue);
+    drop(staging);
+    r
+}
+
+/// Several uploads on one list, one wait: (resource, subresources, before, after) each. A
+/// failure of one is returned with its index; the others still run.
+pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)]) -> Result<Vec<(usize, String)>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let mut staging = Vec::with_capacity(items.len());
+    let mut failed = Vec::new();
+    for (k, (res, subs, before, after)) in items.iter().enumerate() {
+        match record_upload(dev, &list, res, subs, *before, *after) {
+            Ok(s) => staging.push(s),
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    wait(dev, queue)?;
+    drop(staging);
+    Ok(failed)
+}
+
+/// Record the copy of `subs` into `res` on `list` (barriers from `before` and back to `after`);
+/// the staging buffer returned must live until the list has run.
+pub unsafe fn record_upload(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> Result<ID3D12Resource, String> {
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
@@ -223,8 +259,6 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
         }
     }
     up.Unmap(0, None);
-    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
-    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
     if before != D3D12_RESOURCE_STATE_COPY_DEST {
         list.ResourceBarrier(&[transition(res, before, D3D12_RESOURCE_STATE_COPY_DEST)]);
     }
@@ -240,9 +274,7 @@ pub unsafe fn upload(dev: &ID3D12Device, queue: &ID3D12CommandQueue, res: &ID3D1
     if after != D3D12_RESOURCE_STATE_COPY_DEST {
         list.ResourceBarrier(&[transition(res, D3D12_RESOURCE_STATE_COPY_DEST, after)]);
     }
-    list.Close().map_err(err)?;
-    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
-    wait(dev, queue)
+    Ok(up)
 }
 
 /// Wait until `queue` has run everything submitted so far.

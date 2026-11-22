@@ -651,6 +651,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (0, dev_qi_x as usize),
                 (8, x::create_command_queue_x as usize),
                 (25, x::get_resource_allocation_info_x as usize),
+                (29, dev_create_placed_resource_x as usize),
                 // CreateCommittedResource at its PC index too (XDefiant): console code uses the
                 // buffer's GPU address as a CPU pointer – it goes into unified memory
                 (27, dev_create_committed_resource_x as usize),
@@ -693,7 +694,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
-        Kind::CommandQueue => vec![(30, super::present::present_x as usize)],
+        Kind::CommandQueue => vec![(23, q_signal_x as usize), (30, super::present::present_x as usize)],
         Kind::DmaList => {
             use super::list_x as l;
             vec![(9, l::dma_close_x as usize), (10, l::reset_x as usize), (11, l::copy_buffer_region_x as usize), (12, l::copy_texture_region_x as usize), (13, l::copy_resource_x as usize)]
@@ -1715,10 +1716,71 @@ creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resourc
 creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
 creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
 creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+
+/// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
+const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
+
+/// device #29 CreatePlacedResource(heap, offset, desc, state, clear, riid, resource) for console
+/// code: a description the PC refuses (console layouts and flags – Fortnite's buffer in a
+/// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
+/// bits dropped). Logged with the console's values.
+pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_placed_resource(this, heap, offset, desc, state, clear, riid, ppv);
+    if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
+        return hr;
+    }
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let d = super::device_x::pc_resource_desc(&x);
+    let st = state as u32 & PC_RESOURCE_STATES;
+    let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        crate::xlog_info!(
+            "D3D12.X: CreatePlacedResource(dimension {}, {}x{}, format {}, layout {:#x}, flags {:#x}, state {state:#x}) at {offset:#x} refused ({hr:#x}); the PC's way: {hr2:#x}",
+            u(0), u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x2C), u(0x30)
+        );
+    }
+    hr2
+}
 creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
 creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
 creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
-creator!(dev_create_heap, "CreateHeap", Kind::Heap, [a1]);
+creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
+
+/// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
+/// SHARED_CROSS_ADAPTER 0x20, DENY_RT_DS_TEXTURES 0x40, DENY_NON_RT_DS_TEXTURES 0x80, then
+/// 0x100 … 0x2000 (HARDWARE_PROTECTED … TOOLS_USE_MANUAL_WRITE_TRACKING); 0x2 and 0x10 are
+/// the console's (Fortnite: 0xC2)
+const PC_HEAP_FLAGS: u32 = 0x3FED;
+
+/// CreateHeap(desc, riid, heap): a console description the PC refuses (console flags in the
+/// high bits, alignments other than 64 KiB / 4 MiB, console heap types – Fortnite's distance
+/// field atlas heap) is made the PC's way: known flags only, the alignment the PC has that
+/// covers it, an unknown type as DEFAULT. Logged with the console's values.
+pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let hr = dev_create_heap_pc(this, desc, riid, ppv);
+    if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_HEAP_DESC>()) {
+        return hr;
+    }
+    let mut d: D3D12_HEAP_DESC = std::ptr::read_unaligned(desc as *const D3D12_HEAP_DESC);
+    let orig = (d.SizeInBytes, d.Properties.Type.0, d.Alignment, d.Flags.0);
+    d.Flags = D3D12_HEAP_FLAGS(d.Flags.0 & PC_HEAP_FLAGS as i32);
+    d.Alignment = if d.Alignment <= 0x1_0000 { 0 } else { D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT as u64 };
+    if !(1..=5).contains(&d.Properties.Type.0) {
+        d.Properties = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    }
+    d.SizeInBytes = d.SizeInBytes.div_ceil(0x1_0000) * 0x1_0000;
+    let hr2 = dev_create_heap_pc(this, &d as *const _ as usize, riid, ppv);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!(
+            "D3D12.X: CreateHeap({:#x} bytes, type {}, alignment {:#x}, flags {:#x}) refused ({hr:#x}); as type {}, alignment {:#x}, flags {:#x}: {hr2:#x}",
+            orig.0, orig.1, orig.2, orig.3, d.Properties.Type.0, d.Alignment, d.Flags.0
+        );
+    }
+    hr2
+}
 creator!(dev_create_heap1, "CreateHeap1", Kind::Heap, [a1, a2]);
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
@@ -1741,6 +1803,20 @@ unsafe extern "system" fn dev_create_fence(this: *mut c_void, value: usize, flag
 /// later complete), the queues drain, and the process ends without running DLL detach code.
 pub fn end_title(code: u32) -> ! {
     unsafe {
+        // a last resort: the process ends within 15 s whatever happens below (a suspended
+        // thread may hold a lock the drain needs)
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new().name("xcl-end-watchdog".into()).spawn(move || {
+            let _ = tx.send(windows_sys::Win32::System::Threading::GetCurrentThreadId());
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
+        });
+        let watchdog = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or(0);
+        crate::log::flush();
+        // the title's threads stop first: with its fences at the maximum a running title thinks
+        // the GPU is done and resets command allocators the GPU still runs (Fortnite: a device
+        // hang at the end of a run)
+        suspend_other_threads(watchdog);
         for &f in FENCES.lock().unwrap().iter() {
             let fr = f as *mut c_void;
             if let Some(f) = ID3D12Fence::from_raw_borrowed(&fr) {
@@ -1752,6 +1828,40 @@ pub fn end_title(code: u32) -> ! {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }
     std::process::abort()
+}
+
+/// Every thread of the process but this one and `keep` (XCL's end watchdog), suspended – twice
+/// over: the title may start threads meanwhile.
+unsafe fn suspend_other_threads(keep: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, SuspendThread, THREAD_SUSPEND_RESUME};
+    let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+    let mut done: Vec<u32> = Vec::with_capacity(1024);
+    for _ in 0..2 {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut te: THREADENTRY32 = std::mem::zeroed();
+        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut ok = Thread32First(snap, &mut te) != 0;
+        while ok {
+            let tid = te.th32ThreadID;
+            if te.th32OwnerProcessID == pid && tid != me && tid != keep && !done.contains(&tid) {
+                let h = OpenThread(THREAD_SUSPEND_RESUME, 0, tid);
+                if !h.is_null() {
+                    SuspendThread(h);
+                    CloseHandle(h);
+                }
+                if done.len() < done.capacity() {
+                    done.push(tid);
+                }
+            }
+            ok = Thread32Next(snap, &mut te) != 0;
+        }
+        CloseHandle(snap);
+    }
 }
 creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
 creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
@@ -2509,6 +2619,37 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
+            // what the containers hold: each FSSM's hardware stages and its programs
+            let describe = |blob: &[u8]| -> String {
+                crate::gpu::xbox::parse(blob).map_or("not a console container".into(), |sh| {
+                    sh.fssm
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "[{} | {} programs {:?}, version {:#x}, {} B, code {:?} (from header {}), error {:?}]",
+                                f.stages.iter().map(|x| x.label()).collect::<Vec<_>>().join(", "),
+                                f.programs.len(),
+                                f.programs.iter().map(|p| p.len).collect::<Vec<_>>(),
+                                f.version,
+                                f.data.len(),
+                                f.code,
+                                f.code_from_header,
+                                f.error
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            };
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: VS+GS pipeline not translated ({e}); VS {}; GS {}", describe(vs), describe(gs));
+                if let Ok(dir) = std::env::var("XCL_DUMP_GS") {
+                    let k = N.load(Ordering::Relaxed);
+                    let _ = std::fs::write(format!("{dir}/vs{k}.bin"), vs);
+                    let _ = std::fs::write(format!("{dir}/gs{k}.bin"), gs);
+                }
+            }
             note_translation_error(format!("VS+GS: {e}"));
             return E_INVALIDARG;
         }
@@ -2789,6 +2930,16 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
         super::console_list::allocator_reset(this);
     }
     hr
+}
+
+/// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
+/// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
+/// nothing left Fortnite's render fences pending: its render thread waited, textures were
+/// never released, and the garbage collector ended the game after 10 s.)
+unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
+    const PC_SIGNAL: usize = 14;
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
+    f(this, fence, value)
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {

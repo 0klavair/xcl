@@ -241,9 +241,148 @@ unsafe fn fill_block(block: *mut u8, img: &TlsImage) {
     std::ptr::copy_nonoverlapping(img.template as *const u8, block, img.template_len);
 }
 
+// ---------------------------------------------------------------------------------------
+// slot 0 for the title's executable
+// ---------------------------------------------------------------------------------------
+
+/// The slot xcl.exe's own TLS moved to when the title's executable took slot 0 (NO_INDEX: not
+/// moved).
+static XCL_SLOT: AtomicU32 = AtomicU32::new(NO_INDEX);
+/// TEBs of the threads whose slots were exchanged by `take_slot_zero` itself (their TLS
+/// callback, if it still comes, leaves them as they are); held during the exchange
+static MOVED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// xcl.exe's `_tls_index` (its TLS directory's AddressOfIndex)
+unsafe fn own_tls_index() -> Option<*mut u32> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    let base = GetModuleHandleW(std::ptr::null()) as usize;
+    if base == 0 {
+        return None;
+    }
+    let nt = base + *((base + 0x3C) as *const u32) as usize;
+    // PE32+: the optional header at +24, its data directories at +112; TLS is #9
+    let rva = *((nt + 24 + 112 + 9 * 8) as *const u32) as usize;
+    if rva == 0 {
+        return None;
+    }
+    let index = *((base + rva + 16) as *const u64) as usize;
+    (index != 0).then_some(index as *mut u32)
+}
+
+/// The TEBs of the process's threads (the current one first).
+unsafe fn thread_tebs() -> Vec<*mut u8> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION};
+    let mut out = vec![current_teb()];
+    let (pid, tid) = (GetCurrentProcessId(), GetCurrentThreadId());
+    let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if snap == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    let mut te: THREADENTRY32 = std::mem::zeroed();
+    te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut ok = Thread32First(snap, &mut te) != 0;
+    while ok {
+        if te.th32OwnerProcessID == pid && te.th32ThreadID != tid {
+            let h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
+            if !h.is_null() {
+                let mut tbi: ThreadBasicInformation = std::mem::zeroed();
+                if NtQueryInformationThread(h, 0, &mut tbi as *mut _ as *mut _, std::mem::size_of::<ThreadBasicInformation>() as u32, std::ptr::null_mut()) >= 0 && !tbi.teb.is_null() {
+                    out.push(tbi.teb);
+                }
+                CloseHandle(h);
+            }
+        }
+        ok = Thread32Next(snap, &mut te) != 0;
+    }
+    CloseHandle(snap);
+    out
+}
+
+/// The title's executable gets TLS slot 0, as on Windows (and the console) the process's
+/// executable has it: code built with /GA reads `ThreadLocalStoragePointer[0]` directly, without
+/// `_tls_index` (Fortnite: the guard of its thread-safe statics, so its allocator was never
+/// made). Slot 0 is xcl.exe's own: its TLS moves to the carrier's slot `k` (all of its code
+/// goes through `_tls_index`), the carrier's blocks – the title's – to slot 0. Running threads
+/// first get xcl.exe's block in both slots and only then the title's in slot 0, so a TLS
+/// access in flight with either index stays right.
+pub unsafe fn take_slot_zero(img_name: &str, title_index: *mut u32, k: u32) -> Result<(), String> {
+    use std::sync::atomic::fence;
+    let own = own_tls_index().ok_or("xcl.exe has no TLS directory")?;
+    if *own != 0 {
+        return Err(format!("xcl.exe's TLS index is {}, not 0", *own));
+    }
+    let mut moved = MOVED.lock().map_err(|_| "TLS lock poisoned")?;
+    let tebs = thread_tebs();
+    // 1. slot k = slot 0 (xcl.exe's block) in every thread; the carrier blocks kept
+    let mut carriers: Vec<(*mut *mut u8, *mut u8)> = Vec::new();
+    for &teb in &tebs {
+        let arr = *(teb.add(0x58) as *const *mut *mut u8);
+        if arr.is_null() {
+            continue;
+        }
+        carriers.push((arr, *arr.add(k as usize)));
+        *arr.add(k as usize) = *arr;
+        moved.push(teb as usize);
+    }
+    fence(Ordering::SeqCst);
+    XCL_SLOT.store(k, Ordering::Release);
+    std::ptr::write_volatile(own, k);
+    fence(Ordering::SeqCst);
+    // 2. accesses that read index 0 before finish, then slot 0 = the title's block
+    windows_sys::Win32::System::Threading::Sleep(20);
+    for (arr, block) in carriers {
+        *arr = block;
+    }
+    *title_index = 0;
+    if let Ok(images) = IMAGES.read() {
+        for img in images.iter().filter(|i| i.name == img_name) {
+            img.index.store(0, Ordering::Release);
+        }
+    }
+    drop(moved);
+    crate::xlog_info!("TLS: {img_name} has slot 0 (as a process's executable); xcl.exe's own TLS is in slot {k} – {} threads", tebs.len());
+    Ok(())
+}
+
+/// A new thread: ntdll gave slot 0 xcl.exe's block and slot k the carrier's – exchanged before
+/// anything here reads TLS.
+unsafe fn exchange_for_new_thread(teb: *mut u8) {
+    let k = XCL_SLOT.load(Ordering::Acquire);
+    if k == NO_INDEX {
+        return;
+    }
+    let Ok(mut moved) = MOVED.lock() else { return };
+    if let Some(i) = moved.iter().position(|&t| t == teb as usize) {
+        // exchanged by take_slot_zero before it ran: done (and the TEB may come back later)
+        moved.swap_remove(i);
+        return;
+    }
+    let arr = *(teb.add(0x58) as *const *mut *mut u8);
+    if arr.is_null() {
+        return;
+    }
+    let x = *arr;
+    *arr = *arr.add(k as usize);
+    *arr.add(k as usize) = x;
+}
+
+/// A thread ends: its TEB may come back for a new thread, which needs the exchange.
+pub fn on_thread_detach() {
+    if XCL_SLOT.load(Ordering::Acquire) == NO_INDEX {
+        return;
+    }
+    let teb = unsafe { current_teb() } as usize;
+    if let Ok(mut moved) = MOVED.lock() {
+        moved.retain(|&t| t != teb);
+    }
+}
+
 /// Called for every new thread from xcl.exe's TLS callback (DLL_THREAD_ATTACH).
 pub unsafe fn on_thread_attach() {
     let teb = current_teb();
+    exchange_for_new_thread(teb);
     let Ok(images) = IMAGES.try_read() else { return };
     for img in images.iter() {
         let idx = img.index.load(Ordering::Acquire);

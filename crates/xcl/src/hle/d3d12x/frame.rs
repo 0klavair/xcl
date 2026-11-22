@@ -256,6 +256,14 @@ pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_voi
     hr
 }
 
+/// `XCL_ACTIVITY`: WaitFrameEventX calls, their timeouts, GetFrameStatisticsX calls, and those
+/// that found no flip yet
+static ACTIVITY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub fn activity() -> [u64; 4] {
+    ACTIVITY.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
 /// device #80 WaitFrameEventX(type, timeout ms, ancillary, flags, token in/out)
 pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, ty: u32, timeout_ms: u32, block: *const u8, flags: u32, token: *mut u64) -> HRESULT {
     let internal = with(|c| ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled).then(|| c.kinds[ty as usize].internal as usize));
@@ -271,6 +279,10 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     let mut hs = vec![internal as HANDLE];
     hs.extend(extra);
     let r = WaitForMultipleObjects(hs.len() as u32, hs.as_ptr(), (flags & WAIT_ALL != 0) as i32, timeout_ms);
+    ACTIVITY[0].fetch_add(1, Ordering::Relaxed);
+    if r == WAIT_TIMEOUT {
+        ACTIVITY[1].fetch_add(1, Ordering::Relaxed);
+    }
     let (hr, index) = if r == WAIT_TIMEOUT {
         (S_FALSE, -1)
     } else if ((r - WAIT_OBJECT_0) as usize) < hs.len() {
@@ -323,7 +335,9 @@ pub unsafe extern "system" fn frame_statistics_x(_this: *mut std::ffi::c_void, t
         return E_INVALIDARG;
     }
     let flipped = FLIPPED.lock().unwrap().iter().rev().find(|f| f.0 == token).map(|f| (f.1, f.2));
+    ACTIVITY[2].fetch_add(1, Ordering::Relaxed);
     let Some((origin, flip)) = flipped else {
+        ACTIVITY[3].fetch_add(1, Ordering::Relaxed);
         *count = 0;
         return E_FAIL;
     };
