@@ -1502,3 +1502,223 @@ pub fn sparse_buffer_heap_coherence() -> Result<(), String> {
         Ok(())
     }
 }
+
+/// Coherent Window 3 headroom: general `CUSTOM + WRITE_BACK` buffer heaps and buffers must
+/// route to sparse VRAM (windows 0..2), leaving Window 3 free for XCL's Arena pool and small
+/// explicit readback buffers, while `COPY_DEST` buffers in a sparse `CUSTOM + WRITE_BACK` heap
+/// (and oversized `READBACK` buffers that spill to sparse VRAM) still read back automatically
+/// on `Map(0, NULL, ...)`.
+pub fn coherent_window_headroom() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+
+        let win = |va: u64| ((va >> 32) & 3) as u32;
+        let buf_desc = |bytes: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+
+        // 1. General CUSTOM + WRITE_BACK buffer and heap (Xbox UMA pattern) must live in sparse VRAM.
+        let custom_wb = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let mut custom_buf: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&custom_wb, D3D12_HEAP_FLAG_NONE, &buf_desc(0x10_0000), D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut custom_buf).map_err(e)?;
+        let custom_buf = custom_buf.ok_or("custom wb committed buffer")?;
+        let custom_va = custom_buf.GetGPUVirtualAddress();
+        ensure!(custom_va != 0 && win(custom_va) != 3, "general CUSTOM+WRITE_BACK buffer landed in window 3: {custom_va:#x}");
+
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: 0x10_0000,
+            Properties: custom_wb,
+            Alignment: 0x1_0000,
+            Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+        };
+        let mut wb_heap: Option<ID3D12Heap> = None;
+        dev.CreateHeap(&heap_desc, &mut wb_heap).map_err(e)?;
+        let wb_heap = wb_heap.ok_or("CUSTOM+WRITE_BACK heap")?;
+
+        let mut src_buf: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&wb_heap, 0, &buf_desc(0x1_0000), D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut src_buf).map_err(e)?;
+        let src_buf = src_buf.ok_or("placed src in wb heap")?;
+        ensure!(win(src_buf.GetGPUVirtualAddress()) != 3, "CUSTOM+WRITE_BACK heap landed in window 3: {:#x}", src_buf.GetGPUVirtualAddress());
+
+        let mut dst_rb: Option<ID3D12Resource> = None;
+        dev.CreatePlacedResource(&wb_heap, 0x1_0000, &buf_desc(0x1_0000), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut dst_rb).map_err(e)?;
+        let dst_rb = dst_rb.ok_or("placed COPY_DEST in wb heap")?;
+
+        // 2. Oversized READBACK buffer (> 64 MiB) spills cleanly to sparse VRAM and still reads back on Map(NULL).
+        let mut big_rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc(65 << 20),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut big_rb,
+        )
+        .map_err(e)?;
+        let big_rb = big_rb.ok_or("oversized READBACK buffer")?;
+        ensure!(win(big_rb.GetGPUVirtualAddress()) != 3, "oversized READBACK buffer (>64 MiB) landed in window 3: {:#x}", big_rb.GetGPUVirtualAddress());
+
+        let mut p_src = std::ptr::null_mut();
+        src_buf.Map(0, None, Some(&mut p_src)).map_err(e)?;
+        *(p_src as *mut u32) = 0x5EED_CAFE;
+        *((p_src as *mut u32).add(1)) = 0x1234_5678;
+
+        list.CopyBufferRegion(&dst_rb, 0, &src_buf, 0, 64);
+        list.CopyBufferRegion(&big_rb, 0, &src_buf, 0, 64);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 1)?;
+
+        // Map(0, NULL, ...) on both sparse readback buffers must automatically sync from VRAM.
+        let mut p_dst = std::ptr::null_mut();
+        dst_rb.Map(0, None, Some(&mut p_dst)).map_err(e)?;
+        let w0 = *(p_dst as *const u32);
+        let w1 = *((p_dst as *const u32).add(1));
+        ensure!(w0 == 0x5EED_CAFE && w1 == 0x1234_5678, "CUSTOM+WRITE_BACK COPY_DEST Map(NULL) readback mismatch: {w0:#x} {w1:#x}");
+
+        let mut p_big = std::ptr::null_mut();
+        big_rb.Map(0, None, Some(&mut p_big)).map_err(e)?;
+        let b0 = *(p_big as *const u32);
+        let b1 = *((p_big as *const u32).add(1));
+        ensure!(b0 == 0x5EED_CAFE && b1 == 0x1234_5678, "oversized READBACK Map(NULL) readback mismatch: {b0:#x} {b1:#x}");
+        Ok(())
+    }
+}
+
+/// Asynchronous ring-buffered sparse upload stress test: streams 80 MiB across 20 back-to-back
+/// pipelined submits (wrapping both the 64 MiB staging ring and the 16 upload command slots
+/// without CPU waits between submits), plus reused-tile zeroing before new CPU writes.
+pub fn sparse_async_ring_upload_stress() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+
+        const SLICE_BYTES: usize = 4 << 20; // 4 MiB per submit
+        const SUBMITS: usize = 20; // 80 MiB total > 64 MiB staging ring, 20 > 16 upload slots
+        const TOTAL_BYTES: usize = SLICE_BYTES * SUBMITS;
+        let buf_desc = |bytes: u64| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+
+        let mut src: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc(TOTAL_BYTES as u64),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut src,
+        )
+        .map_err(e)?;
+        let src = src.ok_or("stress upload buffer")?;
+
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc((SUBMITS * 64) as u64),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(e)?;
+        let rb = rb.ok_or("stress readback buffer")?;
+
+        let mut p_src = std::ptr::null_mut();
+        src.Map(0, None, Some(&mut p_src)).map_err(e)?;
+        let mut p_rb = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p_rb)).map_err(e)?;
+
+        let mut allocs = Vec::with_capacity(SUBMITS);
+        let mut lists = Vec::with_capacity(SUBMITS);
+        for _ in 0..SUBMITS {
+            let a: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+            let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).map_err(e)?;
+            allocs.push(a);
+            lists.push(l);
+        }
+
+        // Write a disjoint 4 MiB slice on every submit (ring-buffer style) so all 80 MiB cross
+        // the 64 MiB staging ring and 16 upload slots back-to-back without waiting between submits.
+        let src_u32 = p_src as *mut u32;
+        let slice_words = SLICE_BYTES / 4;
+        for s in 0..SUBMITS {
+            let tag = 0xA500_0000u32 | (s as u32);
+            let base_word = s * slice_words;
+            // Touch every 64-byte chunk across this 4 MiB slice so all 4 MiB are genuinely uploaded
+            for off in (0..slice_words).step_by(16) {
+                *src_u32.add(base_word + off) = tag ^ (off as u32);
+            }
+            let list = &lists[s];
+            let slice_off = (s * SLICE_BYTES) as u64;
+            // Copy first 32 bytes + last 32 bytes of this 4 MiB slice into readback slot s
+            list.CopyBufferRegion(&rb, (s * 64) as u64, &src, slice_off, 32);
+            list.CopyBufferRegion(&rb, (s * 64 + 32) as u64, &src, slice_off + (SLICE_BYTES - 64) as u64, 32);
+            list.Close().map_err(e)?;
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        }
+
+        wait(&queue, &fence, 1)?;
+        let rb_u32 = p_rb as *const u32;
+        let last_off = (slice_words - 16) as u32;
+        for s in 0..SUBMITS {
+            let tag = 0xA500_0000u32 | (s as u32);
+            let got_head = *rb_u32.add(s * 16);
+            let got_tail = *rb_u32.add(s * 16 + 8);
+            ensure!(got_head == tag, "submit {s} head mismatch: got {got_head:#x}, want {tag:#x}");
+            ensure!(got_tail == (tag ^ last_off), "submit {s} tail mismatch: got {got_tail:#x}, want {:#x}", tag ^ last_off);
+        }
+
+        // Release `src` so its tiles enter the free list, then allocate a new buffer reusing tiles
+        // and verify `zero_buf` clears untouched bytes before our new write lands.
+        drop(src);
+        let mut reused: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &buf_desc(0x2_0000),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut reused,
+        )
+        .map_err(e)?;
+        let reused = reused.ok_or("reused tile buffer")?;
+        let mut p_reused = std::ptr::null_mut();
+        reused.Map(0, None, Some(&mut p_reused)).map_err(e)?;
+        *(p_reused as *mut u32) = 0x7788_99AA;
+
+        allocs[0].Reset().map_err(e)?;
+        lists[0].Reset(&allocs[0], None).map_err(e)?;
+        lists[0].CopyBufferRegion(&rb, 0, &reused, 0, 128);
+        lists[0].Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(lists[0].cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 2)?;
+        ensure!(*rb_u32.add(0) == 0x7788_99AA, "reused tile written word mismatch: {:#x}", *rb_u32.add(0));
+        ensure!(*rb_u32.add(16) == 0, "reused tile untouched chunk was not zeroed: {:#x}", *rb_u32.add(16));
+        Ok(())
+    }
+}

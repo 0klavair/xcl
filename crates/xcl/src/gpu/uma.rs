@@ -431,6 +431,33 @@ impl Uma {
         (self.base + k * WINDOW, len)
     }
 
+    /// Underlying write-watched `VirtualAlloc` regions `(base, size)` for `GetWriteWatch`:
+    /// contiguous sparse windows belong to a single reservation, while each committed window
+    /// is its own allocation.
+    pub fn watch_regions(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(MAX_WINDOWS);
+        let mut k = 0;
+        while k < MAX_WINDOWS {
+            match self.kinds[k] {
+                WindowKind::None => k += 1,
+                WindowKind::Committed(s) => {
+                    out.push((self.base + k * WINDOW, s));
+                    k += 1;
+                }
+                WindowKind::Sparse => {
+                    let start = self.base + k * WINDOW;
+                    let mut len = 0usize;
+                    while k < MAX_WINDOWS && matches!(self.kinds[k], WindowKind::Sparse) {
+                        len += WINDOW;
+                        k += 1;
+                    }
+                    out.push((start, len));
+                }
+            }
+        }
+        out
+    }
+
     pub fn window_of(&self, p: usize) -> Option<usize> {
         let k = p.checked_sub(self.base)? / WINDOW;
         let (start, len) = self.window(k);
@@ -834,5 +861,7 @@ mod tests {
         assert_eq!(u.sparse_release(y), Some(GRAIN));
         assert_eq!(u.sparse_release(desc), Some(GRAIN));
         assert_eq!(u.sparse_used(), 0);
+        // Contiguous sparse windows 0..2 are reported as one OS watch region; window 3 as another.
+        assert_eq!(u.watch_regions(), vec![(u.base(), 3 * WINDOW), (u.base() + 3 * WINDOW, 16 << 20)]);
     }
 }

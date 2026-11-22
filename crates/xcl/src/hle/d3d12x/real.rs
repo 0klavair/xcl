@@ -1025,12 +1025,62 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
     Some(hr)
 }
 
-/// Whether `props` asks for CPU-cached readback memory (`D3D12_HEAP_TYPE_READBACK`, or
-/// `D3D12_HEAP_TYPE_CUSTOM` with `D3D12_CPU_PAGE_PROPERTY_WRITE_BACK`), which stays on the
-/// coherent committed window so CPU reads after a fence wait need no copy-back.
-fn is_readback_heap(props: &D3D12_HEAP_PROPERTIES) -> bool {
+/// Largest single `D3D12_HEAP_TYPE_READBACK` allocation kept on the coherent window; larger
+/// ones spill to sparse VRAM so one big readback heap/buffer cannot exhaust coherent headroom.
+const COHERENT_READBACK_MAX: usize = 64 << 20;
+/// Largest single `D3D12_HEAP_TYPE_CUSTOM` + `WRITE_BACK` `COPY_DEST` buffer kept on coherent RAM.
+const COHERENT_CUSTOM_WB_MAX: usize = 16 << 20;
+
+fn has_coherent_headroom(u: &crate::gpu::uma::Uma, rounded: usize) -> bool {
+    let headroom = COHERENT_KEPT.min(u.size() / 4);
+    u.size().saturating_sub(u.used()) >= headroom.saturating_add(rounded)
+}
+
+/// Sparse-backed buffers whose `Map(0, NULL, ...)` should read back their full range from VRAM
+/// (readback buffers that spilled to sparse VRAM or `COPY_DEST` buffers in `CUSTOM + WRITE_BACK`).
+static SPARSE_READBACK: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+fn note_sparse_readback(res: usize) {
+    SPARSE_READBACK.lock().unwrap().get_or_insert_with(HashSet::new).insert(res);
+}
+
+/// Whether `props` asks for CPU-cached readback memory. On Xbox UMA, `D3D12_HEAP_TYPE_CUSTOM`
+/// with `D3D12_CPU_PAGE_PROPERTY_WRITE_BACK` is the general CPU-cached graphics pool (used for
+/// hundreds of MB of VBs/IBs/CBs/UAVs), so only explicit `D3D12_HEAP_TYPE_READBACK` heaps — or
+/// small non-UAV `COPY_DEST` buffers — stay in the 512 MB coherent window.
+fn is_coherent_readback_buffer(props: &D3D12_HEAP_PROPERTIES, state: u32, flags: D3D12_RESOURCE_FLAGS, bytes: usize) -> bool {
+    if props.Type == D3D12_HEAP_TYPE_READBACK {
+        return bytes <= COHERENT_READBACK_MAX;
+    }
+    props.Type == D3D12_HEAP_TYPE_CUSTOM
+        && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+        && state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
+        && (flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0
+        && bytes <= COHERENT_CUSTOM_WB_MAX
+}
+
+fn is_cpu_readback_buffer(props: &D3D12_HEAP_PROPERTIES, state: u32, flags: D3D12_RESOURCE_FLAGS) -> bool {
     props.Type == D3D12_HEAP_TYPE_READBACK
-        || (props.Type == D3D12_HEAP_TYPE_CUSTOM && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)
+        || (props.Type == D3D12_HEAP_TYPE_CUSTOM
+            && props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK
+            && state == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32
+            && (flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) == 0)
+}
+
+unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC, bytes: usize, state: u32, readback_on_null_map: bool, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    let (p, _) = super::sparse::alloc(bytes, 0x1_0000)?;
+    if let Some((hr, delta)) = super::sparse::place_buffer(this, p, d, state, riid, ppv) {
+        UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
+        if delta != 0 {
+            BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
+        }
+        if readback_on_null_map {
+            note_sparse_readback(*ppv as usize);
+        }
+        return Some(hr);
+    }
+    super::sparse::free(p);
+    None
 }
 
 unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -1043,29 +1093,30 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     }
     let bytes = d.Width as usize;
-    let readback = props != 0
-        && crate::gpu::shader::readable(props, std::mem::size_of::<D3D12_HEAP_PROPERTIES>())
-        && is_readback_heap(&std::ptr::read_unaligned(props as *const D3D12_HEAP_PROPERTIES));
-    // Non-readback committed console buffers live in sparse VRAM windows (write-watched CPU
-    // view + tiled VRAM backing); readback / write-back buffers stay on coherent committed RAM.
-    if !readback && u.has_sparse() {
-        if let Some((p, _)) = super::sparse::alloc(bytes, 0x1_0000) {
-            let st = state as u32 & PC_RESOURCE_STATES;
-            if let Some((hr, delta)) = super::sparse::place_buffer(this, p, &d, st, riid, ppv) {
-                UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (p, bytes, true));
-                if delta != 0 {
-                    BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
-                }
-                return Some(hr);
-            }
-            super::sparse::free(p);
+    let st = state as u32 & PC_RESOURCE_STATES;
+    let heap_props = (props != 0 && crate::gpu::shader::readable(props, std::mem::size_of::<D3D12_HEAP_PROPERTIES>()))
+        .then(|| std::ptr::read_unaligned(props as *const D3D12_HEAP_PROPERTIES));
+    let rounded = (bytes + 0xFFFF) & !0xFFFF;
+    let prefer_coherent = heap_props.as_ref().is_some_and(|hp| is_coherent_readback_buffer(hp, st, d.Flags, bytes))
+        && has_coherent_headroom(u, rounded);
+    let readback_on_null_map = heap_props.as_ref().is_some_and(|hp| is_cpu_readback_buffer(hp, st, d.Flags));
+    // Non-readback (and general CUSTOM+WRITE_BACK) committed console buffers live in sparse VRAM
+    // windows; small genuine readback buffers prefer coherent committed RAM (spilling to sparse if full).
+    if !prefer_coherent && u.has_sparse() {
+        if let Some(hr) = place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv) {
+            return Some(hr);
         }
     }
+    let Some(p) = u.alloc(rounded, 0x1_0000).map(|a| a as usize) else {
+        if prefer_coherent && u.has_sparse() {
+            return place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv);
+        }
+        return None;
+    };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + this flag
     d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
-    let p = u.alloc((bytes + 0xFFFF) & !0xFFFF, 0x1_0000)? as usize;
     let k = u.window_of(p)?;
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, state, clear, riid, ppv);
@@ -1154,14 +1205,18 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
-        if !range.is_null() && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
-            let r = *(range as *const D3D12_RANGE);
-            if r.End > r.Begin {
-                let begin = r.Begin.min(bytes);
-                let end = r.End.min(bytes);
-                if end > begin {
-                    super::sparse::readback_now(p + begin, end - begin);
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(p)) {
+            if !range.is_null() {
+                let r = *(range as *const D3D12_RANGE);
+                if r.End > r.Begin {
+                    let begin = r.Begin.min(bytes);
+                    let end = r.End.min(bytes);
+                    if end > begin {
+                        super::sparse::readback_now(p + begin, end - begin);
+                    }
                 }
+            } else if SPARSE_READBACK.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+                super::sparse::readback_now(p, bytes);
             }
         }
         if !data.is_null() {
@@ -1244,6 +1299,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+            s.remove(&(this as usize));
+        }
+        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
         if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
@@ -1907,10 +1965,16 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
         let is_buffer = u32::from_le_bytes(x[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
-        if let Some(block) = is_buffer.then(|| heap_block(heap)).flatten() {
+        if let Some((block, cpu_readback)) = is_buffer.then(|| heap_block(heap)).flatten() {
             let d = super::device_x::pc_resource_desc(&x);
             let st = state as u32 & PC_RESOURCE_STATES;
             if let Some(hr) = place_at_title_address(this, block + offset, &d, st, clear as *const c_void, riid, ppv) {
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && cpu_readback && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(block + offset)) {
+                    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+                    if st == D3D12_RESOURCE_STATE_COPY_DEST.0 as u32 && (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32) == 0 {
+                        note_sparse_readback(*ppv as usize);
+                    }
+                }
                 return hr;
             }
         }
@@ -2036,12 +2100,16 @@ pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: u
 struct HeapUma {
     size: usize,
     align: usize,
-    readback: bool,
+    /// Small explicit `D3D12_HEAP_TYPE_READBACK` heap: prefers coherent Window 3 RAM.
+    prefer_coherent: bool,
+    /// `READBACK` or `CUSTOM + WRITE_BACK`: if backed by sparse VRAM, `COPY_DEST` buffers placed
+    /// in it read back on `Map(0, NULL, ...)`.
+    cpu_readback: bool,
     block: Option<usize>,
 }
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
-/// DEFAULT/UPLOAD/write-combine heaps, coherent committed window for READBACK/write-back)
+/// DEFAULT/UPLOAD/CUSTOM heaps, coherent committed window for small explicit READBACK heaps)
 static HEAP_UMA: Mutex<Option<HashMap<usize, HeapUma>>> = Mutex::new(None);
 
 /// A heap the title made that may hold buffers: a block of unified memory as large stands for
@@ -2062,35 +2130,43 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
     if d.Flags.0 & DENY_BUFFERS != 0 || d.SizeInBytes == 0 || UMA_BUFFER.lock().unwrap().is_empty() {
         return;
     }
+    let size = d.SizeInBytes as usize;
+    let is_rb = d.Properties.Type == D3D12_HEAP_TYPE_READBACK;
+    let is_custom_wb = d.Properties.Type == D3D12_HEAP_TYPE_CUSTOM && d.Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     HEAP_UMA.lock().unwrap().get_or_insert_with(HashMap::new).insert(
         *ppv as usize,
         HeapUma {
-            size: d.SizeInBytes as usize,
+            size,
             align: (d.Alignment as usize).max(0x1_0000),
-            readback: is_readback_heap(&d.Properties),
+            prefer_coherent: is_rb && size <= COHERENT_READBACK_MAX,
+            cpu_readback: is_rb || is_custom_wb,
             block: None,
         },
     );
 }
 
-/// The block of unified memory standing for `heap` (taken now if it has none yet; None: not a
-/// heap that takes one, or unified memory is full).
-fn heap_block(heap: usize) -> Option<usize> {
-    let (size, align, readback) = {
+/// The block of unified memory standing for `heap` and whether it may hold CPU-readback buffers
+/// (taken now if it has none yet; None: not a heap that takes one, or unified memory is full).
+fn heap_block(heap: usize) -> Option<(usize, bool)> {
+    let (size, align, prefer_coherent, cpu_readback) = {
         let g = HEAP_UMA.lock().unwrap();
         let e = g.as_ref()?.get(&heap)?;
         if let Some(p) = e.block {
-            return Some(p);
+            return Some((p, e.cpu_readback));
         }
-        (e.size, e.align, e.readback)
+        (e.size, e.align, e.prefer_coherent, e.cpu_readback)
     };
     let u = crate::gpu::uma::get()?;
-    let p = if !readback && u.has_sparse() {
+    let rounded = size.div_ceil(0x1_0000) * 0x1_0000;
+    let use_coherent = prefer_coherent && has_coherent_headroom(u, rounded);
+    let p = if !use_coherent && u.has_sparse() {
         unsafe { super::sparse::alloc(size, align) }
             .map(|(a, _)| a)
-            .or_else(|| u.alloc(size.div_ceil(0x1_0000) * 0x1_0000, align).map(|a| a as usize))
+            .or_else(|| u.alloc(rounded, align).map(|a| a as usize))
     } else {
-        u.alloc(size.div_ceil(0x1_0000) * 0x1_0000, align).map(|a| a as usize)
+        u.alloc(rounded, align)
+            .map(|a| a as usize)
+            .or_else(|| u.has_sparse().then(|| unsafe { super::sparse::alloc(size, align) }.map(|(a, _)| a)).flatten())
     };
     let Some(p) = p else {
         static FULL: AtomicU64 = AtomicU64::new(0);
@@ -2114,13 +2190,14 @@ fn heap_block(heap: usize) -> Option<usize> {
         return None;
     };
     if let Some(existing) = e.block {
+        let cr = e.cpu_readback;
         drop(g);
         if u.is_sparse(p) {
             unsafe { super::sparse::free(p) };
         } else {
             u.free(p);
         }
-        return Some(existing);
+        return Some((existing, cr));
     }
     e.block = Some(p);
     drop(g);
@@ -2129,7 +2206,7 @@ fn heap_block(heap: usize) -> Option<usize> {
         let kind = if u.is_sparse(p) { "sparse VRAM" } else { "coherent RAM" };
         crate::xlog_info!("D3D12.X: heap {heap:#x} ({size:#x} bytes) holds buffers: in {kind} at {p:#x}");
     }
-    Some(p)
+    Some((p, cpu_readback))
 }
 
 /// ID3D12Heap::Release: its block of unified memory goes with it.
@@ -3492,13 +3569,13 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
-    // textures in title memory the CPU wrote since: uploaded again first
-    super::title_textures::refresh(this);
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
         return;
     }
+    // textures in title memory the CPU wrote since: uploaded again first
+    super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into
     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
         .iter()
@@ -3596,5 +3673,40 @@ pub fn stop_if_device_removed() {
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
         }
+    }
+}
+
+#[cfg(test)]
+mod readback_routing_tests {
+    use super::*;
+
+    #[test]
+    fn custom_write_back_only_stays_coherent_for_small_copy_dest_buffers() {
+        let rb = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let custom_wb = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let copy_dest = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        let gen_read = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+        let uav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let none = D3D12_RESOURCE_FLAG_NONE;
+
+        assert!(is_coherent_readback_buffer(&rb, copy_dest, none, 4 << 20));
+        assert!(!is_coherent_readback_buffer(&rb, copy_dest, none, COHERENT_READBACK_MAX + 0x1_0000));
+        assert!(is_cpu_readback_buffer(&rb, copy_dest, none));
+
+        // General CUSTOM+WRITE_BACK buffers route to sparse VRAM, not coherent Window 3.
+        assert!(!is_coherent_readback_buffer(&custom_wb, gen_read, none, 4 << 20));
+        assert!(!is_cpu_readback_buffer(&custom_wb, gen_read, none));
+        assert!(!is_coherent_readback_buffer(&custom_wb, copy_dest, uav, 4 << 20));
+        assert!(!is_cpu_readback_buffer(&custom_wb, copy_dest, uav));
+
+        // Small non-UAV COPY_DEST CUSTOM+WRITE_BACK buffers may use coherent Window 3; larger ones spill.
+        assert!(is_coherent_readback_buffer(&custom_wb, copy_dest, none, 4 << 20));
+        assert!(!is_coherent_readback_buffer(&custom_wb, copy_dest, none, COHERENT_CUSTOM_WB_MAX + 0x1_0000));
+        assert!(is_cpu_readback_buffer(&custom_wb, copy_dest, none));
     }
 }

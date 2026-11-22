@@ -618,6 +618,8 @@ fn main() {
     check("D3D12.X: console device methods (placed title memory, DMA queue + list, page pools)", gpu::console_device_methods);
     check("D3D12.X: console command list memory methods (writes, timestamp, fill, copy, KickoffX, Wait32/64)", gpu::console_list_methods);
     check("D3D12.X: sparse VRAM buffer heaps (placed aliasing, persistent Map coherence, readback)", gpu::sparse_buffer_heap_coherence);
+    check("D3D12.X: coherent window headroom (CUSTOM+WRITE_BACK & oversized READBACK in sparse VRAM)", gpu::coherent_window_headroom);
+    check("D3D12.X: async ring-buffered sparse uploads (80 MiB across 20 submits + reused-tile zeroing)", gpu::sparse_async_ring_upload_stress);
     check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
     check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);
     check("DirectStorage (xcrdapi): a file read into memory, status + D3D12 fence", gpu::direct_storage);

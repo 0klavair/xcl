@@ -496,7 +496,20 @@ unsafe extern "system" fn cl_barrier(this: *mut c_void, _n: u32, _barriers: *con
 }
 unsafe extern "system" fn cl_allocate_upload_memory(this: *mut c_void, size: usize, align: usize) -> *mut u8 {
     let Some(u) = crate::gpu::uma::get() else { return std::ptr::null_mut() };
-    match u.alloc(size.max(16), align.max(16)) {
+    let size = size.max(16);
+    let align = align.max(16);
+    if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+        if let Some(p) = with_list(this as usize, |st| st.arena.take(u, size, align, &mut st.uma)).flatten() {
+            return p;
+        }
+    }
+    if u.has_sparse() {
+        if let Some((p, _)) = super::sparse::alloc(size, align) {
+            with_list(this as usize, |st| st.uma.push(p));
+            return p as *mut u8;
+        }
+    }
+    match u.alloc(size, align) {
         Some(p) => {
             with_list(this as usize, |st| st.uma.push(p as usize));
             p
@@ -580,7 +593,11 @@ pub fn pc_pso(pso: *mut c_void) -> *mut c_void {
 unsafe fn free_uma(blocks: &[usize]) {
     if let Some(u) = crate::gpu::uma::get() {
         for &b in blocks {
-            u.free(b);
+            if u.is_sparse(b) {
+                super::sparse::free(b);
+            } else {
+                u.free(b);
+            }
         }
     }
 }
