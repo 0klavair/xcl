@@ -1180,6 +1180,16 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
     (`eh::arm_current_thread`). This is how the controller path above was found without changing the game.
   - Open: small magenta / black "missing texture" quads on the loading screen's logo (a texture the game did not
     load – trace file opens next).
+- **The title's graphics memory in video memory (PR #40, 2026-11-22)**: XMem graphics allocations, physical pages,
+  D3D12 buffer heaps and the console descriptor heaps live in the sparse windows 0..2 (`Uma::for_runtime`); window 3
+  is 512 MB of coherent system RAM (XCL's arena pool, readback / write-back heaps). GPU writes reach the CPU's view
+  only for the lists' memory operations (Write32/64, Fill, CopyMemoryToMemory, timestamps) and for a Map with a read
+  range. Fixed on top: window 0's descriptor range (512 MB after its first 64 KiB, `Uma::desc_range`) is never the
+  title's. XDefiant reserves 8 GiB + 4 MiB first thing, more than windows 1..2 hold; with the range at the top of
+  window 0 that reservation took all of it, no console descriptor heap could be made ("no room in UMA") and every
+  frame was black. Tested: Minecraft, Unicorn Overlord, Fortnite, XDefiant. Open: Unicorn fills the coherent window
+  from its second second (its draws run on XCL's pool); XDefiant spends about a third of its time uploading CPU
+  writes (so before PR #40 too).
 - **Unicorn Overlord (SEGAofAmericaInc.Pa253b0c1Y 1.0.0.6) is playable (2026-11-22)**: logos, movies, menus and play
   with the right picture. It runs on a **newer console D3D12 runtime** (its own game OS) with the same SDK version
   (0x20004) as XDefiant / Minecraft but other vtable layouts:

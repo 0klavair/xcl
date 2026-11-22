@@ -28,7 +28,7 @@ pub const MAX_SIZE: usize = (4096 << 20) - GRAIN;
 pub const WINDOW: usize = 1 << 32;
 pub const MAX_WINDOWS: usize = 4;
 
-/// top of sparse window 0 kept for 32-bit descriptor heaps unless all other sparse space is full
+/// bytes of sparse window 0 only 32-bit descriptor heaps get (`Uma::desc_range`)
 const DESC_HEADROOM: usize = 512 << 20;
 /// cap on the eager committed coherent window in `for_runtime` (per-draw args, readback buffers)
 const RUNTIME_COMMITTED_CAP: usize = 512 << 20;
@@ -220,6 +220,21 @@ impl Uma {
         }
     }
 
+    /// The range of sparse window 0 kept for 32-bit descriptor heaps (`sparse_alloc_in(0)`):
+    /// after the window's first 64 KiB, which stay unused (a console address of 0 reads as
+    /// null). The title's memory never takes it, and it sits at the start of the window so the
+    /// title still gets one contiguous range of 11.5 GiB: XDefiant reserves 8 GiB + 4 MiB first
+    /// thing, more than windows 1..2 hold, and with the range at the top of window 0 that
+    /// reservation took all of it – no descriptor heap could be made, every frame was black.
+    fn desc_range(&self) -> Option<(usize, usize)> {
+        self.is_sparse_window(0).then(|| (self.base + GRAIN, self.base + GRAIN + DESC_HEADROOM))
+    }
+
+    /// The first sparse address the title's memory may use (after `desc_range`).
+    fn title_sparse_start(&self) -> usize {
+        self.desc_range().map_or(self.base, |(_, end)| end)
+    }
+
     /// Whether window `k` is a sparse VRAM window.
     pub fn is_sparse_window(&self, k: usize) -> bool {
         self.kinds.get(k).is_some_and(|w| matches!(w, WindowKind::Sparse))
@@ -252,7 +267,7 @@ impl Uma {
 
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
     /// aligned, first fit; not committed). Prefers windows 1+ so window 0 stays uncluttered for
-    /// 32-bit descriptor heaps and small allocations, falling back to all sparse windows.
+    /// small allocations, falling back to all of the title's sparse space (never `desc_range`).
     pub fn sparse_reserve(&self, size: usize) -> Option<usize> {
         if !self.has_sparse() {
             return None;
@@ -260,14 +275,16 @@ impl Uma {
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
-        if let Some(at) = take_sparse_in(&mut g, self.base + WINDOW, end, size, GRAIN, false) {
+        let lo = self.title_sparse_start();
+        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
             return Some(at);
         }
-        take_sparse_in(&mut g, self.base, end, size, GRAIN, false)
+        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
     }
 
-    /// Reserve an aligned range strictly inside sparse window `k` (e.g. window 0 for 32-bit
-    /// descriptor heaps). Returns `(address, rounded_size)`.
+    /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
+    /// heaps, from `desc_range` first, then whatever of the window is free). Returns
+    /// `(address, rounded_size)`.
     pub fn sparse_alloc_in(&self, k: usize, size: usize, align: usize) -> Option<(usize, usize)> {
         if !self.is_sparse_window(k) {
             return None;
@@ -276,12 +293,18 @@ impl Uma {
         let align = align.max(GRAIN).next_power_of_two();
         let (w_start, w_len) = self.window(k);
         let mut g = self.sparse_free.lock().unwrap();
-        take_sparse_in(&mut g, w_start, w_start + w_len, size, align, true).map(|at| (at, size))
+        let desc = if k == 0 { self.desc_range() } else { None };
+        if let Some((lo, hi)) = desc {
+            if let Some(at) = take_sparse_in(&mut g, lo, hi, size, align, true) {
+                return Some((at, size));
+            }
+        }
+        let lo = desc.map_or(w_start, |(lo, _)| lo);
+        take_sparse_in(&mut g, lo, w_start + w_len, size, align, true).map(|at| (at, size))
     }
 
     /// Reserve an aligned range in the sparse windows that never straddles a 4 GiB window
-    /// boundary (when `size <= WINDOW`). Keeps `DESC_HEADROOM` at the top of sparse window 0
-    /// reserved for 32-bit descriptor heaps unless all other sparse windows are full.
+    /// boundary (when `size <= WINDOW`): window 0 first, then windows 1+, never `desc_range`.
     /// Returns `(address, rounded_size)`.
     pub fn sparse_alloc(&self, size: usize, align: usize) -> Option<(usize, usize)> {
         if !self.has_sparse() {
@@ -291,24 +314,18 @@ impl Uma {
         let align = align.max(GRAIN).next_power_of_two();
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
+        let lo = self.title_sparse_start();
+        let above_0 = (self.base + WINDOW).max(lo);
         if size <= WINDOW {
             if self.is_sparse_window(0) {
-                if let Some(at) = take_sparse_in(&mut g, self.base, self.base + WINDOW - DESC_HEADROOM, size, align, true) {
+                if let Some(at) = take_sparse_in(&mut g, lo, self.base + WINDOW, size, align, true) {
                     return Some((at, size));
                 }
             }
-            if let Some(at) = take_sparse_in(&mut g, self.base + WINDOW, end, size, align, true) {
-                return Some((at, size));
-            }
-            if self.is_sparse_window(0) {
-                if let Some(at) = take_sparse_in(&mut g, self.base, self.base + WINDOW, size, align, true) {
-                    return Some((at, size));
-                }
-            }
-            None
+            take_sparse_in(&mut g, above_0, end, size, align, true).map(|at| (at, size))
         } else {
-            take_sparse_in(&mut g, self.base + WINDOW, end, size, align, false)
-                .or_else(|| take_sparse_in(&mut g, self.base, end, size, align, false))
+            take_sparse_in(&mut g, above_0, end, size, align, false)
+                .or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
                 .map(|at| (at, size))
         }
     }
@@ -715,6 +732,26 @@ mod tests {
         assert!(!u.is_title_address(a));
     }
 
+    /// XDefiant's first reservation is 8 GiB + 4 MiB, more than windows 1..2 hold: it has to go
+    /// across window 0 without taking the room its 32-bit descriptor heaps need there.
+    #[test]
+    fn a_reservation_larger_than_windows_1_and_2_leaves_window_0_room_for_descriptor_heaps() {
+        let u = Uma::for_runtime(16 << 20).unwrap();
+        let big = 0x2_0041_0000;
+        let r = u.sparse_reserve(big).unwrap();
+        let heap = 442_368 * 32;
+        let (d, ld) = u.sparse_alloc_in(0, heap, 256).expect("a descriptor heap in window 0");
+        assert_eq!(u.window_of(d), Some(0));
+        assert!(d + ld <= r || d >= r + big, "the heap is not inside the title's reservation");
+        assert_ne!(d, u.base(), "no descriptor table at console address 0");
+        let (x, _) = u.sparse_alloc(0x2_0000, 0).expect("the title's graphics memory after its reservation");
+        assert!(x >= r + big || x + 0x2_0000 <= r);
+        assert_eq!(u.sparse_release(x), Some(0x2_0000));
+        assert_eq!(u.sparse_release(d), Some(ld));
+        assert_eq!(u.sparse_release(r), Some(big));
+        assert_eq!(u.sparse_used(), 0);
+    }
+
     #[test]
     fn runtime_layout_places_sparse_in_0_to_2_and_committed_in_3() {
         let u = Uma::for_runtime(16 << 20).unwrap();
@@ -730,9 +767,9 @@ mod tests {
         assert!(u.is_committed(c) && !u.is_sparse(c) && u.is_title_address(c));
         assert!(u.free(c));
 
-        // First sparse_alloc lands at window 0 base (low 32 bits == 0)
+        // First sparse_alloc lands in window 0, after the descriptor range
         let (a, la) = u.sparse_alloc(0x2_0000, 0).unwrap();
-        assert_eq!(a, u.base());
+        assert_eq!(a, u.base() + GRAIN + DESC_HEADROOM);
         assert_eq!(la, 0x2_0000);
         assert_eq!(u.window_of(a), Some(0));
         assert!(u.is_sparse(a) && u.is_title_address(a));
@@ -754,9 +791,9 @@ mod tests {
         assert!(!u.is_title_address(a));
 
         // Allocations <= 4 GiB never straddle a window boundary, and DESC_HEADROOM is preserved
-        let fill_w0 = WINDOW - DESC_HEADROOM;
+        let fill_w0 = WINDOW - DESC_HEADROOM - GRAIN;
         let (x, _) = u.sparse_alloc(fill_w0, GRAIN).unwrap();
-        assert_eq!(x, u.base());
+        assert_eq!(x, u.base() + GRAIN + DESC_HEADROOM);
         let (y, _) = u.sparse_alloc(GRAIN, GRAIN).unwrap();
         assert_eq!(u.window_of(y), Some(1), "overflows to window 1 before touching window 0 descriptor headroom");
         let (desc, _) = u.sparse_alloc_in(0, GRAIN, GRAIN).unwrap();

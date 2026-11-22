@@ -303,8 +303,9 @@ fn main() {
         let a = XMemAlloc(0x20000, attrs);
         let b = XMemAlloc(0x10000, attrs);
         ensure!(!a.is_null() && !b.is_null(), "null");
-        // first graphics allocations: the start of the region, so low 32 bits = offset in it
-        ensure!(a as usize >> 32 >= 4 && a as usize & 0xFFFF_FFFF == 0, "a = {a:?}");
+        // in the region (from 16 GiB up), 64 KiB aligned; the region's first range is XCL's own
+        // (32-bit descriptor heaps), so the title's first allocation is not its start
+        ensure!(a as usize >> 32 >= 4 && a as usize & 0xFFFF == 0, "a = {a:?}");
         ensure!(b as usize == a as usize + 0x20000, "b = {b:?}, a = {a:?}");
         *(b as *mut u64) = 0x1122_3344;
         ensure!(*(b as *const u64) == 0x1122_3344, "read back");
