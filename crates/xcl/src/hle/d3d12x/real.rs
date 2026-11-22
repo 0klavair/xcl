@@ -322,12 +322,8 @@ fn geometry_wave32_required(device: *mut c_void) -> bool {
     }
 }
 
-fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
-    let n = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-    String::from_utf16_lossy(&desc.Description[..n])
-}
-
-/// Create the process-wide D3D12 device (high-performance GPU → WARP); once – later calls
+/// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
+/// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
     if !device_raw().is_null() {
@@ -358,16 +354,16 @@ pub fn init() -> Result<String, String> {
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
-        if !cfg.d3d12_adapter.eq_ignore_ascii_case("warp") {
-            let mut i = 0;
-            while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
-                i += 1;
-                let Ok(desc) = adapter.GetDesc1() else { continue };
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
-                    continue;
-                }
+        let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
+        if sel != crate::gpu::adapter::Selector::Warp {
+            let mut list = crate::gpu::adapter::candidates(&factory, &sel);
+            if list.is_empty() {
+                crate::xlog_warn!("D3D12: {} – using auto", crate::gpu::adapter::no_match(&factory, &sel));
+                list = crate::gpu::adapter::candidates(&factory, &crate::gpu::adapter::Selector::Auto);
+            }
+            for (adapter, desc) in list {
                 if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
-                    name = format!("{} ({} MiB VRAM)", adapter_name(&desc), desc.DedicatedVideoMemory >> 20);
+                    name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
                 }
             }

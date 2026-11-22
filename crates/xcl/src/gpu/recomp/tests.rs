@@ -26,6 +26,17 @@ fn gpu_ready_wave32() -> bool {
     }
 }
 
+/// `runner::mesh_draw` needs mesh shaders (not every adapter with wave64 has them).
+fn mesh_ready() -> bool {
+    match runner::mesh_shaders_supported() {
+        Ok(true) => true,
+        r => {
+            println!("GPU without mesh shaders – skipping ({r:?})");
+            false
+        }
+    }
+}
+
 /// Assemble a program from (name, encoding, fields, literal).
 fn prog(list: &[(&str, &str, &[(&str, u64)], Option<u32>)]) -> Vec<u8> {
     let mut v = Vec::new();
@@ -1673,7 +1684,7 @@ void main(uint gi : SV_GroupIndex, out vertices V verts[128], out indices uint3 
 /// shader, the pass-through mesh shader rasterises its records.
 #[test]
 fn gpu_mesh_mode_two_passes() {
-    if !gpu_ready() {
+    if !gpu_ready() || !mesh_ready() {
         return;
     }
     use super::{dxc, mesh_passthrough, MsInterface, MESH_HEADER};
@@ -2290,7 +2301,7 @@ fn dump_retail_interfaces() {
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
-    if !gpu_ready_wave32() {
+    if !gpu_ready_wave32() || !mesh_ready() {
         return;
     }
     use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};

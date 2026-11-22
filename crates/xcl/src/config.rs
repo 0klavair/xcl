@@ -43,7 +43,8 @@ pub struct Config {
     pub stub_returns: BTreeMap<String, String>,
     /// "d3d12" (real GPU, default) or "null" (no rendering).
     pub graphics: String,
-    /// "auto" (high-performance GPU, then WARP) or "warp".
+    /// "auto" (high-performance GPU, then WARP), "warp", a number (that hardware adapter in
+    /// high-performance order) or a part of the adapter's name ("radeon"). `XCL_ADAPTER` overrides.
     pub d3d12_adapter: String,
     /// Enable the D3D12 debug layer (needs Graphics Tools).
     pub d3d12_debug: bool,

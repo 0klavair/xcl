@@ -13,11 +13,8 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 type HRESULT = i32;
 
-#[link(name = "d3d12_xs", kind = "raw-dylib")]
-extern "system" {
-    fn D3D12CreateDevice(adapter: *mut c_void, fl: u32, riid: *const c_void, dev: *mut *mut c_void) -> HRESULT;
-    fn D3D12SerializeRootSignature(desc: *const c_void, v: u32, blob: *mut *mut c_void, err: *mut *mut c_void) -> HRESULT;
-}
+type D3D12CreateDeviceFn = unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT;
+type D3D12SerializeRootSignatureFn = unsafe extern "system" fn(*const c_void, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 
 // the console's texture layout library
 #[link(name = "xg_xs", kind = "raw-dylib")]
@@ -68,6 +65,19 @@ macro_rules! ensure {
     ($c:expr, $($m:tt)*) => { if !$c { return Err(format!($($m)*)); } };
 }
 
+/// An export of `d3d12_xs.dll` (XCL), looked up by name. Not a static import: the `windows`
+/// crate imports the same two functions from `d3d12.dll`, and of two imports of one symbol
+/// the linker keeps one – the system's. The title then got the system's device for the
+/// default adapter, which is XCL's device only while that adapter is the one XCL chose
+/// (D3D12 hands out one device per adapter); on a machine with two GPUs it is another one.
+unsafe fn xs<F: Copy>(name: &str) -> Result<F, String> {
+    let h = crate::LoadLibraryW(crate::wide("d3d12_xs.dll").as_ptr());
+    ensure!(h != 0, "LoadLibrary(d3d12_xs.dll) failed");
+    let f = crate::GetProcAddress(h, format!("{name}\0").as_ptr());
+    ensure!(f != 0, "d3d12_xs.dll!{name} not found");
+    Ok(transmute_copy(&f))
+}
+
 /// A command list method at its console slot: from SetDescriptorHeaps (PC 28) on, the
 /// console list has the PC methods 4 slots further (the query methods come first).
 unsafe fn xslot<F: Copy>(list: &ID3D12GraphicsCommandList, slot: usize) -> F {
@@ -90,7 +100,8 @@ fn e(x: windows::core::Error) -> String {
 fn device() -> Result<ID3D12Device, String> {
     unsafe {
         let mut p = std::ptr::null_mut();
-        let hr = D3D12CreateDevice(std::ptr::null_mut(), 0xC000, &ID3D12Device::IID as *const _ as *const c_void, &mut p);
+        let create: D3D12CreateDeviceFn = xs("D3D12CreateDevice")?;
+        let hr = create(std::ptr::null_mut(), 0xC000, &ID3D12Device::IID as *const _ as *const c_void, &mut p);
         ensure!(hr >= 0 && !p.is_null(), "D3D12CreateDevice hr={hr:#x}");
         Ok(ID3D12Device::from_raw(p))
     }
@@ -115,7 +126,8 @@ fn root_signature(dev: &ID3D12Device) -> Result<ID3D12RootSignature, String> {
     unsafe {
         let desc = D3D12_ROOT_SIGNATURE_DESC { Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, ..Default::default() };
         let (mut blob, mut err) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let hr = D3D12SerializeRootSignature(&desc as *const _ as *const c_void, 1, &mut blob, &mut err);
+        let serialize: D3D12SerializeRootSignatureFn = xs("D3D12SerializeRootSignature")?;
+        let hr = serialize(&desc as *const _ as *const c_void, 1, &mut blob, &mut err);
         ensure!(hr == 0 && !blob.is_null(), "D3D12SerializeRootSignature hr={hr:#x}");
         let blob = ID3DBlob::from_raw(blob);
         let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
