@@ -3630,3 +3630,21 @@ fn far_jumps_are_direct_branches() {
         assert_eq!((r.vgpr[l][1], r.vgpr[l][2]), (1, 9), "lane {l}");
     }
 }
+
+#[test]
+fn mesh_wave32_emits_wave32_logical_wave64() {
+    let code = 0xBF81_0000u32.to_le_bytes(); // s_endpgm
+    let ms = super::MsInterface { threads: 128, max_vertices: 64, max_primitives: 64, outputs: vec![] };
+    let native = translate(&code, &Options { mode: Mode::Mesh(ms.clone()), wave64: true, mesh_wave32: false, ..Default::default() }).unwrap();
+    assert!(native.hlsl.contains("[WaveSize(64)]"));
+    assert!(native.hlsl.contains("[numthreads(128, 1, 1)]"));
+    assert!(!native.hlsl.contains("xcl_logical_wave64 = true"));
+
+    let split = translate(&code, &Options { mode: Mode::Mesh(ms), wave64: true, mesh_wave32: true, ..Default::default() }).unwrap();
+    assert!(split.hlsl.contains("[WaveSize(32)]"));
+    assert!(split.hlsl.contains("[numthreads(128, 1, 1)]"));
+    assert!(split.hlsl.contains("xcl_half = (gi >> 5) & 1u;"));
+    assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
+    assert!(split.hlsl.contains("lane_id = WaveGetLaneIndex() + 32u * xcl_half;"));
+    assert!(split.complete(), "{:?}", split.unsupported_why);
+}

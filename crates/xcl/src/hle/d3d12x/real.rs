@@ -2879,7 +2879,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps), two_pass_ps(ps)) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, geometry_wave32_required(this)), two_pass_ps(ps)) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));

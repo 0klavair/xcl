@@ -467,6 +467,8 @@ pub struct Options {
     pub hw_wave: u32,
     /// geometry mode: emulate one logical wave64 with two native wave32 phases
     pub geometry_wave32: bool,
+    /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
+    pub mesh_wave32: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -481,7 +483,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
