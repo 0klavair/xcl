@@ -615,8 +615,10 @@ unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Resul
 
 unsafe extern "system" fn hk_find_first_ex_w(n: *const u16, lvl: i32, data: *mut c_void, op: i32, filt: *const c_void, fl: u32) -> HANDLE {
     let orig = orig!(O_FIND_FIRST_EX_W as FnFindFirstExW);
-    // only the common info levels/ops are virtualised
-    if lvl > 1 || op != 0 {
+    // only the common info levels/ops are virtualised. FindExSearchLimitToDirectories (1) is
+    // advisory – a file system without directory filtering ignores it and lists everything –
+    // so it is listed like a name match.
+    if lvl > 1 || op > 1 {
         return orig(n, lvl, data, op, filt, fl);
     }
     let Some(_g) = Guard::enter() else { return orig(n, lvl, data, op, filt, fl) };
