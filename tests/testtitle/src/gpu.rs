@@ -75,10 +75,12 @@ unsafe fn xslot<F: Copy>(list: &ID3D12GraphicsCommandList, slot: usize) -> F {
 }
 
 type OmSetRenderTargets = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_CPU_DESCRIPTOR_HANDLE, i32, *const D3D12_CPU_DESCRIPTOR_HANDLE);
+type ClearDsv = unsafe extern "system" fn(*mut c_void, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, f32, u8, u32, *const RECT);
 type ClearRtv = unsafe extern "system" fn(*mut c_void, D3D12_CPU_DESCRIPTOR_HANDLE, *const [f32; 4], u32, *const RECT);
 type SetRootSignature = unsafe extern "system" fn(*mut c_void, *mut c_void);
 const X_SET_GRAPHICS_ROOT_SIGNATURE: usize = 34;
 const X_OM_SET_RENDER_TARGETS: usize = 50;
+const X_CLEAR_DEPTH_STENCIL_VIEW: usize = 51;
 const X_CLEAR_RENDER_TARGET_VIEW: usize = 52;
 
 fn e(x: windows::core::Error) -> String {
@@ -453,8 +455,8 @@ pub fn console_device_methods() -> Result<(), String> {
 
 /// The console command list's memory methods as a title calls them, on its own graphics
 /// memory: Write32BitValueBottomOfPipeX #69, Write64BitValueTopOfPipeX #89, a GPU timestamp
-/// (#70), FillMemoryWith32BitValueX #61, CopyMemoryToMemoryX #60, and an extension XCL does not
-/// model (Wait32BitValueX #71).
+/// (#70), FillMemoryWith32BitValueX #61, CopyMemoryToMemoryX #60, Wait32BitValueX #71,
+/// Wait64BitValueX #72, and KickoffX #93.
 pub fn console_list_methods() -> Result<(), String> {
     unsafe {
         let dev = device()?;
@@ -476,6 +478,10 @@ pub fn console_list_methods() -> Result<(), String> {
         let fill32: unsafe extern "system" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(slot(61));
         let copy: unsafe extern "system" fn(*mut c_void, u64, u64, u64, u32) = std::mem::transmute(slot(60));
         let wait32: unsafe extern "system" fn(*mut c_void, u64, u32, u32, u32, u32) = std::mem::transmute(slot(71));
+        let wait64: unsafe extern "system" fn(*mut c_void, u64, u32, u64, u64, u32) = std::mem::transmute(slot(72));
+        let kickoff: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(slot(93));
+
+        // 1. Memory writes, timestamp, fill, copy, and same-list write-then-wait (must not deadlock)
         write32_bottom(l, at(0), 0x1234_5678, 0, 0);
         write64_top(l, at(8), 0x1122_3344_5566_7788, 0);
         write64_bottom(l, at(0x10), 0, 0, 1); // GPU timestamp
@@ -493,6 +499,47 @@ pub fn console_list_methods() -> Result<(), String> {
         ensure!(r64(0x10) != 0, "no GPU timestamp");
         ensure!((0..64).all(|i| r32(0x100 + 4 * i) == 0xABCD_EF01) && r32(0x200) == 0 && r32(0xFC) == 0, "FillMemoryWith32BitValueX");
         ensure!((0..64).all(|i| *mem.add(0x2000 + i) == i as u8 ^ 0x5A) && *mem.add(0x2040) == 0, "CopyMemoryToMemoryX");
+
+        // 2. KickoffX (#93): flushes work to the GPU BEFORE Close() is called, then continues recording
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        write32_bottom(l, at(0x400), 0x1111_2222, 0, 0);
+        kickoff(l);
+        // Wait for the kicked-off write on the GPU while the list is still open!
+        let t0 = std::time::Instant::now();
+        while (mem.add(0x400) as *const std::sync::atomic::AtomicU32).as_ref().unwrap().load(std::sync::atomic::Ordering::Acquire) != 0x1111_2222
+            && t0.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        ensure!(r32(0x400) == 0x1111_2222, "KickoffX did not flush work before Close ({:#x})", r32(0x400));
+        // Continue recording on the same list and submit normally via Close + ExecuteCommandLists
+        write32_bottom(l, at(0x404), 0x3333_4444, 0, 0);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 2)?;
+        ensure!(r32(0x404) == 0x3333_4444, "post-KickoffX write failed ({:#x})", r32(0x404));
+
+        // 3. Cross-thread Wait32BitValueX (#71, masked EQUAL) + Wait64BitValueX (#72, GREATER_EQUAL)
+        alloc.Reset().map_err(e)?;
+        list.Reset(&alloc, None).map_err(e)?;
+        wait32(l, at(0x300), 3, 0x0000_00AA, 0x0000_00FF, 0);
+        wait64(l, at(0x308), 7, 0x0000_0002_0000_0000, u64::MAX, 0);
+        write32_bottom(l, at(0x310), 0x55AA_55AA, 0, 0);
+        list.Close().map_err(e)?;
+        let addr32 = at(0x300) as usize;
+        let addr64 = at(0x308) as usize;
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            (*(addr32 as *const std::sync::atomic::AtomicU32)).store(0xDEAD_00AA, std::sync::atomic::Ordering::Release);
+            (*(addr64 as *const std::sync::atomic::AtomicU64)).store(0x0000_0003_0000_0000, std::sync::atomic::Ordering::Release);
+        });
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(e)?)]);
+        wait(&queue, &fence, 3)?;
+        writer.join().map_err(|_| "wait writer thread panicked".to_string())?;
+        ensure!(r32(0x300) == 0xDEAD_00AA && r64(0x308) == 0x0000_0003_0000_0000, "wait cells not written");
+        ensure!(r32(0x310) == 0x55AA_55AA, "post-Wait32/64 write failed ({:#x})", r32(0x310));
+
         crate::XMemFree(mem as *mut c_void, graphics);
         Ok(())
     }
@@ -1112,5 +1159,224 @@ pub fn mfplat_reset_dxgi_device_manager() -> Result<(), String> {
         release(mgr);
         let _ = MFShutdown();
         res
+    }
+}
+
+/// Dynamic depth bias via `RSSetDepthBiasX` (#94): draws a triangle at z = 0.5 against a depth
+/// buffer cleared to 0.5 with `DepthFunc = LESS`, exercising native `ID3D12GraphicsCommandList9`
+/// dynamic depth bias (when supported by the adapter) or the patched-PSO fallback:
+/// 1. Top-left: no bias → rejected (blue).
+/// 2. Top-right: fractional `RSSetDepthBiasX(-1000.5, 0, 0)` → passes (green).
+/// 3. `KickoffX` (#93) while `-1000.5` is active, then bottom-right without re-calling
+///    `RSSetDepthBiasX` → still passes (green).
+/// 4. Bottom-left right half: `RSSetDepthBiasX(0, 0, 0)` resets bias to 0 → rejected (blue).
+/// 5. Bottom-left left half: PSO with baked static `RasterizerState.DepthBias = -1000` (no
+///    `RSSetDepthBiasX` override) → passes (green).
+/// 6. Top-left corner: switch back to zero-bias PSO → previous PSO's static bias does not leak (blue).
+pub fn dynamic_depth_bias() -> Result<(), String> {
+    unsafe {
+        let dev = device()?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let rs = root_signature(&dev)?;
+        let vs = compile(
+            "float4 main(uint id : SV_VertexID) : SV_Position { float2 p[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) }; return float4(p[id], 0.5, 1.0); }",
+            "vs_5_0",
+        )?;
+        let ps = compile("float4 main() : SV_Target { return float4(0, 1, 0, 1); }", "ps_5_0")?;
+        let mut desc = pso_desc(&rs, bc(&vs), bc(&ps));
+        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        desc.DepthStencilState.DepthEnable = true.into();
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        let pso: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&desc).map_err(e)?;
+
+        let mut static_desc = desc;
+        static_desc.RasterizerState.DepthBias = -1000;
+        let pso_static_bias: ID3D12PipelineState = dev.CreateGraphicsPipelineState(&static_desc).map_err(e)?;
+
+        let (w, h) = (64u32, 64u32);
+        let rt_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let rt_clear = D3D12_CLEAR_VALUE { Format: DXGI_FORMAT_R8G8B8A8_UNORM, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0, 0.0, 1.0, 1.0] } };
+        let mut rt: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &rt_desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            Some(&rt_clear),
+            &mut rt,
+        )
+        .map_err(e)?;
+        let rt = rt.ok_or("no render target")?;
+
+        let ds_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let ds_clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.5, Stencil: 0 } },
+        };
+        let mut ds: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &ds_desc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            Some(&ds_clear),
+            &mut ds,
+        )
+        .map_err(e)?;
+        let ds = ds.ok_or("no depth buffer")?;
+
+        let rtv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .map_err(e)?;
+        let dsv_heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default() })
+            .map_err(e)?;
+        let heap_start = |heap: &ID3D12DescriptorHeap| -> D3D12_CPU_DESCRIPTOR_HANDLE {
+            let f: unsafe extern "system" fn(*mut c_void) -> usize = transmute_copy(&(*(*(heap.as_raw() as *const *const usize)).add(9)));
+            D3D12_CPU_DESCRIPTOR_HANDLE { ptr: f(heap.as_raw()) }
+        };
+        let rtv = heap_start(&rtv_heap);
+        let dsv = heap_start(&dsv_heap);
+        dev.CreateRenderTargetView(&rt, None, rtv);
+        dev.CreateDepthStencilView(&ds, None, dsv);
+
+        let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&rt_desc, 0, 1, 0, Some(&mut layout), None, None, Some(&mut total));
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: total,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut rb,
+        )
+        .map_err(e)?;
+        let rb = rb.ok_or("no readback buffer")?;
+
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
+        let bind_pass_state = || {
+            xslot::<OmSetRenderTargets>(&list, X_OM_SET_RENDER_TARGETS)(list.as_raw(), 1, &rtv, 0, &dsv);
+            list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
+            xslot::<SetRootSignature>(&list, X_SET_GRAPHICS_ROOT_SIGNATURE)(list.as_raw(), rs.as_raw());
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        };
+        bind_pass_state();
+        xslot::<ClearRtv>(&list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.0, 0.0, 1.0, 1.0], 0, std::ptr::null());
+        xslot::<ClearDsv>(&list, X_CLEAR_DEPTH_STENCIL_VIEW)(list.as_raw(), dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, 0, std::ptr::null());
+
+        let vp = |x: u32, y: u32, vw: u32, vh: u32| D3D12_VIEWPORT { TopLeftX: x as f32, TopLeftY: y as f32, Width: vw as f32, Height: vh as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        type KickoffX = unsafe extern "system" fn(*mut c_void);
+        type SetDepthBiasX = unsafe extern "system" fn(*mut c_void, f32, f32, f32);
+        let kickoff = xslot::<KickoffX>(&list, 93);
+        let set_bias = xslot::<SetDepthBiasX>(&list, 94);
+
+        // 1. Top-left: no bias (0.5 < 0.5 is false -> rejected -> blue)
+        list.RSSetViewports(&[vp(0, 0, w / 2, h / 2)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        // 2. Top-right: fractional negative depth bias pushes z < 0.5 -> passes -> green
+        set_bias(list.as_raw(), -1000.5, 0.0, 0.0);
+        list.RSSetViewports(&[vp(w / 2, 0, w / 2, h / 2)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        // 3. KickoffX mid-list while depth-bias override is active: bias must persist after Reset()
+        kickoff(list.as_raw());
+        bind_pass_state();
+        list.RSSetViewports(&[vp(w / 2, h / 2, w / 2, h / 2)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        // 4. Bottom-left right half: reset depth bias to 0 -> rejected -> blue
+        set_bias(list.as_raw(), 0.0, 0.0, 0.0);
+        list.RSSetViewports(&[vp(w / 4, h / 2, w / 4, h / 2)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        // 5. Bottom-left left half: PSO with baked static DepthBias = -1000 (no override) -> passes -> green
+        list.SetPipelineState(&pso_static_bias);
+        list.RSSetViewports(&[vp(0, h / 2, w / 4, h / 2)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        // 6. Top-left corner: switch back to zero-bias PSO -> static bias must not leak -> blue
+        list.SetPipelineState(&pso);
+        list.RSSetViewports(&[vp(0, 0, w / 4, h / 4)]);
+        list.DrawInstanced(3, 1, 0, 0);
+
+        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: transmute_copy(&rt),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }),
+            },
+        }]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: transmute_copy(&rb),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: layout },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: transmute_copy(&rt),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        wait(&queue, &fence, 1)?;
+
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).map_err(e)?;
+        let pitch = layout.Footprint.RowPitch as usize;
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let o = y * pitch + x * 4;
+            let s = std::slice::from_raw_parts((p as *const u8).add(o), 4);
+            [s[0], s[1], s[2], s[3]]
+        };
+        let (tl, tr, br, bl_reset, bl_static, tl_after) = (px(20, 20), px(48, 16), px(48, 48), px(24, 48), px(8, 48), px(8, 8));
+        rb.Unmap(0, None);
+        ensure!(tl == [0, 0, 255, 255], "top-left {tl:?} (expected blue: no depth bias, 0.5 < 0.5 fails)");
+        ensure!(tr == [0, 255, 0, 255], "top-right {tr:?} (expected green: RSSetDepthBiasX(-1000.5) passes depth test)");
+        ensure!(br == [0, 255, 0, 255], "bottom-right {br:?} (expected green: depth bias persists across KickoffX)");
+        ensure!(bl_reset == [0, 0, 255, 255], "bottom-left reset {bl_reset:?} (expected blue: RSSetDepthBiasX(0) restores zero bias)");
+        ensure!(bl_static == [0, 255, 0, 255], "bottom-left static {bl_static:?} (expected green: baked static DepthBias = -1000 preserved)");
+        ensure!(tl_after == [0, 0, 255, 255], "top-left after static PSO {tl_after:?} (expected blue: static bias did not leak to zero-bias PSO)");
+        Ok(())
     }
 }

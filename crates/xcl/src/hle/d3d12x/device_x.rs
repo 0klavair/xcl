@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::core::GUID;
 
@@ -34,6 +35,7 @@ pub const XBOX_TYPE_DMA: u32 = 0x10;
 /// IID of the console's DMA command list (created as a PC graphics command list)
 const IID_XBOX_DMA_COMMAND_LIST: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
 const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
+const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
 const XBOX_ARG_DISPATCH_X: u32 = 105;
 
@@ -66,7 +68,11 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
 pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let d = if desc.is_null() { [0; 4] } else { pc_queue_desc(desc.read_unaligned()) };
-    real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv)
+    let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
+    }
+    hr
 }
 
 /// device #9 CreateCommandAllocator(type, riid, allocator)
@@ -81,7 +87,11 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let hr = if super::console_list::enabled() {
         real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
     } else {
-        real::dev_create_command_list(this, node, ty, alloc, pso, riid, ppv)
+        let hr = real::dev_create_command_list(this, node, ty, alloc, pso, riid, ppv);
+        if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+            super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
+        }
+        hr
     };
     if dma && hr >= 0 && !ppv.is_null() {
         real::readopt(*ppv, real::Kind::DmaList);
@@ -123,11 +133,76 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 }
 
 /// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
-/// derived pipelines
+/// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = real::dev_create_graphics_pso(this, desc, riid, ppv);
-    if hr >= 0 && !ppv.is_null() {
-        note_base(*ppv, desc);
+    create_graphics_pso_tracked(this, desc, riid, ppv)
+}
+
+/// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
+/// -1 = not yet probed, 0 = unsupported, 1 = supported.
+static DYN_DEPTH_BIAS: AtomicI8 = AtomicI8::new(-1);
+
+/// Query `D3D12_FEATURE_D3D12_OPTIONS16` for native dynamic depth bias support and cache it.
+pub(super) fn probe_dynamic_depth_bias(dev: &ID3D12Device) -> bool {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    let supported = unsafe {
+        dev.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS16,
+            &mut opts as *mut _ as *mut c_void,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32,
+        )
+        .is_ok()
+            && opts.DynamicDepthBiasSupported.as_bool()
+    };
+    DYN_DEPTH_BIAS.store(if supported { 1 } else { 0 }, Ordering::Release);
+    crate::xlog_info!(
+        "D3D12.X: native dynamic depth bias (OPTIONS16): {}",
+        if supported { "supported (ID3D12GraphicsCommandList9::RSSetDepthBias)" } else { "unsupported (using patched-PSO fallback)" }
+    );
+    supported
+}
+
+/// Whether the D3D12 device supports `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` /
+/// `ID3D12GraphicsCommandList9::RSSetDepthBias`. Lazily probes `dev` if not yet probed.
+pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
+    match DYN_DEPTH_BIAS.load(Ordering::Acquire) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
+    if dev.is_null() {
+        return false;
+    }
+    ID3D12Device::from_raw_borrowed(&dev).is_some_and(probe_dynamic_depth_bias)
+}
+
+/// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
+/// device supports it (retrying without the flag if creation fails), and record it as a base.
+unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let mut used_dynamic = false;
+    let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
+        let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
+        let already_dynamic = rd32(&orig.0, PSO_FLAGS) & FLAG_DYNAMIC_DEPTH_BIAS != 0;
+        let want_dynamic = !already_dynamic && rd32(&orig.0, SO_ENTRIES) == 0 && dynamic_depth_bias_supported(this);
+        if want_dynamic {
+            let mut dyn_desc = orig;
+            enable_dynamic_depth_bias(&mut dyn_desc.0);
+            let hr = real::dev_create_graphics_pso(this, dyn_desc.0.as_ptr() as *const c_void, riid, ppv);
+            if hr >= 0 {
+                used_dynamic = true;
+                hr
+            } else {
+                real::dev_create_graphics_pso(this, desc, riid, ppv)
+            }
+        } else {
+            used_dynamic = already_dynamic;
+            real::dev_create_graphics_pso(this, desc, riid, ppv)
+        }
+    } else {
+        real::dev_create_graphics_pso(this, desc, riid, ppv)
+    };
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        note_base(*ppv, desc, used_dynamic);
     }
     hr
 }
@@ -139,21 +214,98 @@ const STAGES: [usize; 5] = [0x08, 0x18, 0x28, 0x38, 0x48];
 const SO_ENTRIES: usize = 0x60;
 const INPUT_LAYOUT: usize = 0x228;
 const CACHED_PSO: usize = 0x278;
+/// Flags field in D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const PSO_FLAGS: usize = 0x288;
+const FLAG_DYNAMIC_DEPTH_BIAS: u32 = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS.0 as u32;
+/// RasterizerState.{DepthBias, DepthBiasClamp, SlopeScaledDepthBias} in D3D12_GRAPHICS_PIPELINE_STATE_DESC
+const RASTERIZER_DEPTH_BIAS: usize = 0x1D0;
+const RASTERIZER_DEPTH_BIAS_CLAMP: usize = 0x1D4;
+const RASTERIZER_SLOPE_SCALED_DEPTH_BIAS: usize = 0x1D8;
+/// Maximum cached depth-bias PSO variants across all base pipelines
+const MAX_DEPTH_BIAS_PSOS: usize = 1024;
 /// CreateDerivedPipelineStateX patch: { u32 part; payload } at this stride (the largest
 /// payload is the blend state)
 const PATCH: usize = 0x14C;
+
+/// Dynamic depth-bias override from `RSSetDepthBiasX`, stored as canonical f32 bits for hashing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub(super) struct DepthBias {
+    pub bias: u32,
+    pub clamp: u32,
+    pub slope: u32,
+}
+
+impl DepthBias {
+    pub(super) const ZERO: Self = Self { bias: 0, clamp: 0, slope: 0 };
+
+    fn canon(v: f32) -> u32 {
+        if v == 0.0 {
+            0.0f32.to_bits()
+        } else {
+            v.to_bits()
+        }
+    }
+
+    pub(super) fn new(bias: f32, clamp: f32, slope: f32) -> Self {
+        Self { bias: Self::canon(bias), clamp: Self::canon(clamp), slope: Self::canon(slope) }
+    }
+
+    pub(super) fn is_zero(self) -> bool {
+        self == Self::ZERO
+    }
+
+    pub(super) fn depth_bias(self) -> f32 {
+        f32::from_bits(self.bias)
+    }
+
+    pub(super) fn depth_bias_clamp(self) -> f32 {
+        f32::from_bits(self.clamp)
+    }
+
+    pub(super) fn slope_scaled_depth_bias(self) -> f32 {
+        f32::from_bits(self.slope)
+    }
+
+    pub(super) fn from_desc(d: &[u8; GFX_DESC]) -> Self {
+        let bias = i32::from_le_bytes(d[RASTERIZER_DEPTH_BIAS..RASTERIZER_DEPTH_BIAS + 4].try_into().unwrap()) as f32;
+        let clamp = f32::from_le_bytes(d[RASTERIZER_DEPTH_BIAS_CLAMP..RASTERIZER_DEPTH_BIAS_CLAMP + 4].try_into().unwrap());
+        let slope = f32::from_le_bytes(d[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS..RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4].try_into().unwrap());
+        Self::new(bias, clamp, slope)
+    }
+
+    pub(super) fn patch_desc(self, d: &mut [u8; GFX_DESC]) {
+        let bias_i32 = self.depth_bias().round() as i32;
+        d[RASTERIZER_DEPTH_BIAS..RASTERIZER_DEPTH_BIAS + 4].copy_from_slice(&bias_i32.to_le_bytes());
+        d[RASTERIZER_DEPTH_BIAS_CLAMP..RASTERIZER_DEPTH_BIAS_CLAMP + 4].copy_from_slice(&self.clamp.to_le_bytes());
+        d[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS..RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4].copy_from_slice(&self.slope.to_le_bytes());
+    }
+}
+
+fn enable_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
+    let flags = rd32(d, PSO_FLAGS) | FLAG_DYNAMIC_DEPTH_BIAS;
+    d[PSO_FLAGS..PSO_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+}
+
+fn clear_dynamic_depth_bias(d: &mut [u8; GFX_DESC]) {
+    let flags = rd32(d, PSO_FLAGS) & !FLAG_DYNAMIC_DEPTH_BIAS;
+    d[PSO_FLAGS..PSO_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+}
 
 /// A graphics pipeline desc as bytes, aligned like the struct for the runtime's reads.
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct GfxDesc([u8; GFX_DESC]);
 
-/// A title graphics pipeline's description, kept for CreateDerivedPipelineStateX. The input
-/// layout is copied; the shaders stay the title's and are checked by hash when a pipeline is
-/// derived from it.
+/// A title graphics pipeline's description, kept for CreateDerivedPipelineStateX and the
+/// patched-PSO fallback of RSSetDepthBiasX. The input layout is copied; the shaders stay the
+/// title's and are checked by hash when a pipeline is derived from it.
 struct Base {
     desc: GfxDesc,
     shaders: [u64; 5],
+    /// Whether this PSO was created with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS`.
+    dynamic_depth_bias: bool,
+    /// Original static `RasterizerState.{DepthBias, DepthBiasClamp, SlopeScaledDepthBias}`.
+    static_bias: DepthBias,
     _elems: Vec<[u8; 32]>,
     _names: Vec<CString>,
 }
@@ -163,6 +315,9 @@ unsafe impl Send for Base {}
 unsafe impl Sync for Base {}
 
 static BASES: Mutex<Option<HashMap<usize, Arc<Base>>>> = Mutex::new(None);
+/// Cached derived PSOs for `RSSetDepthBiasX`: (base PSO, override) → owned derived PSO.
+/// Released when the base PSO is released in `forget_base`.
+static DEPTH_BIAS_PSOS: Mutex<Option<HashMap<(usize, DepthBias), usize>>> = Mutex::new(None);
 
 fn rd32(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
@@ -188,7 +343,7 @@ unsafe fn stage_hashes(d: &[u8; GFX_DESC]) -> Option<[u64; 5]> {
 }
 
 /// Remember a title graphics pipeline's description (not with stream output).
-unsafe fn note_base(pso: *mut c_void, desc: *const c_void) {
+unsafe fn note_base(pso: *mut c_void, desc: *const c_void, dynamic_depth_bias: bool) {
     if pso.is_null() || desc.is_null() || !crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         return;
     }
@@ -197,6 +352,7 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void) {
         return;
     }
     let Some(shaders) = stage_hashes(&d.0) else { return };
+    let static_bias = DepthBias::from_desc(&d.0);
     let (p, n) = (rd64(&d.0, INPUT_LAYOUT) as usize, rd32(&d.0, INPUT_LAYOUT + 8) as usize);
     let (mut elems, mut names) = (Vec::new(), Vec::new());
     if n > 0 {
@@ -216,15 +372,122 @@ unsafe fn note_base(pso: *mut c_void, desc: *const c_void) {
     let at = if elems.is_empty() { 0 } else { elems.as_ptr() as u64 };
     d.0[INPUT_LAYOUT..INPUT_LAYOUT + 8].copy_from_slice(&at.to_le_bytes());
     d.0[CACHED_PSO..CACHED_PSO + 16].fill(0);
-    let base = Arc::new(Base { desc: d, shaders, _elems: elems, _names: names });
+    let base = Arc::new(Base { desc: d, shaders, dynamic_depth_bias, static_bias, _elems: elems, _names: names });
     BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, base);
 }
 
-/// A pipeline released for good is no longer a base.
+/// Depth-bias metadata for a tracked graphics PSO: `(created_with_dynamic_depth_bias, static_bias)`.
+pub(super) fn base_depth_bias_info(pso: usize) -> Option<(bool, DepthBias)> {
+    if pso == 0 {
+        return None;
+    }
+    BASES.lock().unwrap().as_ref()?.get(&pso).map(|b| (b.dynamic_depth_bias, b.static_bias))
+}
+
+#[cfg(test)]
+pub(super) fn depth_bias_cache_len() -> usize {
+    DEPTH_BIAS_PSOS.lock().unwrap().as_ref().map_or(0, HashMap::len)
+}
+
+#[cfg(test)]
+pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bias: DepthBias) {
+    let base = Arc::new(Base {
+        desc: GfxDesc([0u8; GFX_DESC]),
+        shaders: [0; 5],
+        dynamic_depth_bias,
+        static_bias,
+        _elems: Vec::new(),
+        _names: Vec::new(),
+    });
+    BASES.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, base);
+}
+
+/// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
 pub(super) fn forget_base(pso: usize) {
     if let Some(m) = BASES.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    let gone: Vec<usize> = {
+        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+        match g.as_mut() {
+            Some(m) => {
+                let mut out = Vec::new();
+                m.retain(|&(base, _), &mut derived| {
+                    if base == pso {
+                        out.push(derived);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                out
+            }
+            None => Vec::new(),
+        }
+    };
+    // release outside the lock: pso_release calls forget_pso -> forget_base on each derived PSO
+    for derived in gone {
+        super::pso_async::release(derived);
+    }
+}
+
+/// Derive (or reuse from cache) a graphics PSO from `base` with patched rasterizer depth-bias
+/// fields for `RSSetDepthBiasX`. Returns `None` if `base` is unknown, its shaders are gone,
+/// the cache cap is reached, or creation fails.
+pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBias) -> Option<usize> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if dev.is_null() || base == 0 {
+        return None;
+    }
+    if let Some(&cached) = DEPTH_BIAS_PSOS.lock().unwrap().as_ref().and_then(|m| m.get(&(base, bias))) {
+        return Some(cached);
+    }
+    let b = BASES.lock().unwrap().as_ref().and_then(|m| m.get(&base).cloned())?;
+    if stage_hashes(&b.desc.0) != Some(b.shaders) {
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – shaders of base pipeline {base:#x} are gone");
+        }
+        return None;
+    }
+    let mut d = b.desc;
+    clear_dynamic_depth_bias(&mut d.0);
+    bias.patch_desc(&mut d.0);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let hr = real::dev_create_graphics_pso(dev, d.0.as_ptr() as *const c_void, &IID_PIPELINE_STATE, &mut out);
+    if hr < 0 || out.is_null() {
+        if once(&N, 4) {
+            crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – deriving pipeline from {base:#x} failed ({hr:#x})");
+        }
+        return None;
+    }
+    let derived = out as usize;
+    let mut release_extra = 0usize;
+    let result = {
+        // re-check base liveness so we never leak a derived PSO for a concurrently released base
+        let alive = BASES.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&base));
+        let mut g = DEPTH_BIAS_PSOS.lock().unwrap();
+        let map = g.get_or_insert_with(HashMap::new);
+        if !alive {
+            release_extra = derived;
+            None
+        } else if let Some(&existing) = map.get(&(base, bias)) {
+            release_extra = derived;
+            Some(existing)
+        } else if map.len() >= MAX_DEPTH_BIAS_PSOS {
+            if once(&N, 1) {
+                crate::xlog_warn!("D3D12.X: RSSetDepthBiasX – derived PSO cache full ({MAX_DEPTH_BIAS_PSOS})");
+            }
+            release_extra = derived;
+            None
+        } else {
+            map.insert((base, bias), derived);
+            Some(derived)
+        }
+    };
+    if release_extra != 0 {
+        super::pso_async::release(release_extra);
+    }
+    result
 }
 
 /// Apply one CreateDerivedPipelineStateX patch to a desc: part 0 = depth-stencil state, 1 =
@@ -289,11 +552,7 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         }
     }
     let desc = d.0.as_ptr() as *const c_void;
-    let hr = real::dev_create_graphics_pso(this, desc, riid, ppv);
-    if hr >= 0 {
-        note_base(*ppv, desc);
-    }
-    hr
+    create_graphics_pso_tracked(this, desc, riid, ppv)
 }
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
@@ -605,6 +864,47 @@ mod tests {
         assert_eq!(apply_patch(&mut d, &patch), Ok(false));
         patch[0] = 4;
         assert_eq!(apply_patch(&mut d, &patch), Err(4));
+    }
+
+    #[test]
+    fn depth_bias_patches_rasterizer_fields() {
+        use std::mem::offset_of;
+        type G = D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        let rast = offset_of!(G, RasterizerState);
+        assert_eq!(RASTERIZER_DEPTH_BIAS, rast + offset_of!(D3D12_RASTERIZER_DESC, DepthBias));
+        assert_eq!(RASTERIZER_DEPTH_BIAS_CLAMP, rast + offset_of!(D3D12_RASTERIZER_DESC, DepthBiasClamp));
+        assert_eq!(RASTERIZER_SLOPE_SCALED_DEPTH_BIAS, rast + offset_of!(D3D12_RASTERIZER_DESC, SlopeScaledDepthBias));
+        assert_eq!(PSO_FLAGS, offset_of!(G, Flags));
+        assert_eq!(FLAG_DYNAMIC_DEPTH_BIAS, 4);
+
+        // -0.0 canonicalizes to +0.0 so zero checks and cache keys agree
+        let z = DepthBias::new(-0.0, 0.0, -0.0);
+        assert!(z.is_zero());
+        assert_eq!(z, DepthBias::new(0.0, 0.0, 0.0));
+
+        let b = DepthBias::new(-125.6, 0.05, 1.5);
+        assert!(!b.is_zero());
+        assert_eq!(b.depth_bias(), -125.6);
+        assert_eq!(b.depth_bias_clamp(), 0.05);
+        assert_eq!(b.slope_scaled_depth_bias(), 1.5);
+        let mut d = [0x55u8; GFX_DESC];
+        b.patch_desc(&mut d);
+        assert_eq!(i32::from_le_bytes(d[RASTERIZER_DEPTH_BIAS..RASTERIZER_DEPTH_BIAS + 4].try_into().unwrap()), -126);
+        assert_eq!(f32::from_le_bytes(d[RASTERIZER_DEPTH_BIAS_CLAMP..RASTERIZER_DEPTH_BIAS_CLAMP + 4].try_into().unwrap()), 0.05);
+        assert_eq!(f32::from_le_bytes(d[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS..RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4].try_into().unwrap()), 1.5);
+        // from_desc recovers the baked rasterizer fields
+        assert_eq!(DepthBias::from_desc(&d), DepthBias::new(-126.0, 0.05, 1.5));
+        // untouched bytes before and after the 12-byte depth-bias slice
+        assert!(d[..RASTERIZER_DEPTH_BIAS].iter().all(|&x| x == 0x55));
+        assert!(d[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4..].iter().all(|&x| x == 0x55));
+
+        // enable / clear D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS touches only bit 2 of Flags
+        let mut f = [0u8; GFX_DESC];
+        f[PSO_FLAGS..PSO_FLAGS + 4].copy_from_slice(&1u32.to_le_bytes());
+        enable_dynamic_depth_bias(&mut f);
+        assert_eq!(rd32(&f, PSO_FLAGS), 1 | FLAG_DYNAMIC_DEPTH_BIAS);
+        clear_dynamic_depth_bias(&mut f);
+        assert_eq!(rd32(&f, PSO_FLAGS), 1);
     }
 
     #[test]
