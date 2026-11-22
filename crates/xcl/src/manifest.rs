@@ -24,7 +24,7 @@ fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 }
 
 pub fn parse(xml: &str) -> Manifest {
-    let pls = xml.find("<PersistentLocalStorage>").and_then(|i| element(&xml[i..], "SizeMB"));
+    let pls = element(xml, "PersistentLocalStorage").and_then(|section| element(section, "SizeMB"));
     Manifest {
         pls_mb: pls.and_then(|v| v.parse().ok()),
         anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
@@ -66,5 +66,14 @@ mod tests {
         assert_eq!(m.pls_mb, Some(2048));
         assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
         assert_eq!(parse("<Game/>"), Manifest::default());
+    }
+
+    #[test]
+    fn does_not_take_storage_size_from_another_section() {
+        let xml = r#"<Game>
+  <PersistentLocalStorage></PersistentLocalStorage>
+  <Other><SizeMB>512</SizeMB></Other>
+</Game>"#;
+        assert_eq!(parse(xml).pls_mb, None);
     }
 }
