@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
-exclude = ["tools/ttpf-viewer"]
 members = ["crates/xcl", "tests/testtitle", "tests/testgamedll"]
 
 [workspace.package]

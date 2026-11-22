@@ -639,8 +639,8 @@ mod tests {
         assert_eq!(l.detile(&t, w, h), lin);
     }
 
-    /// The patterns the TTPF viewer found by eye on retail console textures (tools/ttpf-viewer
-    /// tile.rs) are addrlib's SW_64KB_D (64 KB tiles) and SW_4KB_S (4 KB tiles), bit for bit.
+    /// The patterns found by eye on retail console textures are addrlib's SW_64KB_D (64 KB
+    /// tiles) and SW_4KB_S (4 KB tiles), bit for bit.
     #[test]
     fn standard_swizzle_matches_the_retail_texture_patterns() {
         let retail: [(u32, u32, &str); 10] = [

@@ -76,14 +76,14 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
-| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf`; `tools/ttpf-viewer` (texture archive viewer) | – |
+| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
 
 ## What is missing
 
 | Not done yet | Not planned |
 |---|---|
 | MSAA textures in the console's tiled layout | Xbox Live, Store licensing (offline by design) |
-| performance work (GPU buffers live in system memory) | decrypting XVC packages or any DRM |
+| | decrypting XVC packages or any DRM |
 | | console SDK headers / binaries in the repository |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime

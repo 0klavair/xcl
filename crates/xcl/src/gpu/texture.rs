@@ -774,8 +774,8 @@ mod tests {
         end: usize,
     }
 
-    /// Just enough of a .ttpf archive (see tools/ttpf-viewer/src/archive.rs): its zlib blocks
-    /// of one unpacked stream and the texture table.
+    /// Just enough of a .ttpf archive: its zlib blocks of one unpacked stream and the texture
+    /// table.
     struct Ttpf {
         d: Vec<u8>,
         /// (file offset, position in the stream), by position
