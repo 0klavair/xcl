@@ -4694,19 +4694,13 @@ uint mul_hi_u32(uint a, uint b) {
 // wave32 program in a 64-lane hardware wave: each half is its own wave (xcl_half = 0 / 1)
 static bool xcl_w32 = false;
 static uint xcl_half = 0u;
-// A logical wave64 split over two native wave32s. Each half carries only its own mask;
-// geometry mode rejects cross-half lane reads before generating this form.
-static bool xcl_logical_wave64 = false;
 bool lanebit(uint lo, uint hi) { return ((select(lane_id < 32u, lo, hi) >> (lane_id & 31u)) & 1u) != 0u; }
 uint2 ballot(bool b) {
     uint4 m = WaveActiveBallot(b);
-    if (xcl_logical_wave64) return xcl_half != 0u ? uint2(0u, m.x) : uint2(m.x, 0u);
     return uint2(select(and(xcl_w32, xcl_half != 0u), m.y, m.x), select(xcl_w32, 0u, m.y));
 }
 uint rla(uint v, uint l) {
-    uint w;
-    if (xcl_logical_wave64) w = (l >> 5) == xcl_half ? WaveReadLaneAt(v, l & 31u) : 0u;
-    else w = WaveReadLaneAt(v, l + 32u * xcl_half);
+    uint w = WaveReadLaneAt(v, l + 32u * xcl_half);
 #ifdef XCL_PIXEL
     // A lane of the reader's own quad through a quad read: those see helper lanes (wave reads
     // do not before SM 6.7), and the console's derivatives (DPP quad_perm, ds_swizzle) read the
@@ -4718,14 +4712,13 @@ uint rla(uint v, uint l) {
     // here (0 in practice: every other quad of the wave got the wrong value, e.g. a shader's
     // draw type, and took the wrong branch). Its own quad sees it through a quad read; the
     // reader takes that from a live lane of the same quad.
-    uint h = xcl_logical_wave64 ? (l & 31u) : l + 32u * xcl_half;
+    uint h = l + 32u * xcl_half;
     uint4 xcl_lv = WaveActiveBallot(true);
     uint nib = (xcl_lv[min(h >> 5, 3u)] >> (h & 28u)) & 15u;
     uint src = (h & ~3u) + firstbitlow(nib);
     uint r0 = WaveReadLaneAt(q0, src), r1 = WaveReadLaneAt(q1, src), r2 = WaveReadLaneAt(q2, src), r3 = WaveReadLaneAt(q3, src);
     uint r = (l & 2u) != 0u ? ((l & 1u) != 0u ? r3 : r2) : ((l & 1u) != 0u ? r1 : r0);
-    bool same_half = !xcl_logical_wave64 || (l >> 5) == xcl_half;
-    if (same_half && nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
+    if (nib != 0u && ((nib >> (h & 3u)) & 1u) == 0u) w = r;
     if ((l >> 2) == (lane_id >> 2)) w = q;
 #endif
     return w;

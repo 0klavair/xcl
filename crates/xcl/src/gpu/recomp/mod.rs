@@ -1081,8 +1081,9 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Split geometry and split mesh translation reject these
-/// rather than silently changing cross-half lane or mask semantics.
+/// preserving one logical wave64. The split form (`Options::split_wave64`) exchanges masks
+/// and lane values between the halves and needs no such list; a program without any of these
+/// could run as two independent halves without exchanges (a possible fast path).
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
