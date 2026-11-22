@@ -6,5 +6,18 @@ $missing = 'XCL_SAMPLE_RPF', 'XCL_SAMPLE_DLLS', 'XCL_SAMPLE_TTPF', 'XCL_SAMPLE_B
 if ($missing) { Write-Host "not set, their tests are skipped: $($missing -join ', ')" }
 cargo build --workspace
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cargo test --workspace -- --test-threads=4
-exit $LASTEXITCODE
+# GPU tests that cannot run on this adapter pass too: each prints "SKIPPED <test>: <reason>"
+# to stderr (XCL_REQUIRE_GPU=wave64 / =mesh makes them fail); counted at the end
+$ErrorActionPreference = 'Continue'
+$skipped = @()
+cargo test --workspace -- --test-threads=4 2>&1 | ForEach-Object {
+    $line = "$_"
+    if ($line -match '^SKIPPED \S+: (.+)$') { $skipped += $Matches[1] }
+    Write-Host $line
+}
+$code = $LASTEXITCODE
+if ($skipped) {
+    $counts = $skipped | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Count) ($($_.Name))" }
+    Write-Host "GPU tests skipped on this adapter: $($counts -join ', ')"
+}
+exit $code

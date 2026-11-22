@@ -358,6 +358,27 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.mesh).map_err(|x| x.clone())
 }
 
+/// A GPU test (or a part of one) that cannot run here, `reason` one of "no GPU", "no DXC",
+/// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
+/// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
+/// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
+/// turns a skip that leaves that coverage out into a failure.
+pub fn skip_test(reason: &str) {
+    use std::io::Write;
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("?");
+    let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
+    let fails = required.split(',').map(str::trim).any(|r| match r {
+        "wave64" => reason != "no mesh shaders",
+        "mesh" => reason != "no wave64",
+        _ => false,
+    });
+    if fails {
+        panic!("{test}: {reason}, but XCL_REQUIRE_GPU={required}");
+    }
+    let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
+}
+
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
 pub fn run(dxil: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
     run_with(dxil, state, mem, &[], &[])

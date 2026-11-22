@@ -573,6 +573,7 @@ mod tests {
     fn gpu_console_textures_upload_every_mip_and_slice() {
         let Some((dev, queue)) = device() else {
             println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
             return;
         };
         let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
