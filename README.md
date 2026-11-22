@@ -8,9 +8,11 @@ x64 code runs natively and XCL stands in for the console libraries the PC does n
 (`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
 GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
 
-**Project state:** retail games run their menus – see [Games](#games). The foundation is tested
-against real data from retail games (shader packs, texture archives, movies and the console DLLs
-they ship). Details, measurements and next steps:
+**Project state:** retail games run – Minecraft Preview is fully playable (worlds, sound,
+controller), Fortnite and XDefiant work as far as each game goes without its online
+services; see [Games](#games). The foundation is tested against real data from retail games
+(shader packs, texture archives, movies and the console DLLs they ship). Details, measurements and
+next steps:
 [`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
 
 ## Games
@@ -32,7 +34,7 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
   console upscaler sets up and records its work, the GDK HTTP library initialises.
 - **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
   textures of the game's texture archive byte for byte, its volume textures included.
-- **150 automated tests**, including GPU tests that compare translated shaders against expected
+- **370+ automated tests**, including GPU tests that compare translated shaders against expected
   results instruction by instruction.
 
 ## What works
@@ -46,7 +48,7 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 | **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | the game's 16 console DLLs load with 0 unresolved imports |
 | **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
 | **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
-| **File system** | ✅ | console paths (`GAME:` …) → the game folder; writes go to an overlay, the game folder is never modified | end-to-end: the test title's folder stays byte-identical |
+| **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
 
 ### System services
 
@@ -63,7 +65,7 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 | **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
 | **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
 | **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
-| **D3D12.X graphics** | 🟡 | device, resources, heaps and pipelines are in place | draw submission and present need the game exe |
+| **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
 | **Upscaling** | ✅ | the game's AMD FSR 4 console DLL creates its context and records its dispatches | end-to-end with the real DLL |
@@ -77,12 +79,12 @@ XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
 
 ## What is missing
 
-| Needs a game executable | Not done yet | Not planned |
-|---|---|---|
-| D3D12.X draw records and `PresentX` / frame pacing | performance work (GPU buffers live in system memory) | Xbox Live, Store licensing (offline by design) |
-| root arguments → shader registers for graphics | hull / domain / amplification shaders (none in the sample game) | decrypting XVC packages or any DRM |
-| texture creation in title memory (binding the detiler), MSAA tiled textures | | console SDK headers / binaries in the repository |
-| Bink GPU decoding, rehydrating prebuilt BVHs | | |
+| Not done yet | Not planned |
+|---|---|
+| MSAA textures in the console's tiled layout | Xbox Live, Store licensing (offline by design) |
+| Bink GPU decoding | decrypting XVC packages or any DRM |
+| hull / domain / amplification shaders (none in the games so far) | console SDK headers / binaries in the repository |
+| performance work (GPU buffers live in system memory) | |
 
 Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
 classes asked for, shader statistics, audio formats, crash) – the to-do list for the next step.
@@ -108,7 +110,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
-  `logs\xcl.log`, `logs\report.json`.
+  `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
+  previous run's: `xcl.prev.log`, `report.prev.json`).
 
 ## Tests
 
