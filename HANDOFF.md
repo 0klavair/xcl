@@ -1109,12 +1109,54 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `note_alias`). GPU-owned textures (render target / depth / UAV flags) now go to *arenas*: default heaps standing for
   ranges of title addresses (from the 32 MiB below, at least 128 MiB), placed at their address's offset, so resources
   at one address share memory. ~16 arenas in XDefiant's first 25 s. Other textures stay committed and mirrored.
-- **XDefiant now (2026-11-22)**: runs 90 s without a GPU hang and ends itself (`XCL_RUN_SECONDS`); ~1 500 console
-  shaders translated, thousands of draws and dispatches, nothing skipped. The presented 3840x2160 buffer is still
-  black: it is written by a compute pass through a UAV (never a render target); the scene / UI render targets are
-  (almost) black too – the title may be at its online-login gate (another implementer: it retries RTA / Ubisoft
-  services), or something in the frame is still wrong. ~2.3 frames per second: the sparse-window uploads cost ~30 ms
-  a submit (126 s in 4 096 submits) – next to optimise (no wait for idle per upload, cheaper dirty scan).
+- **XDefiant now (2026-11-22, later)**: its title screen is on screen – logo, "Welcome, Player1#0001", "press A to
+  start / change account" (in the system's language), ~40–50 frames per second there (release build). After a
+  change to the translated pixel shaders' HLSL the DXIL cache misses: ~1 500 pixel shaders compile in the
+  background over two or three runs, and until a pipeline is built it draws nothing (black or half-drawn frames –
+  check "new dxil" before blaming a change).
+- **Seams along triangle edges (fixed)**: dotted lines on the diagonal of the logo's quads. The console takes
+  derivatives across a quad's lanes by hand (DPP quad_perm, ds_swizzle) and reads the helper pixels of quads a
+  primitive's edge splits; `rla` read lanes with WaveReadLaneAt, which leaves helper lanes out before SM 6.7. Pixel
+  shaders now read lanes of their own quad with QuadReadLaneAt (quad operations include helper lanes) – `XCL_PIXEL`
+  in the prelude; `console_compiled_derivatives_hold_on_triangle_edges` (two triangles, ddx_fine / ddy_fine: 48 of
+  1 024 pixels wrong before, 0 after). Do NOT use `[WaveOpsIncludeHelperLanes]` (ps_6_7): tried, the device hung
+  ~9 s in – with it the entry `ballot(true)` (the live mask the console code returns to after `s_wqm`) includes the
+  helper lanes, so they never stop. Ballots (v_cmp) still leave helper lanes out (matters for branches inside
+  whole-quad sections). The console sets IASetPrimitiveTopology 17 (rectangle lists) for these quads; the AMD driver
+  draws them as two triangles here – rectangle lists are not modelled otherwise.
+- **Why every frame was black: descriptors are values.** XDefiant makes its views in a CPU-only heap (131 072
+  slots) and copies them into its shader-visible heap (442 368 slots) as memory – the console header's inline
+  CopyDescriptorsSimple; only sampler copies reach the device. T# word 0 was an index into each heap's own PC heap,
+  so every copied T# named a descriptor of the wrong heap (empty): shaders read zeros, UAV writes went nowhere – the
+  presented buffers stayed 0 including alpha. Now all console view heaps share one shader-visible PC heap
+  (`console_heap`, `Global`: up to 2^21 descriptors, OPTIONS19 says this GPU takes 32 M): each heap gets a range,
+  T# word 0 is an index into the shared heap (a copied T# still names its PC descriptor), lists bind the shared
+  heap whatever the title names (`list_x::pc_heaps`: console #32 and the console-list replay), the title's own PC
+  heap is a CPU-only mirror (views are made there and copied over – `publish`; copies come from it; UAV clears take
+  its CPU handle). A heap that finds no room keeps its own PC heap (the old way). Copies follow the source PC
+  descriptor: a source slot rewritten later changes earlier copies too (not seen).
+- **Speed**: the per-submit write-watch scan covered every watched region (4 GiB of window 0, 12 GiB of sparse
+  windows, graphics reservations): ~10 ms a submit, more than half of all time. It now covers only where a CPU write
+  matters – the textures kept in step and the sparse tiles with video memory (`title_textures::watch_ranges`,
+  `sparse::mapped_ranges`). Use the release build for game runs: the debug build hashes the dirty chunks ~10×
+  slower (and the queues then wait on each other for the sparse lock). The log has
+  "sparse windows timing: write-watch / lock wait / chunk scan / upload" lines.
+- **Controllers** (`hle::gameinput`): GameInput.dll was Windows' own (other interfaces, reads only for its own
+  foreground app) – the title never saw a button. Now XCL's: the GDK's v0 interfaces (IGameInput, IGameInputDevice,
+  IGameInputReading in the public header's order), one gamepad always connected, read from the PC's first XInput
+  controller plus the keyboard while a window of the process has the focus (Enter / Space A, Escape / Backspace B,
+  arrows D-pad, Tab View, P Menu); device callbacks (blocking / asynchronous enumeration), reading callbacks
+  (polled at 250 Hz), UI navigation state, rumble through XInputSetState. XDefiant imports GameInputCreate by
+  ordinal #1 (`stubdb.toml`). `XCL_PRESS_A_AT=s1,s2…` presses A for 200 ms at those seconds (tests). With it the
+  title screen takes A and goes to a loading screen (spinner) – it then waits, most likely for Ubisoft's services
+  (the network gate, next).
+- **Audio processor** (`hle::acphal`, routes acphal.dll and xapu.dll; chad.dll / XDsp stays E_NOTIMPL): APU memory
+  (32-bit APU addresses for ApuAlloc / ApuMapVirtualAddress), AcpHalCreate's channel (commands acknowledged at once,
+  an audio frame message every 2.667 ms), SHAPE context arrays, the xapu decoder answering with silence. Before,
+  `ApuCreateHeap` got E_NOTIMPL and XDefiant dropped its whole audio setup (+0x7639ef). Now it creates a 350 MB APU
+  heap, connects the decoder (320 streams), SHAPE contexts [512, 0, 0, 1024, 512] and the channel (commands 2 and
+  8). Its audio is still silent: it mixes through SHAPE (not XAudio2 – only bink2scarlett.dll imports XAudio2),
+  and SHAPE contexts are not run; that is the next step for sound (context layouts unknown).
 - **What made the GPU hang** (four PC reboots – the AMD driver did not always recover from the TDR): vertex buffers.
   Console #48 IASetVertexBuffers gave the title's addresses to the PC as GPU addresses – the index buffer was
   translated, the vertex buffers were not (NaN in every render target, then device hangs). `ia_set_vertex_buffers_x`.
@@ -1145,7 +1187,9 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   as CJK characters); `hle::user` makes them Unicode calls. The window stays white (console titles never paint it).
 - Diagnostics: `XCL_TRACE_FRAME=1` (what console code does with each presented resource; render-target binds, UAV
   views of large render targets, clear colours; with `XCL_FRAME_DUMP` also the busiest render target and raw texel
-  histograms), `XCL_TRACE_ADDRESSES=1` (root descriptor addresses in / outside unified memory), `XCL_DRED=1` (DRED
+  histograms; the console descriptor heaps made, the device's descriptor copies, a census of what each view heap's
+  slots hold – T# with their own index / another (copied as memory) / buffers – and, for full-screen dispatches, the
+  root arguments and constant-buffer words with the resources their small values index in the dispatch's tables), `XCL_TRACE_ADDRESSES=1` (root descriptor addresses in / outside unified memory), `XCL_DRED=1` (DRED
   page fault + breadcrumbs on a device removal – opt-in: twice the title stalled with it), `XCL_LIST_TRACE=1`.
 - **Notes from another implementer** (user-provided): XDefiant also calls XGCreateTextureComputerFromDescriptor, then
   libHttpClient / XCurl (XUserGetTokenAndSignature*, XNetworking) and retries wss://rta.xboxlive.com/connect every

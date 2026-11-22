@@ -63,6 +63,19 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if res == 0 {
         return 0;
     }
+    {
+        let mut p = PRESENTED.lock().unwrap();
+        if !p.contains(&res) {
+            p.push(res);
+        }
+    }
+    if trace_frame() {
+        static K: AtomicU64 = AtomicU64::new(0);
+        let k = K.fetch_add(1, Ordering::Relaxed);
+        if k == 2 || k == 300 {
+            super::console_heap::census();
+        }
+    }
     if trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -153,6 +166,13 @@ pub fn note_use(res: usize, what: usize) {
     if trace_frame() && res != 0 {
         USES.lock().unwrap().get_or_insert_with(HashMap::new).entry(res).or_default()[what] += 1;
     }
+}
+
+/// resources the title presented
+static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub fn is_presented(res: usize) -> bool {
+    PRESENTED.lock().unwrap().contains(&res)
 }
 
 /// the resource an RTV handle names (render-target binds)

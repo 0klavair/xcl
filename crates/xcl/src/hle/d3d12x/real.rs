@@ -703,6 +703,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (13, b::draw_indexed_instanced as usize),
                 (14, b::dispatch as usize),
                 (48, l::ia_set_vertex_buffers_x as usize),
+                (32, l::set_descriptor_heaps_x as usize),
                 (59, b::execute_indirect as usize),
                 (83, l::copy_texture_region_flags_x as usize),
                 (34, b::set_graphics_root_signature as usize),
@@ -779,19 +780,32 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
         return dev_create_descriptor_heap(this, desc as usize, riid, ppv);
     }
-    // views: an SRV / UAV pair per console slot; samplers: one per slot
-    let pc = [d[0], if sampler { d[1] } else { d[1].saturating_mul(2) }, d[2], d[3]];
+    // views: an SRV / UAV pair per console slot (in the shared shader-visible heap, the
+    // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
+    let pc_n = if sampler { d[1] } else { d[1].saturating_mul(2) };
+    let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
+    let first = match ID3D12Device::from_raw_borrowed(&this) {
+        Some(dev) if !sampler && !desc.is_null() => super::console_heap::reserve_global(dev, pc_n),
+        _ => None,
+    };
+    let flags = if first.is_some() { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
+    let pc = [d[0], pc_n, flags, d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
     if hr >= 0 {
         let raw = *ppv;
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
         let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr as u64;
-        let gpu = if d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
+        let gpu = if flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0 { heap.GetGPUDescriptorHandleForHeapStart().ptr } else { 0 };
         let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE(d[0] as i32));
-        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler) {
+        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, first, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
+            if let Some(f) = first {
+                super::console_heap::release_global(f, pc_n);
+            }
         }
+    } else if let Some(f) = first {
+        super::console_heap::release_global(f, pc_n);
     }
     hr
 }
@@ -1192,6 +1206,9 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
+    if !d0.sampler {
+        super::console_heap::publish_range(&d0, n);
+    }
     let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
     for k in 0..n as u64 {
         if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
@@ -1199,6 +1216,15 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
         }
     }
     true
+}
+
+/// `XCL_TRACE_FRAME`: the device's descriptor copies (first few, and a count)
+fn note_copy_call(what: &str, n: u32, dst: u64, src: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if super::present::trace_frame() && (k < 4 || k.is_power_of_two()) {
+        crate::xlog_info!("frame trace: {what} #{k}: {n} from {src:#x} to {dst:#x}");
+    }
 }
 
 static MIXED_COPIES: AtomicU64 = AtomicU64::new(0);
@@ -1211,6 +1237,7 @@ fn note_mixed_copy() {
 
 /// #24 CopyDescriptorsSimple(n, dst, src, type)
 unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
+    note_copy_call("CopyDescriptorsSimple", n, dst, src);
     if copy_console_slots(this, n, dst, src, ty) {
         return;
     }
@@ -1225,6 +1252,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dsts: *const u64, dsizes: *const u32, ns: u32, srcs: *const u64, ssizes: *const u32, ty: u32) {
+    note_copy_call("CopyDescriptors", nd, if dsts.is_null() { 0 } else { *dsts }, if srcs.is_null() { 0 } else { *srcs });
     use super::console_heap::{slot, SAMPLER_SLOT, SLOT};
     let console = !dsts.is_null() && !srcs.is_null() && nd > 0 && slot(*dsts).is_some();
     if !console {
@@ -1267,6 +1295,8 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     f(this, res, desc, slot.pc_srv);
+    super::console_heap::publish(&slot, false);
+    super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
@@ -1316,6 +1346,8 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     }
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
     f(this, res, counter, desc, slot.pc_uav);
+    super::console_heap::publish(&slot, true);
+    super::console_heap::note_resource(&slot, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
@@ -1355,6 +1387,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         };
         let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
         g(this, res, &srv, slot.pc_srv);
+        super::console_heap::publish(&slot, false);
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));

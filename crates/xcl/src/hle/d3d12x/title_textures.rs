@@ -102,11 +102,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
     if TEXTURES.lock().unwrap().is_empty() && !sparse {
         return;
     }
+    let watch_t0 = std::time::Instant::now();
     let mut dirty: Vec<usize> = Vec::new();
     let mut page = 0x1000u32;
-    // the committed windows, the sparse ones (the title's reservations) and other reservations
+    // the write-watched regions (the committed windows, the sparse ones – the title's
+    // reservations – and other graphics reservations) …
     let regions: Vec<(usize, usize)> = (0..u.shader_windows()).map(|k| u.window(k)).chain(crate::hle::kernelx::graphics_reservations()).collect();
-    for (base, size) in regions {
+    // … where a CPU write matters: the textures kept in step and the sparse windows' tiles
+    // with video memory. A scan costs with the size it covers (GetWriteWatch walks the page
+    // tables), and the whole regions are 16 GiB and more – looked at before every submit.
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    wanted.extend(super::sparse::mapped_ranges());
+    for (base, size) in watch_ranges(&regions, wanted) {
         loop {
             let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
             let mut n = buf.len();
@@ -120,6 +127,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         }
     }
     dirty.sort_unstable();
+    super::sparse::note_watch(watch_t0.elapsed(), dirty.len());
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         super::sparse::before_execute(q, &dirty, page as usize);
@@ -149,6 +157,30 @@ unsafe fn refresh_once(queue: *mut c_void) {
             }
         }
     }
+}
+
+/// The parts of `wanted` (start, end) inside `regions` (base, size), merged and sorted, as
+/// (base, size) – each within one region (a write-watch call covers one allocation).
+fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    wanted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in wanted {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let mut out = Vec::new();
+    for (a, b) in merged {
+        for &(base, size) in regions {
+            let (lo, hi) = (a.max(base), b.min(base + size));
+            if lo < hi {
+                out.push((lo, hi - lo));
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
@@ -204,4 +236,17 @@ unsafe fn run_upload((device, va, tex, state): Upload, res: &ID3D12Resource) -> 
     texture::upload(dev, &queue, res, &subs, state, state)?;
     UPLOADS.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the wanted parts of the watched regions are scanned, merged, one region each.
+    #[test]
+    fn watch_ranges_clip_and_merge() {
+        let regions = [(0x10000, 0x10000), (0x40000, 0x10000)];
+        let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
+        assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0x2000), (0x1F000, 0x1000), (0x40000, 0x1000)]);
+    }
 }

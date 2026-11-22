@@ -344,6 +344,38 @@ unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_V
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
+/// The heaps a list binds for console code: a view heap in the shared shader-visible heap
+/// is that one (`console_heap`), which is bound whatever the title names (a console
+/// descriptor table may be in any heap); sampler heaps as they are.
+pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12DescriptorHeap>> {
+    let shared = super::console_heap::global_heap();
+    let mut out: Vec<Option<ID3D12DescriptorHeap>> = shared.iter().cloned().map(Some).collect();
+    for k in 0..n as usize {
+        let p = *heaps.add(k) as *mut c_void;
+        if p.is_null() || (shared.is_some() && super::console_heap::in_global(p as usize)) {
+            continue;
+        }
+        let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
+        if shared.is_some() && h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+            continue;
+        }
+        out.push(Some(h.clone()));
+    }
+    out
+}
+
+/// console #32 SetDescriptorHeaps (PC #28)
+pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
+    const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
+    let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+    if heaps.is_null() || super::console_heap::global_heap().is_none() {
+        return f(this, n, heaps);
+    }
+    let h = pc_heaps(n, heaps);
+    let raw: Vec<usize> = h.iter().map(|x| x.as_ref().map_or(0, |x| x.as_raw() as usize)).collect();
+    f(this, raw.len() as u32, raw.as_ptr())
+}
+
 const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 
 /// command list #48 IASetVertexBuffers(start slot, count, views) (PC #44): the addresses are

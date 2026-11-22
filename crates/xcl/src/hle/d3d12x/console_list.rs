@@ -652,12 +652,14 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;
-                let heaps: Vec<Option<ID3D12DescriptorHeap>> = (0..n)
-                    .map(|k| {
-                        let p = (get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32) as *mut c_void;
-                        ID3D12DescriptorHeap::from_raw_borrowed(&p).cloned()
-                    })
-                    .collect();
+                let named: Vec<usize> = (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect();
+                let heaps = super::list_x::pc_heaps(n as u32, named.as_ptr());
+                if super::present::trace_frame() {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        crate::xlog_info!("frame trace: SetDescriptorHeaps {:x?}", (0..n).map(|k| get(2 + 2 * k) as usize | (get(3 + 2 * k) as usize) << 32).collect::<Vec<_>>());
+                    }
+                }
                 list.SetDescriptorHeaps(&heaps);
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {

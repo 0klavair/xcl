@@ -12,6 +12,9 @@
 "d3d12_x.dll" = "E_NOTIMPL"
 "xg_xs.dll" = "E_NOTIMPL"
 "acphal.dll" = "E_NOTIMPL"
+# the console's audio decoder and DSP: what XCL does not answer is not there
+"xapu.dll" = "E_NOTIMPL"
+"chad.dll" = "E_NOTIMPL"
 # console DirectStorage (DStorageGetFactory) and the Xbox One texture layout library: a fake S_OK
 # would leave the title's output pointer as it was
 "xcrdapi.dll" = "E_NOTIMPL"
@@ -29,6 +32,10 @@
 "*!XGameUiShowTextEntryAsync" = "E_ABORT"
 "*!XGameUiShowAchievementsAsync" = "E_ABORT"
 "*!XGameUiShowPlayerProfileCardAsync" = "E_ABORT"
+
+[ordinals."gameinput.dll"]
+# the console's GameInput.dll exports GameInputCreate as #1 (XDefiant imports it by ordinal)
+1 = "GameInputCreate"
 
 [ordinals."xaudio2_9.dll"]
 # Export ordinals of Windows' xaudio2_9.dll (Bink2Scarlett.dll imports #1); assumed the same on the console.

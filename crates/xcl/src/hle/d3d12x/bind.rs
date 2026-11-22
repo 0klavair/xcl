@@ -289,7 +289,86 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
     }
 }
 
+/// `XCL_TRACE_FRAME`: a full-screen dispatch (enough groups to cover a 4K target in tiles of up
+/// to 128 pixels) – what its root arguments say. A bindless title passes the indices of its
+/// descriptors in root constants and constant buffers: every small value there is looked up
+/// in the dispatch's descriptor tables, and the resources found (the pass's inputs and
+/// outputs) are logged.
+unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
+    if groups[0] < 30 || groups[1] < 17 {
+        return;
+    }
+    let Some(u) = crate::gpu::uma::get() else { return };
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    let Some(layout) = layout else { return };
+    static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    {
+        let mut g = SEEN.lock().unwrap();
+        if g.contains(&pso) || g.len() >= 12 {
+            return;
+        }
+        g.push(pso);
+    }
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let mut tables: Vec<u32> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
+    let mut what: Vec<String> = Vec::new();
+    for (i, p) in layout.params.iter().enumerate() {
+        match *p {
+            Param::Constants { at, count } => {
+                let w: Vec<u32> = (0..count as usize).filter_map(|k| word(at as usize + 4 * k)).collect();
+                what.push(format!("p{i} constants {w:x?}"));
+                values.extend(&w);
+            }
+            Param::Descriptor { at } => {
+                let lo = word(at as usize).unwrap_or(0) as u64;
+                let hi = word(at as usize + 4).unwrap_or(0) as u64;
+                let va = (lo | hi << 32) as usize;
+                let n = 64usize;
+                if va != 0 && crate::gpu::shader::readable(va, 4 * n) {
+                    let w: Vec<u32> = (0..n).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect();
+                    what.push(format!("p{i} buffer {va:#x}: {w:x?}"));
+                    values.extend(&w);
+                } else {
+                    what.push(format!("p{i} buffer {va:#x} (not readable)"));
+                }
+            }
+            Param::Table { at } => {
+                let v = word(at as usize).unwrap_or(0);
+                what.push(format!("p{i} table {v:#x}"));
+                tables.push(v);
+            }
+        }
+    }
+    let mut found: Vec<(u32, usize)> = Vec::new();
+    for &v in &values {
+        if v >= 1 << 20 {
+            continue;
+        }
+        for &t in &tables {
+            let slot = u.base() + t as usize + 32 * v as usize;
+            if let Some(r) = super::console_heap::resource_at(slot) {
+                if !found.iter().any(|x| x.1 == r) {
+                    found.push((v, r));
+                }
+            }
+        }
+    }
+    let res: Vec<String> = found
+        .iter()
+        .map(|&(v, r)| {
+            let d = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc());
+            format!("[{v}] {r:#x} {:?}{}", d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0)), if super::present::is_presented(r) { " PRESENTED" } else { "" })
+        })
+        .collect();
+    crate::xlog_info!("frame trace: full-screen dispatch {groups:?}, pipeline {pso:#x}: {}", what.join("; "));
+    crate::xlog_info!("frame trace: … its indices name: {}", if res.is_empty() { "nothing".to_string() } else { res.join("; ") });
+}
+
 unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+    if super::present::trace_frame() {
+        trace_fullscreen(this, pso, [x, y, z]);
+    }
     bind_abi(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     Ok(())

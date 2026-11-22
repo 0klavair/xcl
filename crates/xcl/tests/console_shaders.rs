@@ -547,3 +547,33 @@ fn console_compiled_graphics_reads_its_root_arguments() {
     println!("pixel {p:?}, want {want:?}");
     assert!(p.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "pixel {p:?}, want {want:?}");
 }
+
+/// Derivatives across a quad where a primitive's edge splits it: a quad of two triangles,
+/// the pixel shader returns ddx_fine / ddy_fine of a linear attribute – the same everywhere,
+/// on the shared diagonal too. The console takes them across the quad's lanes (DPP), the
+/// helper lanes of the other triangle included; a translation whose lane reads miss helper
+/// lanes gets them wrong along every edge (seams on large quads).
+#[test]
+fn console_compiled_derivatives_hold_on_triangle_edges() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT;
+    let Some(c) = console_compiler() else { return };
+    if runner::adapter().is_err() {
+        return;
+    }
+    let root = "#define ROOT [RootSignature(\"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)\")]\n";
+    let vs = format!("{root}struct O {{ float4 p : SV_Position; float2 uv : TEXCOORD0; }};\nROOT O main(float3 pos : POSITION) {{ O o; o.p = float4(pos.xy, 0.5, 1.0); o.uv = pos.xy * 16.0; return o; }}\n");
+    let ps = format!("{root}ROOT float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {{ return float4(ddx_fine(uv.x), ddy_fine(uv.y), ddx_fine(uv.y), 1.0); }}\n");
+    let vs_blob = console_compile(&c, &vs, &["-E", "main", "-T", "vs_6_6"]).unwrap_or_else(|e| panic!("VS: {e}"));
+    let ps_blob = console_compile(&c, &ps, &["-E", "main", "-T", "ps_6_6"]).unwrap_or_else(|e| panic!("PS: {e}"));
+    let vs_dxil = pso::console_to_dxil(&vs_blob, pso::Stage::Vertex, 0).unwrap_or_else(|e| panic!("VS translation: {e}")).dxil;
+    let ps_dxil = pso::console_to_dxil(&ps_blob, pso::Stage::Pixel, 0).unwrap_or_else(|e| panic!("PS translation: {e}")).dxil;
+    // the whole 32x32 target as two triangles: uv steps by 1 per pixel in x, by −1 in y
+    let quad = [-1.0f32, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0];
+    let el = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32_FLOAT, offset: 0 }];
+    let size = 32usize;
+    let px = runner::draw(&vs_dxil, &ps_dxil, &el, &quad, 12, &[], &[0u32; 64], size as u32, [9.0; 4]).unwrap_or_else(|e| panic!("draw: {e}"));
+    let want = [1.0f32, -1.0, 0.0, 1.0];
+    let bad: Vec<(usize, usize, [f32; 4])> = (0..size * size).filter(|&i| px[i].iter().zip(want).any(|(a, b)| (a - b).abs() > 1e-4)).map(|i| (i % size, i / size, px[i])).collect();
+    println!("{} of {} pixels wrong, first: {:?}", bad.len(), size * size, bad.iter().take(6).collect::<Vec<_>>());
+    assert!(bad.is_empty(), "{} pixels with wrong derivatives, first {:?}", bad.len(), &bad[..bad.len().min(6)]);
+}

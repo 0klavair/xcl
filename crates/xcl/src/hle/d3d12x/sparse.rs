@@ -54,6 +54,8 @@ struct State {
     waited: HashMap<usize, u64>,
     /// 4 KiB page → hash of each 64-byte chunk the GPU got from the CPU (absent: all zero)
     sent: HashMap<usize, Box<[u64; CHUNKS]>>,
+    /// `mapped` as sorted (start, end) runs (None: to be made again)
+    runs: Option<Vec<(usize, usize)>>,
 }
 
 const PAGE: usize = 0x1000;
@@ -152,6 +154,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, u64)> {
             list,
             waited: HashMap::new(),
             sent: HashMap::new(),
+            runs: None,
         })
     })();
     match made {
@@ -224,6 +227,7 @@ impl State {
             if !self.mapped.contains_key(&t) && self.window(t).is_some() {
                 let Some((tile, reused)) = self.take_tile() else { break };
                 self.mapped.insert(t, tile);
+                self.runs = None;
                 if reused {
                     self.to_zero.push((t, TILE));
                 }
@@ -363,6 +367,7 @@ pub unsafe fn decommitted(a: usize, n: usize) {
     }
     for t in tiles {
         if let Some(tile) = s.mapped.remove(&t) {
+            s.runs = None;
             if !s.pinned.contains_key(&tile) {
                 s.free.push(tile);
             }
@@ -380,13 +385,47 @@ impl State {
     }
 }
 
+/// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
+/// has to reach the GPU.
+pub fn mapped_ranges() -> Vec<(usize, usize)> {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return Vec::new() };
+    if s.runs.is_none() {
+        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
+        tiles.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for t in tiles {
+            match runs.last_mut() {
+                Some(last) if last.1 == t => last.1 = t + TILE,
+                _ => runs.push((t, t + TILE)),
+            }
+        }
+        s.runs = Some(runs);
+    }
+    s.runs.clone().unwrap_or_default()
+}
+
+/// time spent and pages found by the write-watch scans (`refresh_once`), for the timing line
+static WATCH: [std::sync::atomic::AtomicU64; 2] = [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// [lock wait, chunk scan, upload] in µs, runs uploaded
+static PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub fn note_watch(t: std::time::Duration, pages: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    WATCH[0].fetch_add(t.as_micros() as u64, Relaxed);
+    WATCH[1].fetch_add(pages as u64, Relaxed);
+}
+
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
 /// pages from the write-watch, sorted) and the reused tiles are copied into video memory, and
 /// `queue` waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    let t_locked = std::time::Instant::now();
+    PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Relaxed);
     let zeroed = std::mem::take(&mut s.to_zero);
     for &(a, n) in &zeroed {
         for pg in (a..a + n).step_by(PAGE) {
@@ -428,9 +467,13 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
             }
         }
     }
+    let t_scanned = std::time::Instant::now();
+    PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Relaxed);
+    PHASES[3].fetch_add(runs.len() as u64, Relaxed);
     if !runs.is_empty() {
         s.upload(&runs);
     }
+    PHASES[2].fetch_add(t_scanned.elapsed().as_micros() as u64, Relaxed);
     {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -442,6 +485,16 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
         let us = MICROS.fetch_add(t0.elapsed().as_micros() as u64, Relaxed) + t0.elapsed().as_micros() as u64;
         if n.is_power_of_two() && n >= 16 {
             crate::xlog_info!("sparse windows: {n} submits, {} MB of CPU writes uploaded, {} ms spent, {} tiles mapped", b >> 20, us / 1000, s.mapped.len());
+            let ms = |x: &std::sync::atomic::AtomicU64| x.load(Relaxed) / 1000;
+            crate::xlog_info!(
+                "sparse windows timing: write-watch {} ms ({} dirty pages), lock wait {} ms, chunk scan {} ms, upload {} ms ({} runs)",
+                ms(&WATCH[0]),
+                WATCH[1].load(Relaxed),
+                ms(&PHASES[0]),
+                ms(&PHASES[1]),
+                ms(&PHASES[2]),
+                PHASES[3].load(Relaxed)
+            );
         }
     }
     let q = queue.as_raw() as usize;

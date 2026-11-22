@@ -276,3 +276,23 @@ fn window_sized_reserved_buffer_on_video_memory_tiles() {
         }
     }
 }
+
+/// How large a shader-visible view heap this GPU takes (OPTIONS19 and a real one): console
+/// titles' view heaps together go past the 1 000 000 of resource binding tier 2.
+#[test]
+#[ignore]
+fn view_heap_capacity() {
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).unwrap();
+        let dev = dev.unwrap();
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        let ok = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_ok();
+        println!("OPTIONS19 {ok}: max view heap {} samplers {}", o.MaxViewDescriptorHeapSize, o.MaxSamplerDescriptorHeapSize);
+        for n in [1_000_000u32, 1_200_000, 2_000_000, 4_000_000] {
+            let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: n, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
+            let r: windows::core::Result<ID3D12DescriptorHeap> = dev.CreateDescriptorHeap(&d);
+            println!("shader-visible view heap of {n}: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.code()));
+        }
+    }
+}

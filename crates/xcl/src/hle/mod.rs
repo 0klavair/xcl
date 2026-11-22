@@ -10,10 +10,12 @@ use std::sync::OnceLock;
 use crate::config::Config;
 use crate::util::glob_match;
 
+pub mod acphal;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
 pub mod dxcompiler;
+pub mod gameinput;
 pub mod kernelx;
 pub mod mfplat;
 pub mod opus;
@@ -85,6 +87,10 @@ pub const XG: &str = "xg_xs.dll";
 pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
 pub const MINUSERX: &str = "minuserx.dll";
+/// the console's audio processor (APU memory, its channel, SHAPE contexts) and decoder (xapu)
+pub const ACPHAL: &str = "acphal.dll";
+/// controllers (`GameInputCreate`)
+pub const GAMEINPUT: &str = "gameinput.dll";
 
 fn build(config: &Config) -> Registry {
     let modules = vec![
@@ -97,6 +103,8 @@ fn build(config: &Config) -> Registry {
         HleModule::new(MINUSERX, user::exports(), &["user32.dll"]),
         HleModule::new(XCRDAPI, dstorage::exports(), &[]),
         HleModule::new(XG, xg::exports(), &[]),
+        HleModule::new(ACPHAL, acphal::exports(), &[]),
+        HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
     ];
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
@@ -154,6 +162,12 @@ fn build(config: &Config) -> Registry {
     routes.push((XCRDAPI.into(), Route::Hle(s)));
     let g = idx(XG);
     routes.push((XG.into(), Route::Hle(g)));
+    let ap = idx(ACPHAL);
+    for p in ["acphal.dll", "xapu.dll"] {
+        routes.push((p.into(), Route::Hle(ap)));
+    }
+    let gi = idx(GAMEINPUT);
+    routes.push((GAMEINPUT.into(), Route::Hle(gi)));
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
