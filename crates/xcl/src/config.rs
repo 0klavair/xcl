@@ -74,7 +74,7 @@ impl Config {
     /// setting has a concrete value. Returns what came from the manifest (for the log).
     pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
         let mut from = Vec::new();
-        let series_s = self.device_type.eq_ignore_ascii_case("lockhart");
+        let series_s = self.is_series_s();
         if self.title_memory == "auto" {
             let m = manifest.and_then(|m| if series_s { m.lockhart_memory.clone() } else { m.anaconda_memory.clone() });
             if let Some(m) = &m {
@@ -109,7 +109,7 @@ impl Config {
     /// TitleMemoryStatus budget (MiB): `title_memory_mb`, 0 = the device's standard budget.
     pub fn title_memory_budget_mb(&self) -> u64 {
         match self.title_memory_mb {
-            0 if self.device_type.eq_ignore_ascii_case("lockhart") => 8_192,
+            0 if self.is_series_s() => 8_192,
             0 => 13_824,
             v => v,
         }
@@ -290,6 +290,23 @@ mod tests {
         c.mounts.remove("p:");
         c.mounts.insert("PLS:".into(), PLS_MOUNT_TARGET.into());
         assert_eq!(c.pls_drive(), None);
+    }
+
+    #[test]
+    fn every_series_s_spelling_gets_the_series_s_memory() {
+        let manifest = crate::manifest::Manifest {
+            anaconda_memory: Some("Standard".into()),
+            lockhart_memory: Some("Advanced".into()),
+            ..Default::default()
+        };
+        for device in ["lockhart", "Series S"] {
+            let mut c = Config { device_type: device.into(), ..Config::default() };
+            c.resolve(Some(&manifest));
+            assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("advanced", 8_192), "{device}");
+        }
+        let mut c = Config::default();
+        c.resolve(Some(&manifest));
+        assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("standard", 13_824));
     }
 
     #[test]
