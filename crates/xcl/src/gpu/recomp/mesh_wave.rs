@@ -139,8 +139,10 @@ fn transfer(decoded: &Decoded, mut state: MaskState) -> MaskState {
     let reads_mask = reads
         .iter()
         .any(|&register| state.sgpr.get(register as usize).copied().unwrap_or(false));
-    let implicit_exec =
-        decoded.inst.name.contains("SAVEEXEC") || decoded.inst.name.contains("WREXEC");
+    // a v_cmp result is a lane mask too (ANDed with EXEC), also in an SGPR pair
+    let implicit_exec = decoded.inst.name.contains("SAVEEXEC")
+        || decoded.inst.name.contains("WREXEC")
+        || decoded.inst.name.starts_with("V_CMP");
     // Explicit destinations are definite overwrites. Taint is retained only
     // when a value is computed from a mask-derived input (including EXEC).
     for &register in &writes {
@@ -366,6 +368,18 @@ mod tests {
         ));
         code.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
         assert_eq!(analyze(&code).mask_scc_branches, vec![8]);
+    }
+
+    #[test]
+    fn vcmp_sgpr_destination_is_a_mask() {
+        let mut code = one(
+            "V_CMP_GT_U32",
+            "ENC_VOP3",
+            &[("VDST", 0), ("SRC0", 168), ("SRC1", 256)],
+        );
+        code.extend(one("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]));
+        code.extend(one("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0)]));
+        assert_eq!(analyze(&code).mask_scc_branches, vec![12]);
     }
 
     #[test]

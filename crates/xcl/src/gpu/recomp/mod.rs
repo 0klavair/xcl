@@ -1087,7 +1087,8 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         let n = d.inst.name;
         let (reads, writes) = rdna2::sgpr_uses(&d);
         let reads_mask = reads.iter().any(|r| mask_regs.contains(r));
-        if reads_mask && n.ends_with("_B64") {
+        // a v_cmp result is a mask too, also in an SGPR pair (VOP3)
+        if (reads_mask && n.ends_with("_B64")) || n.starts_with("V_CMP") {
             mask_regs.extend(writes.iter().copied());
         }
         if (n.starts_with("S_CMP") || n.starts_with("S_CMPK")) && !reads_mask {
@@ -1130,6 +1131,15 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
         }
         if matches!(n, "S_BCNT0_I32_B64" | "S_BCNT1_I32_B64" | "S_FF1_I32_B64" | "S_FLBIT_I32_B64" | "S_FLBIT_I32_I64") {
             out.insert("whole-wave mask reduction");
+        }
+        // one 32-bit word of a mask: a half sees its own lanes in its own word only
+        if reads_mask && matches!(n, "S_BCNT0_I32_B32" | "S_BCNT1_I32_B32" | "S_FF1_I32_B32" | "S_FLBIT_I32_B32") {
+            out.insert("whole-wave mask reduction");
+        }
+        // v_mbcnt over a mask: lanes 32..63 also count the active lanes of 0..31, which the
+        // high half does not have (the lane-index idiom, a constant SRC0, is fine)
+        if n.starts_with("V_MBCNT") && !matches!(rdna2::field_value(d.enc, &d.words, "SRC0"), Some(128..=208 | 240..=248 | 255)) {
+            out.insert("prefix count over a whole-wave mask");
         }
         if matches!(n, "S_CMP_EQ_U64" | "S_CMP_LG_U64" | "S_BITCMP0_B64" | "S_BITCMP1_B64") {
             out.insert("scalar condition from a whole-wave mask");
