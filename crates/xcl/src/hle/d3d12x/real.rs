@@ -976,10 +976,18 @@ fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_
 /// Console buffer → a placed resource in the unified memory heap, so its console address is
 /// what the recompiled shaders read through `mem`. None: not placed (fall back to committed).
 /// A committed texture of console code: on the console its memory is unified memory too –
-/// titles write it through its GPU address (XDefiant clears one with memset). It gets UMA
-/// memory of the console's size (XG; the PC's where XG has no model) and is created as a
-/// texture at that address (`device_x::create_placed_resource_x`: kept in step with the
-/// memory where XG lays it out); GetGPUVirtualAddress returns the address.
+/// titles write it through its GPU address (XDefiant clears one with memset). It gets memory
+/// of the console's size (XG; the PC's where XG has no model) and is created as a texture at
+/// that address (`device_x::create_placed_resource_x`: kept in step with the memory where XG
+/// lays it out); GetGPUVirtualAddress returns the address. The memory is the coherent
+/// window's, as long as it keeps `COHERENT_KEPT` free; beyond that the texture is a plain PC
+/// one (None). Unicorn Overlord's 2.2 GB of committed textures filled the 512 MB window in its
+/// first second, leaving no room for readback heaps. (In the sparse windows instead, XDefiant
+/// rendered black – not understood yet.)
+/// bytes of the coherent window committed textures leave free: readback / write-back heaps
+/// and buffers, XCL's blocks outside its arena pool
+const COHERENT_KEPT: usize = 128 << 20;
+
 unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
     if ppv.is_null() || !crate::gpu::shader::readable(desc, 0x38) {
@@ -1003,7 +1011,11 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
         return None;
     }
     let align = (align as usize).max(0x1_0000);
-    let p = u.alloc((size as usize).div_ceil(align) * align, align)? as usize;
+    let bytes = (size as usize).div_ceil(align) * align;
+    if u.size().saturating_sub(u.used()) < bytes + COHERENT_KEPT {
+        return None;
+    }
+    let p = u.alloc(bytes, align)? as usize;
     let hr = super::device_x::create_placed_resource_x(this, p as u64, desc as *const u8, state as u32, clear as *const c_void, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);

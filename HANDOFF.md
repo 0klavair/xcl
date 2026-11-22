@@ -1187,9 +1187,21 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   range. Fixed on top: window 0's descriptor range (512 MB after its first 64 KiB, `Uma::desc_range`) is never the
   title's. XDefiant reserves 8 GiB + 4 MiB first thing, more than windows 1..2 hold; with the range at the top of
   window 0 that reservation took all of it, no console descriptor heap could be made ("no room in UMA") and every
-  frame was black. Tested: Minecraft, Unicorn Overlord, Fortnite, XDefiant. Open: Unicorn fills the coherent window
-  from its second second (its draws run on XCL's pool); XDefiant spends about a third of its time uploading CPU
-  writes (so before PR #40 too).
+  frame was black. Tested: Minecraft, Unicorn Overlord, Fortnite, XDefiant.
+  - Committed console textures (`real::place_console_texture`) take the coherent window only while it keeps
+    `COHERENT_KEPT` (128 MB) free; beyond that they are plain PC textures. Unicorn Overlord makes 2.2 GB of them
+    and had the 512 MB window full in its first second (no room for readback heaps); it now stops at 384 MB, the
+    picture unchanged. Putting them in the sparse windows instead made XDefiant render black (cache warm, no errors
+    in the log) – not understood yet; the GPU-owned ones go to `vram` arenas either way.
+  - XDefiant's menu runs at ~53 fps (~50 before PR #40). Its CPU cost of the sparse windows is the per-submit
+    write-watch scan over the mapped tiles (~2 GB): ~0.8 ms per submit at ~800 submits a second, then ~0.3 ms of
+    uploads (64-byte chunk runs of ~0.5 KB on average). Merging the runs or skipping scans would be faster, but a
+    merged run can overwrite what the GPU wrote next to a CPU-written chunk, and a skipped scan leaves the GPU stale
+    data. Read-only protection of cold tiles would make the scan cost follow the written pages, but the kernel's own
+    writes (ReadFile into title memory) then fail instead of faulting.
+  - Diagnostics: `XCL_TRACE_MEM=1` also logs each coherent-window allocation of 1 MB or more and each failed one,
+    with the XCL code that asked (`Uma::alloc` is `#[track_caller]`); the log has "N frames presented, X fps over
+    the last 300" for titles that call PresentX.
 - **Unicorn Overlord (SEGAofAmericaInc.Pa253b0c1Y 1.0.0.6) is playable (2026-11-22)**: logos, movies, menus and play
   with the right picture. It runs on a **newer console D3D12 runtime** (its own game OS) with the same SDK version
   (0x20004) as XDefiant / Minecraft but other vtable layouts:

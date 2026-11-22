@@ -460,30 +460,58 @@ impl Uma {
 
     /// Zeroed block of `size` bytes aligned to `align` (at least 64 KiB), first fit (window 0
     /// first).
+    #[track_caller]
     pub fn alloc(&self, size: usize, align: usize) -> Option<*mut u8> {
         self.alloc_where(size, align, None, true)
     }
 
     /// `alloc` for reserved address space: not zeroed (a large reservation is not touched –
     /// what the title commits or maps there it writes; never-used memory is zero anyway).
+    #[track_caller]
     pub fn reserve(&self, size: usize, align: usize) -> Option<*mut u8> {
         self.alloc_where(size, align, None, false)
     }
 
     /// `alloc` inside window `k` (memory the console addresses with 32 bits, e.g. descriptor
     /// heaps: window 0).
+    #[track_caller]
     pub fn alloc_in(&self, k: usize, size: usize, align: usize) -> Option<*mut u8> {
         self.alloc_where(size, align, Some(k), true)
     }
 
+    /// `XCL_TRACE_MEM`: each committed-window allocation of 1 MB or more and each one that
+    /// fails, with the XCL code that asked for it (what fills the window).
+    #[track_caller]
+    fn trace(&self, size: usize, got: Option<usize>, used: usize) {
+        let at = std::panic::Location::caller();
+        match got {
+            Some(p) => crate::xlog_info!("UMA: {} KB at {p:#x} for {}:{} ({} MB used)", size >> 10, at.file(), at.line(), used >> 20),
+            None => crate::xlog_info!("UMA: {} KB for {}:{} – no room ({} MB used)", size >> 10, at.file(), at.line(), used >> 20),
+        }
+    }
+
+    fn tracing() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("XCL_TRACE_MEM").is_some())
+    }
+
+    #[track_caller]
     fn alloc_where(&self, size: usize, align: usize, window: Option<usize>, zero: bool) -> Option<*mut u8> {
         let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
         let align = align.max(GRAIN).next_power_of_two();
         let mut g = self.inner.lock().unwrap();
-        let (start, len, at) = g.free.iter().filter(|(&o, _)| window.is_none_or(|k| o / WINDOW == k)).find_map(|(&o, &l)| {
+        let found = g.free.iter().filter(|(&o, _)| window.is_none_or(|k| o / WINDOW == k)).find_map(|(&o, &l)| {
             let at = ((self.base + o + align - 1) & !(align - 1)) - self.base;
             (at + size <= o + l).then_some((o, l, at))
-        })?;
+        });
+        let Some((start, len, at)) = found else {
+            if Self::tracing() {
+                let used = g.used.values().sum();
+                drop(g);
+                self.trace(size, None, used);
+            }
+            return None;
+        };
         g.free.remove(&start);
         if at > start {
             g.free.insert(start, at - start);
@@ -492,8 +520,12 @@ impl Uma {
             g.free.insert(at + size, start + len - at - size);
         }
         g.used.insert(at, size);
+        let used = if Self::tracing() && size >= 1 << 20 { Some(g.used.values().sum()) } else { None };
         drop(g);
         let p = (self.base + at) as *mut u8;
+        if let Some(used) = used {
+            self.trace(size, Some(p as usize), used);
+        }
         if zero {
             unsafe { std::ptr::write_bytes(p, 0, size) };
         }
