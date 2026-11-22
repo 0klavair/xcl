@@ -61,6 +61,8 @@ struct Gpu {
     value: u64,
     adapter: String,
     wave64: bool,
+    /// 32-lane waves (`[WaveSize(32)]`: the split wave64 form; WARP has neither 32 nor 64)
+    wave32: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
 }
@@ -103,6 +105,7 @@ fn init() -> Result<Gpu, String> {
             return Err(format!("{name}: no wave operations/int64"));
         }
         let wave64 = o1.WaveLaneCountMin <= 64 && o1.WaveLaneCountMax >= 64;
+        let wave32 = o1.WaveLaneCountMin <= 32 && o1.WaveLaneCountMax >= 32;
         let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
@@ -110,7 +113,7 @@ fn init() -> Result<Gpu, String> {
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, mesh })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
     }
 }
 
@@ -354,6 +357,13 @@ pub fn wave64_supported() -> Result<bool, String> {
 /// adapter runs only 32-lane waves. False without a usable GPU.
 pub fn split_wave64() -> bool {
     wave64_supported() == Ok(false)
+}
+
+/// Whether wave64 programs run on this adapter at all: natively (64-lane waves) or split (32).
+pub fn wave64_programs_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.wave64 || x.wave32).map_err(|x| x.clone())
 }
 
 /// `Options` for programs run on this adapter: the split wave64 form where it is needed.

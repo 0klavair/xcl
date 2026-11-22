@@ -7,13 +7,14 @@ use super::{translate, Mode, Options};
 use crate::gpu::rdna2::encode;
 
 /// A GPU and DXC for the instruction tests. Wave64 programs run natively where the adapter
-/// has 64-lane waves and in the split form (`runner::options`) where it has only 32.
+/// has 64-lane waves and in the split form (`runner::options`) where it has only 32 (an
+/// adapter with neither, such as WARP, skips).
 fn gpu_ready() -> bool {
-    match (runner::adapter(), runner::wave64_supported(), super::dxc::location()) {
-        (Ok(_), Ok(_), Ok(_)) => true,
+    match (runner::adapter(), runner::wave64_programs_supported(), super::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => true,
         (a, w, d) => {
             println!("GPU/DXC unavailable – skipping ({:?} / {:?} / {:?})", a.as_ref().err(), w.as_ref().ok(), d.as_ref().err());
-            runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else { "no DXC" });
+            runner::skip_test(if a.is_err() || w.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" });
             false
         }
     }
@@ -32,17 +33,6 @@ fn wave64_hardware() -> bool {
 /// `o` for a program run on this adapter (the split wave64 form where it is needed).
 fn on_gpu(o: Options) -> Options {
     Options { split_wave64: runner::split_wave64(), ..o }
-}
-
-fn gpu_ready_wave32() -> bool {
-    match (runner::adapter(), super::dxc::location()) {
-        (Ok(_), Ok(_)) => true,
-        (a, d) => {
-            println!("GPU/DXC unavailable – skipping ({:?} / {:?})", a.as_ref().err(), d.as_ref().err());
-            runner::skip_test(if a.is_err() { "no GPU" } else { "no DXC" });
-            false
-        }
-    }
 }
 
 /// `runner::mesh_draw` needs mesh shaders (not every adapter with wave64 has them).
@@ -2324,7 +2314,7 @@ fn dump_retail_interfaces() {
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
-    if !gpu_ready_wave32() || !mesh_ready() {
+    if !gpu_ready() || !mesh_ready() {
         return;
     }
     use super::{dxc, mesh_passthrough, GsInterface, IO_GS_PRIMS, IO_GS_VERTICES, MESH_HEADER};
@@ -2451,7 +2441,7 @@ fn gpu_geometry_mode_es_gs_strip() {
 /// native form where the GPU has 64-lane waves (the compute pass alone: no mesh shaders needed).
 #[test]
 fn gpu_geometry_wave32_prefix_count_over_a_mask() {
-    if !gpu_ready_wave32() {
+    if !gpu_ready() {
         return;
     }
     use super::{dxc, translate_geometry, GsInterface, IO_GS_PRIMS};
