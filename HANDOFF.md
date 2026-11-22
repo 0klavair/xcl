@@ -1141,6 +1141,15 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `sparse::mapped_ranges`). Use the release build for game runs: the debug build hashes the dirty chunks ~10×
   slower (and the queues then wait on each other for the sparse lock). The log has
   "sparse windows timing: write-watch / lock wait / chunk scan / upload" lines.
+- **No Xbox Live tokens by default (2026-11-22, latest)**: `XUserGetTokenAndSignature(Utf16)Async` fails with
+  0x80072EFD, as on a console that cannot reach Xbox Live; `xbox_live_tokens = true` in `xcl.toml` brings back
+  XCL's local placeholder token (only useful for a backend of your own – Xbox Live and the titles' services
+  reject it). Minecraft asked for one for PlayFab (`*.minecraft.playfabapi.com`), got the placeholder, was refused
+  and retried its "Microsoft account – connecting" dialog for ever; now it shows its offline message ("we can't
+  sign you in … access to Realms, profiles and Marketplace items will be limited", code "jasnoglaz") and goes on
+  in the menu. Fortnite asks for RTA (`wss://rta.xboxlive.com/connect`) and still reaches its title screen.
+  The requests are logged ("XUser: token #n for …"). XCL does not fake sign-in, backends or licences (no
+  TomBox-style local Epic / Xbox Live servers). Minecraft stays a trial (XStore refused).
 - **Minecraft (Microsoft.MinecraftBeta 1.18.30.64) reaches its main menu (2026-11-22, latest)**: panorama, logo,
   buttons, the character, music and Enter work; it offers the trial (XStore is refused – no fake licences) and
   stops at the Microsoft-account sign-in (Xbox Live). Run `Minecraft.Windows.exe.original`: the `Minecraft.Windows.exe`

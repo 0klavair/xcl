@@ -93,13 +93,6 @@ extern "system" {
         b: *mut XAsyncBlock,
     ) -> HRESULT;
     fn XUserGetTokenAndSignatureResultSize(b: *mut XAsyncBlock, size: *mut usize) -> HRESULT;
-    fn XUserGetTokenAndSignatureResult(
-        b: *mut XAsyncBlock,
-        size: usize,
-        buf: *mut c_void,
-        ptr: *mut *mut c_void,
-        used: *mut usize,
-    ) -> HRESULT;
     fn XUserGetGamertag(u: *mut c_void, comp: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT;
     fn XUserCloseHandle(u: *mut c_void);
     fn XNetworkingQueryPreferredLocalUdpMultiplayerPort(port: *mut u16) -> HRESULT;
@@ -492,7 +485,7 @@ fn main() {
         Ok(())
     });
 
-    check("XUser: silent sign-in, device association, and XSTS token/signature", || unsafe {
+    check("XUser: silent sign-in, device association, and no XSTS token offline", || unsafe {
         let mut b: XAsyncBlock = std::mem::zeroed();
         ensure!(XUserAddAsync(1, &mut b) == 0, "XUserAddAsync");
         ensure!(XAsyncGetStatus(&mut b, true) == 0, "status");
@@ -522,23 +515,12 @@ fn main() {
             ) == 0,
             "XUserGetTokenAndSignatureAsync"
         );
-        ensure!(XAsyncGetStatus(&mut tb, true) == 0, "token status");
+        // no Xbox Live (`xbox_live_tokens` off, the default): the request fails as on a console
+        // that cannot reach it, and there is no result
+        let st = XAsyncGetStatus(&mut tb, true);
+        ensure!(st == 0x8007_2EFD_u32 as i32, "token status {st:#x}");
         let mut tsz = 0usize;
-        ensure!(XUserGetTokenAndSignatureResultSize(&mut tb, &mut tsz) == 0 && tsz > 32, "token size {tsz}");
-        let mut tbuf = vec![0u8; tsz];
-        let mut tptr = std::ptr::null_mut();
-        let mut tused = 0usize;
-        ensure!(
-            XUserGetTokenAndSignatureResult(&mut tb, tbuf.len(), tbuf.as_mut_ptr() as *mut c_void, &mut tptr, &mut tused) == 0,
-            "token result"
-        );
-        let tok_ptr = *(tptr as *const *const u8).add(2);
-        let sig_ptr = *(tptr as *const *const u8).add(3);
-        let tok_len = *(tptr as *const usize);
-        let sig_len = *(tptr as *const usize).add(1);
-        let tok = cstr(std::slice::from_raw_parts(tok_ptr, tok_len));
-        let sig = cstr(std::slice::from_raw_parts(sig_ptr, sig_len));
-        ensure!(tok.starts_with("XBL3.0 ") && sig.len() >= 100, "tok={tok:?} sig_len={}", sig.len());
+        ensure!(XUserGetTokenAndSignatureResultSize(&mut tb, &mut tsz) != 0, "a token result offline ({tsz} bytes)");
         XUserCloseHandle(u);
         Ok(())
     });

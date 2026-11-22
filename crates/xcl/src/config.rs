@@ -55,6 +55,11 @@ pub struct Config {
     pub raytracing: String,
     pub window_width: u32,
     pub window_height: u32,
+    /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
+    /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
+    /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
+    /// services would reject the placeholder anyway (Minecraft retried its sign-in forever).
+    pub xbox_live_tokens: bool,
 }
 
 impl Config {
@@ -138,6 +143,7 @@ impl Default for Config {
             raytracing: "auto".into(),
             window_width: 1280,
             window_height: 720,
+            xbox_live_tokens: false,
         }
     }
 }

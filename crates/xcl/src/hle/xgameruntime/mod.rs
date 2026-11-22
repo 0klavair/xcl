@@ -13,7 +13,7 @@ pub mod xsign;
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
 use gamesave::*;
@@ -672,6 +672,30 @@ unsafe fn copy_capped_body(body_size: usize, body: *const c_void) -> Vec<u8> {
     std::slice::from_raw_parts(body as *const u8, len).to_vec()
 }
 
+thread_local! {
+    /// tests: `xbox_live_tokens` for requests made on this thread (None: the configuration's)
+    pub(crate) static TOKENS_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// WININET_E_CANNOT_CONNECT: what a console that cannot reach Xbox Live gets for a token
+const E_CANNOT_CONNECT: HRESULT = 0x8007_2EFD_u32 as i32;
+
+/// The title asks for an Xbox Live token for a request (first 24 and every 64th logged).
+/// Without `xbox_live_tokens` there is none: XCL has no Xbox Live.
+fn note_token_request(method: &str, url: &str) -> Result<(), HRESULT> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let tokens = TOKENS_HERE.with(|t| t.get()).unwrap_or_else(|| crate::state::config().xbox_live_tokens);
+    if n < 24 || n % 64 == 0 {
+        crate::xlog_info!("XUser: token #{n} for {method} {url} – {}", if tokens { "XCL's local placeholder" } else { "none: no Xbox Live (0x80072EFD)" });
+    }
+    if tokens {
+        Ok(())
+    } else {
+        Err(E_CANNOT_CONNECT)
+    }
+}
+
 pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
     user: *mut c_void,
     _options: u32,
@@ -688,8 +712,10 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
     }
     let method = crate::util::from_cstr_ptr(method).filter(|s| !s.is_empty()).unwrap_or_else(|| "GET".into());
     let url = crate::util::from_cstr_ptr(url).unwrap_or_default();
+    let allowed = note_token_request(&method, &url);
     let body = copy_capped_body(body_size, body);
     begin_with_fixups(b, &TOKEN_UTF8_ID as *const u8 as usize, move || {
+        allowed?;
         build_token_payload(false, &method, &url, &body)
     })
 }
@@ -728,8 +754,10 @@ pub unsafe extern "system" fn XUserGetTokenAndSignatureUtf16Async(
     }
     let method = crate::util::from_wide_ptr(method).filter(|s| !s.is_empty()).unwrap_or_else(|| "GET".into());
     let url = crate::util::from_wide_ptr(url).unwrap_or_default();
+    let allowed = note_token_request(&method, &url);
     let body = copy_capped_body(body_size, body);
     begin_with_fixups(b, &TOKEN_UTF16_ID as *const u8 as usize, move || {
+        allowed?;
         build_token_payload(true, &method, &url, &body)
     })
 }

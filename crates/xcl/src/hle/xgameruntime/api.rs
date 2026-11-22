@@ -1449,6 +1449,7 @@ mod tests {
     #[test]
     fn thunk_protocol_with_xcl_objects_on_pc_queues() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::TOKENS_HERE.with(|t| t.set(Some(true)));
         if pc().is_none() {
             println!("no system xgameruntime.dll – skipping");
             return;
@@ -1627,8 +1628,31 @@ mod tests {
     }
 
     #[test]
+    /// Without `xbox_live_tokens` (the default) a token request fails as on a console that
+    /// cannot reach Xbox Live: the async completes with 0x80072EFD and has no result.
+    fn token_requests_fail_offline_by_default() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::TOKENS_HERE.with(|t| t.set(None));
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XUserAddAsync(1, &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut user = std::ptr::null_mut();
+            assert_eq!(XUserAddResult(&mut b, &mut user), S_OK);
+            let mut bt: XAsyncBlock = std::mem::zeroed();
+            let (method, url) = (b"GET\0", b"https://example.playfabapi.com/\0");
+            assert_eq!(super::XUserGetTokenAndSignatureAsync(user, 0, method.as_ptr(), url.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null(), &mut bt), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut bt, true), 0x8007_2EFD_u32 as i32);
+            let mut n = 0usize;
+            assert_ne!(super::XUserGetTokenAndSignatureResultSize(&mut bt, &mut n), S_OK);
+            XUserCloseHandle(user);
+        }
+    }
+
+    #[test]
     fn token_and_signature_utf8_and_utf16_through_vtable() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        super::TOKENS_HERE.with(|t| t.set(Some(true)));
         unsafe {
             let (hr, u) = query(XUSER, XUSER);
             assert_eq!(hr, S_OK);
