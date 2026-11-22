@@ -39,3 +39,38 @@ fn full_scan_and_streaming_probe_agree_on_header_evidence() {
     assert!(full.contains("RPF9 archives (headers every 2 KB): 2"));
     assert!(full.contains("TOC encryption: unknown"));
 }
+
+#[test]
+fn explicit_probe_rejects_conflicting_options() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let archive = std::env::temp_dir().join(format!(
+        "xcl-rpf-options-{}-{nonce}.rpf",
+        std::process::id()
+    ));
+    std::fs::write(&archive, b"9FPR").unwrap();
+
+    let options: [&[&str]; 4] = [
+        &["--full"],
+        &["--find", "record"],
+        &["--extract", "record"],
+        &["--out", "unused"],
+    ];
+    let outputs = options.map(|args| {
+        Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("rpf")
+            .arg(&archive)
+            .arg("--probe")
+            .args(args)
+            .output()
+    });
+    std::fs::remove_file(&archive).unwrap();
+
+    for (args, output) in options.into_iter().zip(outputs) {
+        let output = output.unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(String::from_utf8(output.stderr).unwrap().contains(args[0]));
+    }
+}
