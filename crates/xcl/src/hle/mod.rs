@@ -159,6 +159,9 @@ fn build(config: &Config) -> Registry {
     routes.push((MINUSERX.into(), Route::Hle(u)));
     // the console's ntuser API sets: Windows' user32 but for the ANSI window functions (`user`)
     routes.push(("ext-ms-win-rtcore-ntuser-window-ansi-*".into(), Route::Hle(u)));
+    // … and its Unicode window functions: CreateWindowExW makes the console's screen, the rest
+    // is user32 (the module's fallback)
+    routes.push(("ext-ms-win-rtcore-ntuser-window-l1-*".into(), Route::Hle(u)));
     let s = idx(XCRDAPI);
     routes.push((XCRDAPI.into(), Route::Hle(s)));
     let g = idx(XG);

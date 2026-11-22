@@ -13,7 +13,9 @@
 //! that sizes its back buffer from it (Minecraft) resolved its 1920x1080 scene past the end of
 //! it – the list failed to close and the device was removed. So the title's top-level windows
 //! are made frameless, the console's size, kept frameless through style changes
-//! (WM_NCCALCSIZE) and cloaked: the game's frames are shown in XCL's own window.
+//! (WM_NCCALCSIZE), cloaked and kept off the taskbar: the game's frames are shown in XCL's own
+//! window. Both ways of making it go through here (CreateWindowExA and the Unicode
+//! CreateWindowExW of the ntuser window API set – Fortnite's stayed a second, white window).
 
 #![allow(non_snake_case)]
 
@@ -32,7 +34,10 @@ extern "system" {
 }
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![CreateWindowExA, RegisterClassExA]
+    let mut v = crate::hle_exports![CreateWindowExA, RegisterClassExA];
+    // titles that make their window the Unicode way (Fortnite) get the console's screen too
+    v.push(("CreateWindowExW", create_window_ex_w as usize));
+    v
 }
 
 /// WNDCLASSEXA (`u8`) / WNDCLASSEXW (`u16`): the same layout, the strings are pointers
@@ -93,6 +98,13 @@ pub unsafe extern "system" fn CreateWindowExA(ex_style: u32, class: *const u8, t
     console_window(ex_style, class, title, style, x, y, w, h, parent, menu, instance, param)
 }
 
+/// CreateWindowExW of the console's ntuser API set: as `CreateWindowExA`, without the text
+/// conversion.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn create_window_ex_w(ex_style: u32, class: *const u16, title: *const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: *mut c_void, menu: *mut c_void, instance: *mut c_void, param: *const c_void) -> *mut c_void {
+    console_window(ex_style, class, title, style, x, y, w, h, parent, menu, instance, param)
+}
+
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmSetWindowAttribute(hwnd: *mut c_void, attr: u32, value: *const c_void, size: u32) -> i32;
@@ -107,6 +119,10 @@ const WS_POPUP: u32 = 0x8000_0000;
 const WS_FRAME: u32 = 0x00C0_0000 | 0x0004_0000 | 0x0008_0000 | 0x0002_0000 | 0x0001_0000;
 /// dialog / window / client / static edges
 const WS_EX_FRAME: u32 = 0x1 | 0x100 | 0x200 | 0x2_0000;
+/// no taskbar button and no Alt+Tab entry (the title's window is never shown: the game is in
+/// XCL's window) – a cloaked window kept its taskbar button, a second, empty window
+const WS_EX_TOOLWINDOW: u32 = 0x80;
+const WS_EX_APPWINDOW: u32 = 0x4_0000;
 const GWLP_WNDPROC: i32 = -4;
 const WM_NCDESTROY: u32 = 0x82;
 const WM_NCCALCSIZE: u32 = 0x83;
@@ -123,7 +139,8 @@ unsafe fn console_window(ex_style: u32, class: *const u16, title: *const u16, st
         return CreateWindowExW(ex_style, class, title, style, x, y, w, h, parent, menu, instance, param);
     }
     let style = style & !WS_FRAME | WS_POPUP;
-    let hwnd = CreateWindowExW(ex_style & !WS_EX_FRAME, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, parent, menu, instance, param);
+    let ex_style = ex_style & !WS_EX_FRAME & !WS_EX_APPWINDOW | WS_EX_TOOLWINDOW;
+    let hwnd = CreateWindowExW(ex_style, class, title, style, 0, 0, CONSOLE_W, CONSOLE_H, parent, menu, instance, param);
     if hwnd.is_null() {
         return hwnd;
     }

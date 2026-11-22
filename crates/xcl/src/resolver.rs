@@ -363,8 +363,14 @@ mod tests {
         let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
         let (a, s) = resolve_inner("minuserx.dll", &name("PeekMessageW"), 0);
         assert!(a != 0 && matches!(s, Source::System(ref d) if d == "user32.dll"), "{s:?}");
+        // the title's window is the console's screen whichever way it is made (`hle::user`) …
         let (a, s) = resolve_inner("minuserx.dll", &name("CreateWindowExW"), 0);
-        assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::MINUSERX), "{s:?}");
+        let (a, s) = resolve_inner("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", &name("CreateWindowExW"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::MINUSERX), "{s:?}");
+        // … and the rest of that API set is user32
+        let (a, s) = resolve_inner("ext-ms-win-rtcore-ntuser-window-l1-1-0.dll", &name("ShowWindow"), 0);
+        assert!(a != 0 && matches!(s, Source::System(ref d) if d == "user32.dll"), "{s:?}");
         let (a, s) = resolve_inner("kernel32legacy.dll", &name("GetProcessAffinityMask"), 0);
         assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
         let (a, s) = resolve_inner("minappmodelx.dll", &name("RegisterAppStateChangeNotification"), 0);
