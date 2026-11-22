@@ -35,13 +35,50 @@ fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
             if k == 0 || t[..k].ends_with(char::is_whitespace) {
                 let a = k + key.len();
                 if let Some(b) = t[a..].find('"') {
-                    out.push(t[a..a + b].to_string());
+                    out.push(xml_unescape(&t[a..a + b]));
                 }
                 break;
             }
             pos = k + key.len();
         }
     }
+    out
+}
+
+/// An attribute value with XML's character references replaced: the five named ones
+/// ("Ratchet &amp; Clank") and numeric ones (`&#39;`, `&#x27;`). Anything else stays as written.
+fn xml_unescape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').and_then(|end| {
+            let c = match &rest[1..end] {
+                "amp" => '&',
+                "lt" => '<',
+                "gt" => '>',
+                "quot" => '"',
+                "apos" => '\'',
+                r => {
+                    let n = r.strip_prefix("#x").map(|h| u32::from_str_radix(h, 16)).or_else(|| r.strip_prefix('#').map(|d| d.parse()))?;
+                    char::from_u32(n.ok()?)?
+                }
+            };
+            Some((c, end + 1))
+        });
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -407,11 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn attribute_values_have_their_character_references_replaced() {
+        assert_eq!(xml_unescape("Tom &amp; Jerry&apos;s &lt;&quot;x&quot;&gt;"), "Tom & Jerry's <\"x\">");
+        assert_eq!(xml_unescape("It&#39;s &#x2122;"), "It's \u{2122}");
+        // not a reference: kept as written
+        assert_eq!(xml_unescape("A & B &nbsp; &#xZZ; &"), "A & B &nbsp; &#xZZ; &");
+        let xml = r#"<ExecutableList><Executable Name="Q&amp;A.exe" Id="Game"/></ExecutableList>"#;
+        assert_eq!(xml_attrs(xml, "Executable", "Name"), ["Q&A.exe"]);
+    }
+
+    #[test]
     fn display_name_is_the_shell_name_unless_it_is_a_resource() {
         let dir = TempDir::new("display_name");
         let config = |name: &str| std::fs::write(dir.0.join("MicrosoftGame.config"), format!(r#"<Game><Identity Name="Contoso.Test"/><ShellVisuals DefaultDisplayName="{name}" Square44x44Logo="a.png"/></Game>"#)).unwrap();
         config("Minecraft Preview");
         assert_eq!(display_name(&dir.0).as_deref(), Some("Minecraft Preview"));
+        config("Ratchet &amp; Clank: Rift Apart");
+        assert_eq!(display_name(&dir.0).as_deref(), Some("Ratchet & Clank: Rift Apart"));
         config("ms-resource:AppName");
         assert_eq!(display_name(&dir.0), None);
         std::fs::remove_file(dir.0.join("MicrosoftGame.config")).unwrap();
