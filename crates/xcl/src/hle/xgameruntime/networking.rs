@@ -215,6 +215,37 @@ struct CertContext {
 }
 
 #[repr(C)]
+struct CertTrustStatus {
+    error_status: u32,
+    info_status: u32,
+}
+
+/// `CERT_CHAIN_CONTEXT` up to the fields read here.
+#[repr(C)]
+struct CertChainContext {
+    cb_size: u32,
+    trust_status: CertTrustStatus,
+    chain_count: u32,
+    chains: *const *const CertSimpleChain,
+}
+
+/// `CERT_SIMPLE_CHAIN` up to the fields read here.
+#[repr(C)]
+struct CertSimpleChain {
+    cb_size: u32,
+    trust_status: CertTrustStatus,
+    element_count: u32,
+    elements: *const *const CertChainElement,
+}
+
+/// `CERT_CHAIN_ELEMENT` up to the fields read here.
+#[repr(C)]
+struct CertChainElement {
+    cb_size: u32,
+    cert_context: *const CertContext,
+}
+
+#[repr(C)]
 struct CertChainPara {
     cb_size: u32,
     usage_match_type: u32,
@@ -323,37 +354,16 @@ unsafe fn sha1_thumbprint(procs: &CryptoProcs, cert: *const CertContext) -> Vec<
 
 /// Extract leaf-to-root certificate contexts from the primary simple chain in `CERT_CHAIN_CONTEXT`.
 unsafe fn extract_chain_certs(chain: *const c_void) -> Vec<*const CertContext> {
-    if chain.is_null() {
+    let chain = chain as *const CertChainContext;
+    if chain.is_null() || (*chain).chain_count == 0 || (*chain).chains.is_null() {
         return Vec::new();
     }
-    // CERT_CHAIN_CONTEXT on x64: cChain @ +16 (u32), rgpChain @ +24 (*const *const CERT_SIMPLE_CHAIN)
-    let chain_count = *((chain as *const u8).add(16) as *const u32);
-    let chains_ptr = *((chain as *const u8).add(24) as *const *const *const u8);
-    if chain_count == 0 || chains_ptr.is_null() {
+    let first = *(*chain).chains;
+    if first.is_null() || (*first).elements.is_null() {
         return Vec::new();
     }
-    let first = *chains_ptr;
-    if first.is_null() {
-        return Vec::new();
-    }
-    // CERT_SIMPLE_CHAIN on x64: cElement @ +20 (u32), rgpElement @ +24 (*const *const CERT_CHAIN_ELEMENT)
-    let elem_count = *(first.add(20) as *const u32);
-    let elems_ptr = *(first.add(24) as *const *const *const u8);
-    if elems_ptr.is_null() {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(elem_count as usize);
-    for i in 0..elem_count as usize {
-        let elem = *elems_ptr.add(i);
-        if !elem.is_null() {
-            // CERT_CHAIN_ELEMENT on x64: pCertContext @ +8
-            let ctx = *(elem.add(8) as *const *const CertContext);
-            if !ctx.is_null() {
-                out.push(ctx);
-            }
-        }
-    }
-    out
+    let elements = std::slice::from_raw_parts((*first).elements, (*first).element_count as usize);
+    elements.iter().filter(|e| !e.is_null()).map(|&e| (*e).cert_context).filter(|c| !c.is_null()).collect()
 }
 
 /// Verify optional SHA-1 thumbprint pins against the leaf-to-root certificate chain.
@@ -565,6 +575,42 @@ mod tests {
         assert_eq!(std::mem::size_of::<XNetworkingThumbprint>(), 24);
         assert_eq!(std::mem::size_of::<XNetworkingSecurityInformation>(), 24);
         assert_eq!(std::mem::size_of::<XNetworkingConnectivityHint>(), 16);
+    }
+
+    /// A chain laid out byte by byte as `wincrypt.h` places it on x64, independent of the
+    /// structs above: `cChain` @ +12, `rgpChain` @ +16, `cLowerQualityChainContext` @ +24;
+    /// `cElement` @ +12, `rgpElement` @ +16; `pCertContext` @ +8.
+    #[test]
+    fn chain_certs_read_at_the_sdk_offsets() {
+        #[repr(C, align(8))]
+        struct Raw([u8; 64]);
+        fn put(raw: &mut Raw, at: usize, bytes: &[u8]) {
+            raw.0[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let leaf: CertContext = unsafe { std::mem::zeroed() };
+        let root: CertContext = unsafe { std::mem::zeroed() };
+        let (leaf, root) = (&leaf as *const CertContext, &root as *const CertContext);
+
+        let mut elements = [Raw([0; 64]), Raw([0; 64])];
+        for (e, cert) in elements.iter_mut().zip([leaf, root]) {
+            put(e, 0, &24u32.to_le_bytes());
+            put(e, 8, &(cert as usize).to_le_bytes());
+        }
+        let element_ptrs = [&elements[0] as *const Raw, &elements[1] as *const Raw];
+        let mut simple = Raw([0; 64]);
+        put(&mut simple, 12, &2u32.to_le_bytes());
+        put(&mut simple, 16, &(element_ptrs.as_ptr() as usize).to_le_bytes());
+        let simple_ptrs = [&simple as *const Raw];
+        let mut context = Raw([0; 64]);
+        put(&mut context, 12, &1u32.to_le_bytes());
+        put(&mut context, 16, &(simple_ptrs.as_ptr() as usize).to_le_bytes());
+
+        unsafe {
+            assert_eq!(extract_chain_certs(&context as *const Raw as *const c_void), vec![leaf, root]);
+            assert!(extract_chain_certs(std::ptr::null()).is_empty());
+            put(&mut context, 12, &0u32.to_le_bytes());
+            assert!(extract_chain_certs(&context as *const Raw as *const c_void).is_empty());
+        }
     }
 
     #[test]
