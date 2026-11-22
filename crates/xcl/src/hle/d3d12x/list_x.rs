@@ -1459,23 +1459,24 @@ unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_V
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
-/// The heaps a list binds for console code: a view heap in the shared shader-visible heap
-/// is that one (`console_heap`), which is bound whatever the title names (a console
-/// descriptor table may be in any heap); sampler heaps as they are.
+/// Bind the shared heap for shared view indices and the selected private heap for local
+/// view indices. Sampler heaps are passed through.
 pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12DescriptorHeap>> {
-    let shared = super::console_heap::global_heap();
-    let mut out: Vec<Option<ID3D12DescriptorHeap>> = shared.iter().cloned().map(Some).collect();
+    let mut view_heap = super::console_heap::global_heap();
+    let mut out = Vec::new();
     for k in 0..n as usize {
         let p = *heaps.add(k) as *mut c_void;
-        if p.is_null() || (shared.is_some() && super::console_heap::in_global(p as usize)) {
+        if p.is_null() || super::console_heap::in_global(p as usize) {
             continue;
         }
         let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
-        if shared.is_some() && h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
-            continue;
+        if h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+            view_heap = Some(h.clone());
+        } else {
+            out.push(Some(h.clone()));
         }
-        out.push(Some(h.clone()));
     }
+    out.extend(view_heap.map(Some));
     out
 }
 
@@ -1643,7 +1644,7 @@ const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100
 
 /// #26 ResourceBarrier(count, barriers): console barriers (D3D12_RESOURCE_BARRIER, 32 bytes) as
 /// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
-/// transition left with nothing to do goes, aliasing barriers cover any resources
+/// transition left with nothing to do goes, aliasing barriers name placed textures
 pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
     static N: AtomicU64 = AtomicU64::new(0);
     if barriers.is_null() || n == 0 {
@@ -1669,10 +1670,14 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             continue;
         }
         if ty == 1 {
-            // aliasing (resource before +8, after +16): on the PC only between placed / reserved
-            // resources, and the console's texture memory is mostly XCL's committed resources
-            // (the list would fail to Close) – an aliasing barrier for any resources instead
-            b[2..6].fill(0);
+            // Keep the identity of textures that really share placed GPU memory.
+            // Committed resources still need the wildcard form on the PC.
+            for words in b[2..6].chunks_exact_mut(2) {
+                let resource = (words[0] as u64 | (words[1] as u64) << 32) as usize;
+                if resource != 0 && !super::vram::is_placed_texture(resource) {
+                    words.fill(0);
+                }
+            }
         }
         if ty == 0 {
             // transition: resource (+8), subresource (+16), before (+20), after (+24)
