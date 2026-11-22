@@ -58,6 +58,10 @@ unsafe impl Send for Entry {}
 
 /// PC texture → its place in the title's memory
 static TEXTURES: Mutex<BTreeMap<usize, Entry>> = Mutex::new(BTreeMap::new());
+static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
+static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
+static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
@@ -82,11 +86,16 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     if crate::gpu::uma::get().is_some_and(|u| u.contains(va)) || crate::hle::kernelx::in_graphics_reservation(va) {
         ResetWriteWatch(va as *const c_void, bytes);
     }
-    if let Some(old) = TEXTURES.lock().unwrap().insert(res as usize, e) {
-        if old.pending {
-            PENDING.fetch_sub(1, Ordering::Relaxed);
+    {
+        let mut t = TEXTURES.lock().unwrap();
+        if let Some(old) = t.insert(res as usize, e) {
+            if old.pending {
+                PENDING.fetch_sub(1, Ordering::Relaxed);
+            }
         }
+        TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
     }
+    TEXTURES_GEN.fetch_add(1, Ordering::Release);
     PENDING.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -115,8 +124,17 @@ pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
 
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
-    if TEXTURES.lock().unwrap().remove(&res).is_some_and(|e| e.pending) {
-        PENDING.fetch_sub(1, Ordering::Relaxed);
+    let removed = {
+        let mut t = TEXTURES.lock().unwrap();
+        let r = t.remove(&res);
+        TEXTURES_LEN.store(t.len(), Ordering::Relaxed);
+        r
+    };
+    if let Some(e) = removed {
+        if e.pending {
+            PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -129,6 +147,35 @@ thread_local! {
     /// XCL's own submits on this thread (texture uploads): they read no title memory on the GPU,
     /// so they do not look for CPU writes first – that look is the title's submits' job
     static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Reusable `GetWriteWatch` output buffer (avoids 128 KiB alloc+zero+free per submit).
+    static WATCH_BUF: std::cell::RefCell<Vec<*mut c_void>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Reusable dirty page list for `refresh_once`.
+    static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
+    let key = (
+        super::sparse::mapped_gen(),
+        TEXTURES_GEN.load(Ordering::Acquire),
+        crate::hle::kernelx::graphics_reservations_gen(),
+    );
+    {
+        let g = WATCH_CACHE.lock().unwrap();
+        if let Some((k, ref ranges)) = *g {
+            if k == key {
+                return Arc::clone(ranges);
+            }
+        }
+    }
+    // Recompute the watched ranges (textures kept in step + mapped sparse tiles clipped to
+    // write-watched regions) only when the set of textures, tiles, or reservations changed.
+    let mut regions = u.watch_regions();
+    regions.extend(crate::hle::kernelx::graphics_reservations());
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    wanted.extend(super::sparse::mapped_ranges());
+    let computed = Arc::new(watch_ranges(&regions, wanted));
+    *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
+    computed
 }
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
@@ -157,35 +204,37 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 unsafe fn refresh_once(queue: *mut c_void) {
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
-    if TEXTURES.lock().unwrap().is_empty() && !sparse {
+    if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
         return;
     }
     let watch_t0 = std::time::Instant::now();
-    let mut dirty: Vec<usize> = Vec::new();
     let mut page = 0x1000u32;
-    // the write-watched regions (the committed windows, the sparse ones – the title's
-    // reservations – and other graphics reservations) …
-    let regions: Vec<(usize, usize)> = (0..u.shader_windows()).map(|k| u.window(k)).chain(crate::hle::kernelx::graphics_reservations()).collect();
-    // … where a CPU write matters: the textures kept in step and the sparse windows' tiles
-    // with video memory. A scan costs with the size it covers (GetWriteWatch walks the page
-    // tables), and the whole regions are 16 GiB and more – looked at before every submit.
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().values().map(|e| (e.va & !0xFFF, (e.va + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
-    wanted.extend(super::sparse::mapped_ranges());
-    let mut buf = vec![std::ptr::null_mut::<c_void>(); 16384];
-    for (base, size) in watch_ranges(&regions, wanted) {
-        loop {
-            let mut n = buf.len();
-            if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
-                break;
+    let ranges = cached_watch_ranges(u);
+    let dirty_len = DIRTY_BUF.with(|dcell| {
+        let mut dirty = dcell.borrow_mut();
+        dirty.clear();
+        WATCH_BUF.with(|wcell| {
+            let mut buf = wcell.borrow_mut();
+            if buf.len() < 16384 {
+                buf.resize(16384, std::ptr::null_mut());
             }
-            dirty.extend(buf[..n].iter().map(|&p| p as usize));
-            if n < buf.len() {
-                break;
+            for &(base, size) in ranges.iter() {
+                loop {
+                    let mut n = buf.len();
+                    if GetWriteWatch(WRITE_WATCH_FLAG_RESET, base as *const c_void, size, buf.as_mut_ptr(), &mut n, &mut page) != 0 {
+                        break;
+                    }
+                    dirty.extend(buf[..n].iter().map(|&p| p as usize));
+                    if n < buf.len() {
+                        break;
+                    }
+                }
             }
-        }
-    }
-    dirty.sort_unstable();
-    super::sparse::note_watch(watch_t0.elapsed(), dirty.len());
+        });
+        dirty.sort_unstable();
+        dirty.len()
+    });
+    super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
     if super::present::trace_frame() {
         // every 600th look: what the CPU's view of a few textures holds now (does the title's
         // data reach the address at all, and is the texture still kept in step?)
@@ -212,19 +261,23 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     crate::xlog_info!("frame trace: title texture at {:#x} ({} bytes) has data in memory ({c} of 65536 sampled bytes); GPU-written {}", e.va, e.tex.size(), e.gpu_written);
                 }
             }
-            crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {} dirty pages this look", dirty.len());
+            crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {dirty_len} dirty pages this look");
         }
     }
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
-        super::sparse::before_execute(q, &dirty, page as usize);
+        DIRTY_BUF.with(|dcell| {
+            let dirty = dcell.borrow();
+            super::sparse::before_execute(q, &dirty, page as usize);
+        });
     }
-    if dirty.is_empty() && PENDING.load(Ordering::Relaxed) == 0 {
+    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
         return;
     }
     // textures made since the last submit and those with a written page; a reference each
     // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = {
+    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+        let dirty = dcell.borrow();
         let mut t = TEXTURES.lock().unwrap();
         t.iter_mut()
             .filter(|(_, e)| {
@@ -246,7 +299,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
             })
             .collect()
-    };
+    });
     upload_all(todo);
 }
 

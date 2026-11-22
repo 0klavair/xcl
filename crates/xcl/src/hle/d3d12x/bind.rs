@@ -53,10 +53,11 @@ fn count(k: usize) {
     if n.is_power_of_two() && n >= 64 {
         let c: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         let (allocators, blocks) = console_list::pending_blocks();
+        let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
+            .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
         crate::xlog_info!(
-            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); unified memory {} MB used, {blocks} blocks held for {allocators} allocators",
+            "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
-            crate::gpu::uma::get().map_or(0, |u| u.used() >> 20)
         );
     }
 }
@@ -625,7 +626,20 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     let Some(u) = crate::gpu::uma::get() else {
         return std::ptr::null_mut();
     };
-    match u.alloc(size.max(16), align.max(16)) {
+    let size = size.max(16);
+    let align = align.max(16);
+    if size <= crate::gpu::uma::ARENA_BLOCK / 2 {
+        if let Some(p) = with(this, |s| s.arena.take(u, size, align, &mut s.uma)) {
+            return p;
+        }
+    }
+    if u.has_sparse() {
+        if let Some((p, _)) = super::sparse::alloc(size, align) {
+            with(this, |s| s.uma.push(p));
+            return p as *mut u8;
+        }
+    }
+    match u.alloc(size, align) {
         Some(p) => {
             with(this, |s| s.uma.push(p as usize));
             p

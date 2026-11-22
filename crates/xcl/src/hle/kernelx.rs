@@ -131,6 +131,12 @@ pub fn sanitize_protect(p: u32) -> u32 {
 /// – where it maps physical pages (a texture streaming pool): base → size. Write-watched, like
 /// unified memory, so textures in it follow CPU writes (`d3d12x::title_textures`).
 static GRAPHICS_RESERVATIONS: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static GRAPHICS_RESERVATIONS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Generation counter incremented whenever `GRAPHICS_RESERVATIONS` changes.
+pub fn graphics_reservations_gen() -> u64 {
+    GRAPHICS_RESERVATIONS_GEN.load(Ordering::Acquire)
+}
 
 /// The title's graphics reservations (base, size).
 pub fn graphics_reservations() -> Vec<(usize, usize)> {
@@ -219,6 +225,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
         if !q.is_null() {
             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
             return q;
         }
     }
@@ -274,8 +281,8 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
-    if t & 0x8000 != 0 {
-        GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
+    if t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
     mem::VirtualFree(addr, size, t)
 }
