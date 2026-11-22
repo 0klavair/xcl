@@ -24,8 +24,6 @@ next steps:
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
 
-XCL stays offline: no fake Xbox Live, sign-in, game backends or licences.
-
 ## Highlights
 
 - **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs (26 503 records) of its shader pack
@@ -106,6 +104,9 @@ xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compi
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 ```
 
+- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
+  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
+  window stays open until Enter.
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
