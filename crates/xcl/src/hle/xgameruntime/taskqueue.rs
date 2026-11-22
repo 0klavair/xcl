@@ -25,7 +25,6 @@ pub const MODE_SERIALIZED_THREAD_POOL: u32 = 2;
 pub const MODE_IMMEDIATE: u32 = 3;
 pub const PORT_WORK: u32 = 0;
 pub const PORT_COMPLETION: u32 = 1;
-pub const E_ABORT_QUEUE_TERMINATED: HRESULT = 0x8004_0001u32 as i32; // E_ABORT-like
 pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01ABu32 as i32;
 
 pub type XTaskQueueCallback = unsafe extern "system" fn(*mut c_void, bool);
@@ -469,6 +468,9 @@ pub unsafe extern "system" fn XTaskQueueSubmitCallback(h: *mut c_void, port: u32
         return E_INVALIDARG;
     }
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    if q.terminated.load(Ordering::Acquire) {
+        return crate::util::E_ABORT;
+    }
     submit_now(&q, port, Item { cb, ctx: ctx as usize });
     S_OK
 }
@@ -478,6 +480,11 @@ pub unsafe extern "system" fn XTaskQueueSubmitDelayedCallback(h: *mut c_void, po
         return E_INVALIDARG;
     }
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
+    // A terminated queue takes no new work (libHttpClient: VerifyNotTerminated). A delayed
+    // callback accepted now would run after the termination callback.
+    if q.terminated.load(Ordering::Acquire) {
+        return crate::util::E_ABORT;
+    }
     submit_delayed(&q, port, delay, Item { cb, ctx: ctx as usize });
     S_OK
 }
@@ -598,6 +605,9 @@ pub unsafe extern "system" fn XTaskQueueRegisterWaiter(
     let Some(q) = queue_from(h) else { return E_INVALIDARG };
     if token.is_null() || cb == 0 {
         return E_INVALIDARG;
+    }
+    if q.terminated.load(Ordering::Acquire) {
+        return crate::util::E_ABORT;
     }
     let w = Box::into_raw(Box::new(Waiter { queue: q, port, item: Item { cb, ctx: ctx as usize }, wait: 0 }));
     let mut wh = std::ptr::null_mut();
@@ -820,6 +830,28 @@ mod tests {
 
             XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn a_terminated_queue_takes_no_new_work() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn never(_ctx: *mut c_void, _canceled: bool) {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe {
+            let mut h = std::ptr::null_mut();
+            assert_eq!(XTaskQueueCreate(MODE_THREAD_POOL, MODE_THREAD_POOL, &mut h), S_OK);
+            assert_eq!(XTaskQueueTerminate(h, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(XTaskQueueSubmitCallback(h, PORT_WORK, std::ptr::null_mut(), never as usize), crate::util::E_ABORT);
+            assert_eq!(XTaskQueueSubmitDelayedCallback(h, PORT_WORK, 10, std::ptr::null_mut(), never as usize), crate::util::E_ABORT);
+            let mut token = RegistrationToken { token: 0 };
+            let event = windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 1, std::ptr::null());
+            assert_eq!(XTaskQueueRegisterWaiter(h, PORT_WORK, event, std::ptr::null_mut(), never as usize, &mut token), crate::util::E_ABORT);
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(RAN.load(Ordering::SeqCst), 0, "work submitted after Terminate ran");
+            windows_sys::Win32::Foundation::CloseHandle(event);
+            XTaskQueueCloseHandle(h);
         }
     }
 }
