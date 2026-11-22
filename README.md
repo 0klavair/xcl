@@ -91,8 +91,14 @@ classes asked for, shader statistics, audio formats, crash) – the to-do list f
 
 Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
 + `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
-`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 (developed on AMD RDNA4, others untested),
-and the system XGameRuntime (`System32\xgameruntime.dll`, part of Windows / Gaming Services).
+`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
+(`System32\xgameruntime.dll`, part of Windows / Gaming Services).
+
+- **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
+  mesh pass, so a GPU without mesh shaders draws none of them. GPUs with 32-lane waves only (NVIDIA)
+  run the vertex and pixel shaders, but console wave64 compute, geometry and mesh programs are mostly
+  refused there for now (their draws are skipped). Test results on other GPUs:
+  [#42](https://github.com/ivall/xcl/issues/42).
 
 ```powershell
 cargo build --release --workspace          # target\release\xcl.exe
