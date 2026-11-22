@@ -1454,11 +1454,13 @@ fn gpu_format_stores_atomics_global_lds() {
     }
     assert_eq!(r.mem[0x400 / 4], 64, "buffer_atomic_add");
     assert_eq!(r.mem[0x404 / 4], 163, "buffer_atomic_umax");
-    let mut olds: Vec<u32> = r.vgpr.iter().map(|v| v[26]).collect();
-    olds.sort();
-    // LDS is not zeroed between dispatches (nor on the console): consecutive values from any start
-    let base = olds[0];
-    assert_eq!(olds, (0..64).map(|k| base.wrapping_add(k)).collect::<Vec<u32>>(), "ds_add_rtn_u32 returns every old value once");
+    let olds: Vec<u32> = r.vgpr.iter().map(|v| v[26]).collect();
+    // LDS is not zeroed between dispatches (nor on the console): consecutive values from any
+    // start, which may wrap (0xFFFFFFFF, 0, 1, …)
+    let base = *olds.iter().find(|&&v| !olds.contains(&v.wrapping_sub(1))).unwrap_or(&olds[0]);
+    let mut got: Vec<u32> = olds.iter().map(|v| v.wrapping_sub(base)).collect();
+    got.sort();
+    assert_eq!(got, (0..64).collect::<Vec<u32>>(), "ds_add_rtn_u32 returns every old value once (from {base:#x}): {olds:?}");
 }
 
 /// global_*_dword_addtid (ENC_FLAT_GLBL): the spec gives them no ADDR operand – the
