@@ -1,6 +1,6 @@
 # XNetworking Rust review
 
-Thanks for the work on XCL. This is a one-off contribution to help with the systems Rust side, not a commitment to become a recurring reviewer or PR author. Good job, everyone. I think Rust is the right choice and the project is on the right track.
+Thanks for the work on XCL. This is a one-off contribution to help with the systems Rust side, not a commitment to become a recurring reviewer or PR author. Good job, everyone. I think Rust is the right choice and the project is on the right track. More than XboxtoWindows...
 
 ## First change to review
 
