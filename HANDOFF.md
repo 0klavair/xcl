@@ -795,6 +795,23 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
   OS) differs in 184 render-target cases at plane 1 +0x10 (console 0x2000, ours 0) – a newer library, to look at.
 - `dxc::cache_tests::concurrent_cache_misses_compile_once` can fail under load (a 200 ms timing bound), passes alone.
 
+## PRs #61–#66, #72 (merged), #71 (closed), 2026-11-23
+- **#61** (Mavixot) finished console shaders kept in memory (`pso::ShaderCache`, 64 MB / 128 entries, keyed by blob
+  hash + bytes, stage, sampler base, windows, `split_wave64` – added on merge – and the DXIL cache folder): a
+  pipeline sharing a shader with an earlier one skips translation and the disk cache (`gpu_pso_e2e` 28 s → 9 s).
+- **#62 / #63** (gefydev) MicrosoftGame.config: `<!-- -->` comments removed after decoding (a commented-out
+  Executable / Identity / PLS size / title memory was taken as the game's); `manifest::load` uses the launcher's
+  decoder (UTF-16 BE too).
+- **#64** VFS lists `FindExSearchLimitToDirectories` like a name match (the flag is advisory) – checked on Windows
+  with the real hooks: `G:\data\*` gives `. .. f.txt sub` for both ops.
+- **#65** XUserGetGamertag as documented: no modern suffix, so UniqueModern = the gamertag (`Player1`, games showed
+  `Player1#0001` before); components cut to their documented buffer sizes.
+- **#66** console id = `00000000.00000000.00000000.00000000.00` (38 characters, what the docs give for PC / RETAIL;
+  the old 41-character default did not fit `XSystemConsoleIdBytes`); the old default in existing `xcl.toml` files is
+  replaced on load. `XSystemGetAppSpecificDeviceId` changes once with it.
+- **#72** f64 abs / neg on the sign bit (DXIL's `-x` is `fsub -0.0, x`: a NaN's sign is up to the driver; NVIDIA kept it)
+  – cherry-picked without **#71** (GPU tests as independent wave32 halves), which #67 superseded.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
