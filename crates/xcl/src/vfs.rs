@@ -40,6 +40,7 @@ pub const ERROR_FILE_EXISTS: u32 = 80;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
+pub const ERROR_DIRECTORY: u32 = 267;
 
 const CREATE_NEW: u32 = 1;
 const CREATE_ALWAYS: u32 = 2;
@@ -359,14 +360,36 @@ impl Vfs {
     }
 
     fn remove_whiteout(&self, rel: &str) {
-        let mut g = self.whiteouts.lock().unwrap();
         let k = Self::wkey(rel);
-        let mut changed = g.remove(&k);
-        // re-creating something below a whited-out parent un-hides the parent path
-        let mut cur = k.as_str();
-        while let Some((parent, _)) = cur.rsplit_once('\\') {
-            changed |= g.remove(parent);
-            cur = parent;
+        if k.is_empty() {
+            return;
+        }
+        let mut g = self.whiteouts.lock().unwrap();
+        // Walk top-down through every ancestor prefix and `k` itself.
+        // If a whited-out directory is un-hidden (recreated, or a child is created under it),
+        // push whiteouts down to its immediate original children so none of them resurrect.
+        let mut changed = false;
+        let mut end = 0;
+        loop {
+            let next = k[end..].find('\\').map(|i| end + i);
+            let prefix = match next {
+                Some(pos) => &k[..pos],
+                None => k.as_str(),
+            };
+            if g.remove(prefix) {
+                changed = true;
+                let orig = self.original_path(prefix);
+                if let Ok(entries) = std::fs::read_dir(&orig) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_lowercase();
+                        g.insert(format!("{prefix}\\{name}"));
+                    }
+                }
+            }
+            match next {
+                Some(pos) => end = pos + 1,
+                None => break,
+            }
         }
         if changed {
             self.persist_whiteouts(&g);
@@ -388,6 +411,17 @@ impl Vfs {
         !self.is_whiteout(rel) && Path::new(&self.original_path(rel)).exists()
     }
 
+    pub fn exists(&self, rel: &str) -> bool {
+        self.visible_in_overlay(rel) || self.visible_in_original(rel)
+    }
+
+    pub fn is_dir(&self, rel: &str) -> bool {
+        if let Ok(m) = std::fs::metadata(self.overlay_path(rel)) {
+            return m.is_dir();
+        }
+        self.visible_in_original(rel) && Path::new(&self.original_path(rel)).is_dir()
+    }
+
     /// Real path to read `path` from. None = hidden by a whiteout.
     pub fn real_path_for_read(&self, path: &str) -> Option<String> {
         match self.classify(path) {
@@ -405,6 +439,29 @@ impl Vfs {
             return None;
         }
         Some(self.original_path(rel))
+    }
+
+    /// Stage the overlay path for a new/overwritten file (e.g. copy/move destination)
+    /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
+    /// only after the underlying file operation succeeds so a failed operation cannot
+    /// resurrect a whited-out original.
+    pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
+        if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
+            if !self.is_dir(parent_rel) {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+        }
+        let ov = self.overlay_path(rel);
+        if let Some(parent) = Path::new(&ov).parent() {
+            std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
+        }
+        Ok(ov)
+    }
+
+    /// Finalise a staged write once the underlying file operation succeeded.
+    pub fn commit_write(&self, rel: &str) {
+        self.remove_whiteout(rel);
+        self.record_write(rel);
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
@@ -497,17 +554,25 @@ impl Vfs {
 
     pub fn delete_file(&self, rel: &str) -> Result<(), u32> {
         let ov = self.overlay_path(rel);
-        let had_ov = Path::new(&ov).is_file();
-        let had_orig = self.visible_in_original(rel);
-        if !had_ov && !had_orig {
+        let ov_path = Path::new(&ov);
+        if let Ok(meta) = std::fs::metadata(ov_path) {
+            if meta.is_dir() {
+                return Err(ERROR_ACCESS_DENIED);
+            }
+            std::fs::remove_file(ov_path).map_err(|_| ERROR_ACCESS_DENIED)?;
+            if Path::new(&self.original_path(rel)).exists() {
+                self.add_whiteout(rel);
+            }
+            self.record_write(rel);
+            return Ok(());
+        }
+        if !self.visible_in_original(rel) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if had_ov {
-            std::fs::remove_file(&ov).map_err(|_| ERROR_ACCESS_DENIED)?;
+        if Path::new(&self.original_path(rel)).is_dir() {
+            return Err(ERROR_ACCESS_DENIED);
         }
-        if had_orig {
-            self.add_whiteout(rel);
-        }
+        self.add_whiteout(rel);
         self.record_write(rel);
         Ok(())
     }
@@ -523,18 +588,29 @@ impl Vfs {
     }
 
     pub fn remove_dir(&self, rel: &str) -> Result<(), u32> {
+        if rel.is_empty() {
+            return Err(ERROR_ACCESS_DENIED);
+        }
         let ov = self.overlay_path(rel);
-        let had_ov = Path::new(&ov).is_dir();
-        let had_orig = self.visible_in_original(rel);
-        if !had_ov && !had_orig {
+        let ov_path = Path::new(&ov);
+        if let Ok(meta) = std::fs::metadata(ov_path) {
+            if !meta.is_dir() {
+                return Err(ERROR_DIRECTORY);
+            }
+            std::fs::remove_dir(ov_path).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
+            if Path::new(&self.original_path(rel)).exists() {
+                self.add_whiteout(rel);
+            }
+            self.record_write(rel);
+            return Ok(());
+        }
+        if !self.visible_in_original(rel) {
             return Err(ERROR_FILE_NOT_FOUND);
         }
-        if had_ov {
-            std::fs::remove_dir(&ov).map_err(|_| ERROR_DIR_NOT_EMPTY)?;
+        if !Path::new(&self.original_path(rel)).is_dir() {
+            return Err(ERROR_DIRECTORY);
         }
-        if had_orig {
-            self.add_whiteout(rel);
-        }
+        self.add_whiteout(rel);
         self.record_write(rel);
         Ok(())
     }
@@ -820,5 +896,87 @@ mod tests {
             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
         }
         assert!(!v.visible_in_overlay("data"));
+    }
+
+    #[test]
+    fn delete_file_rejects_directories_and_remove_dir_rejects_files() {
+        let f = Fixture::new("type_checks");
+        let v = &f.vfs;
+
+        // Match native Win32 error codes for mismatched DeleteFileW / RemoveDirectoryW.
+        let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
+        let file_w = crate::util::wide(&f.game().join("data").join("hello.txt").to_string_lossy());
+        // SAFETY: dir_w and file_w are NUL-terminated UTF-16 paths; native Win32 rejects them without modifying disk.
+        unsafe {
+            assert_eq!(windows_sys::Win32::Storage::FileSystem::DeleteFileW(dir_w.as_ptr()), 0);
+            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), ERROR_ACCESS_DENIED);
+            assert_eq!(windows_sys::Win32::Storage::FileSystem::RemoveDirectoryW(file_w.as_ptr()), 0);
+            assert_eq!(windows_sys::Win32::Foundation::GetLastError(), ERROR_DIRECTORY);
+        }
+
+        // delete_file must reject both original and overlay directories without adding whiteouts.
+        assert_eq!(v.delete_file("data"), Err(ERROR_ACCESS_DENIED));
+        assert!(!v.is_whiteout("data"));
+        assert!(v.exists("data"));
+
+        assert_eq!(v.create_dir("saves"), Ok(()));
+        assert_eq!(v.delete_file("saves"), Err(ERROR_ACCESS_DENIED));
+        assert!(v.visible_in_overlay("saves"));
+
+        // remove_dir must reject both original and overlay files without adding whiteouts.
+        assert_eq!(v.remove_dir("data\\hello.txt"), Err(ERROR_DIRECTORY));
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(v.exists("data\\hello.txt"));
+
+        let ov_file = v.prepare_write("data\\ov_only.txt", false).unwrap();
+        std::fs::write(&ov_file, b"hi").unwrap();
+        assert_eq!(v.remove_dir("data\\ov_only.txt"), Err(ERROR_DIRECTORY));
+        assert!(v.visible_in_overlay("data\\ov_only.txt"));
+    }
+
+    #[test]
+    fn recreating_removed_directory_does_not_resurrect_original_children() {
+        let f = Fixture::new("recreate_dir");
+        let v = &f.vfs;
+        std::fs::create_dir_all(f.game().join("data").join("sub")).unwrap();
+        std::fs::write(f.game().join("data").join("sub").join("deep.txt"), b"deep").unwrap();
+
+        assert_eq!(v.remove_dir("data"), Ok(()));
+        assert!(v.is_whiteout("data"));
+        assert!(v.is_whiteout("data\\hello.txt"));
+        assert!(v.is_whiteout("data\\sub\\deep.txt"));
+
+        // Recreating `data` must push whiteouts down to original children so none resurrect.
+        assert_eq!(v.create_dir("data"), Ok(()));
+        assert!(!v.is_whiteout("data"));
+        assert!(v.is_dir("data"));
+        assert!(v.is_whiteout("data\\hello.txt"));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.is_whiteout("data\\sub"));
+        assert!(v.is_whiteout("data\\sub\\deep.txt"));
+        assert_eq!(v.read_path_rel("data\\hello.txt"), None);
+        assert_eq!(v.read_path_rel("data\\sub\\deep.txt"), None);
+
+        // Recreating a nested subdirectory also must not resurrect its original children.
+        assert_eq!(v.create_dir("data\\sub"), Ok(()));
+        assert!(!v.is_whiteout("data\\sub"));
+        assert!(v.is_whiteout("data\\sub\\deep.txt"));
+        assert_eq!(v.read_path_rel("data\\sub\\deep.txt"), None);
+
+        // Whiteouts persist across reload.
+        let v2 = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
+        assert!(!v2.is_whiteout("data"));
+        assert!(v2.is_whiteout("data\\hello.txt"));
+        assert!(v2.is_whiteout("data\\gone.txt"));
+        assert!(v2.is_whiteout("data\\sub\\deep.txt"));
+
+        // Recreating one file un-hides only that file.
+        let Decision::Use(p) = v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
+            panic!("expected overlay path");
+        };
+        std::fs::write(&p, b"fresh").unwrap();
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.is_whiteout("data\\sub\\deep.txt"));
     }
 }
