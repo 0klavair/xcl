@@ -4098,3 +4098,30 @@ fn mesh_wave32_rejects_cross_half_operations() {
     assert!(split.hlsl.contains("xcl_logical_wave64 = true;"));
     assert!(split.complete(), "{:?}", split.unsupported_why);
 }
+
+/// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
+/// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
+/// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.
+#[test]
+fn gpu_fract_f32_edges() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[("V_FRACT_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)], None)]);
+    let inputs = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -0.0, 1.5, -0.25, -(2f32.powi(-25)), 7.0];
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = inputs[l % inputs.len()].to_bits();
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let (x, got) = (inputs[l % inputs.len()], f32::from_bits(r.vgpr[l][2]));
+        if x.is_infinite() || x.is_nan() {
+            assert!(got.is_nan(), "lane {l}: fract({x}) = {got}, want NaN");
+        } else if x == -(2f32.powi(-25)) {
+            assert_eq!(r.vgpr[l][2], 0x3F7F_FFFF, "lane {l}: fract({x}) below 1.0");
+        } else {
+            assert_eq!(got.to_bits(), (x - x.floor()).to_bits(), "lane {l}: fract({x})");
+        }
+    }
+}

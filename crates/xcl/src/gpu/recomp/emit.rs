@@ -4535,7 +4535,9 @@ float mad_nf(float a, float b, float c) { precise float p = a * b; precise float
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
-float fract_f(float x) { return min(x - floor(x), asfloat(0x3F7FFFFFu)); }
+// x - floor(x) below 1.0 (RDNA: a NaN stays NaN and ±inf gives NaN – min() would return the
+// clamp for both: HLSL min returns its non-NaN operand)
+float fract_f(float x) { float r = x - floor(x); return select(r >= 1.0f, asfloat(0x3F7FFFFFu), r); }
 uint cvt_u32(float f) { return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 4294967296.0f, 0xFFFFFFFFu, (uint)f)); }
 int cvt_i32(float f) { return select(isnan(f), 0, select(f <= -2147483648.0f, (int)0x80000000u, select(f >= 2147483648.0f, 0x7FFFFFFF, (int)f))); }
 int i24(uint v) { return ((int)(v << 8)) >> 8; }

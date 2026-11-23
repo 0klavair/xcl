@@ -1649,7 +1649,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if barriers.is_null() || n == 0 {
         return;
     }
-    let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize);
+    let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
+    // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
+    let (mut any_uav, mut uav_transition) = (false, false);
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
@@ -1674,6 +1676,17 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             // (the list would fail to Close) – an aliasing barrier for any resources instead
             b[2..6].fill(0);
         }
+        if ty == 2 {
+            // UAV (resource +8): translated shaders reach title memory through XCL's memory
+            // window buffers – other resources over the same memory – which a UAV barrier for
+            // the title's resource alone does not order (AMD drivers wait and flush for any UAV
+            // barrier, NVIDIA's need not): a UAV barrier for all resources, once per batch
+            b[2..4].fill(0);
+            if any_uav {
+                continue;
+            }
+            any_uav = true;
+        }
         if ty == 0 {
             // transition: resource (+8), subresource (+16), before (+20), after (+24)
             let (before, after) = (b[5], b[6]);
@@ -1692,8 +1705,13 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             if b[5] == b[6] {
                 continue;
             }
+            // UAV writes before (or after) the transition: the same holds for the window buffers
+            uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
         }
         out.push(b);
+    }
+    if uav_transition && !any_uav {
+        out.push([2, 0, 0, 0, 0, 0, 0, 0]);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
@@ -1702,6 +1720,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
 
 /// D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | INDEX_BUFFER: valid for buffers only
 const BUFFER_ONLY_STATES: u32 = 0x1 | 0x2;
+
+/// D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+const UNORDERED_ACCESS: u32 = 0x8;
 
 /// Whether `res` is a buffer (null / unknown: taken as one – its states are left alone).
 unsafe fn is_buffer(res: usize) -> bool {
