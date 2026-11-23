@@ -39,6 +39,11 @@ pub(super) struct Em {
     /// split wave64 (`x64`): words one exchange carries (1: masks and lane reads, up to 16:
     /// coherent scalar loads, 32: `ds_bpermute`)
     x64_words: usize,
+    /// split wave64: pc → SGPRs whose whole value may be read after that instruction
+    /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
+    pub x64_whole_live: BTreeMap<u64, u128>,
+    /// pc of the instruction being emitted
+    cur_pc: u64,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
     pub static_ss: BTreeMap<u64, [u32; 4]>,
     /// the static samplers sampled with: (S#, comparison), in register order
@@ -152,7 +157,7 @@ fn float_compare(op: &str, a: &str, b: &str, isnan: &str) -> Option<String> {
 }
 
 /// Layout of the SDWA / DPP extension dword for this instruction's base encoding.
-fn ext_encoding(d: &Decoded) -> Option<&'static Encoding> {
+pub(super) fn ext_encoding(d: &Decoded) -> Option<&'static Encoding> {
     let base = match d.enc.name {
         "ENC_VOP1" => "VOP1",
         "ENC_VOP2" => "VOP2",
@@ -444,6 +449,8 @@ impl Em {
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
+            x64_whole_live: BTreeMap::new(),
+            cur_pc: 0,
             static_ss: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
@@ -757,7 +764,17 @@ impl Em {
     fn write_mask(&mut self, dst: &Dst, cond: &str) {
         let a = self.act();
         let m = self.t();
-        let ballot = self.ballot_fn();
+        let mut ballot = self.ballot_fn();
+        // no exchange for a mask that is only ever read lane by lane (the half's own word is
+        // enough), that goes nowhere, or that is 0 in every lane anyway
+        let local = match *dst {
+            Dst::S(n) => n < 126 && self.x64_whole_live.get(&self.cur_pc).is_some_and(|live| live & (3u128 << n) == 0),
+            Dst::Null => true,
+            Dst::V(_) => false,
+        };
+        if self.x64() && (local || cond == "false") {
+            ballot = "xcl_x_ballot_local";
+        }
         self.line(&format!("uint2 {m} = {ballot}(and({a}, ({cond})));"));
         if self.opt.wave64 {
             self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
@@ -780,6 +797,7 @@ impl Em {
         let name = d.inst.name.to_ascii_lowercase();
         let text = rdna2::format(d);
         self.line(&format!("// {:04x}: {text}", d.pc));
+        self.cur_pc = d.pc;
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
             return Flow::Jump(t);
@@ -4981,6 +4999,12 @@ uint xcl_x_rla_any(uint v, uint l) {
     uint o = xcl_x_meet() ? xcl_x_get(l & 31u) : 0u;
     uint m = WaveReadLaneAt(v, l & 31u);
     return (l >> 5) == xcl_half ? m : o;
+}
+// a mask only ever read lane by lane (v_cndmask, carry-ins; `x64_masks`): each half's own
+// word, the other half's 0 – no exchange
+uint2 xcl_x_ballot_local(bool b) {
+    uint m = WaveActiveBallot(b).x;
+    return xcl_half != 0u ? uint2(0u, m) : uint2(m, 0u);
 }
 // DPP16, DPP8, ds_swizzle, v_permlane(x)16: the ISA keeps the source in the reader's half
 uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }

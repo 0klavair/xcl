@@ -1576,7 +1576,18 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
 - NVIDIA forms 32-lane waves of non-consecutive `SV_GroupIndex` for 3-D groups (8×8×4): `xcl_x_thread` gives
   each hardware wave the next 32 console threads as it arrives.
 - Cost (`bench_split_wave64`, worst case: one mask per 8 instructions): 1.3× with one console wave per group, ~5×
-  with four (waiting waves keep issuing). Next: no exchange for masks only used lane by lane (`v_cndmask`).
+  with four (waiting waves keep issuing).
+- Masks only read lane by lane (`v_cndmask` selectors, `v_add_co_ci` / `v_sub(rev)_co_ci` carry-ins) are no longer
+  exchanged: `x64_masks.rs`, a backward liveness pass over the SGPRs ("whole-live": some path reads the whole value
+  before it is overwritten; EXEC, indirect jumps, loop exits through the iteration budget and the kernel runner's
+  end count as whole reads; geometry mode unchanged). It follows the emitter, not only the operand tables: SDWA
+  compares into their SDST, `s_cmov*` / `s_addk` / `s_mulk` / `s_bitset*` and `s_movreld` are not overwrites,
+  `s_movrels` reads every register from its base, SDWA scalar sources and SMEM register offsets are reads (each was a
+  way for the halves to diverge: tests `gpu_split_wave64_masks_read_whole_after_partial_writes`, `x64_masks::tests`).
+  `bench_split_wave64` now times GPU work only (timestamps, `runner::dispatch_timed`; before: wall time with
+  pipeline creation and copies). RTX 3090, `XCL_X64_ALL_MASKS=1` vs default: mask-only loop 1.64–1.68× → 1.04–1.11×
+  (one console wave per group), 3.90–4.14× → 1.07–1.16× (four); with a readfirstlane too 1.99–2.02× → 1.74–1.81×,
+  6.45–6.64× → 4.09–4.34×. Test `gpu_split_wave64_lane_local_masks` (fails if the local word lands in the wrong half).
 - Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
   waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
 

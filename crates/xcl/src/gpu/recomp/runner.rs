@@ -1237,7 +1237,24 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem)
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
+}
+
+/// `dispatch` run `reps` times in one command list (a UAV barrier between them, memory not
+/// reset), each between two GPU timestamps: GPU milliseconds per dispatch – no pipeline,
+/// buffer, upload, submission or CPU wait time in them. For benchmarks.
+pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32], reps: usize) -> Result<Vec<f64>, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let pso: ID3D12PipelineState = unsafe {
+        gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&gpu.rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+            ..Default::default()
+        })
+    }
+    .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true).map(|(_, t)| t)
 }
 
 /// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
@@ -1247,7 +1264,7 @@ pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12Roo
     unsafe {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem)
+        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem, 1, false).map(|(m, _)| m)
     }
 }
 
@@ -1262,7 +1279,9 @@ fn dispatch_with(
     groups: [u32; 3],
     sgprs: &[u32],
     mem: &[u32],
-) -> Result<Vec<u32>, String> {
+    reps: usize,
+    timed: bool,
+) -> Result<(Vec<u32>, Vec<f64>), String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
     let mem_len = mem.len().max(64);
@@ -1294,7 +1313,32 @@ fn dispatch_with(
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
-        list.Dispatch(groups[0], groups[1], groups[2]);
+        // `reps` dispatches, each between two timestamps when `timed`
+        let stamps = 2 * reps as u32;
+        let queries = if timed {
+            let mut h: Option<ID3D12QueryHeap> = None;
+            dev.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: stamps, NodeMask: 0 }, &mut h).map_err(e)?;
+            let heap = h.ok_or("CreateQueryHeap")?;
+            let out = buffer(dev, stamps as u64 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+            Some((heap, out))
+        } else {
+            None
+        };
+        for k in 0..reps as u32 {
+            if k > 0 {
+                list.ResourceBarrier(&[uav_barrier(&mem_buf), uav_barrier(&io_buf)]);
+            }
+            if let Some((heap, _)) = &queries {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k);
+            }
+            list.Dispatch(groups[0], groups[1], groups[2]);
+            if let Some((heap, _)) = &queries {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1);
+            }
+        }
+        if let Some((heap, out)) = &queries {
+            list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, stamps, out, 0);
+        }
         list.ResourceBarrier(&[transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyBufferRegion(&readback, 0, &mem_buf, 0, mem_bytes);
         list.Close().map_err(e)?;
@@ -1312,6 +1356,15 @@ fn dispatch_with(
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let out = std::slice::from_raw_parts(q as *const u32, mem_len).to_vec();
         readback.Unmap(0, None);
-        Ok(out)
+        let mut ms = Vec::new();
+        if let Some((_, stamps_buf)) = &queries {
+            let hz = queue.GetTimestampFrequency().map_err(e)? as f64;
+            let mut t = std::ptr::null_mut();
+            stamps_buf.Map(0, None, Some(&mut t)).map_err(e)?;
+            let ticks = std::slice::from_raw_parts(t as *const u64, stamps as usize);
+            ms = ticks.chunks(2).map(|c| c[1].saturating_sub(c[0]) as f64 * 1000.0 / hz).collect();
+            stamps_buf.Unmap(0, None);
+        }
+        Ok((out, ms))
     }
 }

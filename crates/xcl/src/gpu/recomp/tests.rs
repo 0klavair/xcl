@@ -4526,6 +4526,239 @@ fn gpu_split_wave64_cross_half_operations() {
     }
 }
 
+/// Masks only read lane by lane (`x64_masks`): a v_cndmask selector and a 64-bit carry chain,
+/// both with bits in the two halves, need no exchange in the split form – and give the same
+/// lanes as a whole-wave mask.
+#[test]
+fn gpu_split_wave64_lane_local_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)), // vcc = lanes 0..39
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 2), ("VSRC1", 3)], None),
+        // s[20:21] = lanes 0..49, as a VOP3 selector
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 255)], Some(50)),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", 20)], None),
+        // v[4:5] + v[6:7] as 64-bit numbers: the carry of the low words feeds the high words
+        ("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 4), ("SDST", 106), ("SRC0", V + 4), ("SRC1", V + 6)], None),
+        ("V_ADD_CO_CI_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 5), ("VSRC1", 7)], None),
+        // the masks end dead (the kernel runner reads every SGPR back)
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "every mask stays in its half");
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = l;
+        r[2] = 100 + l;
+        r[3] = 200 + l;
+        // a carry out of the low word in every third lane
+        r[4] = if l.is_multiple_of(3) { 0xFFFF_FFF0 } else { l };
+        r[5] = 1000 + l;
+        r[6] = 0x20;
+        r[7] = 7;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64u32 {
+        let v = &r.vgpr[l as usize];
+        assert_eq!(v[1], if l < 40 { 200 + l } else { 100 + l }, "lane {l}: v_cndmask on vcc");
+        assert_eq!(v[8], if l < 50 { 200 + l } else { 100 + l }, "lane {l}: v_cndmask on s[20:21]");
+        let a = ((1000 + l as u64) << 32) | if l % 3 == 0 { 0xFFFF_FFF0 } else { l as u64 };
+        let sum = a + ((7u64 << 32) | 0x20);
+        assert_eq!((v[4], v[5]), (sum as u32, (sum >> 32) as u32), "lane {l}: 64-bit add with carry");
+    }
+}
+
+/// Masks that are read whole after a write `x64_masks` must not take for an overwrite (an
+/// SDWA compare into its SDST, `s_bitset1`, `s_movreld`) or through a read the operand
+/// tables do not show (`s_movrels`, an SMEM register offset, an SDWA scalar src1): each is
+/// still exchanged, and both halves end with the same SGPRs (the runner checks) and the
+/// whole-wave values. A mask that goes nowhere is not exchanged.
+#[test]
+fn gpu_split_wave64_masks_read_whole_after_partial_writes() {
+    if !gpu_ready() {
+        return;
+    }
+    type Inst = (&'static str, &'static str, &'static [(&'static str, u64)], Option<u32>);
+    // vcc / s[20:21] = lanes 0..39, or lane 2 only (low word 4)
+    let cmp_vcc: Inst = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40));
+    let cmp_s20: Inst = ("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 255), ("SRC1", V)], Some(40));
+    let lane2_s20: Inst = ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 130)], None);
+    let s20_dead: Inst = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 128)], None);
+    let cases: Vec<(&str, Vec<Inst>)> = vec![
+        (
+            "SDWA compare into s[22:23]",
+            vec![
+                cmp_vcc,
+                ("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 0), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("SD", 1), ("SDST", 22)], None),
+                ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)], None),
+            ],
+        ),
+        ("s_bitset1_b64", vec![cmp_s20, ("S_BITSET1_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 191)], None), ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)], None)]),
+        (
+            "s_movrels_b64 from VCC",
+            vec![
+                cmp_vcc,
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 134)], None), // m0 = 6
+                ("S_MOVRELS_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 100)], None), // s[0:1] = s[106:107]
+                ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)], None),
+                ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 0)], None),
+            ],
+        ),
+        (
+            "s_movreld_b64 past the mask",
+            vec![
+                cmp_s20,
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 132)], None), // m0 = 4
+                ("S_MOVRELD_B64", "ENC_SOP1", &[("SDST", 20), ("SSRC0", 2)], None), // s[24:25] = s[2:3]
+                ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)], None),
+            ],
+        ),
+        ("SMEM register offset", vec![lane2_s20, ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 0), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 20)], None), s20_dead]),
+        (
+            "SDWA scalar src1",
+            vec![
+                lane2_s20,
+                ("V_ADD_NC_U32", "VOP2_VOP_SDWA", &[("VDST", 9), ("SRC0", 0xF9), ("VSRC0", 0), ("VSRC1", 20), ("S1", 1), ("SRC0_SEL", 6), ("SRC1_SEL", 6), ("DST_SEL", 6)], None),
+                s20_dead,
+            ],
+        ),
+    ];
+    let mem = [11u32, 22, 33, 44];
+    for (what, list) in cases {
+        let code = prog(&list);
+        if runner::split_wave64() {
+            let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+            assert!(t.hlsl.contains("= xcl_x_ballot(and("), "{what}: the mask is exchanged");
+        }
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            r[0] = l as u32;
+        }
+        st.sgpr[2] = 0x1234;
+        let r = runner::run_code(&code, &st, &mem).unwrap_or_else(|e| panic!("{what}: {e}"));
+        match what {
+            "SDWA compare into s[22:23]" => {
+                assert_eq!(r.sgpr[0], 40, "{what}");
+                assert_eq!((r.sgpr[22], r.sgpr[23]), (!0, !0), "{what}");
+            }
+            "s_bitset1_b64" => assert_eq!(r.sgpr[0], 41, "{what}"),
+            "s_movrels_b64 from VCC" => assert_eq!(r.sgpr[0], 40, "{what}"),
+            "s_movreld_b64 past the mask" => {
+                assert_eq!(r.sgpr[0], 40, "{what}");
+                assert_eq!(r.sgpr[24], 0x1234, "{what}");
+            }
+            "SMEM register offset" => assert_eq!(r.sgpr[0], mem[1], "{what}"),
+            _ => {
+                for l in 0..64u32 {
+                    assert_eq!(r.vgpr[l as usize][9], l + 4, "{what}: lane {l}");
+                }
+            }
+        }
+    }
+    if runner::split_wave64() {
+        // v_cmp into NULL: nothing to exchange
+        let code = prog(&[("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 125), ("SRC0", V), ("SRC1", V + 1)], None)]);
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 1);
+    }
+}
+
+/// Four wave64s per group whose waves loop a different number of times (the counter-paired
+/// form on 32-lane GPUs): each iteration a mask read lane by lane (`v_cndmask`) that only the
+/// odd waves also read whole (`s_bcnt1`, on their own path), and a 64-bit carry chain (not
+/// exchanged). The exchanged and the local masks interleave without the halves losing step.
+#[test]
+fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let p = prog(&[
+        // v0 = thread index in the group, v1 = wave, v2 = lane (as gpu_split_wave64_waves_diverge)
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+        ("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 134), ("VSRC1", 0)], None),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(63)),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 1)], None),
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 17), ("SSRC0", 10), ("SSRC1", 129)], None), // odd wave
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None), // n = 2 (w + 1)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None), // sum (odd waves)
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 12), ("SSRC0", 128)], None), // i
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)], None), // per-lane count
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 2)], Some(0x9E37_79B9)),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        // loop: k = 5 i + 3
+        ("S_MUL_I32", "ENC_SOP2", &[("SDST", 13), ("SSRC0", 12), ("SSRC1", 133)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 13), ("SSRC0", 13), ("SSRC1", 131)], None),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 13), ("VSRC1", 2)], None), // vcc = lanes < k
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 129), ("VSRC1", 4)], None),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 4), ("VSRC1", 5)], None), // count += lane < k
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 17), ("SSRC1", 128)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)], None), // even waves: skip
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 106)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 11), ("SSRC1", 14)], None),
+        // v[8:9] += 0x9E3779B9 + lane, through s[20:21]
+        ("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 8), ("SDST", 20), ("SRC0", V + 8), ("SRC1", V + 6)], None),
+        ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 9), ("SDST", 20), ("SRC0", V + 9), ("SRC1", 128), ("SRC2", 20)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 12), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 12), ("SSRC1", 10)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF0)], None), // → loop
+        // out[group · 256 + thread] = (count, sum, v8, v9)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", 11)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V + 8)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 27), ("SRC0", V + 9)], None),
+        ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 16), ("SSRC0", 4), ("SSRC1", 136)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 16), ("VSRC1", 0)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 132), ("VSRC1", 30)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 0), ("VSRC1", 30)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    for dims in [[256u32, 1, 1], [8, 8, 4]] {
+        let threads = dims.iter().product::<u32>();
+        let cs = CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        if runner::split_wave64() {
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmp: read whole by the odd waves");
+            assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "the carries");
+        }
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let base = 0x100usize;
+        let mut io = vec![0u32; 128];
+        io[0] = base as u32;
+        io[1] = dims[0];
+        io[2] = dims[0] * dims[1];
+        let groups = 3usize;
+        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 256 * 16) / 4]).unwrap();
+        for g in 0..groups {
+            for tid in 0..threads as usize {
+                let (w, l) = (tid / 64, (tid % 64) as u32);
+                let n = 2 * (w as u32 + 1);
+                let count = (0..n).filter(|i| 5 * i + 3 > l).count() as u32;
+                let sum = if w % 2 == 1 { (0..n).map(|i| (5 * i + 3).min(64)).sum() } else { 0 };
+                let acc = n as u64 * (0x9E37_79B9u64 + l as u64);
+                let at = (base + (g * 256 + tid) * 16) / 4;
+                let what = format!("{dims:?}, group {g} thread {tid} (wave {w}, lane {l})");
+                assert_eq!(out[at], count, "{what}: per-lane count");
+                assert_eq!(out[at + 1], sum, "{what}: s_bcnt1 sum");
+                assert_eq!((out[at + 2], out[at + 3]), (acc as u32, (acc >> 32) as u32), "{what}: 64-bit carry chain");
+            }
+        }
+    }
+}
+
 /// A group of four wave64s whose waves take different paths: each loops 2 · (wave + 1)
 /// times through a ballot, s_bcnt1 and a readlane, then exchanges lanes across its halves
 /// with ds_bpermute. Split (32-lane GPUs) this is the counter-paired form – a group barrier
@@ -4603,7 +4836,7 @@ fn gpu_split_wave64_waves_diverge() {
 /// --nocapture`): a loop of a few VALU instructions and one mask (`v_cmp`, an exchange in the
 /// split form), plus a readfirstlane (another exchange) in the second variant, as a wave32
 /// program (no exchanges) and as a wave64 program – natively on a GPU with 64-lane waves,
-/// split on one with 32-lane waves only. Wall time of the dispatch, best of 5.
+/// split on one with 32-lane waves only. GPU time of the dispatch (timestamps), median of 9.
 #[test]
 #[ignore]
 fn bench_split_wave64() {
@@ -4648,9 +4881,13 @@ fn bench_split_wave64() {
         let p = body(readfirstlane);
         for threads in [64u32, 256] {
             let mut ms = Vec::new();
+            let mut exchanges = 0;
             for wave64 in [false, true] {
                 let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
                 let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+                // the loop's exchanges: masks read whole (`x64_masks`: not the v_cndmask
+                // selector, unless `XCL_X64_ALL_MASKS`) and the readfirstlane
+                exchanges = t.hlsl.matches("= xcl_x_ballot(and(").count() + t.hlsl.matches("xcl_x_rla_uniform(").count().saturating_sub(1);
                 assert!(t.complete(), "{:?}", t.unsupported_why);
                 let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
                 let groups = (1u32 << 18) / threads;
@@ -4658,19 +4895,16 @@ fn bench_split_wave64() {
                 io[0] = 0;
                 io[1] = iterations;
                 let mem = vec![0u32; threads as usize];
-                let best = (0..5)
-                    .map(|_| {
-                        let t0 = std::time::Instant::now();
-                        runner::dispatch(&dxil, [groups, 1, 1], &io, &mem).unwrap();
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    })
-                    .fold(f64::MAX, f64::min);
-                ms.push(best);
+                // GPU time of each dispatch (timestamps: no pipeline creation, uploads or CPU
+                // wait in it), the median of 9
+                let mut t = runner::dispatch_timed(&dxil, [groups, 1, 1], &io, &mem, 9).unwrap();
+                t.sort_by(f64::total_cmp);
+                ms.push(t[t.len() / 2]);
             }
             let form = if runner::split_wave64() { if threads > 64 { "split, counter-paired" } else { "split, barrier" } } else { "native" };
             println!(
-                "{} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
-                1 + readfirstlane as u32,
+                "v_cmp + v_cndmask{}: {exchanges} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
+                if readfirstlane { " + v_readfirstlane" } else { "" },
                 ms[0],
                 ms[1],
                 ms[1] / ms[0]
