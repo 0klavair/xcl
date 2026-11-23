@@ -1,5 +1,6 @@
 name: A game does not run right
 description: A crash, a black or wrong picture, no sound, a hang – with the run's report attached.
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
