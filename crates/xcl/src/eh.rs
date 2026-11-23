@@ -929,17 +929,20 @@ mod tests {
             exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
             initialized: AtomicBool::new(true), stack_reserve: 0,
         }));
-        unsafe {
-            std::ptr::copy_nonoverlapping([0x67u8, 0x0F, 0x01, 0xFC].as_ptr(), code as *mut u8, 4);
-            std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
-            std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
-            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
-            (ctx.Rip, ctx.Rax) = (code as u64, (high + 0x47) as u64);
-            assert_eq!(emulate_console_only(&mut ctx), -1);
-            assert_eq!(ctx.Rip, code as u64 + 4);
-            let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
-            assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
-            assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+        // alone, and as the first of a loop to rdx (add rax, 0x40; cmp rax, rdx; jb back to the 0F)
+        for bytes in [&[0x67u8, 0x0F, 0x01, 0xFC][..], &[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+                std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+                std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (high + 0x47) as u64, (high + 0x100) as u64);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 4);
+                let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+                assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+                assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+            }
         }
         modules::unregister_mapped(code);
     }
