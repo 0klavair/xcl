@@ -359,6 +359,7 @@ type FnPathW = unsafe extern "system" fn(*const u16) -> i32;
 type FnMoveFileExW = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
 type FnMoveFileWithProgressW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, u32) -> i32;
 type FnCopyFileExW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
+type FnCopyFileW = unsafe extern "system" fn(*const u16, *const u16, i32) -> i32;
 type FnCopyFile2 = unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> i32;
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
@@ -366,6 +367,7 @@ static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
+static O_COPY_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_2: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn bool_result(r: Result<(), u32>) -> i32 {
@@ -503,6 +505,23 @@ unsafe extern "system" fn hk_copy_file_ex_w(src: *const u16, dst: *const u16, pr
         Err(e) => return bool_result(Err(e)),
     };
     orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), prog, data, cancel, flags)
+}
+
+/// CopyFileW (and CopyFileA, which calls it) need not go through CopyFileExW. When it does,
+/// the guard lets the inner call through.
+unsafe extern "system" fn hk_copy_file_w(src: *const u16, dst: *const u16, fail_if_exists: i32) -> i32 {
+    let orig = orig!(O_COPY_FILE_W as FnCopyFileW);
+    let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, fail_if_exists) };
+    let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, fail_if_exists) };
+    let rs = match source_of(v, &s) {
+        Ok((p, _)) => p,
+        Err(e) => return bool_result(Err(e)),
+    };
+    let rd = match dest_of(v, &d) {
+        Ok(p) => p,
+        Err(e) => return bool_result(Err(e)),
+    };
+    orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), fail_if_exists)
 }
 
 unsafe extern "system" fn hk_copy_file_2(src: *const u16, dst: *const u16, params: *const c_void) -> i32 {
@@ -769,6 +788,7 @@ pub fn install() -> Result<(), String> {
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
+        ("CopyFileW", hk_copy_file_w as usize, &O_COPY_FILE_W),
         ("CopyFile2", hk_copy_file_2 as usize, &O_COPY_FILE_2),
         ("FindFirstFileExW", hk_find_first_ex_w as usize, &O_FIND_FIRST_EX_W),
         ("FindFirstFileW", hk_find_first_w as usize, &O_FIND_FIRST_W),
