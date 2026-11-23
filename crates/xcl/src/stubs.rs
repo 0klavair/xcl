@@ -35,7 +35,7 @@ pub type StubHook = fn(&StubInfo, usize);
 
 static ALL: Mutex<Vec<&'static StubInfo>> = Mutex::new(Vec::new());
 static ARENA: Mutex<(usize, usize)> = Mutex::new((0, 0)); // (next, end)
-static BY_KEY: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static BY_KEY: OnceLock<Mutex<HashMap<String, (usize, &'static StubInfo)>>> = OnceLock::new();
 
 const THUNK_SIZE: usize = 48;
 const ARENA_CHUNK: usize = 64 * 1024;
@@ -104,9 +104,7 @@ fn alloc_thunk() -> *mut u8 {
 pub fn info_of_stub(addr: usize) -> Option<&'static StubInfo> {
     let map = BY_KEY.get()?;
     let g = map.lock().ok()?;
-    let key = g.iter().find(|(_, &a)| a == addr).map(|(k, _)| k.clone())?;
-    drop(g);
-    ALL.lock().ok()?.iter().copied().find(|s| format!("{}!{}", s.dll.to_ascii_lowercase(), s.name) == key)
+    g.values().find(|&&(a, _)| a == addr).map(|&(_, info)| info)
 }
 
 /// Create (or reuse) a stub for `dll!name`. Returns the callable address.
@@ -118,11 +116,9 @@ pub fn make_stub(dll: &str, name: &str, ret: u64) -> usize {
 pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubInfo) {
     let key = format!("{}!{}", dll.to_ascii_lowercase(), name);
     let map = BY_KEY.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&addr) = map.lock().unwrap().get(&key) {
-        let info = ALL.lock().unwrap().iter().copied().find(|s| s.dll.eq_ignore_ascii_case(dll) && s.name == name);
-        if let Some(i) = info {
-            return (addr, i);
-        }
+    let mut g = map.lock().unwrap();
+    if let Some(&entry) = g.get(&key) {
+        return entry;
     }
     let info: &'static StubInfo = Box::leak(Box::new(StubInfo {
         dll: dll.to_string(),
@@ -144,6 +140,7 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
     code.push(0xC3); // ret
     debug_assert!(code.len() <= THUNK_SIZE);
+    // SAFETY: `p` is freshly allocated with at least `THUNK_SIZE >= code.len()` bytes of RWX memory.
     unsafe {
         std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
         windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
@@ -153,8 +150,9 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
         );
     }
     ALL.lock().unwrap().push(info);
-    map.lock().unwrap().insert(key, p as usize);
-    (p as usize, info)
+    let entry = (p as usize, info);
+    g.insert(key, entry);
+    entry
 }
 
 pub fn all_stubs() -> Vec<&'static StubInfo> {
@@ -219,15 +217,36 @@ impl StubDb {
     }
 
     pub fn return_for(&self, dll: &str, name: &str) -> u64 {
+        self.return_for_with_fallback(dll, None, name)
+    }
+
+    /// Look up the stub return value for `dll!name`, falling back to `fallback_dll` (e.g. a
+    /// canonical HLE module name when `dll` is a routed alias) if `dll` has no explicit override
+    /// or module default.
+    pub fn return_for_with_fallback(&self, dll: &str, fallback_dll: Option<&str>, name: &str) -> u64 {
         let dll = dll.to_ascii_lowercase();
+        let fallback = fallback_dll.map(str::to_ascii_lowercase);
         let n = name.to_ascii_lowercase();
         if let Some(&r) = self.functions.get(&format!("{dll}!{n}")) {
             return r;
         }
+        if let Some(fb) = fallback.as_deref().filter(|&fb| fb != dll) {
+            if let Some(&r) = self.functions.get(&format!("{fb}!{n}")) {
+                return r;
+            }
+        }
         if let Some(&r) = self.functions.get(&format!("*!{n}")) {
             return r;
         }
-        self.module_defaults.get(&dll).copied().unwrap_or(0)
+        if let Some(&r) = self.module_defaults.get(&dll) {
+            return r;
+        }
+        if let Some(fb) = fallback.as_deref() {
+            if let Some(&r) = self.module_defaults.get(fb) {
+                return r;
+            }
+        }
+        0
     }
 
     pub fn ordinal_name(&self, dll: &str, ordinal: u16) -> Option<&str> {
@@ -264,10 +283,60 @@ mod tests {
     fn builtin_db_parses_with_overrides() {
         let mut ov = std::collections::BTreeMap::new();
         ov.insert("kernelx.dll!Foo".to_string(), "7".to_string());
+        ov.insert("xgameplatform.dll!PerAlias".to_string(), "0".to_string());
+        ov.insert("xgameruntime.dll!CanonicalFn".to_string(), "1".to_string());
         let db = StubDb::parse(BUILTIN_DB, &ov);
         assert_eq!(db.return_for("kernelx.dll", "Foo"), 7);
         assert_eq!(db.return_for("xgameruntime.dll", "XSomethingUnknown"), 0x8000_4001);
         assert_eq!(db.return_for("kernelx.dll", "SomethingUnknown"), 0);
         assert_eq!(db.ordinal_name("d3d12_x.dll", 7), Some("D3D12CreateDevice"));
+        // Routed HLE aliases inherit canonical module defaults while preserving per-alias overrides.
+        assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "XUnknown"), 0x8000_4001);
+        assert_eq!(db.return_for_with_fallback("d3d12x.dll", Some("d3d12_xs.dll"), "D3D12Unknown"), 0x8000_4001);
+        assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "PerAlias"), 0);
+        assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "CanonicalFn"), 1);
+        assert_eq!(db.return_for_with_fallback("xgameplatform.dll", Some("xgameruntime.dll"), "XGameUiShowErrorDialogAsync"), 0x8000_4004);
+        assert_eq!(db.return_for_with_fallback("advapi32legacy.dll", Some("kernelx.dll"), "SomethingUnknown"), 0);
+    }
+
+    #[test]
+    fn make_stub_info_is_race_free_under_concurrency() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const ITERS: usize = 50;
+
+        for iter in 0..ITERS {
+            let func = format!("ConcurrentRaceFn_{iter}");
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let barrier = Arc::clone(&barrier);
+                    let func = func.clone();
+                    let dll = if t % 2 == 0 { "RaceStub.dll" } else { "racestub.dll" };
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let (addr, info) = make_stub_info(dll, &func, 0x8000_4001);
+                        (addr, info as *const StubInfo as usize)
+                    })
+                })
+                .collect();
+
+            let results: Vec<(usize, usize)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let first = results[0];
+            assert_ne!(first.0, 0);
+            for &r in &results[1..] {
+                assert_eq!(r, first, "iter {iter}: concurrent callers received different stubs");
+            }
+            assert_eq!(
+                info_of_stub(first.0).map(|i| i as *const StubInfo as usize),
+                Some(first.1)
+            );
+            let count = all_stubs()
+                .into_iter()
+                .filter(|s| s.dll.eq_ignore_ascii_case("racestub.dll") && s.name == func)
+                .count();
+            assert_eq!(count, 1, "iter {iter}: duplicate StubInfo pushed to ALL");
+        }
     }
 }

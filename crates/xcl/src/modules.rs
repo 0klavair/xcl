@@ -114,6 +114,12 @@ pub fn hle_handle(module_name: &str) -> usize {
     p as usize
 }
 
+pub fn find_hle_handle(module_name: &str) -> Option<usize> {
+    let key = crate::util::dll_key(module_name);
+    let g = HLE_HANDLES.lock().ok()?;
+    g.as_ref()?.get(&key).copied()
+}
+
 pub fn hle_name_by_handle(h: usize) -> Option<String> {
     let g = HLE_HANDLES.lock().ok()?;
     g.as_ref()?.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone())

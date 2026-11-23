@@ -104,14 +104,19 @@ fn hle_name_for<'a>(m: &'a HleModule, dll: &str, what: &'a ImportName) -> Option
 
 /// HLE lookup with cross-module search and (kernel family) system fallback.
 fn resolve_hle(m: &HleModule, key: &str, what: &ImportName) -> Option<(usize, Source)> {
-    let name = hle_name_for(m, key, what)?;
-    if let Some(&a) = m.exports.get(name) {
-        return Some((a, Source::Hle(m.name.to_string())));
-    }
-    if let Some((other, a)) = registry().find_any(name) {
-        return Some((a, Source::HleOther(other.name.to_string())));
-    }
-    let n = ImportName::Name { hint: 0, name: name.to_string() };
+    let fallback_what = if let Some(name) = hle_name_for(m, key, what) {
+        if let Some(&a) = m.exports.get(name) {
+            return Some((a, Source::Hle(m.name.to_string())));
+        }
+        if let Some((other, a)) = registry().find_any(name) {
+            return Some((a, Source::HleOther(other.name.to_string())));
+        }
+        Some(ImportName::Name { hint: 0, name: name.to_string() })
+    } else {
+        None
+    };
+    let query = fallback_what.as_ref().unwrap_or(what);
+    let ordinal_only = fallback_what.is_none();
     for &c in m.fallback {
         let c = if c == crate::hle::SELF {
             if key == m.name {
@@ -121,7 +126,11 @@ fn resolve_hle(m: &HleModule, key: &str, what: &ImportName) -> Option<(usize, So
         } else {
             c
         };
-        if let Some(a) = system_proc(c, &n) {
+        // Raw ordinals are DLL-specific: never resolve one DLL's ordinal in a different DLL.
+        if ordinal_only && c != key {
+            continue;
+        }
+        if let Some(a) = system_proc(c, query) {
             return Some((a, Source::System(c.to_string())));
         }
     }
@@ -152,6 +161,15 @@ pub fn find_game_dll(name: &str) -> Option<PathBuf> {
 }
 
 pub fn resolve_export_of_mapped(m: &modules::MappedModule, what: &ImportName, depth: u32) -> Option<usize> {
+    resolve_export_of_mapped_inner(m, what, depth, false)
+}
+
+fn resolve_export_of_mapped_inner(
+    m: &modules::MappedModule,
+    what: &ImportName,
+    depth: u32,
+    allow_stub: bool,
+) -> Option<usize> {
     let t = match what {
         ImportName::Name { name, .. } => m.exports.by_name.get(name)?,
         ImportName::Ordinal(o) => m.exports.by_ordinal.get(&(*o as u32))?,
@@ -162,67 +180,85 @@ pub fn resolve_export_of_mapped(m: &modules::MappedModule, what: &ImportName, de
             if depth > 8 {
                 return None;
             }
-            let (dll, func) = f.split_once('.')?;
+            let (dll, func) = f.rsplit_once('.')?;
+            if dll.is_empty() || func.is_empty() {
+                return None;
+            }
             let what = match func.strip_prefix('#') {
                 Some(n) => ImportName::Ordinal(n.parse().ok()?),
                 None => ImportName::Name { hint: 0, name: func.to_string() },
             };
-            Some(resolve_inner(&dll_key(dll), &what, depth + 1).0)
+            let target_key = if dll.to_ascii_lowercase().ends_with(".dll") {
+                dll_key(dll)
+            } else {
+                dll_key(&format!("{dll}.dll"))
+            };
+            resolve_inner_opt(&target_key, &what, depth + 1, allow_stub).map(|(a, _)| a)
         }
     }
 }
 
-fn stub_for(key: &str, what: &ImportName) -> (usize, Source) {
+fn stub_for(key: &str, fallback_dll: Option<&str>, what: &ImportName) -> (usize, Source) {
     let name = fname(what);
-    let ret = stubs::db().return_for(key, &name);
+    let ret = stubs::db().return_for_with_fallback(key, fallback_dll, &name);
     (stubs::make_stub(key, &name, ret), Source::Stub)
 }
 
 fn resolve_inner(key: &str, what: &ImportName, depth: u32) -> (usize, Source) {
+    resolve_inner_opt(key, what, depth, true).expect("allow_stub=true always resolves")
+}
+
+fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool) -> Option<(usize, Source)> {
     let reg = registry();
     match reg.route(key) {
-        Some(Route::Stub) => return stub_for(key, what),
+        Some(Route::Stub) => {
+            return allow_stub.then(|| {
+                modules::hle_handle(key);
+                stub_for(key, None, what)
+            });
+        }
         Some(Route::System) => {
             return match system_proc(key, what) {
-                Some(a) => (a, Source::System(key.to_string())),
-                None => stub_for(key, what),
+                Some(a) => Some((a, Source::System(key.to_string()))),
+                None => allow_stub.then(|| stub_for(key, None, what)),
             }
         }
         Some(Route::Hle(i)) => {
             let m = &reg.modules[*i];
-            return resolve_hle(m, key, what).unwrap_or_else(|| stub_for(key, what));
+            let fallback = (m.name != key).then_some(m.name);
+            return resolve_hle(m, key, what).or_else(|| allow_stub.then(|| stub_for(key, fallback, what)));
         }
         None => {}
     }
     // DLL shipped with the game → our loader
     if let Some(m) = modules::find_mapped_by_name(key) {
-        if let Some(a) = resolve_export_of_mapped(&m, what, depth) {
-            return (a, Source::GameDll(key.to_string()));
+        if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
+            return Some((a, Source::GameDll(key.to_string())));
         }
-        return stub_for(key, what);
+        return allow_stub.then(|| stub_for(key, None, what));
     }
     if let Some(path) = find_game_dll(key) {
         match crate::loader::load_game_dll(&path) {
             Ok(m) => {
-                if let Some(a) = resolve_export_of_mapped(&m, what, depth) {
-                    return (a, Source::GameDll(key.to_string()));
+                if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
+                    return Some((a, Source::GameDll(key.to_string())));
                 }
-                return stub_for(key, what);
+                return allow_stub.then(|| stub_for(key, None, what));
             }
             Err(e) => crate::xlog_error!("failed to load {}: {e}", path.display()),
         }
     }
     // Real Windows DLL
     if let Some(a) = system_proc(key, what) {
-        return (a, Source::System(key.to_string()));
+        return Some((a, Source::System(key.to_string())));
     }
     // A known console function imported from an unexpected DLL
     if let ImportName::Name { name, .. } = what {
         if let Some((m, a)) = reg.find_any(name) {
-            return (a, Source::HleOther(m.name.to_string()));
+            return Some((a, Source::HleOther(m.name.to_string())));
         }
     }
-    stub_for(key, what)
+    allow_stub.then(|| stub_for(key, None, what))
 }
 
 /// Resolve one static/delay import and record the outcome for the report.
@@ -394,5 +430,126 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32.dll", &name("RegSetValueExW"), 0);
         assert!(a != 0 && matches!(s, Source::System(ref d) if d == "advapi32.dll"), "{s:?}");
+    }
+
+    #[test]
+    fn hle_alias_stubs_inherit_canonical_module_default() {
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+        let e_notimpl = crate::util::E_NOTIMPL as u32 as u64;
+
+        for (dll, sym) in [
+            ("xgameplatform.dll", "XUnimplementedAliasProbe"),
+            ("xgameruntime.thunks.dll", "XUnimplementedThunkProbe"),
+            ("d3d12x.dll", "D3D12UnimplementedAliasProbe"),
+        ] {
+            let (addr, src) = resolve_inner(dll, &name(sym), 0);
+            assert_eq!(src, Source::Stub, "{dll}!{sym}");
+            let info = stubs::info_of_stub(addr).expect("stub info registered");
+            assert_eq!(info.ret, e_notimpl, "{dll}!{sym} should inherit E_NOTIMPL");
+            assert!(info.dll.eq_ignore_ascii_case(dll));
+            let f: extern "system" fn() -> u64 = unsafe { std::mem::transmute(addr) };
+            assert_eq!(f(), e_notimpl, "{dll}!{sym} thunk return");
+        }
+
+        // Kernel-family aliases keep default 0 (BOOL/handle APIs).
+        let (addr, src) = resolve_inner("advapi32legacy.dll", &name("UnimplementedKernelAliasProbe"), 0);
+        assert_eq!(src, Source::Stub);
+        assert_eq!(stubs::info_of_stub(addr).unwrap().ret, 0);
+    }
+
+    #[test]
+    fn ordinal_imports_fall_through_only_to_matching_system_dll() {
+        let ord1 = ImportName::Ordinal(1);
+        let expected = system_proc("kernel32.dll", &ord1).expect("kernel32 ordinal #1 exists");
+        let (addr, src) = resolve_inner("kernel32.dll", &ord1, 0);
+        assert_eq!(src, Source::System("kernel32.dll".into()));
+        assert_eq!(addr, expected);
+
+        // Console-only kernelx aliases must NOT borrow unrelated ordinals from kernelbase/kernel32.
+        let reg = registry();
+        let kx = reg.module_by_name(crate::hle::KERNELX).unwrap();
+        assert!(resolve_hle(kx, "kernelx.dll", &ord1).is_none());
+        assert!(resolve_hle(kx, "advapi32legacy.dll", &ord1).is_none());
+    }
+
+    #[test]
+    fn mapped_forwarders_preserve_get_proc_address_contract_and_dotted_dll_names() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_NOACCESS};
+
+        // Reserve two disjoint 64 KiB ranges (0 committed RAM) so test bases never collide with
+        // real Windows DLLs in `modules::image_base_for_addr`.
+        let target_base = unsafe { VirtualAlloc(std::ptr::null(), 0x10000, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        let proxy_base = unsafe { VirtualAlloc(std::ptr::null(), 0x10000, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(target_base, 0);
+        assert_ne!(proxy_base, 0);
+
+        let mut target_exports = crate::pe::OwnedExports::default();
+        target_exports.by_name.insert("RealExport".into(), ExportTarget::Rva(0x1234));
+        let target_mod = Arc::new(modules::MappedModule {
+            name: "dotted.fwdtarget.dll".into(),
+            path: PathBuf::from("dotted.fwdtarget.dll"),
+            base: target_base,
+            size: 0x10000,
+            entry_rva: 0,
+            is_dll: true,
+            exports: target_exports,
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true),
+            stack_reserve: 0,
+        });
+        modules::register_mapped(target_mod);
+
+        let mut proxy_exports = crate::pe::OwnedExports::default();
+        proxy_exports
+            .by_name
+            .insert("MissingFwd".into(), ExportTarget::Forwarder("nonexistent_fwd_target.MissingApi".into()));
+        proxy_exports.by_name.insert(
+            "MissingHleFwd".into(),
+            ExportTarget::Forwarder("xgameruntime.thunks.XMissingForwardedApi".into()),
+        );
+        proxy_exports
+            .by_name
+            .insert("DottedFwd".into(), ExportTarget::Forwarder("dotted.fwdtarget.RealExport".into()));
+        proxy_exports
+            .by_name
+            .insert("KernelFwd".into(), ExportTarget::Forwarder("KERNEL32.GetCurrentProcessId".into()));
+        let proxy_mod = Arc::new(modules::MappedModule {
+            name: "fwd_proxy_unit.dll".into(),
+            path: PathBuf::from("fwd_proxy_unit.dll"),
+            base: proxy_base,
+            size: 0x10000,
+            entry_rva: 0,
+            is_dll: true,
+            exports: proxy_exports,
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true),
+            stack_reserve: 0,
+        });
+        modules::register_mapped(Arc::clone(&proxy_mod));
+
+        let name = |s: &str| ImportName::Name { hint: 0, name: s.into() };
+
+        // GetProcAddress must return None (NOT synthesize a stub) on unresolvable forwarders.
+        assert_eq!(get_proc_address(proxy_base, &name("MissingFwd")), None);
+        assert_eq!(get_proc_address(proxy_base, &name("MissingHleFwd")), None);
+
+        // Dotted DLL forwarders split on the LAST dot and resolve cleanly.
+        assert_eq!(get_proc_address(proxy_base, &name("DottedFwd")), Some(target_base + 0x1234));
+        assert_eq!(
+            get_proc_address(proxy_base, &name("KernelFwd")),
+            system_proc("kernel32.dll", &name("GetCurrentProcessId"))
+        );
+
+        // Static import resolution through a mapped forwarder still synthesizes a stub when missing,
+        // including inheriting canonical E_NOTIMPL for dotted HLE alias forwarders.
+        let (stub_addr, _) = resolve_inner("fwd_proxy_unit.dll", &name("MissingHleFwd"), 0);
+        assert_eq!(
+            stubs::info_of_stub(stub_addr).map(|i| i.ret),
+            Some(crate::util::E_NOTIMPL as u32 as u64)
+        );
     }
 }
