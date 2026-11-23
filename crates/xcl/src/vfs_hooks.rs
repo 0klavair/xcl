@@ -371,6 +371,7 @@ type FnReplaceFileW = unsafe extern "system" fn(*const u16, *const u16, *const u
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_A: AtomicUsize = AtomicUsize::new(0);
@@ -411,6 +412,17 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
         Target::Translated(p) => orig(wide(&p).as_ptr()),
         Target::Game { rel } => bool_result(v.remove_dir(&rel)),
     }
+}
+
+/// ReadFile: a buffer in pages the title mapped but has not used yet (`kernelx::lazy`) is
+/// committed first – the kernel's write there would fail rather than fault in the title.
+unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
+    let orig = orig!(O_READ_FILE as F);
+    if !buf.is_null() {
+        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
+    }
+    orig(h, buf, n, read, ov)
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
@@ -1046,6 +1058,7 @@ pub fn install() -> Result<(), String> {
         ("CreateDirectoryW", hk_create_dir_w as usize, &O_CREATE_DIR_W),
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
+        ("ReadFile", hk_read_file as usize, &O_READ_FILE),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
