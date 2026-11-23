@@ -346,20 +346,30 @@ pub fn init() -> Result<String, String> {
         }
         let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
         if debug {
-            if let Ok(d) = crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
-                d.EnableDebugLayer();
-                crate::xlog_info!("D3D12: debug layer enabled");
+            match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                Ok(d) => {
+                    d.EnableDebugLayer();
+                    crate::xlog_info!("D3D12: debug layer enabled");
+                }
+                Err(e) => {
+                    crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
+                }
             }
         }
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
         if std::env::var_os("XCL_DRED").is_some() {
-            if let Ok(d) = crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
+            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
-                d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                Ok(d) => {
+                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                Err(e) => {
+                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
+                }
             }
         }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
@@ -380,15 +390,16 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
-        if device.is_none() {
-            let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
-            device = Some(
-                crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
-                    .map_err(|e| format!("D3D12CreateDevice(WARP): {e}"))?,
-            );
-            name = "WARP (software renderer)".into();
-        }
-        let device = device.ok_or("no device")?;
+        let device = match device {
+            Some(d) => d,
+            None => {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
+                let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
+                    .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
+                name = "WARP (software renderer)".into();
+                d
+            }
+        };
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {

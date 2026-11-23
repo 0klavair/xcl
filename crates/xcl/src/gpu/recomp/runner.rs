@@ -93,7 +93,7 @@ fn init() -> Result<Gpu, String> {
         dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
             .map_err(|x| format!("SM 6.6: {x}"))?;
         if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err(format!("{name}: no SM 6.6 (on Windows 10, set {} to a D3D12 Agility SDK folder)", crate::gpu::agility::ENV));
+            return Err(crate::gpu::agility::format_no_sm66_message(&name, crate::gpu::agility::state()));
         }
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut o1 as *mut _ as _, std::mem::size_of_val(&o1) as u32).map_err(e)?;

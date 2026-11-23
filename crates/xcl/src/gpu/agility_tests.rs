@@ -176,4 +176,70 @@ fn rejects_malformed_export_rvas_and_cross_section_reads() {
     boundary[0x240..0x244].copy_from_slice(&0x13FEu32.to_le_bytes());
     boundary[0x5FE..0x600].copy_from_slice(&[0x6A, 0x02]);
     assert!(read_sdk_version_from_bytes(&boundary).is_err());
+
+    // 32-bit x86 DLL (machine 0x014C) must be rejected.
+    let mut x86 = synthetic_pe_dll(true, Some("D3D12SDKVersion"), Some(618), false);
+    x86[0x84..0x86].copy_from_slice(&0x014Cu16.to_le_bytes());
+    assert!(read_sdk_version_from_bytes(&x86).is_err());
+}
+
+#[test]
+fn env_trimming_trailing_slash_and_no_sm66_messages() {
+    use std::ffi::OsString;
+
+    assert_eq!(clean_env_path(None), None);
+    assert_eq!(clean_env_path(Some(OsString::from(""))), None);
+    assert_eq!(clean_env_path(Some(OsString::from("   \t "))), None);
+    assert_eq!(clean_env_path(Some(OsString::from(r" C:\agility "))), Some(PathBuf::from(r"C:\agility")));
+
+    // Trailing forward slash is normalized to a trailing backslash.
+    let p = format_sdk_path(Path::new("C:/agility/")).unwrap();
+    assert_eq!(p.to_str().unwrap(), r"C:/agility\");
+
+    let msg_not_found = format_no_sm66_message("GPU0", &State::NotFound);
+    assert!(msg_not_found.contains(ENV));
+    let msg_unavail = format_no_sm66_message("GPU0", &State::Unavailable("bad dll".into()));
+    assert!(msg_unavail.contains("bad dll"));
+    assert!(!msg_unavail.contains("on Windows 10, set"));
+}
+
+#[test]
+fn resolve_dir_handles_explicit_override_and_implicit_fallback() {
+    let root = std::env::temp_dir().join(format!("xcl_agility_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let exe_dir = root.join("exe");
+    let exe_d3d12 = exe_dir.join("D3D12");
+    let local_app = root.join("local");
+    let local_d3d12 = local_app.join("XCL").join("D3D12");
+    let empty_dir = root.join("empty");
+    std::fs::create_dir_all(&exe_d3d12).unwrap();
+    std::fs::create_dir_all(&local_d3d12).unwrap();
+    std::fs::create_dir_all(&empty_dir).unwrap();
+
+    // All empty -> NotFound
+    assert_eq!(resolve_dir(None, Some(exe_dir.clone()), Some(local_app.clone())), DirResolution::NotFound);
+
+    // Explicit env override pointing at empty dir -> Unavailable (does NOT fall through to local_app)
+    let valid_dll = synthetic_pe_dll(true, Some("D3D12SDKVersion"), Some(620), false);
+    std::fs::write(local_d3d12.join("D3D12Core.dll"), &valid_dll).unwrap();
+    assert!(matches!(
+        resolve_dir(Some(empty_dir.clone()), Some(exe_dir.clone()), Some(local_app.clone())),
+        DirResolution::Unavailable(_)
+    ));
+
+    // Implicit search skips bad DLL in exe\D3D12 and falls through to valid DLL in %LOCALAPPDATA%\XCL\D3D12
+    std::fs::write(exe_d3d12.join("D3D12Core.dll"), b"not a pe").unwrap();
+    assert_eq!(
+        resolve_dir(None, Some(exe_dir.clone()), Some(local_app.clone())),
+        DirResolution::Found { dir: local_d3d12.clone(), version: 620 }
+    );
+
+    // Implicit search with only a bad DLL returns Unavailable(last_err)
+    let _ = std::fs::remove_file(local_d3d12.join("D3D12Core.dll"));
+    assert!(matches!(
+        resolve_dir(None, Some(exe_dir.clone()), Some(local_app.clone())),
+        DirResolution::Unavailable(_)
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
 }

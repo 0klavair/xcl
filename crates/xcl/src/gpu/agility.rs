@@ -143,6 +143,22 @@ pub(crate) fn encode_wide_for_code_page(wide: &[u16], cp: u32) -> Result<CString
     CString::new(buf).map_err(|_| "Agility SDK path contains interior NUL".into())
 }
 
+/// Trim whitespace-only paths (matching `XCL_ADAPTER` handling) while preserving non-UTF-8 paths.
+pub(crate) fn clean_env_path(val: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let v = val?;
+    if v.is_empty() {
+        return None;
+    }
+    if let Some(s) = v.to_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+    Some(PathBuf::from(v))
+}
+
 /// Format a directory path as a null-terminated ANSI string with a trailing backslash,
 /// as required by `ID3D12SDKConfiguration1::CreateDeviceFactory`.
 pub(crate) fn format_sdk_path(dir: &Path) -> Result<CString, String> {
@@ -153,7 +169,9 @@ pub(crate) fn format_sdk_path(dir: &Path) -> Result<CString, String> {
     if wide.is_empty() {
         return Err("empty Agility SDK path".into());
     }
-    if *wide.last().unwrap() != b'\\' as u16 && *wide.last().unwrap() != b'/' as u16 {
+    if *wide.last().unwrap() == b'/' as u16 {
+        *wide.last_mut().unwrap() = b'\\' as u16;
+    } else if *wide.last().unwrap() != b'\\' as u16 {
         wide.push(b'\\' as u16);
     }
     // SAFETY: `GetACP` takes no arguments and returns the process's active ANSI code page.
@@ -161,28 +179,32 @@ pub(crate) fn format_sdk_path(dir: &Path) -> Result<CString, String> {
     encode_wide_for_code_page(&wide, acp)
 }
 
-fn init() -> State {
-    let env_dir = std::env::var_os(ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let explicit = env_dir.is_some();
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    let local_app_data = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).map(PathBuf::from);
-    let dirs = candidates(env_dir, exe_dir, local_app_data);
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirResolution {
+    Found { dir: PathBuf, version: u32 },
+    NotFound,
+    Unavailable(String),
+}
 
-    let mut found: Option<(PathBuf, u32)> = None;
+pub(crate) fn resolve_dir(
+    env_override: Option<PathBuf>,
+    exe_dir: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+) -> DirResolution {
+    let explicit = env_override.as_ref().is_some_and(|d| !d.as_os_str().is_empty());
+    let dirs = candidates(env_override, exe_dir, local_app_data);
+
     let mut last_err: Option<String> = None;
     for dir in dirs {
         let dll = dir.join("D3D12Core.dll");
         if !dll.is_file() {
             if explicit {
-                return State::Unavailable(format!("{ENV}={} has no D3D12Core.dll", dir.display()));
+                return DirResolution::Unavailable(format!("{ENV}={} has no D3D12Core.dll", dir.display()));
             }
             continue;
         }
         match probe_dir(&dir) {
-            Ok(ver) => {
-                found = Some((dir, ver));
-                break;
-            }
+            Ok(version) => return DirResolution::Found { dir, version },
             Err(err) => {
                 last_err = Some(err);
                 if explicit {
@@ -192,33 +214,67 @@ fn init() -> State {
         }
     }
 
-    let Some((dir, version)) = found else {
-        return match last_err {
-            Some(err) => State::Unavailable(err),
-            None => State::NotFound,
-        };
+    match last_err {
+        Some(err) => DirResolution::Unavailable(err),
+        None => DirResolution::NotFound,
+    }
+}
+
+fn init() -> State {
+    let env_dir = clean_env_path(std::env::var_os(ENV));
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let local_app_data = clean_env_path(std::env::var_os("LOCALAPPDATA"));
+
+    let (dir, version) = match resolve_dir(env_dir, exe_dir, local_app_data) {
+        DirResolution::Found { dir, version } => (dir, version),
+        DirResolution::NotFound => return State::NotFound,
+        DirResolution::Unavailable(reason) => return State::Unavailable(reason),
     };
 
-    let path_cstr = match format_sdk_path(&dir) {
+    // CreateDeviceFactory resolves relative SDK paths relative to the executable directory,
+    // whereas probe_dir checks relative to CWD. Absolutize before passing to Win32.
+    let abs_dir = std::path::absolute(&dir).unwrap_or(dir);
+    let path_cstr = match format_sdk_path(&abs_dir) {
         Ok(p) => p,
         Err(err) => return State::Unavailable(err),
     };
 
-    match create_factory(version, &dir, &path_cstr) {
-        Ok(factory) => State::Loaded { factory, version, dir },
+    match create_factory(version, &abs_dir, &path_cstr) {
+        Ok(factory) => State::Loaded { factory, version, dir: abs_dir },
         Err(err) => State::Unavailable(err),
     }
 }
 
+type D3D12GetInterfaceFn = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut std::ffi::c_void) -> windows::core::HRESULT;
+
+unsafe fn resolve_d3d12_get_interface() -> Result<D3D12GetInterfaceFn, String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+
+    let dll = crate::util::wide("d3d12.dll");
+    let h = LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if h.is_null() {
+        return Err("failed to load d3d12.dll".into());
+    }
+    let sym = GetProcAddress(h, b"D3D12GetInterface\0".as_ptr())
+        .ok_or_else(|| "D3D12GetInterface unavailable (update Windows 10 to 22H2 KB5029331+)".to_string())?;
+    Ok(std::mem::transmute::<_, D3D12GetInterfaceFn>(sym))
+}
+
 fn create_factory(version: u32, dir: &Path, path_cstr: &CString) -> Result<ID3D12DeviceFactory, String> {
-    // SAFETY: `D3D12GetInterface` writes a COM interface pointer on success into `cfg`.
+    // SAFETY: `D3D12GetInterface` (resolved dynamically so pre-2004 Windows 10 builds do not
+    // fail at IAT load time) writes a COM interface pointer on success into `cfg_raw`.
     // `ID3D12SDKConfiguration1::CreateDeviceFactory` takes a valid NUL-terminated ANSI path
     // with trailing backslash and returns an owned `ID3D12DeviceFactory`.
     unsafe {
-        let mut cfg: Option<ID3D12SDKConfiguration1> = None;
-        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut cfg)
+        let get_iface = resolve_d3d12_get_interface()?;
+        let mut cfg_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        get_iface(&CLSID_D3D12SDKConfiguration, &ID3D12SDKConfiguration1::IID, &mut cfg_raw)
+            .ok()
             .map_err(|e| format!("ID3D12SDKConfiguration1 unavailable (update Windows 10 to 22H2 KB5029331+): {e}"))?;
-        let cfg = cfg.ok_or_else(|| "D3D12GetInterface returned null ID3D12SDKConfiguration1".to_string())?;
+        if cfg_raw.is_null() {
+            return Err("D3D12GetInterface returned null ID3D12SDKConfiguration1".into());
+        }
+        let cfg = ID3D12SDKConfiguration1::from_raw(cfg_raw);
         let factory: ID3D12DeviceFactory = cfg
             .CreateDeviceFactory(version, PCSTR(path_cstr.as_ptr().cast()))
             .map_err(|e| format!("CreateDeviceFactory(v{version}, {}): {e}", dir.display()))?;
@@ -239,6 +295,15 @@ fn create_factory(version: u32, dir: &Path, path_cstr: &CString) -> Result<ID3D1
 /// Process-wide Agility SDK state (initialized on first D3D12 use).
 pub fn state() -> &'static State {
     STATE.get_or_init(init)
+}
+
+/// Diagnostic message when a device reports Shader Model < 6.6.
+pub(crate) fn format_no_sm66_message(adapter: &str, state: &State) -> String {
+    match state {
+        State::Loaded { version, .. } => format!("{adapter}: no SM 6.6 (Agility SDK v{version} loaded)"),
+        State::Unavailable(reason) => format!("{adapter}: no SM 6.6 (Agility SDK unavailable: {reason})"),
+        State::NotFound => format!("{adapter}: no SM 6.6 (on Windows 10, set {ENV} to a D3D12 Agility SDK folder)"),
+    }
 }
 
 /// Active Agility SDK `(version, dir)` if loaded, otherwise `None`.
