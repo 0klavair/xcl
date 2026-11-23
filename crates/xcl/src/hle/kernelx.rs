@@ -250,7 +250,13 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
         let a = addr as usize;
-        let n = if t & 0x8000 != 0 {
+        let release = t & mem::MEM_RELEASE != 0;
+        let decommit = t & mem::MEM_DECOMMIT != 0;
+        if release == decommit || (release && size != 0) {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        let n = if release || size == 0 {
             match u.sparse_reservation(a) {
                 Some((start, len)) if start == a => len,
                 _ => {
@@ -259,15 +265,23 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
                 }
             }
         } else {
-            size
+            match u.sparse_reservation(a) {
+                Some((start, len)) if a.checked_add(size).is_some_and(|end| end <= start + len) => size,
+                _ => {
+                    fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+                    return 0;
+                }
+            }
         };
         if n > 0 {
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
             // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
-            mem::VirtualFree(addr, n, mem::MEM_DECOMMIT);
+            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+                return 0;
+            }
         }
-        if t & 0x8000 != 0 {
+        if release {
             u.sparse_release(a);
         }
         return 1;
@@ -281,15 +295,21 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
-    if t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+    let ok = mem::VirtualFree(addr, size, t);
+    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
     }
-    mem::VirtualFree(addr, size, t)
+    ok
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
-    if crate::gpu::uma::get().is_some_and(|u| u.contains(addr as usize)) {
-        return VirtualFree(addr, size, t);
+    if proc_ == thr::GetCurrentProcess() {
+        let a = addr as usize;
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
+            || (t & 0x8000 != 0 && in_graphics_reservation(a))
+        {
+            return VirtualFree(addr, size, t);
+        }
     }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
@@ -329,9 +349,13 @@ impl XAllocAttrs {
 }
 
 unsafe fn aligned_heap_alloc(size: usize, align: usize) -> *mut c_void {
-    let total = size + align + 16;
+    let Some(total) = size.checked_add(align).and_then(|n| n.checked_add(16)) else {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    };
     let raw = mem::HeapAlloc(mem::GetProcessHeap(), mem::HEAP_ZERO_MEMORY, total) as usize;
     if raw == 0 {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return std::ptr::null_mut();
     }
     let aligned = (raw + 16 + align - 1) & !(align - 1);
@@ -349,24 +373,27 @@ unsafe fn aligned_heap_free(p: *mut c_void) {
 
 /// Rounded byte size and alignment for an XMem graphics allocation honoring `page_size`
 /// (`2` = `XALLOC_PAGESIZE_4MB`, otherwise 64 KiB sparse tile grain) and `alignment`.
-fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> (usize, usize) {
+fn xmem_graphics_layout(size: usize, a: XAllocAttrs) -> Option<(usize, usize)> {
     let page_grain = match a.page_size {
         2 => 4 << 20, // XALLOC_PAGESIZE_4MB
         _ => crate::gpu::uma::GRAIN,
     };
-    let align = (1usize << a.alignment.min(30)).max(page_grain);
-    let rounded = size.max(1).div_ceil(page_grain) * page_grain;
-    (rounded, align)
+    let align = (1usize << a.alignment.min(usize::BITS - 2)).max(page_grain);
+    let rounded = size.max(1).checked_next_multiple_of(page_grain)?;
+    Some((rounded, align))
 }
 
 pub unsafe extern "system" fn XMemAllocDefault(size: usize, attrs: u64) -> *mut c_void {
     let a = XAllocAttrs::decode(attrs);
     if a.memory_type == 0 {
-        let q = aligned_heap_alloc(size, 1usize << a.alignment.max(4));
+        let q = aligned_heap_alloc(size, 1usize << a.alignment.clamp(4, usize::BITS - 2));
         trace_mem("XMemAlloc", 0, size, attrs, 0, q as usize);
         return q;
     }
-    let (rounded, align) = xmem_graphics_layout(size, a);
+    let Some((rounded, align)) = xmem_graphics_layout(size, a) else {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return std::ptr::null_mut();
+    };
     // Graphics memory types live in the sparse VRAM pool (fallback to coherent UMA, then Windows).
     if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
         trace_mem("XMemAlloc (graphics, sparse VRAM)", 0, rounded, attrs, 0, q);
@@ -434,8 +461,14 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
-    const READABLE: u32 = mem::PAGE_READONLY | mem::PAGE_READWRITE | mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_READ | mem::PAGE_EXECUTE_READWRITE;
-    let cpu = (*mbi).State == mem::MEM_COMMIT && (*mbi).Protect & READABLE != 0;
+    const READABLE: u32 = mem::PAGE_READONLY
+        | mem::PAGE_READWRITE
+        | mem::PAGE_WRITECOPY
+        | mem::PAGE_EXECUTE_READ
+        | mem::PAGE_EXECUTE_READWRITE
+        | mem::PAGE_EXECUTE_WRITECOPY;
+    let protect = (*mbi).Protect;
+    let cpu = (*mbi).State == mem::MEM_COMMIT && (protect & mem::PAGE_GUARD) == 0 && (protect & READABLE) != 0;
     *(info as *mut u8).add(48).cast::<u32>() = cpu as u32;
     1
 }
@@ -666,13 +699,17 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
         return 0;
     }
     let n = *num;
+    let Some(bytes) = n.checked_mul(PHYS_PAGE) else {
+        fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    };
     let Some(u) = crate::gpu::uma::get() else {
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
         return 0;
     };
-    let block = crate::hle::d3d12x::sparse::alloc(n * PHYS_PAGE, PHYS_PAGE)
+    let block = crate::hle::d3d12x::sparse::alloc(bytes, PHYS_PAGE)
         .map(|(p, _)| p)
-        .or_else(|| u.alloc(n * PHYS_PAGE, PHYS_PAGE).map(|p| p as usize));
+        .or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize));
     let Some(block) = block else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room in UMA");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
@@ -825,16 +862,35 @@ pub unsafe extern "system" fn UnregisterAppConstrainedChangeNotification(_regist
 // Threads / system info
 // ---------------------------------------------------------------------------------------
 
+fn hresult_to_win32(hr: i32) -> u32 {
+    if (hr as u32 & 0xFFFF_0000) == 0x8007_0000 {
+        hr as u32 & 0xFFFF
+    } else {
+        fnd::ERROR_INVALID_PARAMETER
+    }
+}
+
 pub unsafe extern "system" fn SetThreadName(h: HANDLE, name: *const u16) -> BOOL {
     if let Some(n) = from_wide_ptr(name) {
         crate::xlog_debug!("SetThreadName({n})");
     }
-    (thr::SetThreadDescription(h, name) >= 0) as BOOL
+    let hr = thr::SetThreadDescription(h, name);
+    if hr < 0 {
+        fnd::SetLastError(hresult_to_win32(hr));
+        return 0;
+    }
+    1
 }
 
 pub unsafe extern "system" fn GetThreadName(h: HANDLE, buf: *mut u16, len: usize, ret_len: *mut usize) -> BOOL {
+    if buf.is_null() && len > 0 {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let mut p: *mut u16 = std::ptr::null_mut();
-    if thr::GetThreadDescription(h, &mut p) < 0 || p.is_null() {
+    let hr = thr::GetThreadDescription(h, &mut p);
+    if hr < 0 || p.is_null() {
+        fnd::SetLastError(hresult_to_win32(hr));
         return 0;
     }
     let s = from_wide_ptr(p).unwrap_or_default();
@@ -843,8 +899,9 @@ pub unsafe extern "system" fn GetThreadName(h: HANDLE, buf: *mut u16, len: usize
     if !ret_len.is_null() {
         *ret_len = n;
     }
-    if buf.is_null() || len == 0 {
-        return (len == 0) as BOOL;
+    if buf.is_null() || len <= n {
+        fnd::SetLastError(fnd::ERROR_INSUFFICIENT_BUFFER);
+        return 0;
     }
     write_wide_out(&s, buf, len.min(u32::MAX as usize) as u32);
     1
@@ -1029,14 +1086,22 @@ unsafe fn load_as_data(name: &str, file: HANDLE, flags: u32) -> usize {
 
 pub unsafe extern "system" fn LoadLibraryExW(name: *const u16, file: HANDLE, flags: u32) -> usize {
     if flags & LOAD_AS_DATA != 0 {
-        return load_as_data(&from_wide_ptr(name).unwrap_or_default(), file, flags);
+        let Some(name) = from_wide_ptr(name) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        };
+        return load_as_data(&name, file, flags);
     }
     load_library_impl(from_wide_ptr(name))
 }
 
 pub unsafe extern "system" fn LoadLibraryExA(name: *const u8, file: HANDLE, flags: u32) -> usize {
     if flags & LOAD_AS_DATA != 0 {
-        return load_as_data(&from_ansi_ptr(name).unwrap_or_default(), file, flags);
+        let Some(name) = from_ansi_ptr(name) else {
+            fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+            return 0;
+        };
+        return load_as_data(&name, file, flags);
     }
     load_library_impl(from_ansi_ptr(name))
 }
@@ -1046,6 +1111,10 @@ pub unsafe extern "system" fn LoadPackagedLibrary(name: *const u16, _reserved: u
 }
 
 pub unsafe extern "system" fn GetProcAddress(h: usize, name: *const u8) -> usize {
+    if name.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let what = if (name as usize) >> 16 == 0 {
         ImportName::Ordinal(name as usize as u16)
     } else {
@@ -1332,5 +1401,168 @@ mod tests {
         assert!(s.avail <= s.total);
         s.dw_length = 8;
         assert_eq!(unsafe { TitleMemoryStatus(&mut s) }, 0);
+    }
+
+    #[test]
+    fn get_proc_address_and_load_library_ex_reject_null_name() {
+        unsafe {
+            let k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
+            assert_ne!(k32, 0);
+            fnd::SetLastError(0);
+            assert!(ll::GetProcAddress(k32 as _, std::ptr::null()).is_none());
+            let win32_err = fnd::GetLastError();
+
+            fnd::SetLastError(0);
+            assert_eq!(GetProcAddress(k32, std::ptr::null()), 0);
+            assert_eq!(fnd::GetLastError(), win32_err);
+
+            // Non-zero ordinal lookup still resolves when valid (ordinal #1 on kernel32).
+            assert_ne!(GetProcAddress(k32, 1usize as *const u8), 0);
+
+            fnd::SetLastError(0);
+            assert_eq!(LoadLibraryExW(std::ptr::null(), std::ptr::null_mut(), LOAD_AS_DATA), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            fnd::SetLastError(0);
+            assert_eq!(LoadLibraryExA(std::ptr::null(), std::ptr::null_mut(), LOAD_AS_DATA), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+        }
+    }
+
+    #[test]
+    fn get_thread_name_sizing_truncation_and_errors() {
+        std::thread::spawn(|| unsafe {
+            let cur = thr::GetCurrentThread();
+
+            // Empty thread name: capacity 0 fails with ERROR_INSUFFICIENT_BUFFER, capacity 1 writes NUL.
+            let empty = crate::util::wide("");
+            assert_eq!(SetThreadName(cur, empty.as_ptr()), 1);
+            let mut ret = 99usize;
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadName(cur, std::ptr::null_mut(), 0, &mut ret), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(ret, 0);
+            let mut nul_only = [0xBEEFu16; 1];
+            assert_eq!(GetThreadName(cur, nul_only.as_mut_ptr(), 1, &mut ret), 1);
+            assert_eq!((ret, nul_only[0]), (0, 0));
+
+            let want = crate::util::wide("xcl-worker-1");
+            assert_eq!(SetThreadName(cur, want.as_ptr()), 1);
+
+            // Null buffer with non-zero length -> ERROR_INVALID_PARAMETER.
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadName(cur, std::ptr::null_mut(), 4, &mut ret), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+            // Size query (null buffer, len == 0) -> FALSE + ERROR_INSUFFICIENT_BUFFER with ret_len = 12.
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadName(cur, std::ptr::null_mut(), 0, &mut ret), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(ret, 12);
+
+            // Buffer equal to char count (no room for NUL terminator) -> FALSE + ERROR_INSUFFICIENT_BUFFER.
+            let mut exact = [0xBEEFu16; 12];
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadName(cur, exact.as_mut_ptr(), exact.len(), &mut ret), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INSUFFICIENT_BUFFER);
+            assert_eq!(ret, 12);
+
+            // Buffer with room for chars + NUL -> TRUE and exact match (both with and without ret_len).
+            let mut full = [0u16; 13];
+            assert_eq!(GetThreadName(cur, full.as_mut_ptr(), full.len(), &mut ret), 1);
+            assert_eq!(ret, 12);
+            assert_eq!(&full[..], &want[..]);
+            full.fill(0);
+            assert_eq!(GetThreadName(cur, full.as_mut_ptr(), full.len(), std::ptr::null_mut()), 1);
+            assert_eq!(&full[..], &want[..]);
+
+            // Invalid thread handle -> FALSE + Win32 error set.
+            fnd::SetLastError(0);
+            assert_eq!(GetThreadName(std::ptr::null_mut(), full.as_mut_ptr(), full.len(), &mut ret), 0);
+            assert_ne!(fnd::GetLastError(), 0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn xmem_virtual_query_excludes_guard_pages() {
+        unsafe {
+            let proc_ = thr::GetCurrentProcess();
+            let page = mem::VirtualAlloc(std::ptr::null(), 0x1000, mem::MEM_COMMIT | mem::MEM_RESERVE, mem::PAGE_READWRITE | mem::PAGE_GUARD);
+            assert!(!page.is_null());
+            let mut info = [0u64; 8];
+            assert_eq!(XMemVirtualQuery(proc_, page, info.as_mut_ptr() as _), 1);
+            assert_eq!((info[6] as u32) & 3, 0, "PAGE_GUARD page must not be marked CPU-readable");
+            mem::VirtualFree(page, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn xmem_and_physical_page_overflows_fail_cleanly() {
+        unsafe {
+            // CPU heap allocation overflow -> null + ERROR_NOT_ENOUGH_MEMORY.
+            fnd::SetLastError(0);
+            assert!(XMemAllocDefault(usize::MAX, 0).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+
+            // Graphics layout rounding overflow (usize::MAX) and largest 64 KiB multiple
+            // (which previously overflowed `size + GRAIN - 1` inside Uma::sparse_alloc / alloc_where).
+            let gfx_attrs = 1u64 << 29;
+            assert!(xmem_graphics_layout(usize::MAX, XAllocAttrs::decode(gfx_attrs)).is_none());
+            fnd::SetLastError(0);
+            assert!(XMemAllocDefault(usize::MAX, gfx_attrs).is_null());
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+
+            let max_aligned = usize::MAX & !(crate::gpu::uma::GRAIN - 1);
+            assert!(XMemAllocDefault(max_aligned, gfx_attrs).is_null());
+
+            // Physical page byte-count overflow -> FALSE + ERROR_NOT_ENOUGH_MEMORY.
+            let mut huge = usize::MAX;
+            let mut page = 0usize;
+            fnd::SetLastError(0);
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    #[test]
+    fn virtual_free_ex_and_sparse_validation() {
+        unsafe {
+            let cur = thr::GetCurrentProcess();
+
+            // Failed MEM_RELEASE (non-zero size) must keep a tracked graphics reservation registered,
+            // and VirtualFreeEx(GetCurrentProcess(), ...) must release & untrack it.
+            let host = mem::VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
+            assert!(!host.is_null());
+            GRAPHICS_RESERVATIONS.lock().unwrap().insert(host as usize, 0x10000);
+            assert!(in_graphics_reservation(host as usize));
+            assert_eq!(VirtualFree(host, 0x1000, mem::MEM_RELEASE), 0);
+            assert!(in_graphics_reservation(host as usize));
+            assert_eq!(VirtualFreeEx(cur, host, 0, mem::MEM_RELEASE), 1);
+            assert!(!in_graphics_reservation(host as usize));
+
+            // Sparse UMA reservation: invalid flag combos / non-zero MEM_RELEASE fail without freeing;
+            // VirtualFreeEx(GetCurrentProcess(), ...) releases cleanly.
+            let sp = VirtualAlloc(std::ptr::null(), 0x10000, mem::MEM_RESERVE | MEM_GRAPHICS, mem::PAGE_READWRITE);
+            if !sp.is_null() && crate::gpu::uma::get().is_some_and(|u| u.is_sparse(sp as usize)) {
+                fnd::SetLastError(0);
+                assert_eq!(VirtualFree(sp, 0x1000, mem::MEM_RELEASE), 0);
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+                fnd::SetLastError(0);
+                assert_eq!(VirtualFree(sp, 0, mem::MEM_RELEASE | mem::MEM_DECOMMIT), 0);
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+                fnd::SetLastError(0);
+                assert_eq!(VirtualFree(sp, 0, 0), 0);
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+
+                assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
+                assert!(crate::gpu::uma::get().unwrap().sparse_reservation(sp as usize).is_none());
+            } else if !sp.is_null() {
+                assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
+            }
+        }
     }
 }
