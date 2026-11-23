@@ -732,6 +732,25 @@ The EXE (+ EOSSDK) imports 31 functions from console libraries: MFPlat `MFResetD
 - **#7** only the persistent-local-storage accounting (used bytes measured). Its task-queue / XAsync handle registries
   (2.8 k lines against forged handles) were not taken.
 
+## Contributions merged (2026-11-22, PRs #53–#60, all gefydev, tested by him under Wine)
+XCL's own XAsync / XTaskQueue matter only without the PC runtime (with Gaming Services they go to the PC's).
+- **#53** XAsyncCancel only calls the provider (libHttpClient): XCL's `begin_with` and XAsyncRun ignore Cancel and
+  run to their end – completing with E_ABORT there ran Cleanup (freed the payload) under running DoWork.
+- **#56** a failing provider Begin fails the call through the block, XAsyncBegin / XAsyncRun return S_OK;
+  XAsyncComplete(E_PENDING) does not complete.
+- **#54** XTaskQueueTerminate runs the queue's delayed callbacks still in the timer heap (canceled) before its own
+  callback; **#57** a terminated queue refuses new work with E_ABORT (submit, delayed submit, waiters) – and,
+  added on merge, XAsyncSchedule too.
+- **#55** game save names Windows changes (".", "..", device names with any extension, trailing dot / space)
+  get one more character %XX-escaped (`..` deleted every provider's saves); on merge also "nul .txt".
+- **#58–#60** VFS hooks MoveFileWithProgressW, CopyFileW, ReplaceFileW (ReplaceFile into the game folder =
+  CopyFileW backup + MoveFileExW through their hooks). **Measured on Windows 11** (counting hooks): MoveFileW
+  reaches only MoveFileWithProgressW (so it was not redirected before #58); kernel32's MoveFileA / MoveFileExA /
+  MoveFileWithProgressA reach no kernelbase move entry – hooked in kernel32 on merge; CopyFileW and the ANSI
+  copies reach CopyFileExW, ReplaceFileA reaches ReplaceFileW. Probe with the real hooks: all move / copy /
+  replace entries on `T:` work, game folder untouched (the probe is a local test, not in the repo: process-wide
+  hooks + the global VFS).
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
