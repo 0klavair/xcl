@@ -107,20 +107,15 @@ pub unsafe extern "system" fn XNetworkingUnregisterPreferredLocalUdpMultiplayerP
 // Per-URL HTTP security information (TLS 1.2 / 1.3, no certificate pinning)
 // ---------------------------------------------------------------------------------------
 
+/// Serialize the default `XNetworkingSecurityInformation` into bytes without reading
+/// uninitialized `#[repr(C)]` struct padding.
+///
+/// On x86_64 Windows, all-zero bytes represent both `thumbprint_count == 0` and a null
+/// `thumbprints` pointer, as well as deterministic zero padding between fields.
 fn default_security_info_bytes() -> Vec<u8> {
-    let info = XNetworkingSecurityInformation {
-        enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
-        thumbprint_count: 0,
-        thumbprints: std::ptr::null(),
-    };
     let mut out = vec![0u8; std::mem::size_of::<XNetworkingSecurityInformation>()];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            &info as *const XNetworkingSecurityInformation as *const u8,
-            out.as_mut_ptr(),
-            out.len(),
-        );
-    }
+    let off = std::mem::offset_of!(XNetworkingSecurityInformation, enabled_http_security_protocol_flags);
+    out[off..off + std::mem::size_of::<u32>()].copy_from_slice(&DEFAULT_TLS_FLAGS.to_le_bytes());
     out
 }
 
@@ -631,7 +626,23 @@ mod tests {
     }
 
     #[test]
+    fn default_security_info_bytes_zeroes_padding_and_fields() {
+        let bytes = default_security_info_bytes();
+        assert_eq!(bytes.len(), std::mem::size_of::<XNetworkingSecurityInformation>());
+        let off = std::mem::offset_of!(XNetworkingSecurityInformation, enabled_http_security_protocol_flags);
+        assert_eq!(&bytes[off..off + 4], &DEFAULT_TLS_FLAGS.to_le_bytes());
+        assert!(bytes[..off].iter().all(|&b| b == 0));
+        assert!(bytes[off + 4..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
     fn security_info_utf8_and_utf16_follow_gdk_arg_order() {
+        #[repr(C)]
+        struct AlignedBuf {
+            _align: [XNetworkingSecurityInformation; 0],
+            bytes: [u8; 32],
+        }
+
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             // UTF-8
@@ -641,17 +652,18 @@ mod tests {
             let mut sz = 0usize;
             assert_eq!(XNetworkingQuerySecurityInformationForUrlAsyncResultSize(&mut b, &mut sz), S_OK);
             assert_eq!(sz, std::mem::size_of::<XNetworkingSecurityInformation>());
-            let mut buf = [0u8; 32];
+            let mut buf = AlignedBuf { _align: [], bytes: [0xAA; 32] };
             let mut used = 0usize;
             let mut ptr: *mut XNetworkingSecurityInformation = std::ptr::null_mut();
             assert_eq!(
-                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.len(), &mut used, buf.as_mut_ptr(), &mut ptr),
+                XNetworkingQuerySecurityInformationForUrlAsyncResult(&mut b, buf.bytes.len(), &mut used, buf.bytes.as_mut_ptr(), &mut ptr),
                 S_OK
             );
             assert_eq!(used, sz);
-            assert_eq!(ptr as *const u8, buf.as_ptr());
+            assert_eq!(ptr as *const u8, buf.bytes.as_ptr());
             assert_eq!((*ptr).enabled_http_security_protocol_flags, DEFAULT_TLS_FLAGS);
             assert_eq!((*ptr).thumbprint_count, 0);
+            assert!((*ptr).thumbprints.is_null());
 
             // UTF-16
             let url16 = wide("https://example.invalid/hotfix");
@@ -661,12 +673,17 @@ mod tests {
             let mut sz2 = 0usize;
             assert_eq!(XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(&mut b2, &mut sz2), S_OK);
             assert_eq!(sz2, std::mem::size_of::<XNetworkingSecurityInformation>());
+            buf.bytes.fill(0x55);
             let mut ptr2: *mut XNetworkingSecurityInformation = std::ptr::null_mut();
             assert_eq!(
-                XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(&mut b2, buf.len(), &mut used, buf.as_mut_ptr(), &mut ptr2),
+                XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(&mut b2, buf.bytes.len(), &mut used, buf.bytes.as_mut_ptr(), &mut ptr2),
                 S_OK
             );
+            assert_eq!(used, sz2);
+            assert_eq!(ptr2 as *const u8, buf.bytes.as_ptr());
             assert_eq!((*ptr2).enabled_http_security_protocol_flags, DEFAULT_TLS_FLAGS);
+            assert_eq!((*ptr2).thumbprint_count, 0);
+            assert!((*ptr2).thumbprints.is_null());
         }
     }
 
