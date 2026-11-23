@@ -23,6 +23,7 @@ next steps:
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
+| **A newer retail game** | – | 🚧 | starts, presents its first frames after ~4 s and runs for ~3 minutes without a crash (2 frames shown, then it loads its ~3 500 shaders) | stops after ~3 minutes at mesh pipelines it creates; its image has not been checked yet |
 
 ## Highlights
 

@@ -713,7 +713,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if args.iter().any(|a| a == "--precompile") {
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), t0);
+        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -731,7 +732,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// no split form, so a title asked for other HLSL and compiled everything again. Still
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0: std::time::Instant) -> i32 {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, t0: std::time::Instant) -> i32 {
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
@@ -755,6 +756,29 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
+                // into the translation cache too, so the title does not translate it again
+                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok(_) => compiled.fetch_add(1, Ordering::Relaxed),
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 200 == 0 {
+                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                    }
+                    continue;
+                }
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {

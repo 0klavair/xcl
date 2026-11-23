@@ -2744,11 +2744,11 @@ fn note_translation_error(e: String) {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
     }
+    // each different reason once (the first five only hid a retail game's "mesh pipeline with
+    // AS" behind five earlier ones)
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
-    if g.len() < 5 {
+    if g.len() < 40 && !g.contains(&e) {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
-    }
-    if g.len() < 20 && !g.contains(&e) {
         g.push(e);
     }
 }
@@ -3435,8 +3435,13 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
     if !is_console(ms) {
         return None;
     }
-    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
-        note_translation_error("mesh pipeline with AS – not supported yet".into());
+    if let Some(a) = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1)) {
+        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        note_translation_error(format!(
+            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            crate::gpu::shader::fnv64(a),
+            crate::gpu::shader::fnv64(ms)
+        ));
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
