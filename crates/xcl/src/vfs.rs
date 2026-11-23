@@ -25,6 +25,10 @@ pub enum Target {
 pub enum Decision {
     Pass,
     Use(String),
+    /// Use this path with a rewritten Win32 creation disposition (e.g. `TRUNCATE_EXISTING`
+    /// on an un-overlaid game file becomes `CREATE_ALWAYS` in the overlay so no placeholder
+    /// file is published before the native open succeeds).
+    UseWithDisposition(String, u32),
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -33,6 +37,7 @@ pub const ERROR_FILE_NOT_FOUND: u32 = 2;
 pub const ERROR_PATH_NOT_FOUND: u32 = 3;
 pub const ERROR_ACCESS_DENIED: u32 = 5;
 pub const ERROR_FILE_EXISTS: u32 = 80;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
 pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
 
@@ -42,7 +47,8 @@ const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 
-const WRITE_ACCESS: u32 = 0x4000_0000 // GENERIC_WRITE
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const WRITE_ACCESS: u32 = GENERIC_WRITE
     | 0x1000_0000 // GENERIC_ALL
     | 0x0000_0002 // FILE_WRITE_DATA / ADD_FILE
     | 0x0000_0004 // FILE_APPEND_DATA / ADD_SUBDIRECTORY
@@ -51,6 +57,8 @@ const WRITE_ACCESS: u32 = 0x4000_0000 // GENERIC_WRITE
     | 0x0001_0000 // DELETE
     | 0x0004_0000 // WRITE_DAC
     | 0x0008_0000; // WRITE_OWNER
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 
 pub struct Vfs {
@@ -437,13 +445,35 @@ impl Vfs {
                         None => Decision::Fail(ERROR_FILE_NOT_FOUND),
                     };
                 }
+                // Win32 CreateFile requires GENERIC_WRITE for TRUNCATE_EXISTING before checking existence.
+                if disposition == TRUNCATE_EXISTING && access & GENERIC_WRITE == 0 {
+                    return Decision::Fail(ERROR_INVALID_PARAMETER);
+                }
                 match disposition {
                     CREATE_NEW if visible => return Decision::Fail(ERROR_FILE_EXISTS),
                     OPEN_EXISTING | TRUNCATE_EXISTING if !visible => return Decision::Fail(ERROR_FILE_NOT_FOUND),
                     _ => {}
                 }
+                let ov_entry = in_ov || Path::new(&self.overlay_path(&rel)).symlink_metadata().is_ok();
+                if disposition == TRUNCATE_EXISTING {
+                    let check_path = if in_ov { self.overlay_path(&rel) } else { self.original_path(&rel) };
+                    let is_dir = if flags & FILE_FLAG_OPEN_REPARSE_POINT != 0 {
+                        Path::new(&check_path).symlink_metadata().is_ok_and(|m| m.is_dir())
+                    } else {
+                        Path::new(&check_path).is_dir()
+                    };
+                    if is_dir {
+                        let err = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 {
+                            ERROR_INVALID_PARAMETER
+                        } else {
+                            ERROR_ACCESS_DENIED
+                        };
+                        return Decision::Fail(err);
+                    }
+                }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
                 match self.prepare_write(&rel, keep) {
+                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
                     Ok(p) => Decision::Use(p),
                     Err(e) => Decision::Fail(e),
                 }
@@ -661,5 +691,121 @@ mod tests {
         assert_eq!(v.remove_dir("data"), Ok(()));
         assert!(f.game().join("data").exists());
         assert!(v.is_whiteout("data\\hello.txt"), "children of a removed dir are hidden");
+    }
+
+    #[test]
+    fn truncate_existing_rewrites_unoverlaid_disposition_and_opens_with_win32() {
+        let f = Fixture::new("trunc");
+        let v = &f.vfs;
+        let orig = f.game().join("data").join("hello.txt");
+
+        // Un-overlaid game file: TRUNCATE_EXISTING rewrites disposition to CREATE_ALWAYS in the
+        // overlay WITHOUT publishing a placeholder file before the native CreateFile call runs.
+        let Decision::UseWithDisposition(ov, disp) =
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0)
+        else {
+            panic!("expected Decision::UseWithDisposition for TRUNCATE_EXISTING on un-overlaid game file");
+        };
+        assert!(ov.contains("overlay"));
+        assert_eq!(disp, CREATE_ALWAYS);
+        assert!(!Path::new(&ov).exists(), "no placeholder file before native open");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+
+        // Opening the returned overlay path with the rewritten disposition creates a 0-byte overlay file.
+        let w = crate::util::wide(&ov);
+        let h = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                w.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                disp,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
+        assert_eq!(std::fs::read(&ov).unwrap(), b"");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+
+        // Already-overlaid file keeps TRUNCATE_EXISTING and is truncated by Win32 on open.
+        std::fs::write(&ov, b"overlay-content").unwrap();
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
+            Decision::Use(ov.clone())
+        );
+        assert_eq!(std::fs::read(&ov).unwrap(), b"overlay-content");
+        let h2 = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                w.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                TRUNCATE_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(h2, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(h2) };
+        assert_eq!(std::fs::read(&ov).unwrap(), b"");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"original");
+    }
+
+    #[test]
+    fn truncate_existing_validation_errors() {
+        let f = Fixture::new("trunc_err");
+        let v = &f.vfs;
+
+        // Missing GENERIC_WRITE fails with ERROR_INVALID_PARAMETER (even if missing) without touching overlay.
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", 0x8000_0000, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", 0x0000_0002, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            v.open_decision("G:\\data\\hello.txt", 0x1000_0000, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_INVALID_PARAMETER)
+        );
+        assert_eq!(
+            v.open_decision("G:\\data\\missing.txt", 0x8000_0000, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_INVALID_PARAMETER)
+        );
+        assert!(!v.visible_in_overlay("data\\hello.txt"));
+
+        // Missing or whited-out file with GENERIC_WRITE fails with ERROR_FILE_NOT_FOUND.
+        assert_eq!(
+            v.open_decision("G:\\data\\missing.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_FILE_NOT_FOUND)
+        );
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(
+            v.open_decision("G:\\data\\gone.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
+            Decision::Fail(ERROR_FILE_NOT_FOUND)
+        );
+
+        // Directory fails without creating an overlay entry, matching native Win32 CreateFileW error codes.
+        let dir_w = crate::util::wide(&f.game().join("data").to_string_lossy());
+        for (flags, expected) in [(0, ERROR_ACCESS_DENIED), (FILE_FLAG_BACKUP_SEMANTICS, ERROR_INVALID_PARAMETER)] {
+            let h = unsafe {
+                windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                    dir_w.as_ptr(),
+                    GENERIC_WRITE,
+                    7,
+                    std::ptr::null(),
+                    TRUNCATE_EXISTING,
+                    flags,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+            assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
+        }
+        assert!(!v.visible_in_overlay("data"));
     }
 }
