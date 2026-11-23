@@ -3,7 +3,9 @@
 //! - `auto` (or empty): the hardware adapters in high-performance order, the first one that
 //!   creates a device;
 //! - `warp`: the software renderer;
-//! - a number `N`: the N-th hardware adapter in high-performance order (0 = the first);
+//! - a number `N`: the N-th hardware adapter in high-performance order (0 = the first); if `N`
+//!   is out of range, falls back to matching `N` as a standalone numeric token in the adapter
+//!   name (so e.g. `5070`, `3080`, or `7900` selects that GPU model);
 //! - anything else: the hardware adapters whose name contains it (case-insensitive), e.g.
 //!   `radeon` or `rtx 3080`.
 //!
@@ -34,8 +36,11 @@ impl Selector {
             Selector::Auto
         } else if s.eq_ignore_ascii_case("warp") {
             Selector::Warp
-        } else if let Ok(n) = s.parse::<usize>() {
-            Selector::Index(n)
+        } else if (s == "0" || !s.starts_with('0')) && s.bytes().all(|b| b.is_ascii_digit()) {
+            match s.parse::<usize>() {
+                Ok(n) => Selector::Index(n),
+                Err(_) => Selector::Name(s.to_lowercase()),
+            }
         } else {
             Selector::Name(s.to_lowercase())
         }
@@ -49,7 +54,8 @@ impl Selector {
         }
     }
 
-    /// Whether the hardware adapter at `index` (high-performance order) named `name` is chosen.
+    /// Whether the hardware adapter at `index` (high-performance order) named `name` matches
+    /// directly (without the out-of-range numeric model fallback applied by [`candidates`]).
     pub fn allows(&self, index: usize, name: &str) -> bool {
         match self {
             Selector::Auto => true,
@@ -69,6 +75,44 @@ impl fmt::Display for Selector {
             Selector::Name(s) => write!(f, "\"{s}\""),
         }
     }
+}
+
+/// True if `name` contains `digits` not immediately preceded or followed by another ASCII digit
+/// (e.g. `"5070"` matches `"RTX 5070"` and `"RX 7900XTX"` matches `"7900"`, while `"2"` does not
+/// match `"RTX 2080"`).
+fn contains_numeric_token(name: &str, digits: &str) -> bool {
+    if digits.is_empty() {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = name[start..].find(digits) {
+        let pos = start + rel;
+        let end = pos + digits.len();
+        let before_ok = pos == 0 || !bytes[pos - 1].is_ascii_digit();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// Indices into `names` allowed by `sel`. For `Selector::Index(n)` with `n >= names.len()`,
+/// falls back to matching `n` as a standalone numeric token in each adapter's name.
+pub(crate) fn select_indices<S: AsRef<str>>(names: &[S], sel: &Selector) -> Vec<usize> {
+    let direct: Vec<usize> = names.iter().enumerate().filter(|(i, n)| sel.allows(*i, n.as_ref())).map(|(i, _)| i).collect();
+    if !direct.is_empty() {
+        return direct;
+    }
+    if let Selector::Index(n) = sel {
+        if *n >= names.len() {
+            let token = n.to_string();
+            return names.iter().enumerate().filter(|(_, name)| contains_numeric_token(name.as_ref(), &token)).map(|(i, _)| i).collect();
+        }
+    }
+    Vec::new()
 }
 
 /// The adapter's name from its description.
@@ -96,7 +140,13 @@ pub fn hardware(factory: &IDXGIFactory6) -> Vec<(IDXGIAdapter1, DXGI_ADAPTER_DES
 
 /// The hardware adapters `sel` allows, in high-performance order (empty for `warp`).
 pub fn candidates(factory: &IDXGIFactory6, sel: &Selector) -> Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
-    hardware(factory).into_iter().enumerate().filter(|(i, (_, d))| sel.allows(*i, &name(d))).map(|(_, a)| a).collect()
+    let hw = hardware(factory);
+    let names: Vec<String> = hw.iter().map(|(_, d)| name(d)).collect();
+    let mut keep = vec![false; hw.len()];
+    for i in select_indices(&names, sel) {
+        keep[i] = true;
+    }
+    hw.into_iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, a)| a).collect()
 }
 
 /// "`sel` matches no adapter (have: 0 = …, 1 = …)" – for logs and test skips.
