@@ -2130,7 +2130,8 @@ impl Em {
                 0 => ("Texture1D<float4>", coords[0].clone()),
                 1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
                 2 => ("Texture3D<float4>", format!("float3({}, {}, {})", coords[0], coords[1], coords[2])),
-                3 => ("TextureCube<float4>", format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2])),
+                // every cube T# is a cube array view; the face coordinate is face + 8 · slice
+                3 => ("TextureCubeArray<float4>", format!("float4(cube_dir({0}, {1}, {2}), cube_slice({2}))", coords[0], coords[1], coords[2])),
                 4 => ("Texture1DArray<float4>", format!("float2({}, round({}))", coords[0], coords[1])),
                 5 => ("Texture2DArray<float4>", format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2])),
                 _ => return Err("MIMG dim"),
@@ -2185,7 +2186,7 @@ impl Em {
                     (None, Some((dx, dy)), _, _) if dim == 3 => {
                         let len = |x: &[String]| format!("length(float2({}, {}))", x[0], x.get(1).cloned().unwrap_or("0.0f".into()));
                         let size = format!("{t}_cw");
-                        self.line(&format!("uint {size} = 1u, {t}_ch = 1u, {t}_cn = 1u; {t}_T.GetDimensions(0u, {size}, {t}_ch, {t}_cn);"));
+                        self.line(&format!("uint {size} = 1u, {t}_ch = 1u, {t}_ce = 1u, {t}_cn = 1u; {t}_T.GetDimensions(0u, {size}, {t}_ch, {t}_ce, {t}_cn);"));
                         let lod = format!("log2(max(max({}, {}) * (float){size}, 1e-8f))", len(dx), len(dy));
                         format!("{t}_T.SampleLevel({t}_S, {coord}, {})", floor(lod))
                     }
@@ -2217,7 +2218,8 @@ impl Em {
                 0 => ("Texture1D<float4>", coords[0].clone()),
                 1 => ("Texture2D<float4>", format!("float2({}, {})", coords[0], coords[1])),
                 2 => ("Texture3D<float4>", format!("float3({}, {}, {})", coords[0], coords[1], coords[2])),
-                3 => ("TextureCube<float4>", format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2])),
+                // a cube array's level of detail takes the direction only
+                3 => ("TextureCubeArray<float4>", format!("cube_dir({}, {}, {})", coords[0], coords[1], coords[2])),
                 4 => ("Texture1DArray<float4>", format!("float2({}, round({}))", coords[0], coords[1])),
                 5 => ("Texture2DArray<float4>", format!("float3({}, {}, round({}))", coords[0], coords[1], coords[2])),
                 _ => return Err("MIMG dim"),
@@ -2240,7 +2242,8 @@ impl Em {
                 0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
                 1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
-                3 => ("TextureCube", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                // the hardware returns the layers (6 per cube), as for a 2D array
+                3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
                 4 => ("Texture1DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_d, {t}_n); {t}_h = 1u;")),
                 5 => ("Texture2DArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 _ => return Err("get_resinfo dim"),
@@ -5154,6 +5157,8 @@ float3 cube_dir(float s, float t, float face) {
     if (f == 4u) return float3(u, -v, 1.0f);
     return float3(-u, -v, -1.0f);
 }
+// the cube of a cube array the face coordinate (face + 8 · slice) is in
+float cube_slice(float face) { return (float)(((uint)round(face)) / 8u); }
 uint first_lane(uint lo, uint hi) { return select(lo != 0u, firstbitlow(lo), select(hi != 0u, 32u + firstbitlow(hi), 0u)); }
 uint lanemask_lt_lo() { return lane_id >= 32u ? 0xFFFFFFFFu : (lane_id == 0u ? 0u : (0xFFFFFFFFu >> (32u - lane_id))); }
 uint lanemask_lt_hi() { return lane_id <= 32u ? 0u : (0xFFFFFFFFu >> (64u - lane_id)); }
