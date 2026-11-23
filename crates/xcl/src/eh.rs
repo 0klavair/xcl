@@ -278,7 +278,10 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb | ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
         ConsoleOnly::Clzero => {
-            let line = (ctx.Rax as usize) & !63;
+            // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
+            // is at EAX, zero-extended – as a Zen 5 runs it
+            let a32 = code[..len - 3].contains(&0x67);
+            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
             if crate::gpu::shader::readable(line, 64) {
                 std::ptr::write_bytes(line as *mut u8, 0, 64);
             } else {
@@ -865,5 +868,35 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
+    /// the 32-bit address: only the 32-bit one's line is zeroed.
+    #[test]
+    fn clzero_with_an_address_size_prefix_zeroes_at_eax() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = |at: usize| unsafe { VirtualAlloc(at as *const _, 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let low = (1..64).map(|n| alloc(n << 26)).find(|&p| p != 0).expect("a buffer below 4 GiB");
+        let high = (1..256).map(|n| alloc(low + (n << 32))).find(|&p| p != 0).expect("a buffer at low + n << 32");
+        let code = alloc(0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_a32.exe".into(), path: "clzero_a32.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        unsafe {
+            std::ptr::copy_nonoverlapping([0x67u8, 0x0F, 0x01, 0xFC].as_ptr(), code as *mut u8, 4);
+            std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+            std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax) = (code as u64, (high + 0x47) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + 4);
+            let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+            assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+            assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+        }
+        modules::unregister_mapped(code);
     }
 }
