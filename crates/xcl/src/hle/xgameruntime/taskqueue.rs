@@ -2,7 +2,9 @@
 //!
 //! Dispatch modes: Manual (caller pumps `XTaskQueueDispatch`), ThreadPool,
 //! SerializedThreadPool (pool, one at a time) and Immediate (run on the submitting
-//! thread). Callbacks submitted after `XTaskQueueTerminate` run with `canceled = true`.
+//! thread). `XTaskQueueTerminate` runs the queue's pending callbacks (delayed ones included)
+//! with `canceled = true` before its own callback; after it the queue takes no new work
+//! (`E_ABORT`, like libHttpClient's `VerifyNotTerminated`).
 //!
 //! Ports are reference-counted (`Arc<Port>`) so composite queues created via
 //! `XTaskQueueGetPort` + `XTaskQueueCreateComposite` can share underlying work/completion
@@ -211,6 +213,10 @@ impl Queue {
             idle: (Mutex::new(()), Condvar::new()),
             monitors: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
     }
 
     fn done_one(&self) {

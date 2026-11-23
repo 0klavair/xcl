@@ -250,6 +250,10 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
     let Some(q) = taskqueue::queue_from((*b).queue) else {
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
+    // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
+    if q.is_terminated() {
+        return E_ABORT;
+    }
     taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize });
     S_OK
 }
@@ -725,6 +729,27 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b, false), E_PENDING);
             XAsyncComplete(&mut b, 3, 0);
             assert_eq!(XAsyncGetStatus(&mut b, true), 3);
+        }
+    }
+
+    /// A terminated queue takes no new async work: the call fails with E_ABORT through the
+    /// block, and the work never runs.
+    #[test]
+    fn async_work_on_a_terminated_queue_is_aborted() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_THREAD_POOL, taskqueue::MODE_THREAD_POOL, &mut q), S_OK);
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(XAsyncRun(&mut b, run_work as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), E_ABORT);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            b.queue = q;
+            assert_eq!(begin_with(&mut b, 9, || -> Result<Vec<u8>, HRESULT> { panic!("work ran on a terminated queue") }), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), E_ABORT);
+            taskqueue::XTaskQueueCloseHandle(q);
         }
     }
 }
