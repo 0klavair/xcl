@@ -35,6 +35,14 @@ cargo test -p xcl --lib <filter>                           # one area while iter
 
 ## Rules
 
+### Before a PR can be merged
+The full list is in CONTRIBUTING.md ("What a PR needs to be merged"). In short: run the whole test
+suite and report the real counts; for a change to `crates/xcl/src` outside tests, run
+`scripts/smoke.ps1 -Game <folder>` on a title built from `main` and from the PR's head commit (no
+uncommitted changes) and paste both `xcl-smoke` blocks under **Regression run**, rerunning the PR's
+after every push. The `PR checks` workflow refuses the PR without them. Never write a smoke block or
+test counts by hand.
+
 ### Scope
 - **Do what was asked, nothing more.** No refactors, renames, reformatting, comment rewrites or
   dependency changes the task does not need. Mention other problems you notice instead of fixing them.
@@ -60,8 +68,8 @@ cargo test -p xcl --lib <filter>                           # one area while iter
   `Frame clock`, `xcl run`, `Tests`, `e2e`, `Scripts`, `README`, `Docs`. No `fix:` / `feat(x):`.
 - Body: why, root cause, what was measured. One logical change per commit; every commit builds and
   passes the tests. Squash fixups before the PR is reviewed.
-- Keep the attribution trailer your tool adds (e.g. `Co-Authored-By: Claude Opus 5.5 <…>`); it is how
-  AI use is disclosed in history. If your tool adds none, add `Assisted-by: <tool> (<model>)`.
+- Disclose AI use in the PR's **AI use** section (tool, model, what it did). A trailer in the commit
+  (`Assisted-by: <tool> (<model>)`) is welcome but not required.
 
 ### Tests
 - A bug fix comes with a test that fails without the fix. New logic comes with a test of it.

@@ -11,5 +11,6 @@ Specific to Claude Code:
 - Plan a task that spans more than one subsystem or more than ~400 lines (plan mode), and propose
   how to split it into PRs before you write code.
 - Run the tests and report the real output; do not stop at "the tests should pass".
-- Leave the `Co-Authored-By: Claude …` trailer in commits, and fill in the **AI use** section of the
-  PR description with Claude Code and your exact model name.
+- Fill in the **AI use** section of the PR description with Claude Code and your exact model name.
+- For a runtime change, run `scripts/smoke.ps1` on main and on the PR's head commit and paste both
+  `xcl-smoke` blocks; do not write or edit them by hand.

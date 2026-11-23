@@ -7,6 +7,31 @@ may be closed without a review, however good the code is.
 AI tools are welcome (see [AI-assisted contributions](#ai-assisted-contributions)). The rules are
 the same for code written by hand and by an agent.
 
+## What a PR needs to be merged
+
+XCL gets more pull requests in an hour than anyone can test by hand, most of them written with AI
+tools. So a PR is merged only when it shows that it was tested and that it breaks nothing. These are
+checked before anything else; a PR that does not meet them waits (or is closed after a week).
+
+1. **Both required checks are green:** `CI` (build and tests on Windows, no GPU) and `PR checks`
+   (the description: the sections below, and the regression runs when they are needed).
+2. **The whole suite ran on a GPU**, with the counts in **Tested**
+   (`cargo test --workspace -- --test-threads=4`: N passed, N failed, N ignored, and the SKIPPED tests).
+3. **A PR that changes the runtime** (`crates/xcl/src` outside tests) **has a regression run on a real
+   title**: `scripts/smoke.ps1 -Game <your game folder>` built from `main` and built from the PR's head
+   commit, both `xcl-smoke` blocks pasted under **Regression run**. The PR's block must name its head
+   commit with no uncommitted changes: rerun it after every push. It must show no device removal and
+   no crash, at least as many frames as `main` and no much higher peak commit. A run on a title that
+   does not reach the code the PR changes still counts as a regression check; say what it does not
+   cover under **Not tested**.
+4. **No regression on the maintainer's run.** The maintainer merges in batches: the whole suite and a
+   retail title run again on the merged tree, on an AMD RDNA4 GPU. A PR that breaks either is taken
+   out of the batch and gets a comment with what failed.
+5. **Up to date and reviewable:** it merges into `main` without conflicts, and keeps to the size and
+   scope rules below. A PR that duplicates one already merged is closed.
+
+A test result that was not produced by a real run on the hardware named gets the PR closed.
+
 ## Before you start
 
 1. **Search open PRs and issues first.** Several PRs have solved the same problem at once and all
@@ -55,6 +80,9 @@ Use this outline:
 - commands run and their results, e.g. `cargo test --workspace -- --test-threads=4`: 541 passed, 0 failed, 21 ignored
 - `SKIPPED` GPU tests on your adapter, if any
 - game checked (if any), and what got better, with numbers if you have them
+
+**Regression run**
+- for a runtime change: the two `xcl-smoke` blocks (main, this PR's head) – see above
 
 **Not tested**
 - what you could not check, e.g. AMD / NVIDIA, the retail title, wave32-only GPUs
