@@ -4531,7 +4531,8 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> Result<String, String> {
     h.push_str("[maxvertexcount(6)]\nvoid main(triangle XclOut v[3], inout TriangleStream<XclOut> s)\n{\n");
     h.push_str("    s.Append(v[0]);\n    s.Append(v[1]);\n    s.Append(v[2]);\n");
     h.push_str("    if (!(v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w && v[2].pos.w == v[0].pos.w))\n        return;\n");
-    h.push_str("    float2 q[3] = { v[0].pos.xy / v[0].pos.w, v[1].pos.xy / v[1].pos.w, v[2].pos.xy / v[2].pos.w };\n");
+    // one w: clip-space x and y compare as the screen's do
+    h.push_str("    float2 q[3] = { v[0].pos.xy, v[1].pos.xy, v[2].pos.xy };\n");
     // the corner c: x shared with a and y with b, or the other way round (a = c + 1, b = c + 2)
     h.push_str("    uint c = 3u;\n    [unroll] for (uint i = 0u; i < 3u; i++) {\n");
     h.push_str("        float2 p = q[i], a = q[(i + 1u) % 3u], b = q[(i + 2u) % 3u];\n");
