@@ -609,16 +609,34 @@ pub unsafe extern "system" fn XUserGetState(h: *mut c_void, out: *mut u32) -> HR
 
 pub const GAMERTAG_SIZES: [usize; 4] = [16, 97, 15, 101]; // Classic, Modern, ModernSuffix, UniqueModern
 
+/// A gamertag component of the configured gamertag, as XUserGamertagComponent describes it:
+/// the user has no modern suffix, so ModernSuffix is empty and UniqueModern is the gamertag
+/// without '#'. Each fits the component's buffer size (`GAMERTAG_SIZES`, terminator included),
+/// which titles allocate: a longer configured gamertag is cut at a character boundary.
+fn gamertag_component(tag: &str, component: u32) -> String {
+    if component == 2 {
+        return String::new(); // ModernSuffix: none
+    }
+    let max = match component {
+        0 => 15, // Classic: 15 characters
+        3 => 16, // UniqueModern: 16 rendered characters
+        _ => GAMERTAG_SIZES[1] - 1,
+    };
+    let mut end = 0;
+    for (i, c) in tag.char_indices() {
+        if i + c.len_utf8() > GAMERTAG_SIZES[component as usize] - 1 || tag[..i].chars().count() >= max {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    tag[..end].to_string()
+}
+
 pub unsafe extern "system" fn XUserGetGamertag(h: *mut c_void, component: u32, size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
     if !valid_user(h) || component > 3 {
         return E_INVALIDARG;
     }
-    let tag = crate::state::config().gamertag.clone();
-    let value = match component {
-        2 => String::new(), // ModernSuffix: none
-        3 => format!("{tag}#0001"),
-        _ => tag,
-    };
+    let value = gamertag_component(&crate::state::config().gamertag, component);
     if size < value.len() + 1 {
         if !used.is_null() {
             *used = value.len() + 1;
@@ -975,6 +993,23 @@ mod tests {
     }
 
     #[test]
+    fn gamertag_components_are_consistent_and_fit_their_buffers() {
+        // no modern suffix: UniqueModern is the gamertag itself, not "Player1#0001"
+        let parts: Vec<String> = (0..4).map(|c| gamertag_component("Player1", c)).collect();
+        assert_eq!(parts, ["Player1", "Player1", "", "Player1"]);
+        // a long configured gamertag still fits each documented buffer
+        let long = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        assert_eq!(gamertag_component(long, 0), "ABCDEFGHIJKLMNO");
+        assert_eq!(gamertag_component(long, 1), long);
+        assert_eq!(gamertag_component(long, 3), "ABCDEFGHIJKLMNOP");
+        // cut at a character boundary
+        assert_eq!(gamertag_component("ÁÉÍÓÚÁÉÍÓÚÁÉÍÓÚÁÉ", 0), "ÁÉÍÓÚÁÉÍÓÚÁÉÍÓÚ".chars().take(7).collect::<String>());
+        for c in 0..4 {
+            assert!(gamertag_component(&long.repeat(10), c).len() < GAMERTAG_SIZES[c as usize]);
+        }
+    }
+
+    #[test]
     fn user_add_and_queries() {
     let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -989,6 +1024,10 @@ mod tests {
             assert_eq!(XUserGetGamertag(u, 0, 16, tag.as_mut_ptr(), &mut used), S_OK);
             assert_eq!(&tag[..used - 1], b"Player1");
             assert_eq!(XUserGetGamertag(u, 0, 3, tag.as_mut_ptr(), &mut used), E_NOT_SUFFICIENT_BUFFER);
+            // no modern suffix: UniqueModern matches it
+            let mut unique = [0u8; 101];
+            assert_eq!(XUserGetGamertag(u, 3, 101, unique.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(&unique[..used - 1], b"Player1");
             let mut id = 0u64;
             assert_eq!(XUserGetId(u, &mut id), S_OK);
             assert_ne!(id, 0);
