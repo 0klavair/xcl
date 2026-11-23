@@ -1039,6 +1039,11 @@ mod tests {
     #[test]
     fn system_info() {
         unsafe {
+            // a buffer of XSystemConsoleIdBytes (39) takes the console id
+            let mut id = [0u8; 39];
+            let mut used = 0usize;
+            assert_eq!(XSystemGetConsoleId(39, id.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(&id[..used - 1], b"00000000.00000000.00000000.00000000.00");
             assert_eq!(XSystemGetDeviceType(), DEVICE_XBOX_SCARLETT_ANACONDA);
             let info = XSystemGetAnalyticsInfo();
             assert!(info.os_version.major >= 10);

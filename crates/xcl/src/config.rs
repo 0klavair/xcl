@@ -148,7 +148,7 @@ impl Default for Config {
             console_type_raw: 6,
             gamertag: "Player1".into(),
             user_id: 0x0009_0000_0000_0001,
-            console_id: "XCL00000000000000000000000000000000000001".into(),
+            console_id: CONSOLE_ID.into(),
             sandbox_id: "RETAIL".into(),
             title_memory_mb: 0,
             title_memory: "auto".into(),
@@ -182,6 +182,12 @@ const HEADER: &str = "# XCL – title configuration. Created automatically; you 
 # aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
 # stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
 
+/// What XSystemGetConsoleId returns on a PC and in RETAIL (the default sandbox): the console id
+/// format, 38 characters, which titles size their buffer for (XSystemConsoleIdBytes).
+pub const CONSOLE_ID: &str = "00000000.00000000.00000000.00000000.00";
+/// The default before: 41 characters, too long for that buffer.
+const OLD_CONSOLE_ID: &str = "XCL00000000000000000000000000000000000001";
+
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
@@ -190,6 +196,10 @@ impl Config {
                 // default mounts added since the file was written
                 for (k, v) in Config::default().mounts {
                     c.mounts.entry(k).or_insert(v);
+                }
+                // the old default console id, written into every xcl.toml created before
+                if c.console_id == OLD_CONSOLE_ID {
+                    c.console_id = CONSOLE_ID.into();
                 }
                 Ok(c)
             }
@@ -276,6 +286,21 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+    }
+
+    #[test]
+    fn the_console_id_fits_the_console_id_buffer() {
+        // XSystemConsoleIdBytes: the 38-character console id format plus its terminator
+        assert_eq!(Config::default().console_id.len() + 1, 39);
+        let dir = std::env::temp_dir().join(format!("xcl_cfg_console_id_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("xcl.toml");
+        // an xcl.toml written with the old default gets the new one; a user's own id is kept
+        std::fs::write(&path, format!("console_id = \"{OLD_CONSOLE_ID}\"\n")).unwrap();
+        assert_eq!(Config::load_or_create(&path).unwrap().console_id, CONSOLE_ID);
+        std::fs::write(&path, "console_id = \"12345678.12345678.12345678.12345678.12\"\n").unwrap();
+        assert_eq!(Config::load_or_create(&path).unwrap().console_id, "12345678.12345678.12345678.12345678.12");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
