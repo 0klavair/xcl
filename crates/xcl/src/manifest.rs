@@ -37,12 +37,8 @@ pub fn parse(xml: &str) -> Manifest {
 pub fn load(game_root: &Path) -> Option<Manifest> {
     let p = std::fs::read_dir(game_root).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("MicrosoftGame.Config")))?;
     let raw = std::fs::read(p).ok()?;
-    // UTF-8 or UTF-16 LE (with BOM)
-    let text = if raw.starts_with(&[0xFF, 0xFE]) {
-        String::from_utf16_lossy(&raw[2..].chunks(2).map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)])).collect::<Vec<_>>())
-    } else {
-        String::from_utf8_lossy(&raw).into_owned()
-    };
+    // the launcher's decoding: UTF-8, or UTF-16 with its BOM; comments removed
+    let text = crate::launcher::decode_game_config(&raw)?;
     Some(parse(&text))
 }
 
@@ -66,6 +62,29 @@ mod tests {
         assert_eq!(m.pls_mb, Some(2048));
         assert_eq!((m.anaconda_memory.as_deref(), m.lockhart_memory.as_deref()), (Some("Advanced"), Some("Advanced")));
         assert_eq!(parse("<Game/>"), Manifest::default());
+    }
+
+    #[test]
+    fn commented_out_settings_are_not_read() {
+        let dir = std::env::temp_dir().join(format!("xcl_manifest_comments_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = r#"<Game configVersion="1">
+  <!-- <PersistentLocalStorage><SizeMB>4096</SizeMB></PersistentLocalStorage> -->
+  <PersistentLocalStorage><SizeMB>1024</SizeMB></PersistentLocalStorage>
+  <VirtualMachine>
+    <!--<XboxAnacondaTitleMemory>Advanced</XboxAnacondaTitleMemory>-->
+  </VirtualMachine>
+</Game>"#;
+        let want = Manifest { pls_mb: Some(1024), ..Default::default() };
+        std::fs::write(dir.join("MicrosoftGame.config"), xml).unwrap();
+        assert_eq!(load(&dir), Some(want.clone()));
+        // UTF-16 big-endian, as the launcher reads it too
+        let mut raw = vec![0xFE, 0xFF];
+        raw.extend(xml.encode_utf16().flat_map(u16::to_be_bytes));
+        std::fs::write(dir.join("MicrosoftGame.config"), raw).unwrap();
+        assert_eq!(load(&dir), Some(want));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

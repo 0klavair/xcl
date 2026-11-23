@@ -86,7 +86,27 @@ fn xml_attr(xml: &str, tag: &str, attr: &str) -> Option<String> {
     xml_attrs(xml, tag, attr).into_iter().next()
 }
 
-fn decode_game_config(raw: &[u8]) -> Option<String> {
+/// MicrosoftGame.config as text, without its comments: a commented-out `<Executable>` or
+/// `<Identity>` is not the game's.
+pub(crate) fn decode_game_config(raw: &[u8]) -> Option<String> {
+    decode_text(raw).map(|xml| without_comments(&xml))
+}
+
+fn without_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find("<!--") {
+        out.push_str(&rest[..i]);
+        match rest[i + 4..].find("-->") {
+            Some(j) => rest = &rest[i + 4 + j + 3..],
+            None => return out, // unterminated: the rest is comment
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_text(raw: &[u8]) -> Option<String> {
     let (body, little_endian) = if let Some(body) = raw.strip_prefix(&[0xFF, 0xFE]) {
         (body, true)
     } else if let Some(body) = raw.strip_prefix(&[0xFE, 0xFF]) {
@@ -465,6 +485,28 @@ mod tests {
         assert_eq!(display_name(&dir.0), None);
         std::fs::remove_file(dir.0.join("MicrosoftGame.config")).unwrap();
         assert_eq!(display_name(&dir.0), None);
+    }
+
+    #[test]
+    fn commented_out_entries_are_not_the_games() {
+        let dir = TempDir::new("config_comments");
+        std::fs::write(dir.0.join("old.exe"), b"MZ").unwrap();
+        std::fs::write(dir.0.join("game.exe"), b"MZ").unwrap();
+        let xml = r#"<Game>
+  <!-- <Identity Name="Contoso.Old"/> -->
+  <Identity Name="Contoso.Test"/>
+  <ExecutableList>
+    <!--<Executable Name="old.exe" Id="Game"/>-->
+    <Executable Name="game.exe" Id="Game"/>
+  </ExecutableList>
+  <ShellVisuals DefaultDisplayName="Contoso Game"/>
+  <!-- <ShellVisuals DefaultDisplayName="Old Name"/>
+</Game>"#;
+        std::fs::write(dir.0.join("MicrosoftGame.config"), xml).unwrap();
+        assert_eq!(read_game_config(&dir.0), (vec!["game.exe".into()], Some("Contoso.Test".into())));
+        assert_eq!(pick_exe(&dir.0).unwrap(), dir.0.join("game.exe"));
+        assert_eq!(display_name(&dir.0).as_deref(), Some("Contoso Game"));
+        assert_eq!(without_comments("a<!--b-->c<!--d-->e<!--f"), "ace");
     }
 
     #[test]
