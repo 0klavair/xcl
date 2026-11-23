@@ -22,10 +22,11 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -392,15 +393,17 @@ fn window_thread() {
         let title = window_name();
         let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (x, y) = window_position(&cfg.window_pos, w, h);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(inst.into()),
@@ -420,6 +423,45 @@ fn window_thread() {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// The XCL window's top-left from `window_pos` (`XCL_WINDOW_POS` overrides): "auto" keeps
+/// CW_USEDEFAULT (Windows may pick any monitor), "center" centers on the primary monitor's
+/// work area, "x,y" is clamped into the nearest monitor's work area — a multi-monitor desktop
+/// otherwise gets the window on whichever monitor Windows' cascade picks.
+unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
+    let env = std::env::var("XCL_WINDOW_POS").ok();
+    let mode = env.as_deref().unwrap_or(setting).trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    }
+    let work = |pt: POINT, flags: u32| -> Option<RECT> {
+        let mon = MonitorFromPoint(pt, MONITOR_FROM_FLAGS(flags));
+        if mon.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+    };
+    if mode.eq_ignore_ascii_case("center") {
+        let Some(r) = work(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY.0) else {
+            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        };
+        return (r.left + ((r.right - r.left) - w).max(0) / 2, r.top + ((r.bottom - r.top) - h).max(0) / 2);
+    }
+    let Some((xs, ys)) = mode.split_once(',') else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    let (Ok(x), Ok(y)) = (xs.trim().parse::<i32>(), ys.trim().parse::<i32>()) else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    // clamp into the work area of the monitor nearest the requested top-left
+    let Some(r) = work(POINT { x, y }, MONITOR_DEFAULTTONEAREST.0) else {
+        return (x, y);
+    };
+    (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)))
 }
 
 fn ensure_window() -> Option<HWND> {
@@ -884,6 +926,46 @@ impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
+    #[test]
+    fn window_position_modes() {
+        unsafe {
+            std::env::remove_var("XCL_WINDOW_POS");
+            assert_eq!(window_position("auto", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("nonsense", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("12,abc", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+
+            let (cx, cy) = window_position("center", 1280, 720);
+            if cx != CW_USEDEFAULT {
+                // centered on the primary work area: inside it, and not off its left/top
+                let mi = {
+                    let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    assert!(GetMonitorInfoW(mon, &mut mi).as_bool());
+                    mi
+                };
+                assert!(cx >= mi.rcWork.left && cy >= mi.rcWork.top);
+                assert!(cx + 1280 <= mi.rcWork.right || mi.rcWork.right - mi.rcWork.left < 1280);
+            }
+
+            // a position far outside every monitor clamps into the nearest work area
+            let (x, y) = window_position("100000,100000", 1280, 720);
+            let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+            assert!(!mon.is_invalid());
+
+            // the env override wins over the setting
+            std::env::set_var("XCL_WINDOW_POS", "center");
+            assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
+            std::env::remove_var("XCL_WINDOW_POS");
         }
     }
 }
