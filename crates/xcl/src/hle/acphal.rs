@@ -54,16 +54,67 @@ struct Apu {
 
 static APU: Mutex<Apu> = Mutex::new(Apu { regions: Vec::new(), next: 0x1000_0000 });
 
+const APU_BASE: u64 = 0x1000_0000;
+const APU_LIMIT: u64 = (u32::MAX as u64) + 1;
+
 impl Apu {
-    /// The APU address of `va` – in a known region, or a new region of `size` bytes there.
-    fn address(&mut self, va: usize, size: u32, owned: bool) -> u32 {
-        if let Some(r) = self.regions.iter().find(|r| va >= r.va && va - r.va < r.size.max(1) as usize) {
-            return r.apu + (va - r.va) as u32;
+    fn region_end(r: &Region) -> u64 {
+        let len = (r.size.max(1) as u64 + 0xFFF) & !0xFFF;
+        (r.apu as u64).saturating_add(len)
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> Option<u64> {
+        self.regions
+            .iter()
+            .filter(|r| {
+                let rs = r.apu as u64;
+                let re = Self::region_end(r);
+                start < re && rs < end
+            })
+            .map(Self::region_end)
+            .max()
+    }
+
+    fn find_free_range(&self, step: u64) -> Option<u32> {
+        if step == 0 || step > APU_LIMIT - APU_BASE {
+            return None;
         }
-        let apu = self.next;
-        self.next = self.next.wrapping_add((size.max(1) + 0xFFF) & !0xFFF);
+        // Fast path from `self.next`, then wrap once to `APU_BASE` to reclaim freed ranges.
+        for start_hint in [self.next as u64, APU_BASE] {
+            let mut cand = start_hint.max(APU_BASE);
+            while let Some(end) = cand.checked_add(step).filter(|&e| e <= APU_LIMIT) {
+                match self.overlaps(cand, end) {
+                    None => return Some(cand as u32),
+                    Some(skip_to) => {
+                        let next = (skip_to + 0xFFF) & !0xFFF;
+                        if next <= cand {
+                            break;
+                        }
+                        cand = next;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The APU address of `va` – in a known region (for non-owned mappings covering the full span),
+    /// or a new non-overlapping 32-bit APU range of `size` bytes.
+    fn address(&mut self, va: usize, size: u32, owned: bool) -> Option<u32> {
+        let span = size.max(1) as usize;
+        if !owned {
+            if let Some(r) = self.regions.iter().find(|r| {
+                va >= r.va && (va - r.va).saturating_add(span) <= r.size.max(1) as usize
+            }) {
+                return Some(r.apu + (va - r.va) as u32);
+            }
+        }
+        let step = (size.max(1) as u64 + 0xFFF) & !0xFFF;
+        let apu = self.find_free_range(step)?;
+        let next = (apu as u64) + step;
+        self.next = if next < APU_LIMIT { next as u32 } else { APU_BASE as u32 };
         self.regions.push(Region { va, size, apu, owned });
-        apu
+        Some(apu)
     }
 }
 
@@ -71,19 +122,20 @@ impl Apu {
 /// 64 KiB – VirtualAlloc's granularity – so MEM_RELEASE of it frees all)
 unsafe fn alloc_aligned(size: usize, align: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
-    let align = align.max(1).next_power_of_two();
+    let align = align.max(1).checked_next_power_of_two()?;
     if align <= 0x1_0000 {
         let p = VirtualAlloc(std::ptr::null(), size.max(1), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
         return (p != 0).then_some(p);
     }
+    let reserve = size.checked_add(align)?;
     // reserve enough to find an aligned start, then reserve exactly there
     for _ in 0..8 {
-        let p = VirtualAlloc(std::ptr::null(), size + align, MEM_RESERVE, PAGE_READWRITE) as usize;
+        let p = VirtualAlloc(std::ptr::null(), reserve, MEM_RESERVE, PAGE_READWRITE) as usize;
         if p == 0 {
             return None;
         }
         VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
-        let a = (p + align - 1) & !(align - 1);
+        let a = p.checked_add(align - 1)? & !(align - 1);
         let q = VirtualAlloc(a as *const c_void, size.max(1), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize;
         if q == a {
             return Some(q);
@@ -103,6 +155,7 @@ pub unsafe extern "system" fn ApuCreateHeap(size: u32, flags: u32) -> HRESULT {
 
 /// ApuAlloc(&va, &apu, size, alignment, flags)
 pub unsafe extern "system" fn ApuAlloc(va: *mut *mut c_void, apu: *mut u32, size: u32, alignment: u32, _flags: u32) -> HRESULT {
+    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
     if va.is_null() {
         return E_INVALIDARG;
     }
@@ -110,8 +163,12 @@ pub unsafe extern "system" fn ApuAlloc(va: *mut *mut c_void, apu: *mut u32, size
         *va = std::ptr::null_mut();
         return E_OUTOFMEMORY;
     };
+    let Some(a) = APU.lock().unwrap().address(p, size, true) else {
+        VirtualFree(p as *mut c_void, 0, MEM_RELEASE);
+        *va = std::ptr::null_mut();
+        return E_OUTOFMEMORY;
+    };
     *va = p as *mut c_void;
-    let a = APU.lock().unwrap().address(p, size, true);
     if !apu.is_null() {
         *apu = a;
     }
@@ -126,7 +183,11 @@ pub unsafe extern "system" fn ApuFree(va: *mut c_void) -> HRESULT {
     }
     let owned = {
         let mut g = APU.lock().unwrap();
-        let i = g.regions.iter().position(|r| r.va == va as usize);
+        let i = g
+            .regions
+            .iter()
+            .position(|r| r.va == va as usize && r.owned)
+            .or_else(|| g.regions.iter().position(|r| r.va == va as usize));
         i.map(|i| g.regions.swap_remove(i).owned).unwrap_or(false)
     };
     if owned {
@@ -137,10 +198,13 @@ pub unsafe extern "system" fn ApuFree(va: *mut c_void) -> HRESULT {
 
 /// ApuMapVirtualAddress(&apu, va, size): an APU address for the title's own memory
 pub unsafe extern "system" fn ApuMapVirtualAddress(apu: *mut u32, va: *mut c_void, size: u32) -> HRESULT {
-    if apu.is_null() {
+    if apu.is_null() || va.is_null() {
         return E_INVALIDARG;
     }
-    *apu = APU.lock().unwrap().address(va as usize, size, false);
+    let Some(a) = APU.lock().unwrap().address(va as usize, size, false) else {
+        return E_OUTOFMEMORY;
+    };
+    *apu = a;
     S_OK
 }
 
@@ -187,28 +251,66 @@ pub struct ShapeContexts {
 const CONTEXT_BYTES: u32 = 64;
 static SHAPE: Mutex<[usize; 5]> = Mutex::new([0; 5]);
 
-/// AcpHalAllocateShapeContexts(&contexts): an array of each kind in APU memory (none run)
-pub unsafe extern "system" fn AcpHalAllocateShapeContexts(c: *mut ShapeContexts) -> HRESULT {
+unsafe fn allocate_shape_contexts_with<F>(c: *mut ShapeContexts, mut alloc_fn: F) -> HRESULT
+where
+    F: FnMut(usize, u32) -> Result<*mut c_void, HRESULT>,
+{
     if c.is_null() {
         return E_INVALIDARG;
     }
     let c = &mut *c;
-    let mut arrays = SHAPE.lock().unwrap();
+    let mut sizes = [0u32; 5];
     for i in 0..5 {
-        c.contexts[i] = std::ptr::null_mut();
-        if c.counts[i] == 0 {
+        if c.counts[i] != 0 {
+            let Some(bytes) = c.counts[i].checked_mul(CONTEXT_BYTES) else {
+                c.contexts = [std::ptr::null_mut(); 5];
+                return E_OUTOFMEMORY;
+            };
+            sizes[i] = bytes;
+        }
+    }
+    let mut new_arrays = [0usize; 5];
+    let mut new_ptrs = [std::ptr::null_mut(); 5];
+    for i in 0..5 {
+        if sizes[i] == 0 {
             continue;
         }
-        let mut va = std::ptr::null_mut();
-        let hr = ApuAlloc(&mut va, std::ptr::null_mut(), c.counts[i].saturating_mul(CONTEXT_BYTES), 256, 0);
-        if hr < 0 {
-            return hr;
+        match alloc_fn(i, sizes[i]) {
+            Ok(va) => {
+                new_arrays[i] = va as usize;
+                new_ptrs[i] = va;
+            }
+            Err(hr) => {
+                for &a in &new_arrays[..i] {
+                    if a != 0 {
+                        ApuFree(a as *mut c_void);
+                    }
+                }
+                c.contexts = [std::ptr::null_mut(); 5];
+                return hr;
+            }
         }
-        arrays[i] = va as usize;
-        c.contexts[i] = va;
+    }
+    let old_arrays = {
+        let mut arrays = SHAPE.lock().unwrap();
+        let old = std::mem::replace(&mut *arrays, new_arrays);
+        c.contexts = new_ptrs;
+        old
+    };
+    for a in old_arrays.into_iter().filter(|&a| a != 0) {
+        ApuFree(a as *mut c_void);
     }
     crate::xlog_info!("acphal: SHAPE contexts {:?} (they do not run: no audio from the console's mixer)", c.counts);
     S_OK
+}
+
+/// AcpHalAllocateShapeContexts(&contexts): an array of each kind in APU memory (none run)
+pub unsafe extern "system" fn AcpHalAllocateShapeContexts(c: *mut ShapeContexts) -> HRESULT {
+    allocate_shape_contexts_with(c, |_, bytes| {
+        let mut va = std::ptr::null_mut();
+        let hr = ApuAlloc(&mut va, std::ptr::null_mut(), bytes, 256, 0);
+        if hr < 0 { Err(hr) } else { Ok(va) }
+    })
 }
 
 /// AcpHalReleaseShapeContexts()
@@ -279,7 +381,10 @@ impl Channel {
         }
         if self.frame_due(now) {
             let t = self.next_frame.unwrap_or(now) + FRAME;
-            self.next_frame = Some(t.max(now - FRAME * 8));
+            self.next_frame = Some(match now.checked_sub(FRAME * 8) {
+                Some(floor) => t.max(floor),
+                None => t,
+            });
             return Some(Message { kind: MSG_AUDIO_FRAME, ..Default::default() });
         }
         None
@@ -439,21 +544,76 @@ struct XApu {
     frames_per_output: u32,
 }
 
-/// XApuConnect(&input, &output, &handle)
-pub unsafe extern "system" fn XApuConnect(input: *const XApuConnectInput, output: *mut XApuConnectOutput, handle: *mut *mut c_void) -> HRESULT {
-    use windows_sys::Win32::System::Threading::CreateEventW;
+unsafe fn xapu_connect_with<FA, FE>(
+    input: *const XApuConnectInput,
+    output: *mut XApuConnectOutput,
+    handle: *mut *mut c_void,
+    alloc_fn: FA,
+    event_fn: FE,
+) -> HRESULT
+where
+    FA: FnOnce(usize, usize) -> Option<usize>,
+    FE: FnOnce() -> usize,
+{
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
     if input.is_null() || output.is_null() || handle.is_null() {
         return E_INVALIDARG;
     }
     let i = std::ptr::read_unaligned(input);
-    let data = if i.data_bytes != 0 { alloc_aligned(i.data_bytes as usize, 0x1_0000).unwrap_or(0) } else { 0 };
-    let ready = if i.options & 8 != 0 { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize } else { 0 };
-    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(vec![2; i.streams.max(1) as usize]), data, ready, frames_per_output: i.frames_per_output });
+    let clear_out = || {
+        std::ptr::write_unaligned(output, XApuConnectOutput { data: std::ptr::null_mut(), ready: std::ptr::null_mut() });
+        *handle = std::ptr::null_mut();
+    };
+    let data = if i.data_bytes != 0 {
+        let Some(p) = alloc_fn(i.data_bytes as usize, 0x1_0000) else {
+            clear_out();
+            return E_OUTOFMEMORY;
+        };
+        p
+    } else {
+        0
+    };
+    let ready = if i.options & 8 != 0 {
+        let e = event_fn();
+        if e == 0 {
+            if data != 0 {
+                VirtualFree(data as *mut c_void, 0, MEM_RELEASE);
+            }
+            clear_out();
+            return E_OUTOFMEMORY;
+        }
+        e
+    } else {
+        0
+    };
+    let n_streams = i.streams.max(1) as usize;
+    let mut channels = Vec::new();
+    if channels.try_reserve_exact(n_streams).is_err() {
+        if data != 0 {
+            VirtualFree(data as *mut c_void, 0, MEM_RELEASE);
+        }
+        if ready != 0 {
+            CloseHandle(ready as _);
+        }
+        clear_out();
+        return E_OUTOFMEMORY;
+    }
+    channels.resize(n_streams, 2);
+    let x = Box::new(XApu { results: Mutex::new(VecDeque::new()), channels: Mutex::new(channels), data, ready, frames_per_output: i.frames_per_output });
     std::ptr::write_unaligned(output, XApuConnectOutput { data: data as *mut c_void, ready: ready as *mut c_void });
     *handle = Box::into_raw(x) as *mut c_void;
     let (process, streams) = (i.process, i.streams);
     crate::xlog_info!("xapu: decoder connected (process {process}, {streams} streams) – it answers with silence");
     S_OK
+}
+
+/// XApuConnect(&input, &output, &handle)
+pub unsafe extern "system" fn XApuConnect(input: *const XApuConnectInput, output: *mut XApuConnectOutput, handle: *mut *mut c_void) -> HRESULT {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    xapu_connect_with(input, output, handle, |sz, al| alloc_aligned(sz, al), || {
+        CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize
+    })
 }
 
 /// XApuDisconnect(handle)
@@ -644,6 +804,130 @@ mod tests {
             assert!(buf[..256 * 8].iter().all(|&b| b == 0) && buf[256 * 8] == 0xAA);
             assert_eq!(XApuDequeueResult(h, &mut r), XAPU_NO_RESULTS);
             assert_eq!(XApuDisconnect(h), S_OK);
+        }
+    }
+
+    #[test]
+    fn apu_address_prevents_overflow_overlap_and_rejects_null_va() {
+        // u32::MAX cannot fit within [APU_BASE, 4 GiB) without wrapping.
+        let mut apu = Apu { regions: Vec::new(), next: 0x1000_0000 };
+        assert_eq!(apu.address(0x1_0000_0000, u32::MAX, false), None);
+
+        // Near the 4 GiB boundary: a region that would cross u32::MAX wraps to APU_BASE without
+        // overlapping an existing live region at APU_BASE.
+        let first = apu.address(0x2_0000_0000, 0x2000, false).unwrap();
+        assert_eq!(first, 0x1000_0000);
+        apu.next = 0xFFFF_F000;
+        let second = apu.address(0x3_0000_0000, 0x2000, false).unwrap();
+        assert_eq!(second, 0x1000_2000, "wrapped range must skip past live region at APU_BASE");
+
+        // Owned allocation must register its own entry even if an unowned mapping covers the VA.
+        let owned = apu.address(0x2_0000_0000, 0x1000, true).unwrap();
+        assert_ne!(owned, first);
+        assert!(apu.regions.iter().any(|r| r.apu == owned && r.owned));
+
+        unsafe {
+            let mut out = 0xDEAD_BEEFu32;
+            assert_eq!(ApuMapVirtualAddress(&mut out, std::ptr::null_mut(), 16), E_INVALIDARG);
+            assert_eq!(out, 0xDEAD_BEEF);
+        }
+    }
+
+    #[test]
+    fn shape_contexts_overflow_and_partial_failure_roll_back() {
+        unsafe {
+            // Overflow on counts[1] * CONTEXT_BYTES fails cleanly without allocating slot 0.
+            let mut c = ShapeContexts {
+                counts: [4, u32::MAX / CONTEXT_BYTES + 1, 0, 0, 0],
+                reserved: 0,
+                contexts: [0x1234 as *mut c_void; 5],
+            };
+            assert_eq!(AcpHalAllocateShapeContexts(&mut c), E_OUTOFMEMORY);
+            assert!(c.contexts.iter().all(|p| p.is_null()));
+
+            // Partial failure after slot 0 allocated via real ApuAlloc rolls back slot 0.
+            let mut first_apu = 0u32;
+            let mut c2 = ShapeContexts {
+                counts: [4, 4, 0, 0, 0],
+                reserved: 0,
+                contexts: [0x1234 as *mut c_void; 5],
+            };
+            let hr = allocate_shape_contexts_with(&mut c2, |idx, bytes| {
+                if idx == 0 {
+                    let mut va = std::ptr::null_mut();
+                    let hr = ApuAlloc(&mut va, &mut first_apu, bytes, 256, 0);
+                    assert_eq!(hr, S_OK);
+                    Ok(va)
+                } else {
+                    Err(E_OUTOFMEMORY)
+                }
+            });
+            assert_eq!(hr, E_OUTOFMEMORY);
+            assert!(c2.contexts.iter().all(|p| p.is_null()));
+            assert!(ApuMapApuAddress(first_apu).is_null(), "slot 0 must be freed on rollback");
+
+            // Success followed by a failed replacement preserves the live allocation;
+            // a subsequent successful replacement frees the prior allocation cleanly.
+            let mut c3 = ShapeContexts { counts: [2, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            assert_eq!(AcpHalAllocateShapeContexts(&mut c3), S_OK);
+            let old_va = c3.contexts[0];
+            assert!(!old_va.is_null());
+            let mut old_apu = 0u32;
+            assert_eq!(ApuMapVirtualAddress(&mut old_apu, old_va, 128), S_OK);
+
+            let mut failed_replace = ShapeContexts { counts: [4, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            assert_eq!(allocate_shape_contexts_with(&mut failed_replace, |_, _| Err(E_OUTOFMEMORY)), E_OUTOFMEMORY);
+            assert_eq!(ApuMapApuAddress(old_apu), old_va, "failed replacement must preserve prior live allocation");
+
+            let mut c4 = ShapeContexts { counts: [3, 0, 0, 0, 0], reserved: 0, contexts: [std::ptr::null_mut(); 5] };
+            assert_eq!(AcpHalAllocateShapeContexts(&mut c4), S_OK);
+            assert!(!c4.contexts[0].is_null());
+            assert!(ApuMapApuAddress(old_apu).is_null(), "prior SHAPE context allocation must be freed on replace");
+            assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        }
+    }
+
+    #[test]
+    fn xapu_connect_returns_oom_and_cleans_up_on_failure() {
+        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE};
+        unsafe {
+            let input = XApuConnectInput { process: 1, streams: 2, commands_per_stream: 4, data_bytes: 0x1000, frames_per_output: 256, options: 8 };
+            let sentinel = 0x1234 as *mut c_void;
+
+            // Data allocation failure returns E_OUTOFMEMORY and clears output + handle.
+            let mut out = XApuConnectOutput { data: sentinel, ready: sentinel };
+            let mut h = sentinel;
+            let hr = xapu_connect_with(&input, &mut out, &mut h, |_, _| None, || unreachable!());
+            assert_eq!(hr, E_OUTOFMEMORY);
+            assert!(h.is_null());
+            assert!({ out.data }.is_null() && { out.ready }.is_null());
+
+            // Event creation failure frees the allocated data buffer and returns E_OUTOFMEMORY.
+            let mut out2 = XApuConnectOutput { data: sentinel, ready: sentinel };
+            let mut h2 = sentinel;
+            let mut allocated_ptr = 0usize;
+            let mut event_attempted = false;
+            let hr2 = xapu_connect_with(
+                &input,
+                &mut out2,
+                &mut h2,
+                |sz, al| {
+                    let p = alloc_aligned(sz, al);
+                    allocated_ptr = p.unwrap_or(0);
+                    p
+                },
+                || {
+                    event_attempted = true;
+                    0
+                },
+            );
+            assert_eq!(hr2, E_OUTOFMEMORY);
+            assert!(allocated_ptr != 0 && event_attempted);
+            assert!(h2.is_null());
+            assert!({ out2.data }.is_null() && { out2.ready }.is_null());
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(allocated_ptr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+            assert_eq!(mbi.State, MEM_FREE, "data buffer must be released when event creation fails");
         }
     }
 }
