@@ -1475,6 +1475,9 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -2631,6 +2634,16 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     }
 }
 
+/// user SGPRs of the console CS of a translated compute pipeline
+static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// How many user SGPRs the console compute shader of a translated pipeline has (None: not
+/// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
+pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
 /// The root signature a translated pipeline state was created with.
 pub fn pso_root_signature(pso: usize) -> Option<usize> {
     let pso = super::pso_async::resolve(pso);
@@ -2727,6 +2740,9 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
     note_translated_compute(hr, ppv);
     crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
     Some(Ok(hr))

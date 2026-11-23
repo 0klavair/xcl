@@ -738,19 +738,21 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
+    // a pipeline still being built in the background is waited for
+    let real = super::pso_async::resolve_wait(pso);
+    // a compute shader takes no more arguments from registers than it has (`inline_for`)
+    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
         Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data(l, &args, table_at as u64),
+        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
     let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
