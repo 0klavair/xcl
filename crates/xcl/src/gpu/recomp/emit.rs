@@ -3328,12 +3328,33 @@ impl Em {
             Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
             _ => false,
         };
+        // ADDTID forms have no ADDR VGPR: byte address = M0[15:0] + offset16 + 4 * lane_id.
+        if matches!(name, "ds_write_addtid_b32" | "ds_read_addtid_b32") {
+            if f("GDS") != 0 {
+                return Err("GDS");
+            }
+            self.uses_lds = true;
+            let m0 = self.sreg(124);
+            let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
+            let slot = format!("xcl_lds[(({at}) >> 2) & 8191u]");
+            if name == "ds_write_addtid_b32" {
+                let src = self.vreg(f("DATA0"));
+                self.line(&format!("if ({act}) {{ {slot} = {src}; }}"));
+                if gs_phase {
+                    self.line(&format!("if ({act}) xcl_gs_base = min(xcl_gs_base, {at});"));
+                }
+            } else {
+                let dst = self.vreg(f("VDST"));
+                self.line(&format!("if ({act}) {{ {dst} = {slot}; }}"));
+            }
+            return Ok(());
+        }
         self.uses_lds = true;
+        let lds = |at: String| format!("xcl_lds[(({at}) >> 2) & 8191u]");
         // the address is read before any result is written (ds_read2_b32 v[0:1], v0 …)
         let addr = self.vreg(f("ADDR"));
         let a = format!("{t}_ad");
         self.line(&format!("uint {a} = {addr};"));
-        let lds = |at: String| format!("xcl_lds[(({at}) >> 2) & 8191u]");
         let mut st = Vec::new();
         let rw = |n: &str| -> Option<(bool, u64, u64, bool)> {
             // (write?, dwords per element, stride of offsets (bytes), two elements?)
