@@ -179,8 +179,8 @@ fn dpp16_src(ctrl: u64) -> Option<String> {
     let n = ctrl & 15;
     Some(match ctrl {
         0x000..=0x0FF => format!("(int)((lane_id & ~3u) | (({ctrl}u >> (2u * (lane_id & 3u))) & 3u))"),
-        0x101..=0x10F => format!("(((lane_id & 15u) + {n}u < 16u) ? (int)(lane_id + {n}u) : -1)"),
-        0x111..=0x11F => format!("(((lane_id & 15u) >= {n}u) ? (int)(lane_id - {n}u) : -1)"),
+        0x101..=0x10F => format!("select((lane_id & 15u) + {n}u < 16u, (int)(lane_id + {n}u), -1)"),
+        0x111..=0x11F => format!("select((lane_id & 15u) >= {n}u, (int)(lane_id - {n}u), -1)"),
         0x121..=0x12F => format!("(int)((lane_id & ~15u) | (((lane_id & 15u) - {n}u) & 15u))"),
         0x140 => "(int)((lane_id & ~15u) | (15u - (lane_id & 15u)))".into(),
         0x141 => "(int)((lane_id & ~15u) | (lane_id & 8u) | (7u - (lane_id & 7u)))".into(),
@@ -1020,7 +1020,7 @@ impl Em {
             let dst = Dst::S(sd);
             match name {
                 "s_movk_i32" => self.write32(&dst, &hex(k_s)),
-                "s_cmovk_i32" => self.write32(&dst, &format!("(scc != 0u) ? {} : {cur}", hex(k_s))),
+                "s_cmovk_i32" => self.write32(&dst, &format!("select(scc != 0u, {}, {cur})", hex(k_s))),
                 "s_addk_i32" => {
                     let t = self.t();
                     self.line(&format!("uint {t} = {cur} + {};", hex(k_s)));
@@ -1165,7 +1165,7 @@ impl Em {
                     Dst::S(n) => self.sreg(*n),
                     _ => "0u".into(),
                 };
-                (format!("(scc != 0u) ? {a} : {cur}"), None)
+                (format!("select(scc != 0u, {a}, {cur})"), None)
             }
             "s_not_b32" => (format!("~{a}"), Some(format!("{t} != 0u"))),
             "s_brev_b32" => (format!("reversebits({a})"), None),
@@ -1209,7 +1209,7 @@ impl Em {
             "s_max_u32" => (format!("max({a}, {b})"), Some(format!("{a} > {b}"))),
             "s_min_i32" => (format!("(uint)min((int){a}, (int){b})"), Some(format!("(int){a} < (int){b}"))),
             "s_max_i32" => (format!("(uint)max((int){a}, (int){b})"), Some(format!("(int){a} > (int){b}"))),
-            "s_cselect_b32" => (format!("(scc != 0u) ? {a} : {b}"), None),
+            "s_cselect_b32" => (format!("select(scc != 0u, {a}, {b})"), None),
             "s_wqm_b32" => (format!("wqm({a})"), Some(format!("{t} != 0u"))),
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 let cur = match &dst {
@@ -1327,22 +1327,22 @@ impl Em {
                     Dst::S(n) => (self.sreg(*n), self.sreg(*n + 1)),
                     _ => ("0u".into(), "0u".into()),
                 };
-                (format!("(scc != 0u) ? {al} : {}", cur.0), format!("(scc != 0u) ? {ah} : {}", cur.1), None)
+                (format!("select(scc != 0u, {al}, {})", cur.0), format!("select(scc != 0u, {ah}, {})", cur.1), None)
             }
             "s_not_b64" => (format!("~{al}"), format!("~{ah}"), Some(nz.clone())),
-            "s_cselect_b64" => (format!("(scc != 0u) ? {al} : {bl}"), format!("(scc != 0u) ? {ah} : {bh}"), None),
+            "s_cselect_b64" => (format!("select(scc != 0u, {al}, {bl})"), format!("select(scc != 0u, {ah}, {bh})"), None),
             "s_wqm_b64" => (format!("wqm({al})"), format!("wqm({ah})"), Some(nz.clone())),
             "s_brev_b64" => (format!("reversebits({ah})"), format!("reversebits({al})"), None),
             "s_bcnt1_i32_b64" => (format!("countbits({al}) + countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
             "s_bcnt0_i32_b64" => (format!("64u - countbits({al}) - countbits({ah})"), "0u".into(), Some(format!("{t0} != 0u"))),
             "s_ff1_i32_b64" => {
-                (format!("({al} != 0u) ? firstbitlow({al}) : (({ah} != 0u) ? 32u + firstbitlow({ah}) : 0xFFFFFFFFu)"), "0u".into(), None)
+                (format!("select({al} != 0u, firstbitlow({al}), select({ah} != 0u, 32u + firstbitlow({ah}), 0xFFFFFFFFu))"), "0u".into(), None)
             }
             "s_ff0_i32_b64" => {
-                (format!("(~{al} != 0u) ? firstbitlow(~{al}) : ((~{ah} != 0u) ? 32u + firstbitlow(~{ah}) : 0xFFFFFFFFu)"), "0u".into(), None)
+                (format!("select(~{al} != 0u, firstbitlow(~{al}), select(~{ah} != 0u, 32u + firstbitlow(~{ah}), 0xFFFFFFFFu))"), "0u".into(), None)
             }
             "s_flbit_i32_b64" => (
-                format!("({ah} != 0u) ? 31u - firstbithigh({ah}) : (({al} != 0u) ? 63u - firstbithigh({al}) : 0xFFFFFFFFu)"),
+                format!("select({ah} != 0u, 31u - firstbithigh({ah}), select({al} != 0u, 63u - firstbithigh({al}), 0xFFFFFFFFu))"),
                 "0u".into(),
                 None,
             ),
@@ -1351,7 +1351,7 @@ impl Em {
                 let (nl, nh) = (self.t(), self.t());
                 self.line(&format!("uint {nl} = select((int){ah} < 0, ~{al}, {al}); uint {nh} = select((int){ah} < 0, ~{ah}, {ah});"));
                 (
-                    format!("({nh} != 0u) ? 31u - firstbithigh({nh}) : (({nl} != 0u) ? 63u - firstbithigh({nl}) : 0xFFFFFFFFu)"),
+                    format!("select({nh} != 0u, 31u - firstbithigh({nh}), select({nl} != 0u, 63u - firstbithigh({nl}), 0xFFFFFFFFu))"),
                     "0u".into(),
                     None,
                 )
@@ -1423,7 +1423,7 @@ impl Em {
             self.line(&format!("{lo} = 0u; {hi} = 0u;"));
             return Ok(());
         }
-        let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
+        let count: usize = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
             "dword" => 1,
             "dwordx2" => 2,
             "dwordx4" => 4,
@@ -1443,22 +1443,48 @@ impl Em {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
             self.window(&d1);
             self.line(&format!("uint {t}_off = {} + {soff};", hex(imm)));
-            self.line(&format!("uint {t}_lim = ((({d1} >> 16) & 0x3FFFu) == 0u) ? {d2} : {d2} * (({d1} >> 16) & 0x3FFFu);"));
-            for i in 0..count {
-                let v = format!("{t}_{i}");
-                self.line(&format!("uint {v} = ({t}_off + {}u < {t}_lim) ? mem.Load(({d0} + {t}_off + {}u) & ~3u) : 0u;", 4 * i, 4 * i));
-                vals.push(v);
+            self.line(&format!("uint {t}_st = ({d1} >> 16) & 0x3FFFu;"));
+            self.line(&format!("uint {t}_lim = select({t}_st == 0u, {d2}, {d2} * {t}_st);"));
+            self.line(&format!("uint {t}_a = ({d0} + {t}_off) & ~3u;"));
+            // Branch-free: a dword past num_records reads offset 0 (always in the window) and
+            // comes out 0. HLSL 2021's `?:` is a branch, and with several memory windows every
+            // access is a switch between them (`windowed`): one per dword made DXC several
+            // times slower on big programs. Four dwords share one switch (`xcl_loadx4`).
+            if count == 1 {
+                self.line(&format!("bool {t}_in = {t}_off < {t}_lim;"));
+                self.line(&format!("uint {t}_0 = select({t}_in, mem.Load(select({t}_in, {t}_a, 0u)), 0u);"));
+                vals.push(format!("{t}_0"));
+            } else {
+                for g in 0..count.div_ceil(4) {
+                    let n = (count - 4 * g).min(4);
+                    let o = (0..4).map(|k| format!("{}u", 16 * g + 4 * k.min(n - 1))).collect::<Vec<_>>().join(", ");
+                    self.line(&format!("bool4 {t}_in{g} = {t}_off + uint4({o}) < {t}_lim;"));
+                    self.line(&format!("uint4 {t}_g{g} = select({t}_in{g}, xcl_loadx4(select({t}_in{g}, {t}_a + uint4({o}), 0u)), 0u);"));
+                    vals.extend(["x", "y", "z", "w"][..n].iter().map(|c| format!("{t}_g{g}.{c}")));
+                }
             }
         } else {
             let imm = ((imm << 11) as i32 >> 11) as u32; // 21-bit signed
             let b = self.sreg(sbase);
             let hi = self.sreg(sbase + 1);
             self.window(&hi);
-            self.line(&format!("uint {t}_a = {b} + {} + {soff};", hex(imm)));
-            for i in 0..count {
-                let v = format!("{t}_{i}");
-                self.line(&format!("uint {v} = mem.Load(({t}_a + {}u) & ~3u);", 4 * i));
-                vals.push(v);
+            // the dwords are contiguous: Load2 / Load4 (one window switch per four dwords)
+            self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            match count {
+                1 => {
+                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                    vals.push(format!("{t}_0"));
+                }
+                2 => {
+                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                    vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
+                }
+                _ => {
+                    for g in 0..count / 4 {
+                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                        vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
+                    }
+                }
             }
         }
         // split wave64, a coherent load (GLC / DLC: memory other waves may be writing): both
@@ -1570,13 +1596,26 @@ impl Em {
         }
         match kind {
             BufKind::Load => {
-                let mut assigns = Vec::new();
-                for i in 0..count {
-                    let ok = in_range(format!("{}u", 4 * i + 4));
-                    let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = {ok} ? mem.Load(({t}_a + {}u) & ~3u) : 0u;", 4 * i));
+                // branch-free (see `smem`): a lane that is inactive or out of range reads offset
+                // 0 and keeps its register / gets 0; one window switch per four dwords
+                self.line(&format!("bool {t}_act = {act};"));
+                if count == 1 {
+                    let ok = in_range("4u".into());
+                    let v = self.vreg(vdata);
+                    self.line(&format!("bool {t}_ok = {ok};"));
+                    self.line(&format!("uint {t}_v = mem.Load(select(and({t}_act, {t}_ok), {t}_a & ~3u, 0u));"));
+                    self.line(&format!("{v} = select({t}_act, select({t}_ok, {t}_v, 0u), {v});"));
+                } else {
+                    let oks: Vec<String> = (0..4).map(|i| in_range(format!("{}u", 4 * i.min(count - 1) + 4))).collect();
+                    let o = (0..4).map(|i| format!("{}u", 4 * i.min(count - 1))).collect::<Vec<_>>().join(", ");
+                    self.line(&format!("bool4 {t}_ok = bool4({});", oks.join(", ")));
+                    self.line(&format!("uint4 {t}_v = xcl_loadx4(select(and({t}_act, {t}_ok), ({t}_a & ~3u) + uint4({o}), 0u));"));
+                    for i in 0..count {
+                        let v = self.vreg(vdata + i);
+                        let c = ["x", "y", "z", "w"][i as usize];
+                        self.line(&format!("{v} = select({t}_act, select({t}_ok.{c}, {t}_v.{c}, 0u), {v});"));
+                    }
                 }
-                self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
             BufKind::Store => {
                 let mut st = Vec::new();
@@ -1825,7 +1864,7 @@ impl Em {
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
                 // (float): the value of an int / uint input, not its bits (see v_interp_mov_f32)
-                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
+                self.line(&format!("{v} = select({act}, asuint((float){src}), {v});"));
             }
             "v_interp_mov_f32" => {
                 if ij != 2 {
@@ -1838,14 +1877,14 @@ impl Em {
                 // nothing, with the converted value (never 1 or 2) it draws the text (red; whether
                 // the console's is another colour is not known). Open: why those branches draw
                 // nothing (they sample the font with gradients from ds_swizzle derivatives).
-                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
+                self.line(&format!("{v} = select({act}, asuint((float){src}), {v});"));
             }
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
                 let h = to_f16_expr(self.dynamic_f16_rm, &format!("(float){src}"));
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
-                self.line(&format!("if ({act}) {v} = {e};"));
+                self.line(&format!("{v} = select({act}, {e}, {v});"));
             }
             _ => return Err("interpolation"),
         }
@@ -2011,21 +2050,23 @@ impl Em {
         let comps: Vec<u64> = (0..4).filter(|c| dmask >> c & 1 == 1).collect();
         // write the selected result components (`r` is a uint4 of raw bits); D16 packs halves
         let write_result = |s: &mut Self, r: &str, n: usize, sel: &dyn Fn(usize) -> u64, half: &dyn Fn(&str) -> String| {
-            let mut st = Vec::new();
+            // selects, not `if (act)`: a branch per image instruction is work for DXC on big
+            // programs, and the result is computed for every lane anyway
+            let a = format!("{r}_act");
+            s.line(&format!("bool {a} = {act};"));
             if d16 {
                 for k in (0..n).step_by(2) {
                     let v = s.vreg(vdata + k as u64 / 2);
                     let lo = half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k) as usize]));
                     let hi = if k + 1 < n { half(&format!("{r}.{}", ["x", "y", "z", "w"][sel(k + 1) as usize])) } else { "0u".into() };
-                    st.push(format!("{v} = ({lo} & 0xFFFFu) | ({hi} << 16);"));
+                    s.line(&format!("{v} = select({a}, ({lo} & 0xFFFFu) | ({hi} << 16), {v});"));
                 }
             } else {
                 for k in 0..n {
                     let v = s.vreg(vdata + k as u64);
-                    st.push(format!("{v} = {r}.{};", ["x", "y", "z", "w"][sel(k) as usize]));
+                    s.line(&format!("{v} = select({a}, {r}.{}, {v});", ["x", "y", "z", "w"][sel(k) as usize]));
                 }
             }
-            s.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
         };
         let f16 = |e: &str| format!("f32tof16(asfloat({e}))");
 
@@ -3138,7 +3179,7 @@ impl Em {
             "v_bfe_u32" => format!("bfe_u({a}, {b}, {c})"),
             "v_bfe_i32" => format!("(uint)bfe_i({a}, {b}, {c})"),
             "v_bfi_b32" => format!("({a} & {b}) | (~{a} & {c})"),
-            "v_bfm_b32" => format!("((({a} & 31u) == 0u) ? 0u : (0xFFFFFFFFu >> (32u - ({a} & 31u)))) << ({b} & 31u)"),
+            "v_bfm_b32" => format!("select(({a} & 31u) == 0u, 0u, 0xFFFFFFFFu >> (32u - ({a} & 31u))) << ({b} & 31u)"),
             "v_bcnt_u32_b32" => format!("countbits({a}) + {b}"),
             "v_perm_b32" => format!("perm_b32({a}, {b}, {c})"),
             "v_alignbit_b32" => format!("alignbit({a}, {b}, {c})"),
@@ -3918,6 +3959,8 @@ impl Em {
             }
             h.push_str("static uint xcl_w = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
+        } else {
+            h.push_str(LOADX4_ONE_WINDOW);
         }
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
             let k = self.opt.static_sampler_base as usize + i;
@@ -4662,6 +4705,10 @@ fn float_minmax_mem(min: bool, x2: bool, a: &str, v: &str, old: &str, t: &str) -
 /// Placeholder where the memory window accessors go (after the `mem` declarations).
 const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 
+/// Four dwords at four addresses (scalar buffer loads with their bounds checks); with several
+/// windows `mem_accessors` defines it, with one switch for all four.
+const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }\n";
+
 /// Several memory windows: every `mem.Method(` of the program (and of the preludes) becomes
 /// an accessor `xcl_mMethod(` that switches on `xcl_w` between `mem` and `mem1`.., whose
 /// definitions replace the placeholder.
@@ -4712,6 +4759,11 @@ fn mem_accessors(windows: u32) -> String {
         }
     }
     let mut s = String::new();
+    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+    for k in 1..windows {
+        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    }
+    let _ = writeln!(s, "default: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); }} }}");
     for (ret, name, params, args) in sigs {
         let r = if ret == "void" { "" } else { "return " };
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
@@ -4802,10 +4854,11 @@ void scr_st(uint a, uint v, uint n) {
 
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
+    // one Load4 + one Load (with several memory windows each is a switch) and no branch
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
-    uint w0 = mem.Load(b), w1 = mem.Load(b + 4u), w2 = mem.Load(b + 8u), w3 = mem.Load(b + 12u), w4 = mem.Load(b + 16u);
-    if (s == 0u) return uint4(w0, w1, w2, w3);
-    return uint4((w0 >> s) | (w1 << (32u - s)), (w1 >> s) | (w2 << (32u - s)), (w2 >> s) | (w3 << (32u - s)), (w3 >> s) | (w4 << (32u - s)));
+    uint4 w = mem.Load4(b); uint w4 = mem.Load(b + 16u);
+    uint4 n = uint4(w.yzw, w4);
+    return select((s == 0u).xxxx, w, (w >> s) | (n << ((32u - s) & 31u)));
 }
 // format helpers: no loops, no branches (inlined at every buffer access; `?:` and `if`
 // on scalars become control flow in HLSL 2021, which DXC is slow to clean up)

@@ -1187,6 +1187,62 @@ fn gpu_memory_and_exports() {
     }
 }
 
+/// Multi-dword loads as the emitter groups them (four dwords per memory access, bounds checks
+/// without branches): an unaligned `s_load`, `s_buffer_load`s that straddle num_records, and
+/// vector buffer loads with lanes past the end and inactive lanes (which keep their registers).
+#[test]
+fn gpu_grouped_loads_bounds_and_inactive_lanes() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x22), ("SOFFSET", 125)], None), // low bits ignored
+        ("S_BUFFER_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 125)], None), // 5 of 8 in range
+        ("S_BUFFER_LOAD_DWORDX16", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 4), ("OFFSET", 0), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 48), ("SBASE", 2), ("OFFSET", 16), ("SOFFSET", 125)], None), // 1 of 2
+        ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", 128 + 48), ("VSRC1", 1)], None), // lanes 0..47
+        ("BUFFER_LOAD_DWORDX3", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORDX2", "ENC_MUBUF", &[("VDATA", 13), ("VADDR", 2), ("SRSRC", 13), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let mut mem = vec![0u32; 1024];
+    for (i, m) in mem.iter_mut().enumerate() {
+        *m = 0x1000 + i as u32;
+    }
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0; // flat pointer 0
+    st.sgpr[4..8].copy_from_slice(&[0x80, 0, 20, 0]); // V#: base 0x80, 20 bytes
+    st.sgpr[8..12].copy_from_slice(&[0x100, 0, 0x100, 0]); // V#: base 0x100, 0x100 bytes
+    st.sgpr[12..16].copy_from_slice(&[0x100, 12 << 16, 40, 0]); // V#: base 0x100, stride 12, 40 records
+    st.sgpr[52..56].copy_from_slice(&[0x400, 0, 0x104, 0]); // V#: base 0x400, 0x104 bytes
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = l as u32;
+        r[2] = 8 * l as u32;
+        for k in 10..15 {
+            r[k] = 0xDEAD;
+        }
+    }
+    let r = runner::run_code(&code, &st, &mem).unwrap();
+    for i in 0..8 {
+        assert_eq!(r.sgpr[16 + i], 0x1008 + i as u32, "s_load_dwordx8 dword {i}");
+        assert_eq!(r.sgpr[24 + i], if i < 5 { 0x1020 + i as u32 } else { 0 }, "s_buffer_load_dwordx8 dword {i}");
+    }
+    for i in 0..16 {
+        assert_eq!(r.sgpr[32 + i], 0x1040 + i as u32, "s_buffer_load_dwordx16 dword {i}");
+    }
+    assert_eq!((r.sgpr[48], r.sgpr[49]), (0x1024, 0), "s_buffer_load_dwordx2 across num_records");
+    for l in 0..64usize {
+        for k in 0..3usize {
+            let want = if l >= 48 { 0xDEAD } else if l < 40 { 0x1040 + 3 * l as u32 + k as u32 } else { 0 };
+            assert_eq!(r.vgpr[l][10 + k], want, "lane {l} buffer_load_dwordx3 (idxen) dword {k}");
+        }
+        for k in 0..2usize {
+            let off = 8 * l + 4 * k;
+            let want = if l >= 48 { 0xDEAD } else if off + 4 <= 0x104 { 0x1100 + (off / 4) as u32 } else { 0 };
+            assert_eq!(r.vgpr[l][13 + k], want, "lane {l} buffer_load_dwordx2 (offen) dword {k}");
+        }
+    }
+}
+
 /// A real console vertex shader from the retail pack, run on the PC GPU
 /// (needs XCL_SAMPLE_RPF=…\shaders.rpf).
 #[test]
@@ -2329,6 +2385,7 @@ fn gpu_memory_windows_above_4_gib() {
     let list = vec![
         ("S_LOAD_DWORDX2", "ENC_SMEM", vec![("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)], None), // s[2:3] → window 1
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", vec![("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None), // V# in window 1
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 24), ("SBASE", 4), ("OFFSET", 4)], None), // that V#: one switch, 4 dwords
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None), // V# in window 0
         glbl("GLOBAL_LOAD_DWORD", &[("VDST", 6), ("ADDR", 4), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[4:5] → window 1
         glbl("GLOBAL_STORE_DWORD", &[("ADDR", 8), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)]), // v[8:9] → window 1
@@ -2360,6 +2417,7 @@ fn gpu_memory_windows_above_4_gib() {
     }
     let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
     assert_eq!((r.sgpr[20], r.sgpr[21]), (0xC0FFEE, 0x1234), "s_load from window 1");
+    assert_eq!(r.sgpr[24..28], [1001, 1002, 1003, 1004], "s_buffer_load_dwordx4 from window 1");
     for l in 0..64u64 {
         assert_eq!(r.vgpr[l as usize][1], 1000 + l as u32, "lane {l}: buffer_load from window 1");
         assert_eq!(r.vgpr[l as usize][6], 5000 + l as u32, "lane {l}: global_load from window 1");
