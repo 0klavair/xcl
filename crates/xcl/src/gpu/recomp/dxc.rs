@@ -116,9 +116,19 @@ struct Job {
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-/// Compile threads at most: big translated programs take gigabytes each in DXC and the driver,
-/// and a title compiles hundreds at once – the machine must not run out of memory.
-pub const MAX_COMPILE_THREADS: usize = 6;
+/// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
+/// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
+/// pack's biggest translations take ~0.7 GB in DXC (a typical one 0.1–0.3 GB). The cap used
+/// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
+/// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
+/// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+pub fn compile_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+    })
+}
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
 static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -132,7 +142,8 @@ impl Drop for MemorySlot {
     }
 }
 
-/// Before a compile: with 6 GB of commit left or more, at once; with less, one compile at a
+/// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
+/// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
 /// time – it goes when no other is running (and after a minute in any case). Each compile used
 /// to wait the minute while commit was short: with XDefiant's own 10 GB committed, 4 GB were
 /// left, and its last cold-cache shaders came a few a minute.
@@ -143,7 +154,8 @@ pub fn wait_for_memory() -> MemorySlot {
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= 6 << 30;
+        let need = (6u64 << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
+        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
         if plenty || start.elapsed().as_secs() >= 60 {
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
@@ -155,14 +167,14 @@ pub fn wait_for_memory() -> MemorySlot {
     }
 }
 
-/// DXC workers (one per core, at most `MAX_COMPILE_THREADS`, each with its own compiler and a
-/// `DXC_STACK` stack), started on first use; callers wait for their job.
+/// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
+/// on first use; callers wait for their job.
 fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
     static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
     POOL.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        for k in 0..std::thread::available_parallelism().map_or(4, |n| n.get()).min(MAX_COMPILE_THREADS) {
+        for k in 0..compile_threads() {
             let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
                 let job = match rx.lock().unwrap().recv() {
