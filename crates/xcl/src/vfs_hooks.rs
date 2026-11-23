@@ -88,6 +88,7 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
         Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
+        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
         Decision::Fail(e) => {
             SetLastError(e);
             INVALID_HANDLE_VALUE
@@ -103,6 +104,7 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     match v.open_decision(&path, acc, disp, fl) {
         Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
         Decision::Use(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
+        Decision::UseWithDisposition(p, d) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
         Decision::Fail(e) => {
             SetLastError(e);
             INVALID_HANDLE_VALUE
@@ -120,6 +122,7 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     match v.open_decision(&path, acc, disp, flags) {
         Decision::Pass => orig(n, acc, sh, disp, params),
         Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, disp, params),
+        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, d, params),
         Decision::Fail(e) => {
             SetLastError(e);
             INVALID_HANDLE_VALUE
