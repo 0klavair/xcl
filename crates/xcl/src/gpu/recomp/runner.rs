@@ -142,7 +142,7 @@ pub struct TestTexture {
     pub format: DXGI_FORMAT,
     pub width: u32,
     pub height: u32,
-    /// array slices (cube: 6) or depth
+    /// array slices (cube: 6 per cube) or depth
     pub depth: u32,
     pub texel_bytes: u32,
     /// tightly packed texels, slice after slice
@@ -288,10 +288,11 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 uv.Anonymous.Texture3D = D3D12_TEX3D_UAV { WSize: t.depth, ..Default::default() };
             }
             TexDim::Cube => {
-                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                sv.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() };
+                // a cube array, as translated shaders declare it (depth = 6 per cube)
+                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+                sv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: t.depth / 6, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: 6, ..Default::default() };
+                uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
             }
         }
         if !t.uav {

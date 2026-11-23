@@ -1545,6 +1545,54 @@ fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
     [index, format << 20, 0, ty << 28, 0, 0, 0, 0]
 }
 
+/// A cube T# of two cubes: the face coordinate (face + 8 · cube, as v_cubeid and the console's
+/// compiler give it) picks the cube, and image_get_resinfo gives the layers (6 per cube).
+#[test]
+fn gpu_cube_array_slices() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestSampler, TestTexture, TexDim};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mimg = |name: &'static str, f: &[(&str, u64)]| -> Vec<u8> { encode(name, "ENC_MIMG", f, None).unwrap() };
+    let mut code = Vec::new();
+    // v[0:2] = (s, t, face + 8 · cube), T# in s[16:23], S# point in s[24:27]
+    code.extend(mimg("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 3)]));
+    code.extend(mimg("IMAGE_GET_RESINFO", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 3)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 11));
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (face, cube) = (l % 6, l / 6 % 2);
+        r[0] = f(1.5); // the middle of the face
+        r[1] = f(1.5);
+        r[2] = f((face + 8 * cube) as f32);
+        r[3] = 0; // mip
+    }
+    // 2 x 2 faces, every texel of layer (cube, face) = (face, cube, 6 · cube + face, 1)
+    let mut data = Vec::new();
+    for cube in 0..2 {
+        for face in 0..6 {
+            for _ in 0..4 {
+                for v in [face as f32, cube as f32, (6 * cube + face) as f32, 1.0] {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+    let tex = [TestTexture { dim: TexDim::Cube, format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 2, height: 2, depth: 12, texel_bytes: 16, data, uav: false }];
+    let samp = [TestSampler { filter: D3D12_FILTER_MIN_MAG_MIP_POINT, address: D3D12_TEXTURE_ADDRESS_MODE_CLAMP, comparison: None }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &samp).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let (face, cube) = ((l % 6) as f32, (l / 6 % 2) as f32);
+        let fl = |i: usize| f32::from_bits(v[i]);
+        assert_eq!([fl(10), fl(11), fl(12), fl(13)], [face, cube, 6.0 * cube + face, 1.0], "lane {l}: cube {cube} face {face}");
+        assert_eq!(&v[20..24], &[2, 2, 12, 1], "lane {l} resinfo (w, h, layers, mips)");
+    }
+}
+
 #[test]
 fn gpu_images_sample_load_store_atomic() {
     if !gpu_ready() {

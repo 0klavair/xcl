@@ -969,7 +969,8 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
     let depth = match ty {
         T::D3 => d,
         T::D1Array | T::D2Array | T::D2MsaaArray => array.max(1),
-        T::Cube => 6,
+        // a cube view: its faces (6 per cube)
+        T::Cube => array.max(6),
         _ => 1,
     };
     Some((fmt, ty, w, h, depth, mips))
@@ -1670,6 +1671,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
                 7 => (a.Texture2DMSArray.ArraySize, 1),
                 8 => (1, a.Texture3D.MipLevels),
                 9 => (6, a.TextureCube.MipLevels),
+                10 => (a.TextureCubeArray.NumCubes.max(1) * 6, a.TextureCubeArray.MipLevels),
                 _ => (1, 1),
             };
             (v.Format, v.ViewDimension.0, array, mips)
