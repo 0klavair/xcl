@@ -20,6 +20,7 @@ pub mod launcher;
 pub mod loader;
 pub mod modules;
 pub mod pe;
+pub mod preflight;
 pub mod report;
 pub mod resolver;
 pub mod rpf;

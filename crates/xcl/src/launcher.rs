@@ -350,6 +350,8 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         Some(c) => println!("  console: imports {}", c.join(", ")),
         None => println!("  WARNING: this is not a valid x64 PE file (encrypted? from an XVC package?)"),
     }
+    let environment = crate::preflight::run(&boot.config.d3d12_adapter);
+    crate::preflight::print(&environment);
 
     let mut cmdline = quote(&exe.to_string_lossy());
     for a in args {
@@ -363,7 +365,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    summarize(&boot, code);
+    summarize(&boot, code, &environment);
     code as i32
 }
 
@@ -406,15 +408,22 @@ fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String
     }
 }
 
-fn summarize(boot: &Boot, code: u32) {
+fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
     let path = boot.report_path();
     let mut report = crate::report::load(&path);
     if let Some(r) = report.as_mut() {
         r.exit_code = Some(code as i64);
+        r.environment = environment.to_vec();
         let _ = std::fs::write(&path, serde_json::to_string_pretty(r).unwrap_or_default());
     }
     println!();
     println!("Game exited with code {code:#x} ({code})");
+    // repeated here: what the game printed in between has scrolled them away
+    let missing: Vec<_> = environment.iter().filter(|c| matches!(c.level, crate::preflight::Level::Warning | crate::preflight::Level::Error)).cloned().collect();
+    if !missing.is_empty() {
+        println!("Missing on this PC (see the start of the run):");
+        crate::preflight::print(&missing);
+    }
     let Some(r) = report else {
         println!("No report – see the log: {}", boot.logs_dir().join("xcl.log").display());
         return;
