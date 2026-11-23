@@ -144,6 +144,56 @@ fn xinput() -> Option<(GetState, SetState)> {
 
 /// the XInput user index that answered last
 static PAD: AtomicU32 = AtomicU32::new(0);
+/// a controller answered the last poll (connect / disconnect are logged)
+static PAD_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// microseconds since start of the last search over the four XInput slots while none answered:
+/// XInputGetState on an empty slot is slow (it asks the driver each time), so with no
+/// controller connected the slots are searched at most every `SEARCH_US`
+static LAST_SEARCH: AtomicU64 = AtomicU64::new(0);
+const SEARCH_US: u64 = 1_000_000;
+
+/// The PC's controller (the XInput slot that answers first: an Xbox pad, or any pad Windows
+/// exposes through XInput) as a GameInput gamepad state; None without one.
+fn xinput_pad() -> Option<GamepadState> {
+    let (get, _) = xinput()?;
+    let connected = PAD_CONNECTED.load(Ordering::Relaxed);
+    let first = PAD.load(Ordering::Relaxed);
+    // with a controller: its slot answers first (one call); without: all four, now and then
+    if !connected {
+        let now = now_us();
+        let last = LAST_SEARCH.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < SEARCH_US {
+            return None;
+        }
+        LAST_SEARCH.store(now, Ordering::Relaxed);
+    }
+    for k in (0..4).map(|i| (first + i) % 4) {
+        let mut x = XInputState::default();
+        if unsafe { get(k, &mut x) } == 0 {
+            if !connected || k != first {
+                crate::xlog_info!("GameInput: the PC's controller (XInput slot {k}) is the title's gamepad");
+            }
+            PAD.store(k, Ordering::Relaxed);
+            PAD_CONNECTED.store(true, Ordering::Relaxed);
+            let axis = |v: i16| (v as f32 / 32767.0).max(-1.0);
+            return Some(GamepadState {
+                buttons: buttons_from_xinput(x.buttons),
+                left_trigger: x.left_trigger as f32 / 255.0,
+                right_trigger: x.right_trigger as f32 / 255.0,
+                left_x: axis(x.lx),
+                left_y: axis(x.ly),
+                right_x: axis(x.rx),
+                right_y: axis(x.ry),
+            });
+        }
+    }
+    if connected {
+        crate::xlog_info!("GameInput: the PC's controller was disconnected (keyboard{} still play)", if super::kbm::enabled() { " and mouse" } else { "" });
+        PAD_CONNECTED.store(false, Ordering::Relaxed);
+        LAST_SEARCH.store(now_us(), Ordering::Relaxed);
+    }
+    None
+}
 
 fn start() -> Instant {
     static T: OnceLock<Instant> = OnceLock::new();
@@ -217,27 +267,7 @@ unsafe fn keyboard() -> u32 {
 
 /// the gamepad now
 pub fn poll() -> GamepadState {
-    let mut s = GamepadState::default();
-    if let Some((get, _)) = xinput() {
-        let first = PAD.load(Ordering::Relaxed);
-        for k in (0..4).map(|i| (first + i) % 4) {
-            let mut x = XInputState::default();
-            if unsafe { get(k, &mut x) } == 0 {
-                PAD.store(k, Ordering::Relaxed);
-                let axis = |v: i16| (v as f32 / 32767.0).max(-1.0);
-                s = GamepadState {
-                    buttons: buttons_from_xinput(x.buttons),
-                    left_trigger: x.left_trigger as f32 / 255.0,
-                    right_trigger: x.right_trigger as f32 / 255.0,
-                    left_x: axis(x.lx),
-                    left_y: axis(x.ly),
-                    right_x: axis(x.rx),
-                    right_y: axis(x.ry),
-                };
-                break;
-            }
-        }
-    }
+    let mut s = xinput_pad().unwrap_or_default();
     s.buttons |= unsafe { keyboard() };
     super::kbm::apply(&mut s);
     s.buttons |= scripted();

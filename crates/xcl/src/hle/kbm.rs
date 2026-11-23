@@ -209,7 +209,7 @@ struct Mouse {
 
 static MOUSE: Mutex<Option<Mouse>> = Mutex::new(None);
 
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     crate::state::config().keyboard_mouse
 }
 
@@ -309,9 +309,9 @@ pub fn apply(s: &mut GamepadState) {
         WHEEL.store(0, Ordering::Relaxed);
         return;
     }
-    // movement keys: the left stick (a real stick moved further wins)
+    // movement keys: the left stick (a real stick moved further wins; so does it for the mouse)
     let (lx, ly) = stick_from_keys(key(0x57), key(0x41), key(0x53), key(0x44));
-    if lx != 0.0 || ly != 0.0 {
+    if (lx != 0.0 || ly != 0.0) && lx * lx + ly * ly >= s.left_x * s.left_x + s.left_y * s.left_y {
         s.left_x = lx;
         s.left_y = ly;
     }
@@ -337,7 +337,7 @@ pub fn apply(s: &mut GamepadState) {
     m.last = now;
     m.velocity.update(DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed), dt);
     let (rx, ry) = stick_from_mouse(m.velocity.x, m.velocity.y, crate::state::config().mouse_sensitivity);
-    if rx != 0.0 || ry != 0.0 {
+    if (rx != 0.0 || ry != 0.0) && rx * rx + ry * ry >= s.right_x * s.right_x + s.right_y * s.right_y {
         s.right_x = rx;
         s.right_y = ry;
     }
