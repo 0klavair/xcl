@@ -3256,6 +3256,16 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     copy.VS = bytecode(&vs_dxil);
     copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
+    // it each rect is drawn as the triangle of its three vertices
+    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
+        rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("rect list drawn as triangles: {e}"))).ok()
+    } else {
+        None
+    };
+    if let Some(gs) = &rect_gs {
+        copy.GS = bytecode(gs);
+    }
     pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
@@ -3458,6 +3468,7 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    pc_topology_type(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -3944,8 +3955,27 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
+/// The console's pipeline topology type of rect lists (draws of topology 17, `list_x::RECT_LIST`).
+const RECT_LIST_TYPE: i32 = 19;
+
+/// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused
+/// for a PS that reads flat or is not a console one (its inputs' modes are not known).
+fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    use crate::gpu::recomp::pso;
+    if let Some(p) = ps {
+        if !pso::is_console(p) {
+            return Err("a PC pixel shader".into());
+        }
+        if pso::ps_reads_flat(p)? {
+            return Err("the PS reads a flat attribute".into());
+        }
+    }
+    pso::rect_list_gs(vs)
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
-/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists; UNDEFINED (a stream
+/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
+/// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
@@ -4084,7 +4114,10 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             _ => {}
         }
     }
-    pc_topology_type(&mut g);
+    // a rect list stays one for translated_graphics_pso, which gives it its GS
+    if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        pc_topology_type(&mut g);
+    }
     StreamPipeline::Graphics(Box::new(g))
 }
 
