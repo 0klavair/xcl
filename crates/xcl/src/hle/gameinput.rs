@@ -537,6 +537,18 @@ unsafe fn qi_for(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void, own
         *out = this;
         return S_OK;
     }
+    if !iid.is_null() {
+        // refused interfaces are worth a line each (a title built for a newer GameInput asks
+        // for its interfaces this way – before #100 it got the v0 object for any IID)
+        static SEEN: Mutex<Vec<u128>> = Mutex::new(Vec::new());
+        let i = &*iid;
+        let g = (i.data1 as u128) << 96 | (i.data2 as u128) << 80 | (i.data3 as u128) << 64 | u64::from_be_bytes(i.data4) as u128;
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&g) && seen.len() < 16 {
+            seen.push(g);
+            crate::xlog_warn!("GameInput: QueryInterface({g:032x}) refused (E_NOINTERFACE)");
+        }
+    }
     *out = std::ptr::null_mut();
     E_NOINTERFACE
 }
