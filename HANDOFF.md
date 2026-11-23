@@ -859,6 +859,33 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
 - **#90** AcpHal: APU address ranges without wrap / overlap, SHAPE allocation rolls back, XApuConnect reports OOM.
 - Checked: workspace tests with the retail samples (also `XCL_SPLIT_WAVE64=1`), Unicorn Overlord, XDefiant.
 
+## PRs #95–#102 (merged, all raylitebull), 2026-11-23
+Checked: workspace tests with the retail samples (also `XCL_SPLIT_WAVE64=1`), XDefiant (title screen; a scripted A
+opens its "Xbox network unavailable" dialog – input arrives), Unicorn Overlord, Minecraft starts.
+- **#95** XGameSaveDeleteContainer("") deleted the provider's whole folder – now E_GS_INVALID_CONTAINER_NAME.
+- **#96** VFS move / copy: case-only renames of game files (were deleted on NTFS), MOVEFILE_REPLACE_EXISTING /
+  fail-if-exists across the merged view, a failed copy / move no longer lifts a whiteout (`stage_write` /
+  `commit_write`), ReplaceFileW checks both files; whited-out directories list as missing, delete_file /
+  remove_dir type checks, a recreated directory does not bring back the original's children.
+- **#97** XPackage slot 27 = 3-argument XPackageGetIdentifier (was the 2-argument one: crash); game saves written
+  through unique temp files + MoveFileEx (write-through), blob / container names matched case-insensitively,
+  XPackageGetUserLocale picks from MicrosoftGame.config's `<Resources>` languages, the controller id from
+  XUserFindControllerForUserWithUi is the gamepad's.
+- **#98** XTaskQueue / XAsync: termination and submission under one lock (no work after Terminate, no deadlock on
+  a manual completion port), per-port in-flight counts, XAsync phases (cleanup exactly once), XErrorReport's
+  callback called outside its lock.
+- **#99** sparse windows: tiles of placed buffers know their uncommitted pages, sub-tile decommits give the pool
+  tile back; ResolveQueryData adds `buffer_delta`; console heap type 4 → CBV/SRV/UAV in copies; DMA list Release.
+- **#100** keyboard / mouse emulation by physical scancodes (AZERTY etc.), mouse state reset on focus loss,
+  `keyboard_mouse = false` turns off the keyboard as gamepad too, GameInput QueryInterface answers only its own
+  IIDs (refused ones logged – added on merge), UnregisterCallback waits for callbacks in flight.
+- **#101** ANSI outputs encoded in CP_ACP, stubs of HLE alias DLLs return their canonical module's default,
+  GetModuleHandle for console-only aliases, ordinal imports fall back only to the same system DLL, forwarders
+  with dotted names, no duplicate stub thunks.
+- **#102** async compute PSOs: the real pipeline (not the stand-in) is registered as translated (ExecuteIndirect
+  bound the ABI on the stand-in, a failed build bound it anyway); the initial PSO of CreateCommandList / Reset /
+  ClearState is tracked; DrawIndexedX goes through `bind`; KickoffX keeps multiple render targets.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
