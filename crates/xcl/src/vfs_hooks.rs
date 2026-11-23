@@ -580,6 +580,18 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                             return Err(vfs::ERROR_ALREADY_EXISTS);
                         }
                     }
+                    // Move an overlay file directly when both paths are on one volume.
+                    // Windows checks delete sharing before replacing the destination.
+                    if rs == v.overlay_path(sr) && flags & windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
+                        if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED) != 0 {
+                            v.delete_file(sr).or_else(|e| if e == vfs::ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(e) })?;
+                            return Ok(());
+                        }
+                        let error = windows_sys::Win32::Foundation::GetLastError();
+                        if error != windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE {
+                            return Err(error);
+                        }
+                    }
                 }
                 std::fs::copy(&rs, &rd).map_err(|e| io_err_code(&e, vfs::ERROR_ACCESS_DENIED))?;
                 if let Some(dr) = &drel {
@@ -1229,6 +1241,39 @@ mod tests {
         assert_eq!(ok, 1);
         assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"from-ext".to_vec()));
         assert!(!f.temp().join("ext.txt").exists());
+    }
+
+    #[test]
+    fn locked_overlay_move_to_temp_preserves_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let f = HookFixture::new("locked_move_temp");
+        let source = r"G:\data\hello.txt";
+        let destination = r"T:\destination.txt";
+        let overlay_source = f.vfs.prepare_write(r"data\hello.txt", false).unwrap();
+        std::fs::write(&overlay_source, b"overlay source").unwrap();
+        std::fs::write(f.temp().join("destination.txt"), b"old destination").unwrap();
+        let held = std::fs::OpenOptions::new().read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&overlay_source).unwrap();
+
+        let result = unsafe { move_file_vfs(&f.vfs, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_eq!(result, 0);
+        assert_eq!(std::fs::read(f.temp().join("destination.txt")).unwrap(), b"old destination");
+        assert_eq!(f.read_vfs(source).as_deref(), Some(&b"overlay source"[..]));
+        drop(held);
+        assert_ne!(unsafe { move_file_vfs(&f.vfs, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) }, 0);
+        assert_eq!(std::fs::read(f.temp().join("destination.txt")).unwrap(), b"overlay source");
+        assert_eq!(f.read_vfs(source), None);
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+
+        // A file that exists only in the overlay has no original to white out.
+        let new_source = r"G:\data\new.txt";
+        let new_overlay = f.vfs.prepare_write(r"data\new.txt", false).unwrap();
+        std::fs::write(new_overlay, b"new file").unwrap();
+        assert_ne!(unsafe { move_file_vfs(&f.vfs, new_source, r"T:\new.txt", 0, real_move) }, 0);
+        assert_eq!(std::fs::read(f.temp().join("new.txt")).unwrap(), b"new file");
+        assert_eq!(f.read_vfs(new_source), None);
     }
 
     #[test]
