@@ -1,6 +1,6 @@
 //! XGameSave – containers of named blobs (public GDK `XGameSave.h`), stored as files:
 //! `<data>/gamesave/<configuration id>/<container>/b/<blob>` + `display` (display name).
-//! Offline: no cloud sync, every operation completes at once (async variants through XAsync).
+//! Offline: no cloud sync. Async variants use XAsync.
 
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
@@ -251,24 +251,52 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlo
     XAsyncGetResult(b, &QUOTA_ID as *const u8 as *const c_void, 8, quota as *mut c_void, std::ptr::null_mut())
 }
 
-pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
-    let (Some(pr), Some(n)) = (provider(p), from_cstr_ptr(name)) else { return E_INVALIDARG };
-    if n.is_empty() || n.len() > 256 {
-        return E_GS_INVALID_CONTAINER_NAME;
+fn valid_container_name_length(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 256
+}
+
+unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRESULT> {
+    let pr = provider(p).ok_or(E_INVALIDARG)?;
+    let name = from_cstr_ptr(name).ok_or(E_INVALIDARG)?;
+    if !valid_container_name_length(&name) {
+        return Err(E_GS_INVALID_CONTAINER_NAME);
     }
-    let _ = std::fs::remove_dir_all(pr.root.join(enc(&n)));
-    S_OK
+    std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
+}
+
+// A queued delete must not remove a container partway through a blob update.
+static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn delete_container(dir: &Path) {
+    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
+    match delete_path(p, name) {
+        Ok(dir) => {
+            delete_container(&dir);
+            S_OK
+        }
+        Err(hr) => hr,
+    }
 }
 
 static DELETE_ID: u8 = 0;
 
 pub unsafe extern "system" fn XGameSaveDeleteContainerAsync(p: *mut Provider, name: *const u8, b: *mut XAsyncBlock) -> HRESULT {
-    let hr = XGameSaveDeleteContainer(p, name);
-    begin_with(b, &DELETE_ID as *const u8 as usize, move || if hr < 0 { Err(hr) } else { Ok(Vec::new()) })
+    if b.is_null() {
+        return E_INVALIDARG;
+    }
+    let dir = delete_path(p, name);
+    begin_with(b, &DELETE_ID as *const u8 as usize, move || {
+        delete_container(&dir?);
+        Ok(Vec::new())
+    })
 }
 
 pub unsafe extern "system" fn XGameSaveDeleteContainerResult(b: *mut XAsyncBlock) -> HRESULT {
-    XAsyncGetResult(b, &DELETE_ID as *const u8 as *const c_void, 0, std::ptr::null_mut(), std::ptr::null_mut())
+    XAsyncGetStatus(b, false)
 }
 
 pub unsafe extern "system" fn XGameSaveCreateContainer(p: *mut Provider, name: *const u8, out: *mut *mut Container) -> HRESULT {
@@ -276,7 +304,7 @@ pub unsafe extern "system" fn XGameSaveCreateContainer(p: *mut Provider, name: *
     if out.is_null() {
         return E_INVALIDARG;
     }
-    if n.is_empty() || n.len() > 256 {
+    if !valid_container_name_length(&n) {
         return E_GS_INVALID_CONTAINER_NAME;
     }
     *out = Box::into_raw(Box::new(Container { magic: MAGIC_CONTAINER, dir: pr.root.join(enc(&n)), name: n }));
@@ -534,6 +562,7 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
 }
 
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
+    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
@@ -583,6 +612,138 @@ pub unsafe extern "system" fn XGameSaveSubmitUpdateResult(b: *mut XAsyncBlock) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::taskqueue::{
+        XTaskQueueCloseHandle, XTaskQueueCreate, XTaskQueueDispatch, XTaskQueueTerminate,
+        MODE_MANUAL, PORT_WORK,
+    };
+    use crate::util::{E_ABORT, E_PENDING};
+
+    const DELETE_TEST_NAME: &str = "slot/1";
+
+    struct DeleteFixture {
+        root: PathBuf,
+        provider: *mut Provider,
+        block: Box<XAsyncBlock>,
+    }
+
+    impl DeleteFixture {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("xcl-gamesave-delete-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let mut fixture = Self {
+                provider: Box::into_raw(Box::new(Provider { magic: MAGIC_PROVIDER, root: root.clone() })),
+                root,
+                block: Box::new(unsafe { std::mem::zeroed() }),
+            };
+            unsafe {
+                assert_eq!(XTaskQueueCreate(MODE_MANUAL, MODE_MANUAL, &mut fixture.block.queue), S_OK);
+            }
+            std::fs::create_dir_all(fixture.container_dir().join("b")).unwrap();
+            std::fs::write(fixture.blob_path(), b"synthetic save").unwrap();
+            fixture
+        }
+
+        fn container_dir(&self) -> PathBuf {
+            self.root.join(enc(DELETE_TEST_NAME))
+        }
+
+        fn blob_path(&self) -> PathBuf {
+            self.container_dir().join("b").join("data")
+        }
+    }
+
+    impl Drop for DeleteFixture {
+        fn drop(&mut self) {
+            unsafe {
+                let queue = self.block.queue;
+                if !queue.is_null() {
+                    // Drain pending work before freeing the block, including after an assertion fails.
+                    let _ = XTaskQueueTerminate(queue, true, std::ptr::null_mut(), 0);
+                    XTaskQueueCloseHandle(queue);
+                }
+                XGameSaveCloseProvider(self.provider);
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn delete_container_async_runs_on_work_dispatch_with_owned_inputs() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = DeleteFixture::new();
+        unsafe {
+            let name = CString::new(DELETE_TEST_NAME).unwrap();
+            let sibling = fixture.root.join("another-slot");
+            std::fs::create_dir(&sibling).unwrap();
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), &mut *fixture.block), S_OK);
+            drop(name);
+            XGameSaveCloseProvider(fixture.provider);
+            fixture.provider = std::ptr::null_mut();
+
+            assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), E_PENDING);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), E_PENDING);
+            assert_eq!(std::fs::read(fixture.blob_path()).unwrap().as_slice(), b"synthetic save");
+            assert!(XTaskQueueDispatch(fixture.block.queue, PORT_WORK, 0));
+            assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), S_OK);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), S_OK);
+            assert!(sibling.is_dir());
+        }
+        assert!(!fixture.container_dir().exists());
+        assert!(fixture.root.is_dir());
+    }
+
+    #[test]
+    fn delete_container_async_terminated_queue_preserves_save() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = DeleteFixture::new();
+        unsafe {
+            let name = CString::new(DELETE_TEST_NAME).unwrap();
+            let queue = fixture.block.queue;
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), &mut *fixture.block), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), E_PENDING);
+            assert_eq!(XTaskQueueTerminate(queue, true, std::ptr::null_mut(), 0), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), E_ABORT);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), E_ABORT);
+            assert_eq!(std::fs::read(fixture.blob_path()).unwrap().as_slice(), b"synthetic save");
+
+            // A new request on the same queue fails at scheduling.
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), &mut *fixture.block), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), E_ABORT);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), E_ABORT);
+            assert!(!XTaskQueueDispatch(queue, PORT_WORK, 0));
+        }
+        assert_eq!(std::fs::read(fixture.blob_path()).unwrap().as_slice(), b"synthetic save");
+    }
+
+    #[test]
+    fn delete_container_invalid_arguments_preserve_provider_root() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = DeleteFixture::new();
+        unsafe {
+            let name = CString::new(DELETE_TEST_NAME).unwrap();
+            let too_long = CString::new("a".repeat(257)).unwrap();
+            assert_eq!(XGameSaveDeleteContainerAsync(fixture.provider, name.as_ptr().cast(), std::ptr::null_mut()), E_INVALIDARG);
+            for (provider, name, expected) in [
+                (std::ptr::null_mut(), name.as_ptr().cast(), E_INVALIDARG),
+                (fixture.provider, std::ptr::null(), E_INVALIDARG),
+                (fixture.provider, b"\0".as_ptr(), E_GS_INVALID_CONTAINER_NAME),
+                (fixture.provider, too_long.as_ptr().cast(), E_GS_INVALID_CONTAINER_NAME),
+            ] {
+                assert_eq!(XGameSaveDeleteContainer(provider, name), expected);
+                assert_eq!(XGameSaveDeleteContainerAsync(provider, name, &mut *fixture.block), S_OK);
+                assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), E_PENDING);
+                assert!(XTaskQueueDispatch(fixture.block.queue, PORT_WORK, 0));
+                assert_eq!(XAsyncGetStatus(&mut *fixture.block, false), expected);
+                assert_eq!(XGameSaveDeleteContainerResult(&mut *fixture.block), expected);
+                assert_eq!(std::fs::read(fixture.blob_path()).unwrap().as_slice(), b"synthetic save");
+            }
+        }
+        assert!(fixture.root.is_dir());
+    }
 
     unsafe extern "system" fn count_containers(i: *const ContainerInfo, ctx: *mut c_void) -> bool {
         let v = &mut *(ctx as *mut Vec<(String, String, u32, u64)>);
