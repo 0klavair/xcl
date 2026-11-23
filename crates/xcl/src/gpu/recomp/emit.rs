@@ -2566,11 +2566,14 @@ impl Em {
                 Some(if clamp { format!("asuint(saturate({e}))") } else { format!("asuint({e})") })
             }
             "v_dot2c_f32_f16" => Some(format!("asuint(mad({}, {}, mad({}, {}, asfloat({cur}))))", fh(0, true), fh(1, true), fh(0, false), fh(1, false))),
-            "v_dot4c_i32_i8" => Some(format!("dot4_i8({}, {}, {cur})", src(0), src(1))),
+            // the packed 8-bit dot products as SM 6.4's intrinsics (the GPU's own instruction): FSR4's
+            // network passes are thousands of them, and the shift-and-multiply form made one pass
+            // 1.5 MB of DXIL that the AMD driver could not compile (E_OUTOFMEMORY)
+            "v_dot4c_i32_i8" => Some(format!("(uint)dot4add_i8packed({}, {}, (int){cur})", src(0), src(1))),
             "v_dot2_i32_i16" => Some(format!("(uint)({} * {} + {} * {} + (int){})", si(0, false), si(1, false), si(0, true), si(1, true), src(2))),
             "v_dot2_u32_u16" => Some(format!("({} * {} + {} * {} + {})", h(0, false), h(1, false), h(0, true), h(1, true), src(2))),
-            "v_dot4_u32_u8" => Some(format!("dot4_u8({}, {}, {})", src(0), src(1), src(2))),
-            "v_dot4_i32_i8" => Some(format!("dot4_i8({}, {}, {})", src(0), src(1), src(2))),
+            "v_dot4_u32_u8" => Some(format!("dot4add_u8packed({}, {}, {})", src(0), src(1), src(2))),
+            "v_dot4_i32_i8" => Some(format!("(uint)dot4add_i8packed({}, {}, (int){})", src(0), src(1), src(2))),
             "v_dot8_u32_u4" => Some(format!("dot8_u4({}, {}, {})", src(0), src(1), src(2))),
             "v_dot8_i32_i4" => Some(format!("dot8_i4({}, {}, {})", src(0), src(1), src(2))),
             _ => None,

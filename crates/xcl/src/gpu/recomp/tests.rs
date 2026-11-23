@@ -5940,3 +5940,37 @@ fn gpu_cmp_class_f16_preserves_snan() {
         assert_eq!((r.sgpr[10], r.sgpr[11]), all, "wave{lanes} f16 neg(-1.0) matches +normal");
     }
 }
+
+/// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
+/// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
+#[test]
+#[ignore]
+fn fspx_containers_translate_and_compile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let Some(dir) = std::env::var_os("XCL_SAMPLE_FSPX") else { return };
+    let files: Vec<std::path::PathBuf> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+    let next = AtomicUsize::new(0);
+    let (n, ok) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|s| {
+        for _ in 0..super::dxc::compile_threads() {
+            s.spawn(|| loop {
+                let Some(path) = files.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                let blob = std::fs::read(path).unwrap();
+                let Some(f) = super::pso::fspx(&blob) else { continue };
+                n.fetch_add(1, Ordering::Relaxed);
+                let t0 = std::time::Instant::now();
+                let name = path.file_name().unwrap().to_string_lossy();
+                match super::pso::console_to_dxil(&blob, super::pso::Stage::Compute, 0) {
+                    Ok(c) => {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                        println!("FSPX {name}: threads {:?} rsrc2 {:#x}, {} B code -> {} B DXIL, {:.2} s", f.threads, f.rsrc2, f.code.len(), c.dxil.len(), t0.elapsed().as_secs_f64());
+                    }
+                    Err(err) => println!("FSPX {name}: FAILED {err}"),
+                }
+            });
+        }
+    });
+    let (n, ok) = (n.into_inner(), ok.into_inner());
+    println!("FSPX: {ok} / {n} translated and compiled");
+    assert_eq!(ok, n);
+}

@@ -915,6 +915,26 @@ opens its "Xbox network unavailable" dialog – input arrives), Unicorn Overlord
   (DXC's loop passes: unroll ~30 %, jump threading ~18 %, indvars ~12 % on the slowest); the largest program
   (29 000 instructions, 6.5 MB HLSL) peaks at ~0.6 GB in DXC. `XCL_DXC_ARGS` passes DXC arguments in the survey.
 
+## FidelityFX (FSR4) runs on the GPU (2026-11-23)
+- The console upscaler (`amd_fidelityfx_upscaler_xbox.dll`) creates its passes with CreateComputePipelineState on a
+  blob with an `ACCC` part holding `FSPX` (the console driver's container, "NewBE"; it tries
+  DeserializeComputePipelineStateX first, which stays E_NOTIMPL). `pso::fspx` reads it: entry 0 = numthreads (u16 x3
+  @+0x0C), RSRC1 @+0x14, RSRC2 @+0x18; entry 6 = the RDNA2 code behind a 0x24-byte header (cut at the last
+  s_endpgm). Compute interface from RSRC2 as for FSSM CS. All 29 FSR4 pipelines translate and compile
+  (`fspx_containers_translate_and_compile`, `XCL_SAMPLE_FSPX=<folder of dumped *_rootsig.bin>`).
+- `v_dot4(c)_i32_i8` / `v_dot4_u32_u8` as SM 6.4 `dot4add_i8packed` / `dot4add_u8packed` (the network passes are
+  thousands of them): the biggest pass went 1.55 MB → 1.23 MB DXIL, DXC 604 s → 74 s, and the AMD driver now accepts
+  it (it returned E_OUTOFMEMORY before).
+- `fsr4_console_upscaler_creates_a_context_probe` with `XCL_CONSOLE_LISTS=1 XCL_PROBE_FSR=1 XCL_PROBE_FSR_DISPATCH=1
+  XCL_PROBE_FSR_EXECUTE=1` (`XCL_SAMPLE_DLLS` = the game's DLLs): inputs uploaded (a 0..1 grey gradient, depth 0.5,
+  no motion), ffxDispatch records 20 dispatches / 24 barriers / 2 clears / 4 copies on a console list, all
+  recognised, the PC list runs on the RX 9070 (~11 ms with submission), the 1920x1080 RGBA16F output is finite and
+  keeps the gradient (red mean 0.123 left quarter, 0.872 right). The probe needs `XCL_CONSOLE_LISTS=1` (without it
+  the pipelines are not console-shaped and the stream has unknown records).
+- Based on PR #33 (ElHombreAlex), rebuilt on current `main`: #33 went through DeserializePipelineStateX with a guessed
+  thread geometry; the FSPX path carries the real one. Its wave64 rendezvous is #67; R9G9B9E5 UAVs were not needed here.
+- Not yet: a title using FSR4 (none of the four run here ships it; the dump with it has no executable).
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet

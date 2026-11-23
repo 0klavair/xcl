@@ -24,7 +24,53 @@ pub enum Stage {
 
 /// A console (xbox-native) shader container?
 pub fn is_console(blob: &[u8]) -> bool {
-    xbox::is_xbox(blob)
+    xbox::is_xbox(blob) || fspx(blob).is_some()
+}
+
+/// A compute program in the console driver's own container (an `ACCC` part holding `FSPX`),
+/// what AMD FidelityFX (FSR4) creates its passes from on the console: no DXIL, the RDNA2
+/// code with its thread geometry and COMPUTE_PGM_RSRC2.
+pub struct Fspx<'a> {
+    pub threads: [u32; 3],
+    pub rsrc1: u32,
+    pub rsrc2: u32,
+    /// RDNA2 code, from its first instruction to the last `s_endpgm`
+    pub code: &'a [u8],
+}
+
+/// `FSPX`: 'FSPX', version, entry count, size, then 16-byte entries (type, offset, size, 0)
+/// from +0x10, offsets from the start of FSPX. Type 0 (0x1C bytes): numthreads as u16 x3 at
+/// +0x0C, RSRC1 at +0x14, RSRC2 at +0x18; type 1: a 0x14-byte hash; type 6: the code behind
+/// a 0x24-byte header (the v_nop hash prologue); type 7: resource declarations (32-byte
+/// records). Read from FSR4's pipelines (the console upscaler's "NewBE" path).
+pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
+    let parts = crate::gpu::shader::container_parts(blob)?;
+    let p = parts.iter().find(|p| p.fourcc == "ACCC")?;
+    let part = blob.get(p.offset..p.offset + p.size)?;
+    let u32_at = |b: &[u8], o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    if part.get(..4)? != b"FSPX" {
+        return None;
+    }
+    let n = u32_at(part, 8)? as usize;
+    let entry = |ty: u32| -> Option<&[u8]> {
+        (0..n.min(32)).find_map(|e| {
+            let at = 0x10 + 16 * e;
+            (u32_at(part, at)? == ty).then(|| {
+                let (o, s) = (u32_at(part, at + 4)? as usize, u32_at(part, at + 8)? as usize);
+                part.get(o..o.checked_add(s)?)
+            })?
+        })
+    };
+    let head = entry(0)?;
+    let u16_at = |o: usize| head.get(o..o + 2).map(|x| u16::from_le_bytes(x.try_into().unwrap()) as u32);
+    let threads = [u16_at(0x0C)?, u16_at(0x0E)?, u16_at(0x10)?];
+    if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
+        return None;
+    }
+    let code = entry(6)?.get(0x24..)?;
+    // up to the last s_endpgm (the driver pads with s_code_end)
+    let end = (0..code.len() / 4).rev().find(|&i| u32_at(code, 4 * i) == Some(0xBF81_0000))?;
+    Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
 /// Memory windows of the title's unified memory (1 without it).
@@ -275,6 +321,25 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
 }
 
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+    if let Some(f) = fspx(blob) {
+        if stage != Stage::Compute {
+            return Err("an FSPX (driver) container in a graphics slot".into());
+        }
+        let r = f.rsrc2;
+        let cs = super::CsInterface {
+            threads: f.threads,
+            user_sgprs: (r >> 1) & 31,
+            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
+            tg_size: (r >> 10) & 1 == 1,
+            tid_components: ((r >> 11) & 3) + 1,
+        };
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        if !t.complete() {
+            let missing: Vec<&String> = t.unsupported.keys().collect();
+            return Err(format!("incomplete translation, missing: {missing:?}"));
+        }
+        return Ok((t, "cs_6_6"));
+    }
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {

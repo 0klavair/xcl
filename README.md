@@ -30,7 +30,7 @@ next steps:
   become HLSL; random samples compile to DXIL with 0 errors.
 - **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
   movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
-  console upscaler sets up and records its work, the GDK HTTP library initialises.
+  console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
 - **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
   textures of the game's texture archive byte for byte, its volume textures included.
 - **370+ automated tests**, including GPU tests that compare translated shaders against expected
@@ -67,7 +67,7 @@ next steps:
 | **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
 | **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
 | **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
-| **Upscaling** | ✅ | the game's AMD FSR 4 console DLL creates its context and records its dispatches | end-to-end with the real DLL |
+| **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
 
 ### Media and tools
 
