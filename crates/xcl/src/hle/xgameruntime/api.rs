@@ -218,7 +218,10 @@ static ERROR_OPTIONS: AtomicUsize = AtomicUsize::new(0);
 pub unsafe extern "system" fn XErrorReport(hr: HRESULT, message: *const u8) {
     let text = crate::util::from_cstr_ptr(message).unwrap_or_default();
     crate::xlog_warn!("XErrorReport {:#x}: {text}", hr as u32);
-    if let Some((cb, ctx)) = *ERROR_CB.lock().unwrap() {
+    // Copy and release `ERROR_CB` before invoking the guest callback so re-entrant calls to
+    // `XErrorSetCallback` or `XErrorReport` do not deadlock.
+    let entry = *ERROR_CB.lock().unwrap();
+    if let Some((cb, ctx)) = entry {
         let f: unsafe extern "system" fn(HRESULT, *const u8, *mut c_void) -> bool = std::mem::transmute(cb);
         let _ = f(hr, message, ctx as *mut c_void);
     }
@@ -1839,6 +1842,40 @@ mod tests {
             assert_eq!(ERR_SEEN.load(Ordering::SeqCst), crate::util::E_FAIL as u32);
             set_cb(err, 0, std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn xerror_report_allows_reentrant_set_callback_and_report() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        static TRACE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn second_cb(hr: HRESULT, _msg: *const u8, _ctx: *mut c_void) -> bool {
+            TRACE.lock().unwrap().push(hr as u32);
+            error_set_callback(0, std::ptr::null_mut());
+            true
+        }
+        unsafe extern "system" fn first_cb(hr: HRESULT, _msg: *const u8, _ctx: *mut c_void) -> bool {
+            TRACE.lock().unwrap().push(hr as u32);
+            // Re-entrantly swap callback and report a second error while inside XErrorReport.
+            error_set_callback(second_cb as usize, std::ptr::null_mut());
+            XErrorReport(crate::util::E_INVALIDARG, b"nested error\0".as_ptr());
+            true
+        }
+
+        TRACE.lock().unwrap().clear();
+        let (tx, rx) = mpsc::channel();
+        let t = std::thread::spawn(move || unsafe {
+            error_set_callback(first_cb as usize, std::ptr::null_mut());
+            XErrorReport(crate::util::E_FAIL, b"outer error\0".as_ptr());
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("XErrorReport deadlocked on re-entrant XErrorSetCallback / XErrorReport");
+        t.join().unwrap();
+        assert_eq!(*TRACE.lock().unwrap(), vec![crate::util::E_FAIL as u32, crate::util::E_INVALIDARG as u32]);
+        unsafe { error_set_callback(0, std::ptr::null_mut()) };
     }
 
     #[test]
