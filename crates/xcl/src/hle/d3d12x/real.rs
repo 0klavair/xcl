@@ -2041,6 +2041,9 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
             }
         }
     }
+    if let Some(hr) = own_memory_if_larger_on_the_pc(this, heap, offset, desc, state, clear, riid, ppv) {
+        return hr;
+    }
     let hr = dev_create_placed_resource(this, heap, offset, desc, state, clear, riid, ppv);
     if hr >= 0 || desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
         return hr;
@@ -2076,6 +2079,42 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
         );
     }
     hr3.unwrap_or(hr2)
+}
+
+/// A texture the title placed in a heap by the console's size (`get_resource_allocation_info_x`
+/// answers with XG's), when the PC's is larger: placed at the console's offset it would cover
+/// the start of whatever the title placed after it, and each would write over the other.
+/// Minecraft's logo (1937x333, 0x2A0000 bytes on the console, 0x2E0000 on the PC) ran into the
+/// text and 16x16 textures packed after it – magenta / black squares and a white speck along
+/// its bottom edge. Such a texture gets memory of its own, of the heap's kind; the console's
+/// aliasing of that one placement is lost. None: placed as the title asked.
+#[allow(clippy::too_many_arguments)]
+unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+    if desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
+        return None;
+    }
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    if u32::from_le_bytes(x[0..4].try_into().unwrap()) == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 {
+        return None;
+    }
+    let console = crate::hle::xg::Texture::new(&x).ok()?.size();
+    let d = super::device_x::pc_resource_desc(&x);
+    let pc = pc_allocation_size(this, &d);
+    if console == u64::MAX || pc == u64::MAX || pc <= console {
+        return None;
+    }
+    let h = pc_heap_desc(heap)?;
+    let st = state as u32 & PC_RESOURCE_STATES;
+    let hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+        crate::xlog_info!(
+            "D3D12.X: CreatePlacedResource({}x{}, format {}, flags {:#x}) at {offset:#x}: {pc:#x} bytes on the PC, {console:#x} on the console – memory of its own ({hr:#x})",
+            u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18), u(0x20), u(0x30)
+        );
+    }
+    (hr >= 0).then_some(hr)
 }
 
 /// `XCL_DEBUG_NO_STENCIL` / `XCL_DEBUG_NO_CULL` `=hash,…` (pixel shader dump hashes, hex):
