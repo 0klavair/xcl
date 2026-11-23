@@ -751,6 +751,34 @@ XCL's own XAsync / XTaskQueue matter only without the PC runtime (with Gaming Se
   replace entries on `T:` work, game folder untouched (the probe is a local test, not in the repo: process-wide
   hooks + the global VFS).
 
+## Contributions merged (2026-11-23, PRs #84, #68, #67, #69; #70 superseded by #67)
+Checked on the RX 9070 (AMD): workspace tests with the retail samples (`XCL_SAMPLE_RPF` / `_DLLS` / `_TTPF`) natively
+and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which runs both wave sizes); XDefiant
+(title screen right, 6 299 translated pipelines, 0 errors), Minecraft and Unicorn Overlord run.
+- **#84** (Foniass) console view heaps take the shared heap a page of 256 slots at a time, when a slot is first
+  used: NVIDIA's shared heap holds 1 000 000 descriptors, Minecraft's eight heaps of 73 727 slots wanted 1.18 M –
+  the last two heaps' views were lost (blank frames, "flicker" on NVIDIA).
+- **#68** (Foniass) a UAV barrier for all resources per batch with a UAV barrier / UNORDERED_ACCESS transition
+  (translated shaders reach title memory through the window buffers – other resources); `v_fract_f32` of ±inf /
+  NaN = NaN as on RDNA.
+- **#67** (Foniass) wave64 kernel / compute / mesh / ES+GS programs on 32-lane GPUs: two hardware wave32s per
+  console wave exchanging masks and lane values through groupshared (`docs/wave64-on-wave32.md`); replaces the
+  refused-on-hazards halves of #14 / #39. Still open on NVIDIA: wave64 VS / PS reading lanes 32..63.
+- **Found on merge (AMD):** the PC driver lays 2-D / 3-D thread groups out in 2 x 2 quads (RX 9070: an 8 x 8 group's
+  lanes 0, 1, 4, 5, 8, 9 … hold SV_GroupIndex 0, 1, 2, 3 …; 1-D groups in order), the console in order – every
+  native 2-D / 3-D compute translation read the wrong lanes in DPP / readlane / bpermute / mbcnt. The native form now
+  hands each hardware wave the next console threads as it arrives (as #67's split form does).
+- **#69** (Tems-py) PresentX queues XCL's copy before reporting the flip and keeps its source until the copy's fence
+  (no allocator reset after a timed-out wait); aliasing barriers keep placed (`vram`) textures; title-texture
+  refreshes serialized, no ResetWriteWatch at register (it dropped other users' pending CPU writes). Its heap
+  binding was narrowed on merge: a title's own view heap is bound only when shader visible.
+- **#70** (gefydev, compute as two independent wave32 halves, hazards refused) closed: #67 covers it without the
+  refusals.
+- Pre-existing, not from these PRs (fails on the previous `main` the same way): the opt-in GPU probes
+  `xbox_bvh_builder_builds_on_the_gpu` / `_a_tlas_on_the_gpu` (`XCL_CONSOLE_LISTS=1 XCL_PROBE_BVH_GPU=1`) – the
+  CPU-side trace finds no hit where brute force does (likely the builder's GPU output is not read back through the
+  CPU view since the sparse windows of PR #40). To look at.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
