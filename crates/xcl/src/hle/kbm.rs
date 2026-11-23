@@ -128,6 +128,9 @@ impl Wheel {
 extern "system" {
     fn GetAsyncKeyState(key: i32) -> i16;
     fn GetForegroundWindow() -> *mut c_void;
+    fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+    fn GetKeyboardLayout(id_thread: u32) -> *mut c_void;
+    fn MapVirtualKeyExW(code: u32, map_type: u32, dwhkl: *mut c_void) -> u32;
     fn RegisterRawInputDevices(devices: *const RawInputDevice, n: u32, size: u32) -> i32;
     fn GetRawInputData(input: isize, command: u32, data: *mut c_void, size: *mut u32, header: u32) -> u32;
     fn ClipCursor(rect: *const Rect) -> i32;
@@ -189,6 +192,16 @@ const RIM_TYPEMOUSE: u32 = 0;
 const MOUSE_MOVE_ABSOLUTE: u16 = 1;
 const RI_MOUSE_WHEEL: u16 = 0x0400;
 const HTCLIENT: isize = 1;
+const MAPVK_VSC_TO_VK_EX: u32 = 3;
+
+/// Physical AT Set 1 keyboard scancodes for the left-hand cluster, paired with their
+/// QWERTY virtual-key fallbacks if `MapVirtualKeyExW` returns 0.
+const SC_Q: (u32, i32) = (0x10, 0x51);
+const SC_W: (u32, i32) = (0x11, 0x57);
+const SC_E: (u32, i32) = (0x12, 0x45);
+const SC_A: (u32, i32) = (0x1E, 0x41);
+const SC_S: (u32, i32) = (0x1F, 0x53);
+const SC_D: (u32, i32) = (0x20, 0x44);
 
 /// the XCL window (raw input goes there; the cursor is held in it)
 static WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -207,7 +220,26 @@ struct Mouse {
     wheel_rest: i32,
 }
 
+impl Mouse {
+    fn reset(&mut self, now: Instant) {
+        self.last = now;
+        self.velocity = Velocity::default();
+        self.wheel = Wheel::default();
+        self.wheel_rest = 0;
+    }
+}
+
 static MOUSE: Mutex<Option<Mouse>> = Mutex::new(None);
+
+fn reset_mouse_state() {
+    DX.store(0, Ordering::Relaxed);
+    DY.store(0, Ordering::Relaxed);
+    WHEEL.store(0, Ordering::Relaxed);
+    let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.as_mut() {
+        m.reset(Instant::now());
+    }
+}
 
 pub fn enabled() -> bool {
     crate::state::config().keyboard_mouse
@@ -272,7 +304,11 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
             false // DefWindowProc cleans up
         }
         WM_ACTIVATE => {
-            hold_cursor(hwnd, wp & 0xFFFF != 0);
+            let active = wp & 0xFFFF != 0;
+            hold_cursor(hwnd, active);
+            if !active {
+                reset_mouse_state();
+            }
             false
         }
         WM_LBUTTONDOWN | WM_SIZE | WM_MOVE => {
@@ -290,7 +326,39 @@ pub unsafe fn on_message(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> b
 }
 
 fn key(vk: i32) -> bool {
+    // SAFETY: `GetAsyncKeyState` accepts any virtual-key code with no memory invariants.
     unsafe { GetAsyncKeyState(vk) as u16 & 0x8000 != 0 }
+}
+
+/// Active keyboard layout (`HKL`) of `hwnd`'s thread, falling back to the current thread.
+fn keyboard_layout_for_window(hwnd: *mut c_void) -> *mut c_void {
+    // SAFETY: `GetWindowThreadProcessId` and `GetKeyboardLayout` accept null/valid handles
+    // and thread ID 0 (calling thread) with no pointer aliasing requirements.
+    unsafe {
+        let tid = if hwnd.is_null() { 0 } else { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+        let hkl = GetKeyboardLayout(tid);
+        if hkl.is_null() && tid != 0 {
+            GetKeyboardLayout(0)
+        } else {
+            hkl
+        }
+    }
+}
+
+/// Translate a physical hardware scancode to a virtual-key code for `layout`, falling
+/// back to `fallback_vk` (the QWERTY VK) when `layout` is null or unmapped.
+pub(crate) fn scancode_to_vk(scancode: u32, fallback_vk: i32, layout: *mut c_void) -> i32 {
+    if layout.is_null() {
+        return fallback_vk;
+    }
+    // SAFETY: `MapVirtualKeyExW` is a pure Win32 lookup on `scancode` and `layout`, returning 0
+    // when no translation exists.
+    let vk = unsafe { MapVirtualKeyExW(scancode, MAPVK_VSC_TO_VK_EX, layout) };
+    if vk != 0 {
+        vk as i32
+    } else {
+        fallback_vk
+    }
 }
 
 /// The keyboard and the mouse on top of `s` (the real controller), while the XCL window
@@ -303,27 +371,31 @@ pub fn apply(s: &mut GamepadState) {
     let focused = hwnd != 0 && unsafe { GetForegroundWindow() } as isize == hwnd;
     if !focused {
         // Alt+Tab, another window: the cursor is free, nothing is pressed
+        // SAFETY: `hold_cursor(..., false)` only releases the cursor clip when captured.
         unsafe { hold_cursor(hwnd as *mut c_void, false) };
-        DX.store(0, Ordering::Relaxed);
-        DY.store(0, Ordering::Relaxed);
-        WHEEL.store(0, Ordering::Relaxed);
+        reset_mouse_state();
         return;
     }
-    // movement keys: the left stick (a real stick moved further wins; so does it for the mouse)
-    let (lx, ly) = stick_from_keys(key(0x57), key(0x41), key(0x53), key(0x44));
+    let layout = keyboard_layout_for_window(hwnd as *mut c_void);
+    let sc_key = |(sc, fb): (u32, i32)| key(scancode_to_vk(sc, fb, layout));
+    // movement keys: physical WASD cluster -> left stick (a real stick moved further wins; so does it for the mouse)
+    let (lx, ly) = stick_from_keys(sc_key(SC_W), sc_key(SC_A), sc_key(SC_S), sc_key(SC_D));
     if (lx != 0.0 || ly != 0.0) && lx * lx + ly * ly >= s.left_x * s.left_x + s.left_y * s.left_y {
         s.left_x = lx;
         s.left_y = ly;
     }
     // (Space / Enter, Escape / Backspace, arrows, Tab, P: `gameinput::keyboard`)
-    const KEYS: [(i32, u32); 5] = [
+    const VK_KEYS: [(i32, u32); 3] = [
         (0xA0, LEFT_STICK),  // Left Shift
         (0xA2, RIGHT_STICK), // Left Ctrl
         (0x04, RIGHT_STICK), // middle mouse button
-        (0x45, Y),           // E
-        (0x51, X),           // Q
     ];
-    s.buttons |= KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
+    const SC_KEYS: [((u32, i32), u32); 2] = [
+        (SC_E, Y), // physical E
+        (SC_Q, X), // physical Q
+    ];
+    s.buttons |= VK_KEYS.iter().filter(|(k, _)| key(*k)).fold(0, |b, (_, g)| b | g);
+    s.buttons |= SC_KEYS.iter().filter(|(sc, _)| sc_key(*sc)).fold(0, |b, (_, g)| b | g);
     if key(0x01) {
         s.right_trigger = 1.0;
     }
@@ -412,5 +484,84 @@ mod tests {
         // held for NOTCH_HOLD, released for NOTCH_GAP, then the second press
         assert_eq!(held.iter().filter(|&&b| b == LEFT_SHOULDER).count(), 10);
         assert!(held[..5].iter().all(|&b| b == LEFT_SHOULDER) && held[5..10].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn scancodes_map_to_distinct_vks_and_fall_back_safely() {
+        const MAPVK_VK_TO_VSC: u32 = 0;
+        const MAPVK_VSC_TO_VK: u32 = 1;
+        let layout = keyboard_layout_for_window(std::ptr::null_mut());
+        assert!(!layout.is_null(), "current thread should have an active Windows keyboard layout");
+
+        let cluster = [SC_Q, SC_W, SC_E, SC_A, SC_S, SC_D];
+        let mut seen_vks = Vec::new();
+        for &(sc, fb) in &cluster {
+            let vk = scancode_to_vk(sc, fb, layout);
+            // SAFETY: pure Win32 lookup on the current thread's HKL.
+            let vk_basic = unsafe { MapVirtualKeyExW(sc, MAPVK_VSC_TO_VK, layout) } as i32;
+            assert_eq!(vk, vk_basic, "MAPVK_VSC_TO_VK and MAPVK_VSC_TO_VK_EX should agree for scancode {sc:#x}");
+            assert_ne!(vk, 0);
+            assert!(!seen_vks.contains(&vk), "scancode {sc:#x} collided with another key's VK {vk:#x}");
+            seen_vks.push(vk);
+
+            // Round-trip VK -> scancode verifies we resolved the physical key position.
+            // SAFETY: pure Win32 lookup on the current thread's HKL.
+            let roundtrip = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, layout) };
+            assert_eq!(roundtrip, sc, "VK {vk:#x} should round-trip back to physical scancode {sc:#x}");
+        }
+
+        // Verify MAPVK_VSC_TO_VK_EX distinguishes Left Shift (0x2A -> VK_LSHIFT 0xA0) whereas
+        // MAPVK_VSC_TO_VK collapses it to generic VK_SHIFT (0x10).
+        // SAFETY: pure Win32 lookup on the current thread's HKL.
+        let lshift_basic = unsafe { MapVirtualKeyExW(0x2A, MAPVK_VSC_TO_VK, layout) };
+        let lshift_ex = scancode_to_vk(0x2A, 0xA0, layout) as u32;
+        assert_eq!(lshift_basic, 0x10);
+        assert_eq!(lshift_ex, 0xA0);
+
+        // Fallback when layout is null or scancode has no mapping.
+        assert_eq!(scancode_to_vk(SC_W.0, SC_W.1, std::ptr::null_mut()), SC_W.1);
+        assert_eq!(scancode_to_vk(0xFFFF, SC_Q.1, layout), SC_Q.1);
+    }
+
+    #[test]
+    fn focus_loss_resets_mouse_velocity_and_wheel_state() {
+        // Seed raw deltas and active MOUSE state (velocity, in-flight & pending wheel notches, remainder).
+        DX.store(250, Ordering::Relaxed);
+        DY.store(-180, Ordering::Relaxed);
+        WHEEL.store(240, Ordering::Relaxed);
+        {
+            let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut v = Velocity::default();
+            for _ in 0..20 {
+                v.update(40, -20, 0.004);
+            }
+            let mut w = Wheel::default();
+            w.notches(3);
+            assert_eq!(w.step(0.01), RIGHT_SHOULDER);
+            *g = Some(Mouse {
+                last: Instant::now(),
+                velocity: v,
+                wheel: w,
+                wheel_rest: 90,
+            });
+            let m = g.as_ref().unwrap();
+            assert!(m.velocity.x.abs() > REST_SPEED && m.velocity.y.abs() > REST_SPEED);
+        }
+
+        // With no focused XCL window (`WINDOW == 0`), `apply` treats focus as lost and resets everything.
+        let mut s = GamepadState::default();
+        apply(&mut s);
+        assert_eq!(s, GamepadState::default());
+        assert_eq!(DX.load(Ordering::Relaxed), 0);
+        assert_eq!(DY.load(Ordering::Relaxed), 0);
+        assert_eq!(WHEEL.load(Ordering::Relaxed), 0);
+
+        let mut g = MOUSE.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.as_mut().expect("mouse state should remain allocated");
+        assert_eq!(m.velocity, Velocity::default());
+        assert_eq!(m.wheel_rest, 0);
+        for _ in 0..20 {
+            assert_eq!(m.wheel.step(0.01), 0, "stale wheel notches must not fire after refocusing");
+        }
     }
 }
