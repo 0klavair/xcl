@@ -13,8 +13,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{SetLastError, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{WIN32_FIND_DATAA, WIN32_FIND_DATAW};
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError, ERROR_NOT_SAME_DEVICE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, WIN32_FIND_DATAA, WIN32_FIND_DATAW};
 
 use crate::hooks::hook;
 use crate::util::{from_ansi_ptr, from_wide_ptr, wide};
@@ -553,13 +553,14 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                 if src_meta.is_dir() {
                     return Err(vfs::ERROR_ACCESS_DENIED); // moving whole game dirs is not supported
                 }
+                let source_in_overlay = rs == v.overlay_path(sr);
                 // Case-only or exact self-rename inside the game folder: never delete/whiteout!
                 if let Some(dr) = &drel_opt {
                     if sr.to_lowercase() == dr.to_lowercase() {
                         if sr == dr {
                             return Ok(());
                         }
-                        if v.visible_in_overlay(sr) {
+                        if source_in_overlay {
                             let rd = v.overlay_path(dr);
                             if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags) == 0 {
                                 // SAFETY: GetLastError reads thread-local Win32 error state.
@@ -583,14 +584,26 @@ unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl F
                     }
                 }
                 let (rd, drel) = dest_of(v, d)?;
-                if drel.is_none() {
-                    if let Ok(m) = std::fs::metadata(&rd) {
-                        if m.is_dir() {
-                            return Err(vfs::ERROR_ACCESS_DENIED);
+                if let Some(dr) = &drel {
+                    if source_in_overlay && flags & MOVEFILE_DELAY_UNTIL_REBOOT == 0 {
+                        // An in-place rename checks delete sharing before replacing the destination.
+                        let moved = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags & !MOVEFILE_COPY_ALLOWED);
+                        if moved != 0 {
+                            v.commit_write(dr);
+                            v.commit_overlay_removal(sr);
+                            return Ok(());
                         }
-                        if !replace_existing {
-                            return Err(vfs::ERROR_ALREADY_EXISTS);
+                        let error = GetLastError();
+                        if error != ERROR_NOT_SAME_DEVICE {
+                            return Err(error);
                         }
+                    }
+                } else if let Ok(m) = std::fs::metadata(&rd) {
+                    if m.is_dir() {
+                        return Err(vfs::ERROR_ACCESS_DENIED);
+                    }
+                    if !replace_existing {
+                        return Err(vfs::ERROR_ALREADY_EXISTS);
                     }
                 }
                 std::fs::copy(&rs, &rd).map_err(|e| io_err_code(&e, vfs::ERROR_ACCESS_DENIED))?;
@@ -1242,6 +1255,42 @@ mod tests {
         assert_eq!(ok, 1);
         assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"from-ext".to_vec()));
         assert!(!f.temp().join("ext.txt").exists());
+    }
+
+    #[test]
+    fn move_with_locked_overlay_source_preserves_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let f = HookFixture::new("locked_move");
+        let v = &f.vfs;
+        let source = r"G:\data\hello.txt";
+        let destination = r"G:\data\gone.txt";
+        let overlay_source = v.prepare_write(r"data\hello.txt", false).unwrap();
+        let overlay_destination = v.prepare_write(r"data\gone.txt", false).unwrap();
+        std::fs::write(&overlay_source, b"overlay source").unwrap();
+        std::fs::write(overlay_destination, b"old destination").unwrap();
+
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(overlay_source)
+            .unwrap();
+        let result = unsafe { move_file_vfs(v, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        let error = unsafe { GetLastError() };
+        assert_eq!(result, 0, "the open source does not share delete access");
+        assert_eq!(f.read_vfs(destination).as_deref(), Some(&b"old destination"[..]));
+        assert_eq!(f.read_vfs(source).as_deref(), Some(&b"overlay source"[..]));
+        assert_eq!(error, ERROR_SHARING_VIOLATION);
+
+        drop(held);
+        let result = unsafe { move_file_vfs(v, source, destination, MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_ne!(result, 0, "move should succeed after the source handle closes");
+        assert_eq!(f.read_vfs(destination).as_deref(), Some(&b"overlay source"[..]));
+        assert_eq!(f.read_vfs(source), None, "the original stays hidden after the move");
+        assert_eq!(std::fs::read(f.game().join("data/hello.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::read(f.game().join("data/gone.txt")).unwrap(), b"bye");
     }
 
     #[test]
