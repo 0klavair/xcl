@@ -88,14 +88,12 @@ fn init() -> Result<Gpu, String> {
                 .ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             (a, crate::gpu::adapter::name(&desc))
         };
-        let mut dev: Option<ID3D12Device> = None;
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(e)?;
-        let dev = dev.ok_or("no device")?;
+        let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(e)?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
         dev.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &mut sm as *mut _ as _, std::mem::size_of_val(&sm) as u32)
             .map_err(|x| format!("SM 6.6: {x}"))?;
         if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err(format!("{name}: no SM 6.6"));
+            return Err(format!("{name}: no SM 6.6 (on Windows 10, set {} to a D3D12 Agility SDK folder)", crate::gpu::agility::ENV));
         }
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &mut o1 as *mut _ as _, std::mem::size_of_val(&o1) as u32).map_err(e)?;

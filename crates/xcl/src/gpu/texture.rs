@@ -514,9 +514,7 @@ mod tests {
 
     fn device() -> Option<(ID3D12Device, ID3D12CommandQueue)> {
         unsafe {
-            let mut dev: Option<ID3D12Device> = None;
-            windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0, &mut dev).ok()?;
-            let dev = dev?;
+            let dev = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0).ok()?;
             let queue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).ok()?;
             Some((dev, queue))
         }

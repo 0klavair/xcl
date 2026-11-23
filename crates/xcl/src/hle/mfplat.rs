@@ -286,7 +286,6 @@ mod tests {
     #[test]
     fn reset_dxgi_device_manager_with_d3d12_device_and_token_validation() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
-        use windows::Win32::Graphics::Direct3D12::D3D12CreateDevice;
         use windows::Win32::Media::MediaFoundation::{
             MFCreateDXGIDeviceManager, MFShutdown, MFStartup, MFSTARTUP_LITE, MF_VERSION,
         };
@@ -302,12 +301,10 @@ mod tests {
             assert!(hr.is_ok(), "MFCreateDXGIDeviceManager failed: {hr:?}");
             let manager = manager.expect("manager");
 
-            let mut d3d12_dev: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut d3d12_dev).is_err() {
+            let Ok(d3d12_dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
                 let _ = MFShutdown();
                 return;
-            }
-            let d3d12_dev = d3d12_dev.expect("d3d12_dev");
+            };
 
             // Invalid reset token MUST be rejected.
             let bad_token = reset_token.wrapping_add(1);

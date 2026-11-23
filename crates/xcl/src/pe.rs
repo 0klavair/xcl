@@ -183,7 +183,10 @@ impl Exports {
     }
 
     pub fn is_forwarder_rva(&self, rva: u32) -> bool {
-        rva >= self.dir.rva && rva < self.dir.rva.saturating_add(self.dir.size)
+        self.dir
+            .rva
+            .checked_add(self.dir.size)
+            .is_some_and(|end| rva >= self.dir.rva && rva < end)
     }
 }
 
@@ -260,8 +263,9 @@ impl<'a> Pe<'a> {
         let stack_reserve = rd_u64(data, opt + 72).ok_or(t(72))?;
         let stack_commit = rd_u64(data, opt + 80).ok_or(t(80))?;
         let ndirs = (rd_u32(data, opt + 108).ok_or(t(108))? as usize).min(16);
+        let max_dirs = opt_size.saturating_sub(112) / 8;
         let mut dirs = [DataDir::default(); 16];
-        for (i, d) in dirs.iter_mut().enumerate().take(ndirs) {
+        for (i, d) in dirs.iter_mut().enumerate().take(ndirs.min(max_dirs)) {
             let o = opt + 112 + i * 8;
             d.rva = rd_u32(data, o).ok_or(t(112))?;
             d.size = rd_u32(data, o + 4).ok_or(t(112))?;
@@ -346,24 +350,51 @@ impl<'a> Pe<'a> {
         }
     }
 
+    fn rva_tail(&self, rva: u32) -> Option<&'a [u8]> {
+        match self.layout {
+            Layout::Mapped => self.data.get(rva as usize..),
+            Layout::File => {
+                if rva < self.size_of_headers {
+                    let off = rva as usize;
+                    let end = off.saturating_add((self.size_of_headers - rva) as usize).min(self.data.len());
+                    return self.data.get(off..end);
+                }
+                for s in &self.sections {
+                    let size = s.mapped_size().max(s.raw_size);
+                    if rva >= s.va && rva < s.va.saturating_add(size) {
+                        let delta = rva - s.va;
+                        if delta >= s.raw_size {
+                            return None; // in zero-filled tail, not present in file
+                        }
+                        let off = (s.raw_ptr as usize).checked_add(delta as usize)?;
+                        let end = off.saturating_add((s.raw_size - delta) as usize).min(self.data.len());
+                        return self.data.get(off..end);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     pub fn bytes_at(&self, rva: u32, len: usize) -> Option<&'a [u8]> {
-        let off = self.rva_to_offset(rva)?;
-        self.data.get(off..off.checked_add(len)?)
+        self.rva_tail(rva)?.get(..len)
     }
 
     pub fn u16_at(&self, rva: u32) -> Option<u16> {
-        rd_u16(self.data, self.rva_to_offset(rva)?)
+        let b = self.bytes_at(rva, 2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
     }
     pub fn u32_at(&self, rva: u32) -> Option<u32> {
-        rd_u32(self.data, self.rva_to_offset(rva)?)
+        let b = self.bytes_at(rva, 4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     pub fn u64_at(&self, rva: u32) -> Option<u64> {
-        rd_u64(self.data, self.rva_to_offset(rva)?)
+        let b = self.bytes_at(rva, 8)?;
+        Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
     pub fn cstr_at(&self, rva: u32) -> Option<String> {
-        let off = self.rva_to_offset(rva)?;
-        let tail = self.data.get(off..)?;
+        let tail = self.rva_tail(rva)?;
         let end = tail.iter().take(4096).position(|&c| c == 0)?;
         Some(String::from_utf8_lossy(&tail[..end]).into_owned())
     }
@@ -498,7 +529,13 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(None);
         }
-        let g = |o: u32| self.u32_at(d.rva + o).ok_or(PeError::BadRva(d.rva + o));
+        if d.size < 40 || d.rva.checked_add(d.size).is_none() {
+            return Err(PeError::BadRva(d.rva));
+        }
+        let g = |o: u32| {
+            let rva = d.rva.checked_add(o).ok_or(PeError::BadRva(d.rva))?;
+            self.u32_at(rva).ok_or(PeError::BadRva(rva))
+        };
         let name_rva = g(12)?;
         let base = g(16)?;
         let nfunc = g(20)?.min(65536);
@@ -508,12 +545,15 @@ impl<'a> Pe<'a> {
         let aords = g(36)?;
         let mut functions = Vec::with_capacity(nfunc as usize);
         for i in 0..nfunc {
-            functions.push(self.u32_at(afunc + i * 4).ok_or(PeError::BadRva(afunc))?);
+            let rva = i.checked_mul(4).and_then(|o| afunc.checked_add(o)).ok_or(PeError::BadRva(afunc))?;
+            functions.push(self.u32_at(rva).ok_or(PeError::BadRva(rva))?);
         }
         let mut names = Vec::with_capacity(nnames as usize);
         for i in 0..nnames {
-            let nr = self.u32_at(anames + i * 4).ok_or(PeError::BadRva(anames))?;
-            let idx = self.u16_at(aords + i * 2).ok_or(PeError::BadRva(aords))?;
+            let nr_rva = i.checked_mul(4).and_then(|o| anames.checked_add(o)).ok_or(PeError::BadRva(anames))?;
+            let ord_rva = i.checked_mul(2).and_then(|o| aords.checked_add(o)).ok_or(PeError::BadRva(aords))?;
+            let nr = self.u32_at(nr_rva).ok_or(PeError::BadRva(nr_rva))?;
+            let idx = self.u16_at(ord_rva).ok_or(PeError::BadRva(ord_rva))?;
             if let Some(n) = self.cstr_at(nr) {
                 names.push((n, idx));
             }
