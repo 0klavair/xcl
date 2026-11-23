@@ -5595,3 +5595,287 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     assert_eq!(r.vgpr[1][0], 0x0000, "mad_nf_f16 RTZ clamp: 65504*(1+2^-10)->65504, -65504 -> 0");
     assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
 }
+
+#[test]
+fn ps_interp_preserves_integer_and_float_inputs() {
+    use super::PsInterface;
+    let ps_code = prog(&[
+        ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 1), ("ATTR", 0), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 5), ("VSRC", 2), ("ATTR", 1), ("ATTRCHAN", 0)], None),
+        ("V_INTERP_P2_F32", "ENC_VINTRP", &[("VDST", 6), ("VSRC", 1), ("ATTR", 1), ("ATTRCHAN", 1)], None),
+        ("V_INTERP_MOV_F32", "ENC_VINTRP", &[("VDST", 7), ("VSRC", 2), ("ATTR", 2), ("ATTRCHAN", 0)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let psi = PsInterface {
+        inputs: vec![
+            el("SV_Position", 0, 1, 3, 0, 0xF),
+            el("TEXCOORD", 0, 0, 3, 1, 0xF), // float4
+            el("TEXCOORD", 1, 0, 1, 2, 0xF), // uint4
+            el("TEXCOORD", 2, 0, 2, 3, 0xF), // int4
+        ],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
+    assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
+    assert!(!pt.hlsl.contains("asuint((float)xi.a"), "integer PS inputs must not be cast through float:\n{}", pt.hlsl);
+    assert!(pt.hlsl.contains("asuint(xi.a0[0])"), "{}", pt.hlsl);
+    assert!(pt.hlsl.contains("asuint(xi.a1[0])"), "{}", pt.hlsl);
+    assert!(pt.hlsl.contains("asuint(xi.a1[1])"), "{}", pt.hlsl);
+    assert!(pt.hlsl.contains("asuint(xi.a2[0])"), "{}", pt.hlsl);
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
+    }
+}
+
+#[test]
+fn gpu_ds_swizzle_and_bpermute_zero_inactive_lanes() {
+    let run_case = |wave64: bool, split_wave64: bool| {
+        let mut insns: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = vec![
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 255)], Some(0x5555_5555)),
+        ];
+        if wave64 {
+            insns.push(("S_MOV_B32", "ENC_SOP1", &[("SDST", 127), ("SSRC0", 255)], Some(0x5555_5555)));
+        }
+        insns.extend_from_slice(&[
+            // swizzle XOR 1: even lanes read inactive odd neighbor -> must be 0
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 1 << 2)], None),
+            // bpermute targeting odd neighbor -> must be 0
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 1), ("DATA0", 0)], None),
+            // bpermute targeting cross-half odd lane (lane ^ 33) -> must be 0
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 12), ("ADDR", 2), ("DATA0", 0)], None),
+            // swizzle XOR 2: even lanes read active even lane -> must return its value
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 13), ("ADDR", 0), ("OFFSET0", 0x1F), ("OFFSET1", 2 << 2)], None),
+        ]);
+        let code = prog(&insns);
+        let t = translate(&code, &Options { wave64, split_wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mut st = KernelState::default();
+        let lanes = if wave64 { 64 } else { 32 };
+        for (l, r) in st.vgpr.iter_mut().take(lanes).enumerate() {
+            r[0] = if l & 1 == 1 { 0xDEAD } else { 0x1000 + l as u32 };
+            r[1] = 4 * (l ^ 1) as u32;
+            r[2] = 4 * ((l ^ 33) & (lanes - 1)) as u32;
+            for dst in 10..=13 {
+                r[dst] = 0xCAFE_BABE;
+            }
+        }
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..lanes {
+            let v = &r.vgpr[l];
+            if l & 1 == 0 {
+                assert_eq!(v[10], 0, "wave{lanes} split={split_wave64} lane {l}: ds_swizzle inactive src");
+                assert_eq!(v[11], 0, "wave{lanes} split={split_wave64} lane {l}: ds_bpermute inactive src");
+                assert_eq!(v[12], 0, "wave{lanes} split={split_wave64} lane {l}: ds_bpermute cross-half inactive src");
+                assert_eq!(v[13], 0x1000 + (l ^ 2) as u32, "wave{lanes} split={split_wave64} lane {l}: ds_swizzle active src");
+            } else {
+                for dst in 10..=13 {
+                    assert_eq!(v[dst], 0xCAFE_BABE, "wave{lanes} split={split_wave64} lane {l}: inactive dst v{dst}");
+                }
+            }
+        }
+    };
+    for wave64 in gpu_waves() {
+        run_case(wave64, false);
+    }
+    if gpu_ready() {
+        run_case(true, true);
+    }
+}
+
+#[test]
+fn gpu_ldexp_f32() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[("V_LDEXP_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1)], None)]);
+        const CASES: [(u32, i32, u32); 15] = [
+            (1e30f32.to_bits(), -150, 1e30f32.to_bits() - (150 << 23)),
+            (0.5f32.to_bits(), 128, 0x7F00_0000),            // 2^127
+            (2.0f32.to_bits(), -127, 0x0080_0000),           // 2^-126 (min normal)
+            (0.0f32.to_bits(), 200, 0x0000_0000),            // +0 stays +0
+            (0x8000_0000, 200, 0x8000_0000),                 // -0 stays -0
+            (f32::INFINITY.to_bits(), -200, 0x7F80_0000),    // +inf stays +inf
+            (f32::NEG_INFINITY.to_bits(), -200, 0xFF80_0000),// -inf stays -inf
+            (0x7FC0_1234, 10, 0x7FC0_1234),                  // NaN stays NaN
+            (1.0f32.to_bits(), -149, 0x0000_0001),           // min subnormal
+            (1.0f32.to_bits(), -150, 0x0000_0000),           // tie to even -> 0
+            (1.5f32.to_bits(), -149, 0x0000_0002),           // tie to even -> 2
+            (0x0000_0001, 149, 1.0f32.to_bits()),            // subnormal input -> 1.0
+            (0x0000_0001, 276, 0x7F00_0000),                 // subnormal input -> 2^127
+            (1.0f32.to_bits(), i32::MAX, 0x7F80_0000),       // overflow to +inf
+            ((-1.0f32).to_bits(), i32::MIN, 0x8000_0000),    // underflow to -0
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (x, n, _) = CASES[l % CASES.len()];
+            (r[0], r[1]) = (x, n as u32);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (x, n, want) = CASES[l % CASES.len()];
+            let got = v[4];
+            let both_nan = f32::from_bits(got).is_nan() && f32::from_bits(want).is_nan();
+            assert!(
+                got == want || both_nan,
+                "wave{lanes} lane {l} v_ldexp_f32({x:#010x}, {n}) = {got:#010x}, want {want:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gpu_f64_literal_high_word() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // 1.0 + literal(1.5 = 0x3FF8_0000_0000_0000) == 2.5
+            ("V_ADD_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 255)], Some(0x3FF8_0000)),
+            // compare result against literal(2.5 = 0x4004_0000_0000_0000)
+            ("V_CMP_EQ_F64", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 4), ("SRC1", 255)], Some(0x4004_0000)),
+            // verify integer 64-bit literal still goes in low 32 bits
+            ("V_CMP_EQ_U64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 6), ("SRC1", 255)], Some(0x1234_5678)),
+        ]);
+        let mut st = KernelState::default();
+        let one = 1.0f64.to_bits();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1]) = (one as u32, (one >> 32) as u32);
+            (r[6], r[7]) = (0x1234_5678, 0);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(pair(v, 4), 2.5f64, "wave{lanes} lane {l} v_add_f64 literal");
+        }
+        let expected_hi = if wave64 { u32::MAX } else { 0 };
+        assert_eq!((r.sgpr[0], r.sgpr[1]), (u32::MAX, expected_hi), "wave{lanes} v_cmp_eq_f64 literal");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (u32::MAX, expected_hi), "wave{lanes} v_cmp_eq_u64 literal");
+    }
+}
+
+#[test]
+fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    // Formats: 43 = 11_11_10_FLOAT (X:10b, Y:11b, Z:11b), 36 = 10_11_11_FLOAT (X:11b, Y:11b, Z:10b), 24 = 16_16_SNORM
+    let p = prog(&[
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 0), ("SRC1", V + 0)], None), // (NaN, NaN)
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1)], None), // (NaN, 1.0)
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 0)], None), // (-1.0, NaN)
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 4), ("SOFFSET", 128)], None), // 11_11_10_FLOAT (-1, -inf, 1)
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 24), ("SRSRC", 5), ("SOFFSET", 128)], None), // 11_11_10_FLOAT (NaN, +inf, -0.5)
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 20), ("SRSRC", 6), ("SOFFSET", 128)], None), // 10_11_11_FLOAT (-1, -inf, 1)
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 28), ("SRSRC", 7), ("SOFFSET", 128)], None),  // 16_16_SNORM (NaN, -1.0)
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 43));
+    st.sgpr[20..24].copy_from_slice(&vs(0x204, 43));
+    st.sgpr[24..28].copy_from_slice(&vs(0x208, 36));
+    st.sgpr[28..32].copy_from_slice(&vs(0x20C, 24));
+    for r in st.vgpr.iter_mut() {
+        r[0] = f32::NAN.to_bits();
+        r[1] = 1.0f32.to_bits();
+        r[2] = (-1.0f32).to_bits();
+        // (-1.0, -Inf, 1.0)
+        r[20] = (-1.0f32).to_bits();
+        r[21] = f32::NEG_INFINITY.to_bits();
+        r[22] = 1.0f32.to_bits();
+        // (NaN, +Inf, -0.5)
+        r[24] = f32::NAN.to_bits();
+        r[25] = f32::INFINITY.to_bits();
+        r[26] = (-0.5f32).to_bits();
+        // (NaN, -1.0)
+        r[28] = f32::NAN.to_bits();
+        r[29] = (-1.0f32).to_bits();
+    }
+    let mem = vec![0u32; 0x100];
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.vgpr[0][10], 0x0000_0000, "v_cvt_pknorm_i16_f32(NaN, NaN)");
+    assert_eq!(r.vgpr[0][11], 0x7FFF_0000, "v_cvt_pknorm_i16_f32(NaN, 1.0)");
+    assert_eq!(r.vgpr[0][12], 0x0000_8001, "v_cvt_pknorm_i16_f32(-1.0, NaN)");
+    // 11_11_10_FLOAT (-1, -inf, 1): X(10b)=0, Y(11b)=0, Z(11b)=0x3C0 -> 0x3C0 << 21 = 0x7800_0000
+    assert_eq!(r.mem[0x200 / 4], 0x3C0 << 21, "11_11_10_FLOAT (-1, -inf, 1)");
+    // 11_11_10_FLOAT (NaN, +inf, -0.5): X(10b)=0x3F0 (NaN), Y(11b)=0x7C0 (+inf), Z(11b)=0
+    assert_eq!(r.mem[0x204 / 4], 0x3F0 | (0x7C0 << 10), "11_11_10_FLOAT (NaN, +inf, -0.5)");
+    // 10_11_11_FLOAT (-1, -inf, 1): X(11b)=0, Y(11b)=0, Z(10b)=0x1E0 -> 0x1E0 << 22 = 0x7800_0000
+    assert_eq!(r.mem[0x208 / 4], 0x1E0 << 22, "10_11_11_FLOAT (-1, -inf, 1)");
+    // 16_16_SNORM (NaN, -1.0): lo=0, hi=-32767 (0x8001)
+    assert_eq!(r.mem[0x20C / 4], 0x8001_0000, "16_16_SNORM (NaN, -1.0)");
+}
+
+#[test]
+fn gpu_signed_bfe_arithmetic_shift() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // s_bfe_i64(-1, offset=8, width=64) -> -1
+            ("S_BFE_I64", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 4), ("SSRC1", 6)], None),
+            // s_bfe_i64(0x8000_0000_0000_0000, offset=32, width=40) -> 0xFFFF_FFFF_8000_0000
+            ("S_BFE_I64", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 8), ("SSRC1", 10)], None),
+            // s_bfe_i32(0x8000_0000, offset=16, width=20) -> 0xFFFF_8000
+            ("S_BFE_I32", "ENC_SOP2", &[("SDST", 12), ("SSRC0", 11), ("SSRC1", 13)], None),
+            // v_bfe_i32(0x8000_0000, offset=16, width=20) -> 0xFFFF_8000
+            ("V_BFE_I32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 0), ("SRC1", 144), ("SRC2", 148)], None),
+            // v_bfe_i32(0x0000_8000, offset=0, width=16) -> 0xFFFF_8000 (o + w < 32)
+            ("V_BFE_I32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", 128), ("SRC2", 144)], None),
+            // v_bfe_i32(0xFFFF_FFFF, offset=4, width=0) -> 0
+            ("V_BFE_I32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", 132), ("SRC2", 128)], None),
+        ]);
+        let mut st = KernelState::default();
+        (st.sgpr[4], st.sgpr[5]) = (u32::MAX, u32::MAX);
+        st.sgpr[6] = (64 << 16) | 8;
+        (st.sgpr[8], st.sgpr[9]) = (0, 0x8000_0000);
+        st.sgpr[10] = (40 << 16) | 32;
+        st.sgpr[11] = 0x8000_0000;
+        st.sgpr[13] = (20 << 16) | 16;
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x8000_0000;
+            r[1] = 0x0000_8000;
+            r[2] = u32::MAX;
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        assert_eq!((r.sgpr[0], r.sgpr[1]), (u32::MAX, u32::MAX), "wave{lanes} s_bfe_i64(-1, 8, 64)");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0x8000_0000, u32::MAX), "wave{lanes} s_bfe_i64(i64::MIN, 32, 40)");
+        assert_eq!(r.sgpr[12], 0xFFFF_8000, "wave{lanes} s_bfe_i32(i32::MIN, 16, 20)");
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            assert_eq!(v[4], 0xFFFF_8000, "wave{lanes} lane {l} v_bfe_i32(i32::MIN, 16, 20)");
+            assert_eq!(v[5], 0xFFFF_8000, "wave{lanes} lane {l} v_bfe_i32(0x8000, 0, 16)");
+            assert_eq!(v[6], 0, "wave{lanes} lane {l} v_bfe_i32(width=0)");
+        }
+    }
+}
+
+#[test]
+fn gpu_cmp_class_f16_preserves_snan() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            // 0x7C01 (sNaN) tested against mask 1 << 0 (sNaN) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 0), ("SRC1", 129)], None),
+            // 0x7C01 (sNaN) tested against mask 1 << 1 (qNaN) -> false
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 0), ("SRC1", 130)], None),
+            // 0x7E01 (qNaN) tested against mask 1 << 0 (sNaN) -> false
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 129)], None),
+            // 0x7E01 (qNaN) tested against mask 1 << 1 (qNaN) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1), ("SRC1", 130)], None),
+            // 0xBC00 (-1.0) with ABS tested against mask 1 << 8 (+normal) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 2), ("SRC1", 255), ("ABS", 1)], Some(1 << 8)),
+            // 0xBC00 (-1.0) with NEG tested against mask 1 << 8 (+normal) -> true
+            ("V_CMP_CLASS_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", 255), ("NEG", 1)], Some(1 << 8)),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            r[0] = 0x7C01; // f16 sNaN
+            r[1] = 0x7E01; // f16 qNaN
+            r[2] = 0xBC00; // f16 -1.0
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        let all = (u32::MAX, if wave64 { u32::MAX } else { 0 });
+        assert_eq!((r.sgpr[0], r.sgpr[1]), all, "wave{lanes} f16 sNaN matches sNaN bit");
+        assert_eq!((r.sgpr[2], r.sgpr[3]), (0, 0), "wave{lanes} f16 sNaN does not match qNaN bit");
+        assert_eq!((r.sgpr[4], r.sgpr[5]), (0, 0), "wave{lanes} f16 qNaN does not match sNaN bit");
+        assert_eq!((r.sgpr[6], r.sgpr[7]), all, "wave{lanes} f16 qNaN matches qNaN bit");
+        assert_eq!((r.sgpr[8], r.sgpr[9]), all, "wave{lanes} f16 abs(-1.0) matches +normal");
+        assert_eq!((r.sgpr[10], r.sgpr[11]), all, "wave{lanes} f16 neg(-1.0) matches +normal");
+    }
+}

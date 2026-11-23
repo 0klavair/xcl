@@ -624,7 +624,9 @@ impl Em {
     }
 
     /// 64-bit value (lo, hi) of a scalar source code.
-    fn code64(&mut self, code: u64, lit: Option<u32>) -> Option<(String, String)> {
+    /// In RDNA2 ISA, a 32-bit literal (`code == 255`) goes in the high 32 bits for f64
+    /// operands (`{0, lit}`) and in the low 32 bits for integer/bitmask operands (`{lit, 0}`).
+    fn code64(&mut self, code: u64, lit: Option<u32>, f64: bool) -> Option<(String, String)> {
         Some(match code {
             0..=123 | 126 => (self.sreg(code), self.sreg(code + 1)),
             125 => ("0u".into(), "0u".into()),
@@ -636,7 +638,7 @@ impl Em {
                 (hex(b as u32), hex((b >> 32) as u32))
             }
             253 => ("scc".into(), "0u".into()),
-            255 => (hex(lit?), "0u".into()),
+            255 => if f64 { ("0u".into(), hex(lit?)) } else { (hex(lit?), "0u".into()) },
             256..=510 => (self.vreg(code - 256), self.vreg(code - 255)),
             _ => return None,
         })
@@ -673,14 +675,14 @@ impl Em {
         }
     }
 
-    fn read64(&mut self, d: &Decoded, o: &Operand) -> Option<(String, String)> {
+    fn read64(&mut self, d: &Decoded, o: &Operand, f64: bool) -> Option<(String, String)> {
         match o.field {
             Some(f) => {
                 let v = Self::field(d, f);
                 if o.ty.starts_with("OPR_VGPR") && d.enc.field_width(f) <= 8 {
                     return Some((self.vreg(v), self.vreg(v + 1)));
                 }
-                self.code64(v, d.literal)
+                self.code64(v, d.literal, f64)
             }
             None => match o.ty {
                 "OPR_VCC" => Some((self.sreg(106), self.sreg(107))),
@@ -1037,7 +1039,7 @@ impl Em {
         }
         if d.enc.name == "ENC_SOPC" {
             if matches!(name, "s_bitcmp0_b64" | "s_bitcmp1_b64") {
-                let (a0, a1) = self.read64(d, ins[0]).ok_or("op")?;
+                let (a0, a1) = self.read64(d, ins[0], false).ok_or("op")?;
                 let b = self.read(d, ins[1], false).ok_or("op")?;
                 let bit = format!("((select(({b} & 32u) == 0u, {a0}, {a1}) >> ({b} & 31u)) & 1u)");
                 if name == "s_bitcmp0_b64" {
@@ -1049,7 +1051,7 @@ impl Em {
             }
             let a64 = name.ends_with("_u64");
             if a64 {
-                let (a, b) = (self.read64(d, ins[0]).ok_or("op")?, self.read64(d, ins[1]).ok_or("op")?);
+                let (a, b) = (self.read64(d, ins[0], false).ok_or("op")?, self.read64(d, ins[1], false).ok_or("op")?);
                 let op = match name {
                     "s_cmp_eq_u64" => "==",
                     "s_cmp_lg_u64" => "!=",
@@ -1076,7 +1078,7 @@ impl Em {
         // SOP1 / SOP2
         let saveexec = name.contains("saveexec") || name.contains("wrexec");
         if saveexec {
-            let s0 = self.read64(d, ins[0]).ok_or("op")?;
+            let s0 = self.read64(d, ins[0], false).ok_or("op")?;
             let (el, eh) = (self.sreg(126), self.sreg(127));
             let op = |a: &str, e: &str| -> Option<String> {
                 Some(match base.split('_').nth(1)? {
@@ -1286,7 +1288,7 @@ impl Em {
 
     fn salu64(&mut self, d: &Decoded, name: &str, dst: &Dst, ins: &[&Operand]) -> Result<(), &'static str> {
         let a = match ins.first() {
-            Some(o) => Some(self.read64(d, o).ok_or("op")?),
+            Some(o) => Some(self.read64(d, o, false).ok_or("op")?),
             None => None,
         };
         let b = match ins.get(1) {
@@ -1296,7 +1298,7 @@ impl Em {
                     let v = self.read(d, o, false).ok_or("op")?;
                     Some((v, "0u".into()))
                 } else {
-                    Some(self.read64(d, o).ok_or("op")?)
+                    Some(self.read64(d, o, false).ok_or("op")?)
                 }
             }
             None => None,
@@ -1377,15 +1379,16 @@ impl Em {
                 let w = self.t();
                 let o = self.t();
                 let x = self.t();
-                self.line(&format!("uint {w} = ({bl} >> 16) & 0x7Fu; uint {o} = {bl} & 63u; uint64_t {x} = {v} >> {o};"));
                 let r = self.t();
                 if name == "s_bfe_u64" {
+                    self.line(&format!("uint {w} = ({bl} >> 16) & 0x7Fu; uint {o} = {bl} & 63u; uint64_t {x} = {v} >> {o};"));
                     self.line(&format!(
                         "uint64_t {r} = ({w} == 0u) ? 0ull : (({w} >= 64u) ? {x} : ({x} & (0xFFFFFFFFFFFFFFFFull >> (64u - {w}))));"
                     ));
                 } else {
+                    self.line(&format!("uint {w} = ({bl} >> 16) & 0x7Fu; uint {o} = {bl} & 63u; int64_t {x} = ((int64_t){v}) >> {o};"));
                     self.line(&format!(
-                        "uint64_t {r} = ({w} == 0u) ? 0ull : (({w} >= 64u) ? (uint64_t)(int64_t){x} : (uint64_t)(((int64_t)({x} << (64u - {w}))) >> (64u - {w})));"
+                        "uint64_t {r} = ({w} == 0u) ? 0ull : (({w} >= 64u) ? (uint64_t){x} : (uint64_t)(((int64_t)({x} << ((64u - {w}) & 63u))) >> ((64u - {w}) & 63u)));"
                     ));
                 }
                 (format!("(uint){r}"), format!("(uint)({r} >> 32)"), Some(nz.clone()))
@@ -1821,14 +1824,14 @@ impl Em {
             }
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
-                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
+                self.line(&format!("if ({act}) {v} = asuint({src});"));
             }
             "v_interp_mov_f32" => {
                 if ij != 2 {
                     return Err("v_interp_mov p10/p20");
                 }
                 let v = self.vreg(vdst);
-                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
+                self.line(&format!("if ({act}) {v} = asuint({src});"));
             }
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
@@ -2374,7 +2377,7 @@ impl Em {
             }
             match o.ty {
                 "OPR_SREG" | "OPR_VCC" if o.size == 64 => {
-                    let (l, h) = self.read64(d, o).ok_or("op")?;
+                    let (l, h) = self.read64(d, o, false).ok_or("op")?;
                     u.push(format!("{l}|{h}"));
                 }
                 _ if o.size == 64 => return Err("operand 64-bit"),
@@ -2790,10 +2793,11 @@ impl Em {
         if d.variant != Variant::Plain {
             return Err("64-bit SDWA/DPP");
         }
+        let src_f64 = name.ends_with("_f64");
         let mut lo_hi: Vec<(String, String)> = Vec::new();
         for o in &ins {
             if o.size == 64 {
-                lo_hi.push(self.read64(d, o).ok_or("op")?);
+                lo_hi.push(self.read64(d, o, src_f64).ok_or("op")?);
             } else {
                 let v = self.read(d, o, false).ok_or("op")?;
                 lo_hi.push((v, "0u".into()));
@@ -3073,7 +3077,7 @@ impl Em {
             "v_rndne_f32" => fr(format!("round({})", fs(0))),
             "v_frexp_mant_f32" => fr(format!("frexp_mant({})", fs(0))),
             "v_frexp_exp_i32_f32" => format!("(uint)frexp_exp({})", fs(0)),
-            "v_ldexp_f32" => fr(format!("ldexp({}, (float)(int){b})", fs(0))),
+            "v_ldexp_f32" => fr(format!("ldexp_f({}, (int){b})", fs(0))),
             "v_add_f32" => fr(format!("{} + {}", fs(0), fs(1))),
             "v_sub_f32" => fr(format!("{} - {}", fs(0), fs(1))),
             "v_subrev_f32" => fr(format!("{} - {}", fs(1), fs(0))),
@@ -3160,11 +3164,7 @@ impl Em {
             ),
             "v_cvt_pk_u16_u32" => format!("min({a}, 0xFFFFu) | (min({b}, 0xFFFFu) << 16)"),
             "v_cvt_pk_i16_i32" => format!("((uint)clamp((int){a}, -32768, 32767) & 0xFFFFu) | (((uint)clamp((int){b}, -32768, 32767) & 0xFFFFu) << 16)"),
-            "v_cvt_pknorm_i16_f32" => format!(
-                "((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) | (((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) << 16)",
-                fs(0),
-                fs(1)
-            ),
+            "v_cvt_pknorm_i16_f32" => format!("(cvt_norm_i16_f32({}) | (cvt_norm_i16_f32({}) << 16))", fs(0), fs(1)),
             "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
             // packed f16 sources: op_sel[0]/[1] pick each source's half; result fills all 32 bits
             "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
@@ -3303,15 +3303,14 @@ impl Em {
             "f16" => {
                 // compare in f32: exact for every f16 value (class keeps the f16 view)
                 if op == "class" {
-                    let (h, c) = (half(0, &ua), ub.clone());
-                    let mut v = format!("f16tof32({h})");
+                    let (mut h, c) = (half(0, &ua), ub.clone());
                     if m.abs[0] {
-                        v = format!("abs({v})");
+                        h = format!("({h} & 0x7FFFu)");
                     }
                     if m.neg[0] {
-                        v = format!("(-{v})");
+                        h = format!("({h} ^ 0x8000u)");
                     }
-                    let cond = format!("((({c}) >> fclass16(f32tof16({v}))) & 1u) != 0u");
+                    let cond = format!("((({c}) >> fclass16({h})) & 1u) != 0u");
                     return self.vopc_write(d, cmpx, outs, &cond);
                 }
                 ua = format!("asuint(f16tof32({}))", half(0, &ua));
@@ -3644,8 +3643,12 @@ impl Em {
                 if let Some(decl) = decl {
                     self.line(&decl);
                 }
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                self.line(&format!("uint {t}_l = {src};"));
                 let rla = self.rla_half_fn();
-                self.line(&format!("uint {t} = {rla}({a}, {src});"));
+                self.line(&format!("uint {t} = {rla}({a}, {t}_l);"));
+                self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
@@ -3653,13 +3656,17 @@ impl Em {
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let m = if self.opt.wave64 { 63 } else { 31 };
+                let (el, eh) = (self.sreg(126), self.sreg(127));
+                let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
                 let rla = if self.x64() {
                     self.x64_words = 32;
                     "xcl_x_rla_any"
                 } else {
                     "rla"
                 };
-                self.line(&format!("uint {t} = {rla}({v}, (({a} + {off16}u) >> 2) & {m}u);"));
+                self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
+                self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
                 return Ok(());
@@ -4867,8 +4874,8 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
         float i = dot(sv, p), j = dot(d, q), t = dot(e2, q);
-        // inside when i, j, 1 - i - j >= 0 relative to det (either winding)
-        bool hit = det != 0.0f && i * det >= 0.0f && j * det >= 0.0f && (i + j) * det <= det * det;
+        // inside when i, j, 1 - i - j >= 0 relative to det (either winding); avoid det * det underflow/overflow
+        bool hit = det > 0.0f ? (i >= 0.0f && j >= 0.0f && i + j <= det) : (det < 0.0f && i <= 0.0f && j <= 0.0f && i + j >= det);
         // barycentrics back to the original vertex order: triangle id @60, per triangle I / J source
         float bc[4] = { det - i - j, i, j, 0.0f };
         uint tid = mem.Load(at + 60u) >> (8u * type);
@@ -4888,12 +4895,15 @@ uint fmt_encode(uint x, uint info, uint c) {
     float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
     float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
     if (ty == 0u) return (uint)round(saturate(f) * maxu);
-    if (ty == 1u) return (uint)(int)round(clamp(f, -1.0f, 1.0f) * maxs);
+    if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
     if (ty == 4u || ty == 5u || w == 32u) return x;
+    if (w == 16u) return f32tof16(f);
+    if (isnan(f)) return w == 11u ? 0x7E0u : 0x3F0u;
+    if (f <= 0.0f) return 0u;
     uint h = f32tof16(f);
-    return w == 16u ? h : (w == 11u ? ((h >> 4) & 0x7FFu) : ((h >> 5) & 0x3FFu));
+    return w == 11u ? ((h >> 4) & 0x7FFu) : ((h >> 5) & 0x3FFu);
 }
 uint4 fmt_pack(uint4 v, uint info) {
     uint4 r = uint4(0u, 0u, 0u, 0u); uint n = info & 7u; uint off = 0u;
@@ -5140,9 +5150,9 @@ uint cvt_u32(float f) { return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 4
 int cvt_i32(float f) { return select(isnan(f), 0, select(f <= -2147483648.0f, (int)0x80000000u, select(f >= 2147483648.0f, 0x7FFFFFFF, (int)f))); }
 int i24(uint v) { return ((int)(v << 8)) >> 8; }
 uint bfe_u(uint v, uint o, uint w) { o &= 31u; w &= 31u; return select(w == 0u, 0u, (v >> o) & (0xFFFFFFFFu >> ((32u - w) & 31u))); }
-int bfe_i(uint v, uint o, uint w) { o &= 31u; w &= 31u; uint s = (32u - w) & 31u; return select(w == 0u, 0, ((int)((v >> o) << s)) >> s); }
+int bfe_i(uint v, uint o, uint w) { o &= 31u; w &= 31u; uint s = (32u - w) & 31u; return select(w == 0u, 0, ((int)(((uint)(((int)v) >> o)) << s)) >> s); }
 uint sbfe_u(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; return select(w == 0u, 0u, select(w >= 32u, v >> o, (v >> o) & (0xFFFFFFFFu >> ((32u - w) & 31u)))); }
-int sbfe_i(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; uint s = (32u - w) & 31u; return select(w == 0u, 0, select(w >= 32u, ((int)v) >> o, ((int)((v >> o) << s)) >> s)); }
+int sbfe_i(uint v, uint c) { uint o = c & 31u; uint w = (c >> 16) & 0x7Fu; uint s = (32u - w) & 31u; return select(w == 0u, 0, select(w >= 32u, ((int)v) >> o, ((int)(((uint)(((int)v) >> o)) << s)) >> s)); }
 uint ffbh_i(uint v) { uint x = select((int)v < 0, ~v, v); return select(x == 0u, 0xFFFFFFFFu, 31u - firstbithigh(x)); }
 uint alignbit(uint s0, uint s1, uint s) { s &= 31u; return select(s == 0u, s1, (s1 >> s) | (s0 << ((32u - s) & 31u))); }
 uint perm_b32(uint s0, uint s1, uint sel) {
@@ -5180,8 +5190,37 @@ uint cvt_norm_i16_f16(uint h) {
     uint r = cvt_norm_f16(h, 32767u);
     return ((h & 0x8000u) != 0u ? (uint)(-(int)r) : r) & 0xFFFFu;
 }
+uint cvt_norm_i16_f32(float f) {
+    return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * 32767.0f) & 0xFFFFu;
+}
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
+// Exact f32 x * 2^n on the IEEE-754 bits: handles |n| >= 127, ±0, ±inf, NaN, and subnormals
+// without exp2() overflow/underflow or FTZ flushing.
+float ldexp_f(float x, int n) {
+    uint u = asuint(x);
+    uint sign = u & 0x80000000u;
+    uint exp = (u >> 23) & 0xFFu;
+    uint mant = u & 0x7FFFFFu;
+    if (exp == 0xFFu || (exp == 0u && mant == 0u)) return x;
+    int e = (int)exp;
+    if (exp == 0u) {
+        uint top = firstbithigh(mant);
+        mant = (mant << (23u - top)) & 0x7FFFFFu;
+        e = (int)top - 22;
+    }
+    int eo = e + clamp(n, -500, 500);
+    if (eo >= 255) return asfloat(sign | 0x7F800000u);
+    if (eo >= 1) return asfloat(sign | ((uint)eo << 23) | mant);
+    uint sh = (uint)(1 - eo);
+    if (sh > 24u) return asfloat(sign);
+    uint sig = 0x00800000u | mant;
+    uint q = sig >> sh;
+    uint half_bit = 1u << (sh - 1u);
+    uint rem = sig & ((1u << sh) - 1u);
+    bool inc = rem > half_bit || (rem == half_bit && (q & 1u) != 0u);
+    return asfloat(sign | (q + (uint)inc));
+}
 // f64 frexp pair: input = mant * 2^exp with |mant| in [0.5, 1); denormals are normalized.
 // 0/±inf/NaN: mant = input, exp = 0 (per the ISA and the amdgcn frexp intrinsics).
 // Bit-exact by construction – HLSL frexp() only takes float and would narrow the input.
