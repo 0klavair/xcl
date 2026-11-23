@@ -843,6 +843,22 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
 - **#85** XAccessibility (closed captions, high contrast) as an XCL fallback object and by-name exports when the
   system xgameruntime.dll is missing.
 
+## PRs #87–#91 (merged), issue #73, 2026-11-23
+- **#91** (fixes #73) `s_round_mode` / `s_setreg*` of MODE[3:0] are no longer blanket NOOPs: a pre-scan
+  (`Em::configure_round_modes`); default writes stay counted NOOPs; a non-default f16 / f64 mode (MODE[3:2], `0xC`
+  = f16 / f64 round toward zero, 95 % of the pack's `s_round_mode`) in a program with f16 ops is tracked in
+  `xcl_fp16_rm` and the f16 results are rounded with `f32_to_f16_rm`; non-default f32 / f64 modes are reported
+  unsupported (none in the pack: still 26 698 / 26 698 translated in full). `v_mad_f16` rounds per step
+  (`mad_nf_f16`). DXC on the programs that get the dynamic mode (122 of a 1-in-40 sample of 670): 0 errors, median
+  0.84 s. Changed HLSL: those programs compile again on the first run (XDefiant's UI text came back after it).
+- **#87** kernelx: GetProcAddress / LoadLibraryEx with null names, GetThreadName sizing, VirtualFree(Ex) bookkeeping
+  only after success (sparse / graphics reservations), XMemVirtualQuery guard pages, checked allocation arithmetic.
+- **#88** VFS: `TRUNCATE_EXISTING` on a game file without an overlay copy opens the overlay with `CREATE_ALWAYS`
+  (was ERROR_FILE_NOT_FOUND), with Win32's checks (GENERIC_WRITE, directories).
+- **#89** XAudio2 play / loop regions always valid for SubmitSourceBuffer (`clamp_regions`, `silent_buffer`).
+- **#90** AcpHal: APU address ranges without wrap / overlap, SHAPE allocation rolls back, XApuConnect reports OOM.
+- Checked: workspace tests with the retail samples (also `XCL_SPLIT_WAVE64=1`), Unicorn Overlord, XDefiant.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
