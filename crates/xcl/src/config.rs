@@ -203,6 +203,9 @@ impl Config {
                 }
                 Ok(c)
             }
+            // only a missing file gets the defaults written: an unreadable one (locked, not UTF-8)
+            // must not be replaced by them (issue #106)
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
             Err(_) => {
                 let c = Config::default();
                 let body = toml::to_string_pretty(&c).map_err(|e| e.to_string())?;

@@ -45,7 +45,8 @@ const FLIPPED_KEEP: usize = 64;
 /// Frame intervals the console accepts (µs, with the rounding a title may use); the 120 Hz
 /// ones (8 333, 25 000) only on a display that runs at 120 Hz.
 pub fn interval_valid(len_us: u32, high_refresh: bool) -> bool {
-    let near = |base: u32, span: u32| len_us >= base && len_us - base <= span;
+    // either side of the nominal length: 1_000_000 / 60 = 16 666 and 16 667 are both 60 Hz
+    let near = |base: u32, span: u32| len_us.abs_diff(base) <= span;
     if near(8333, 9) || near(25000, 25) {
         return high_refresh;
     }
@@ -434,6 +435,7 @@ mod tests {
     fn console_intervals_and_deadlines() {
         assert!(interval_valid(16667, false) && interval_valid(16666 + 16, false) && interval_valid(33333, false));
         assert!(!interval_valid(16000, false) && !interval_valid(8333, false) && interval_valid(8333, true));
+        assert!(interval_valid(16666, false) && interval_valid(66666, false) && interval_valid(33333 - 34, false));
         assert_eq!(next_deadline(100, 10, 3, 50), 103);
         assert_eq!(next_deadline(100, 10, 3, 103), 113);
         assert_eq!(next_deadline(100, 10, 3, 120), 123);

@@ -573,6 +573,16 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
         (queue, src.clone(), guard)
     };
+    // PresentX on another queue than the presenter was made for (the fallback presented once from
+    // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
+    // a new presenter for the title's present queue, after the old one's copy is done
+    if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
+        if let Some(old) = guard.as_ref() {
+            let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
+        }
+        crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
+        *guard = None;
+    }
     if guard.is_none() {
         *guard = new_presenter(queue);
     }
