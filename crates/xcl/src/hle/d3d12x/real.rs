@@ -1445,6 +1445,25 @@ pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+#[cfg(test)]
+pub(super) fn register_translated_compute_for_test(pso: usize) {
+    if pso != 0 {
+        TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn register_translated_graphics_for_test(pso: usize) {
+    if pso != 0 {
+        TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn forget_pso_for_test(pso: usize) {
+    forget_pso(pso);
+}
+
 fn forget_pso(pso: usize) {
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
@@ -1932,7 +1951,8 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let hr = f(this, allocator, initial_state);
+    let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
+    let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
     hr
 }
@@ -2530,6 +2550,11 @@ fn dummy() -> &'static Dummy {
     })
 }
 
+#[cfg(test)]
+pub(super) fn dummy_cs_bytecode() -> &'static [u8] {
+    &dummy().cs
+}
+
 fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
     D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as *const c_void, BytecodeLength: b.len() }
 }
@@ -2700,6 +2725,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    note_translated_compute(hr, ppv);
     crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
     Some(Ok(hr))
 }
@@ -3061,17 +3087,18 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
         if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
-            // a console program the worker is translating (its root signature comes with it)
+            // a console program the worker is translating (its root signature comes with it);
+            // the real PSO registers itself in TRANSLATED_COMPUTE once build_compute succeeds
+            // (if build_compute fails, the stand-in stays unregistered so Dispatch /
+            // ExecuteIndirect never bind XCL's ABI root signature onto it)
             LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
             LAST_COMPUTE_RS.with(|c| c.set(0));
-            note_translated_compute(hr, ppv);
             return hr;
         }
         console = translated_compute_pso(this, f, desc, riid, ppv);
     }
     LAST_COMPUTE_TRANSLATED.with(|c| c.set(matches!(console, Some(Ok(hr)) if hr >= 0)));
     if let Some(Ok(hr)) = console {
-        note_translated_compute(hr, ppv);
         return hr;
     }
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
@@ -3521,6 +3548,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_clear_state(this, pso as usize);
+    super::bind::clear_state(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
@@ -3558,6 +3586,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_release(this as usize);
+        super::bind::forget(this);
     }
     n
 }

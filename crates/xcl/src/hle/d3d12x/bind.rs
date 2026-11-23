@@ -66,15 +66,33 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
     f(STATES.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default())
 }
 
-/// The list was reset onto `allocator`: the previous recording's memory is the previous
-/// allocator's until that one is reset.
-pub(super) fn reset(list: *mut c_void, allocator: usize) {
+/// The list was created or reset onto `allocator` with `initial_pso`: the previous
+/// recording's memory is the previous allocator's until that one is reset, and pipeline
+/// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
+pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
+        s.pso = initial_pso;
+        s.layout = None;
+        s.args.clear();
+        s.layout_gfx = None;
+        s.args_gfx.clear();
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
+}
+
+/// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
+/// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
+pub(super) fn clear_state(list: *mut c_void, pso: usize) {
+    with(list, |s| {
+        s.pso = pso;
+        s.layout = None;
+        s.args.clear();
+        s.layout_gfx = None;
+        s.args_gfx.clear();
+    });
 }
 
 /// The list is gone.
@@ -522,11 +540,11 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
-        // a console pipeline without a translation: nothing to run (its root arguments were
-        // not given to the PC list either)
+        // a console pipeline without a translation (including a background build that
+        // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
@@ -534,11 +552,14 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         count(DISPATCHES_SKIPPED);
         return;
     }
-    count(DISPATCHES);
-    if let Err(e) = translated_dispatch(this, list, pso, x, y, z) {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
+    match translated_dispatch(this, list, pso, x, y, z) {
+        Ok(()) => count(DISPATCHES),
+        Err(e) => {
+            count(DISPATCHES_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");
+            }
         }
     }
 }
@@ -703,4 +724,352 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn last_draw_args() -> (bool, u32, u32, u32, i32) {
+    DRAW_ARGS.with(|d| d.get())
+}
+
+#[cfg(test)]
+pub(super) fn counts_snapshot() -> [u64; 5] {
+    std::array::from_fn(|k| COUNTS[k].load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+pub(super) fn tracked_pso(list: *mut c_void) -> usize {
+    STATES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&(list as usize)))
+        .map_or(0, |s| s.pso)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{device_x, list_x, pso_async, real, title_list};
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
+    fn test_rts0_blob() -> Vec<u8> {
+        let words: [u32; 12] = [
+            2, 1, 24, 0, 0, 0, // version=2, num_params=1, params_offset=24
+            1, 0, 36,          // param 0: type=Constants(1), visibility=0, payload_offset=36
+            0, 0, 4,           // shader_reg=0, reg_space=0, num_32bit_values=4
+        ];
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn reset_and_clear_state_track_initial_pso_and_clear_root_args() {
+        let list = 0x7100_0001usize as *mut c_void;
+        let rs_compute = 0x7100_0010usize;
+        let rs_gfx = 0x7100_0020usize;
+        let alloc1 = 0x7100_0100usize;
+        let alloc2 = 0x7100_0200usize;
+        let pso_init = 0x7100_1000usize;
+        let pso_mid = 0x7100_2000usize;
+        let pso_cleared = 0x7100_3000usize;
+        let pso_reset = 0x7100_4000usize;
+
+        let blob = test_rts0_blob();
+        console_list::note_root_signature(rs_compute, &blob);
+        console_list::note_root_signature(rs_gfx, &blob);
+
+        // Initial CreateCommandList / reset seeds PSO and allocator with clean root state.
+        reset(list, alloc1, pso_init);
+        with(list, |s| {
+            assert_eq!(s.pso, pso_init);
+            assert_eq!(s.allocator, alloc1);
+            assert!(s.layout.is_none() && s.args.is_empty());
+            assert!(s.layout_gfx.is_none() && s.args_gfx.is_empty());
+        });
+
+        // Populate compute + graphics root signatures, constants, and a different PSO.
+        unsafe {
+            set_compute_root_signature(list, rs_compute as *mut c_void);
+            set_compute_root_constant(list, 0, 0xDEAD_BEEF, 0);
+            set_graphics_root_signature(list, rs_gfx as *mut c_void);
+            set_graphics_root_constant(list, 0, 0xCAFE_BABE, 0);
+        }
+        with(list, |s| {
+            s.pso = pso_mid;
+            assert!(s.layout.is_some() && !s.args.is_empty());
+            assert!(s.layout_gfx.is_some() && !s.args_gfx.is_empty());
+        });
+
+        // ClearState(pso_cleared) updates PSO and clears root signatures/args while keeping allocator.
+        clear_state(list, pso_cleared);
+        with(list, |s| {
+            assert_eq!(s.pso, pso_cleared);
+            assert_eq!(s.allocator, alloc1);
+            assert!(s.layout.is_none() && s.args.is_empty());
+            assert!(s.layout_gfx.is_none() && s.args_gfx.is_empty());
+        });
+
+        // ClearState(null) clears PSO to 0.
+        clear_state(list, 0);
+        assert_eq!(tracked_pso(list), 0);
+
+        // Re-populate root args, then Reset(alloc2, pso_reset) switches allocator/PSO and clears root args.
+        unsafe {
+            set_compute_root_signature(list, rs_compute as *mut c_void);
+            set_compute_root_constant(list, 0, 0x1234_5678, 0);
+            set_graphics_root_signature(list, rs_gfx as *mut c_void);
+            set_graphics_root_constant(list, 0, 0x8765_4321, 0);
+        }
+        reset(list, alloc2, pso_reset);
+        with(list, |s| {
+            assert_eq!(s.pso, pso_reset);
+            assert_eq!(s.allocator, alloc2);
+            assert!(s.layout.is_none() && s.args.is_empty());
+            assert!(s.layout_gfx.is_none() && s.args_gfx.is_empty());
+        });
+
+        // Reset with null initial PSO clears stale PSO back to 0.
+        reset(list, alloc2, 0);
+        assert_eq!(tracked_pso(list), 0);
+
+        forget(list);
+    }
+
+    #[repr(C)]
+    struct FakeAdoptedList {
+        vt: *const usize,
+        refs: AtomicUsize,
+        dispatch_calls: AtomicUsize,
+        set_compute_rs_calls: AtomicUsize,
+        set_compute_uav_calls: AtomicUsize,
+        set_pso_calls: AtomicUsize,
+        execute_indirect_calls: AtomicUsize,
+    }
+
+    unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
+        (*(this as *const FakeAdoptedList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+
+    unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+        (*(this as *const FakeAdoptedList)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+    }
+
+    unsafe extern "system" fn fake_dispatch(this: *mut c_void, _x: u32, _y: u32, _z: u32) {
+        (*(this as *const FakeAdoptedList)).dispatch_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn fake_set_pso(this: *mut c_void, _pso: *mut c_void) {
+        (*(this as *const FakeAdoptedList)).set_pso_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn fake_set_compute_rs(this: *mut c_void, _rs: *mut c_void) {
+        (*(this as *const FakeAdoptedList)).set_compute_rs_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn fake_set_compute_uav(this: *mut c_void, _slot: u32, _va: u64) {
+        (*(this as *const FakeAdoptedList)).set_compute_uav_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn fake_execute_indirect(
+        this: *mut c_void,
+        _sig: usize,
+        _max: u32,
+        _args: usize,
+        _args_off: u64,
+        _count_buf: usize,
+        _count_off: u64,
+    ) {
+        (*(this as *const FakeAdoptedList)).execute_indirect_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn async_compute_pso_success_and_failure_in_dispatch_and_execute_indirect() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[29] = fake_set_compute_rs as usize;
+        orig_vt[41] = fake_set_compute_uav as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+
+        // Extended vtable layout expected by `real::orig_fn`: entry -1 holds `orig_vt` pointer,
+        // and entries 0..64 hold the COM method pointers used via `ID3D12GraphicsCommandList`.
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeAdoptedList {
+            // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+
+        // 1. Background compute build SUCCEEDS: real PSO R is registered in TRANSLATED_COMPUTE,
+        // stand-in S is NOT. ExecuteIndirect resolves S -> R and treats it as translated.
+        let standin_ok = 0x7200_0001usize;
+        let real_ok = 0x7200_0002usize;
+        let sig_root_changing = 0x7200_00F0usize;
+        note_root_changing_signature(sig_root_changing);
+
+        pso_async::submit(
+            standin_ok,
+            true,
+            Box::new(move || {
+                real::register_translated_compute_for_test(real_ok);
+                real_ok
+            }),
+        );
+        assert_eq!(pso_async::resolve_wait(standin_ok), real_ok);
+        assert!(!real::is_translated_compute(standin_ok));
+        assert!(real::is_translated_compute(real_ok));
+
+        reset(list_ptr, 0x7200_0100, standin_ok);
+        unsafe {
+            // With `sig_root_changing`, a translated compute PSO is caught by the root-changing
+            // guard instead of falling through to `pc` (which happened when `R` wasn't registered).
+            execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            0,
+            "ExecuteIndirect must recognize resolved async compute PSO R as translated"
+        );
+
+        // 2. Background compute build FAILS (returns 0): stand-in S_fail is NOT in
+        // TRANSLATED_COMPUTE. Dispatch must skip cleanly without binding XCL's ABI RS/UAVs
+        // onto S_fail, and ExecuteIndirect must not enter bind_abi either.
+        let standin_fail = 0x7200_0003usize;
+        pso_async::submit(standin_fail, true, Box::new(|| 0));
+        assert_eq!(pso_async::resolve_wait(standin_fail), standin_fail);
+        assert!(!real::is_translated_compute(standin_fail));
+
+        reset(list_ptr, 0x7200_0100, standin_fail);
+        let before = counts_snapshot();
+        unsafe {
+            dispatch(list_ptr, 1, 1, 1);
+        }
+        let after = counts_snapshot();
+        assert_eq!(after[DISPATCHES], before[DISPATCHES]);
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
+        assert_eq!(fake.set_compute_rs_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_compute_uav_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+
+        unsafe {
+            execute_indirect(list_ptr, sig_root_changing, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(fake.set_compute_rs_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_compute_uav_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            1,
+            "failed async compute stand-in must not enter translated ExecuteIndirect path"
+        );
+
+        forget(list_ptr);
+        let _ = pso_async::released(standin_ok);
+        let _ = pso_async::released(standin_fail);
+        real::forget_pso_for_test(real_ok);
+    }
+
+    #[test]
+    fn create_list_reset_and_clear_state_track_initial_pso_on_d3d12() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+
+        if console_list::enabled() {
+            return;
+        }
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            real::adopt(dev.as_raw(), real::Kind::Device);
+
+            // Build two real PC compute PSOs from the inbox dummy CS bytecode.
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let cs = real::dummy_cs_bytecode();
+            let make_pso = || -> ID3D12PipelineState {
+                let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                    ..Default::default()
+                };
+                let pso = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+                std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+                pso
+            };
+            let pso1 = make_pso();
+            let pso2 = make_pso();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("alloc");
+
+            // Stand-in synthetic key backed by real `pso1` in pso_async: CreateCommandList must
+            // resolve it via resolve_for_bind for PC D3D12 while tracking `standin` in `bind`.
+            let standin = 0x7300_0001usize;
+            let pso1_raw = pso1.as_raw() as usize;
+            pso_async::submit(standin, true, Box::new(move || pso1_raw));
+            assert_eq!(pso_async::resolve_wait(standin), pso1_raw);
+
+            let mut raw_list: *mut c_void = std::ptr::null_mut();
+            let iid = windows_sys::core::GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
+            let hr = device_x::create_command_list_pc(
+                dev.as_raw(),
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT.0 as u32,
+                alloc.as_raw() as usize,
+                standin,
+                &iid,
+                &mut raw_list,
+            );
+            assert!(hr >= 0 && !raw_list.is_null(), "create_command_list_pc failed: {hr:#x}");
+            let backing = title_list::backing(raw_list).expect("wrapped in title_list");
+            assert_eq!(tracked_pso(backing), standin, "CreateCommandList must seed bind::State.pso");
+
+            // ClearState(pso2) updates bind::State.pso to pso2 and clears root args.
+            let rs_key = 0x7300_0010usize;
+            console_list::note_root_signature(rs_key, &test_rts0_blob());
+            set_compute_root_signature(backing, rs_key as *mut c_void);
+            set_compute_root_constant(backing, 0, 0xABCD, 0);
+            let cl = ID3D12GraphicsCommandList::from_raw_borrowed(&backing).unwrap();
+            cl.ClearState(&pso2);
+            assert_eq!(tracked_pso(backing), pso2.as_raw() as usize, "ClearState must update bind::State.pso");
+            with(backing, |s| assert!(s.layout.is_none() && s.args.is_empty()));
+
+            // ClearState(None) clears bind::State.pso to 0.
+            cl.ClearState(None);
+            assert_eq!(tracked_pso(backing), 0, "ClearState(None) must clear bind::State.pso");
+
+            // Close + reset_x(alloc, pso2) updates bind::State.pso to pso2 and clears root args.
+            set_graphics_root_signature(backing, rs_key as *mut c_void);
+            set_graphics_root_constant(backing, 0, 0x1111, 0);
+            cl.Close().expect("Close");
+            let hr = list_x::reset_x(backing, alloc.as_raw() as usize, pso2.as_raw() as usize);
+            assert!(hr >= 0, "reset_x failed: {hr:#x}");
+            assert_eq!(tracked_pso(backing), pso2.as_raw() as usize, "Reset must update bind::State.pso");
+            with(backing, |s| assert!(s.layout_gfx.is_none() && s.args_gfx.is_empty()));
+
+            // Release the wrapped title list cleanly (calls bind::forget + list_x::on_release).
+            let release_fn: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(raw_list as *const *const usize)).add(2));
+            assert_eq!(release_fn(raw_list), 0);
+            let _ = pso_async::released(standin);
+        }
+    }
 }
