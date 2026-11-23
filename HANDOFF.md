@@ -1313,10 +1313,13 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   call; it stays 2 s after the last one). XDefiant from an empty cache: ~1750 shaders in ~2 min 15 s. Before,
   `dxc::wait_for_memory` held each compile up to a minute while less than 6 GB of commit was left, and with
   XDefiant's own ~10 GB committed only ~4 GB were: its last ~160 shaders came a few a minute (it looked hung at
-  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). Open: after a cold-cache run
-  XDefiant's logo was missing and "Witaj" flickered even once the compiles were done; the next run (warm) is right.
-  Suspected, not checked: what the title recorded with a stand-in pipeline in a list it replays keeps drawing
-  nothing.
+  ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). After a cold-cache run
+  XDefiant's logo was once missing even after the compiles seemed done. **Checked 2026-11-23, not a bug:** two runs
+  with an empty `XCL_DXIL_CACHE` (native, and `XCL_SPLIT_WAVE64=1`), 1 756 shaders compiled each, frame dumps
+  every 2 s: the logo comes at ~70 s, the red text and "Witaj" ~15 s later, by themselves, and stay; the log
+  counts 0 draws with PC (stand-in) pipelines – draws wait for a pipeline still being built (`resolve_wait` in
+  `bind::graphics_bound`). The title creates the text's pipelines after the logo's, so their compiles come in a
+  later burst; a restart in between just finds them cached.
 - **The title's graphics memory in video memory (PR #40, 2026-11-22)**: XMem graphics allocations, physical pages,
   D3D12 buffer heaps and the console descriptor heaps live in the sparse windows 0..2 (`Uma::for_runtime`); window 3
   is 512 MB of coherent system RAM (XCL's arena pool, readback / write-back heaps). GPU writes reach the CPU's view
@@ -1590,9 +1593,9 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   6.45–6.64× → 4.09–4.34×. Test `gpu_split_wave64_lane_local_masks` (fails if the local word lands in the wrong half).
   Merged 2026-11-23 (#94) after: workspace tests on the RX 9070 natively and with `XCL_SPLIT_WAVE64=1`, and
   XDefiant run in the split form on AMD (`XCL_SPLIT_WAVE64=1`, every wave64 compute / mesh program split): its
-  title screen right with a warm cache. With a cold cache (the split programs compiling) it showed only the logo
-  and the A / Y glyphs even after the compiles ended, until restarted – the known cold-cache issue (pipelines
-  recorded while a stand-in was bound), not the split form. Also merged: #92 (the VFS hook guard keeps
+  title screen right with a warm cache. With a cold cache it shows only the logo and the A / Y glyphs for a while
+  (the text's pipelines compile in a later burst, ~15 s after the logo's) – then the whole title screen; checked
+  with an empty `XCL_DXIL_CACHE`, see the cold-cache note in the XDefiant section. Also merged: #92 (the VFS hook guard keeps
   GetLastError – GNU builds' TLS access reset it), #93 (under Wine PEB.ImageBaseAddress stays the real image).
 - Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
   waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
