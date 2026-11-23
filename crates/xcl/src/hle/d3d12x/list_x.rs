@@ -1600,10 +1600,13 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     if count == 0 {
         return;
     }
+    let Some(list) = super::bind::prepare_indexed_draw(this, count, 1, 0, 0) else {
+        return;
+    };
+    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
-    super::bind::draw_indexed_instanced(this, count, 1, 0, 0, 0);
-    let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
+    super::bind::emit_prepared_indexed_draw(&list, count, 1, 0, 0, 0);
     set_index_buffer(this, bound.as_ref());
 }
 
@@ -1625,6 +1628,16 @@ type QueryFn = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u
 /// command list #10 Reset(allocator, initial pipeline): updates allocator/pipeline and clears
 /// per-recording state (queries, index buffer, depth bias, pending waits, written ranges)
 pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
+    // transfer its allocations until the driver accepts the new recording.
+    let ext = *(this as *const usize);
+    let resolved = super::pso_async::resolve_for_bind(pso);
+    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
+    real::preserve_vtable(this, ext);
+    if hr < 0 {
+        return hr;
+    }
+
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -1644,12 +1657,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc, pso);
-    // the PC runtime writes its own vtable into a list on Reset (copy lists, Agility SDK 1.620+): re-adopt it
-    let ext = *(this as *const usize);
-    let resolved = super::pso_async::resolve_for_bind(pso);
-    let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
-    real::preserve_vtable(this, ext);
-    if hr >= 0 && !is_bundle && pso != 0 {
+    if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
                 if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(this as usize))) {
@@ -2073,6 +2081,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);
+    static RESET_TEST_REPLACEMENT_VT: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "system" fn reset_test_native(this: *mut c_void, _alloc: usize, _pso: usize) -> i32 {
+        *(this as *mut usize) = RESET_TEST_REPLACEMENT_VT.load(Ordering::SeqCst) as usize;
+        RESET_TEST_HR.load(Ordering::SeqCst) as i32
+    }
+
     #[test]
     fn nested_occlusion_queries_end_the_outer_one_early() {
         let ty = D3D12_QUERY_TYPE_OCCLUSION;
@@ -2094,6 +2110,78 @@ mod tests {
         assert_eq!(o.begin((1, 5), D3D12_QUERY_TYPE_BINARY_OCCLUSION), None);
         assert_eq!(o.end_active_early(), Some(((1, 5), D3D12_QUERY_TYPE_BINARY_OCCLUSION)));
         assert!(!o.end((1, 5)));
+    }
+
+    #[test]
+    fn reset_commits_state_only_after_native_success_and_always_restores_vtable() {
+        let mut native = vec![0usize; PC_RESET + 1];
+        native[PC_RESET] = reset_test_native as usize;
+        let extended = [native.as_ptr() as usize, 0usize];
+        let ext = unsafe { extended.as_ptr().add(1) as usize };
+        let replacement = 0x1234_5678usize;
+        let mut object = [ext];
+        let list = object.as_mut_ptr() as *mut c_void;
+        let key = list as usize;
+
+        unsafe { on_create(list, 0x100, 0, D3D12_COMMAND_LIST_TYPE_DIRECT) };
+        {
+            let mut g = LISTS.lock().unwrap();
+            let s = g.as_mut().unwrap().get_mut(&key).unwrap();
+            s.allocator = 0x111;
+            s.bound_pso = 0x222;
+            s.depth_bias = Some(DepthBias::new(-3.5, 0.25, 2.0));
+            s.native_bias = DepthBias::new(-4.5, 0.5, 3.0);
+            s.pso_dirty = true;
+            s.using_fallback_pso = true;
+            s.index_buffer = Some(D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: 0x5000,
+                SizeInBytes: 12,
+                Format: DXGI_FORMAT_R32_UINT,
+            });
+            s.depth_bounds = Some((0.25, 0.75));
+            s.written_ranges.push((0x6000, 0x6010));
+        }
+        super::super::bind::seed_reset_state_for_test(list, 0x111, 0x222, vec![0x4444]);
+        RESET_TEST_REPLACEMENT_VT.store(replacement as u64, Ordering::SeqCst);
+
+        RESET_TEST_HR.store(0x8000_4005, Ordering::SeqCst);
+        assert!(unsafe { reset_x(list, 0x333, 0x555) } < 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x111, 0x222));
+            assert_eq!(s.depth_bias, Some(DepthBias::new(-3.5, 0.25, 2.0)));
+            assert_eq!(s.native_bias, DepthBias::new(-4.5, 0.5, 3.0));
+            assert!(s.pso_dirty && s.using_fallback_pso);
+            assert_eq!(s.index_buffer.as_ref().unwrap().BufferLocation, 0x5000);
+            assert_eq!(s.depth_bounds, Some((0.25, 0.75)));
+            assert_eq!(s.written_ranges, vec![(0x6000, 0x6010)]);
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x111, 0x222, vec![1, 2, 3, 4], vec![5, 6, 7, 8], vec![0x4444])
+        );
+        assert!(super::super::console_list::take_pending_for_test(0x111).is_empty());
+
+        RESET_TEST_HR.store(0, Ordering::SeqCst);
+        assert_eq!(unsafe { reset_x(list, 0x333, 0x555) }, 0);
+        assert_eq!(object[0], ext);
+        {
+            let g = LISTS.lock().unwrap();
+            let s = g.as_ref().unwrap().get(&key).unwrap();
+            assert_eq!((s.allocator, s.bound_pso), (0x333, 0x555));
+            assert!(s.depth_bias.is_none() && s.index_buffer.is_none() && s.depth_bounds.is_none());
+            assert!(!s.pso_dirty && !s.using_fallback_pso && s.written_ranges.is_empty());
+        }
+        assert_eq!(
+            super::super::bind::reset_state_for_test(list),
+            (0x333, 0x555, Vec::new(), Vec::new(), Vec::new())
+        );
+        assert_eq!(super::super::console_list::take_pending_for_test(0x111), vec![0x4444]);
+
+        LISTS.lock().unwrap().as_mut().unwrap().remove(&key);
+        super::super::bind::remove_state_for_test(list);
     }
 
     #[test]
@@ -2675,10 +2763,14 @@ mod tests {
             );
             assert_eq!(after[2], before[2], "translated graphics PSO must not take the PC draw path");
             let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
-            assert_eq!(ibs.len(), 2);
-            assert_eq!(ibs[0].unwrap().SizeInBytes, 48);
-            assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R32_UINT);
-            assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+            if after[0] > before[0] {
+                assert_eq!(ibs.len(), 2);
+                assert_eq!(ibs[0].unwrap().SizeInBytes, 48);
+                assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R32_UINT);
+                assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+            } else {
+                assert!(ibs.is_empty(), "a rejected preparation must not mutate the native index buffer");
+            }
 
             // 3. Zero count or invalid format returns early without touching IB or draws.
             let draws_before = fake.draws.lock().unwrap().len();

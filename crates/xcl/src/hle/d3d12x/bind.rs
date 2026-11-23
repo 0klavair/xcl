@@ -102,6 +102,29 @@ pub(super) fn forget(list: *mut c_void) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
+    with(list, |s| {
+        s.allocator = allocator;
+        s.pso = pso;
+        s.layout = Some(Arc::new(Layout::default()));
+        s.args = vec![1, 2, 3, 4];
+        s.layout_gfx = Some(Arc::new(Layout::default()));
+        s.args_gfx = vec![5, 6, 7, 8];
+        s.uma = uma;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<usize>) {
+    with(list, |s| (s.allocator, s.pso, s.args.clone(), s.args_gfx.clone(), s.uma.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn remove_state_for_test(list: *mut c_void) {
+    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
+}
+
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
 fn put_in(list: *mut c_void, gfx: bool, i: u32, offset: u32, bytes: &[u8]) {
     with(list, |s| {
@@ -229,10 +252,33 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    if let Some(list) = graphics_bound(this) {
-        list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
+}
+
+/// Prepare an indexed draw once, before callers make temporary native state changes.
+pub(super) unsafe fn prepare_indexed_draw(
+    this: *mut c_void,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+) -> Option<ID3D12GraphicsCommandList> {
+    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+    graphics_bound(this)
+}
+
+/// Submit an indexed draw whose translated graphics state has already been prepared.
+pub(super) unsafe fn emit_prepared_indexed_draw(
+    list: &ID3D12GraphicsCommandList,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
