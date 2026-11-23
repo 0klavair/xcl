@@ -1715,6 +1715,9 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   inactive lanes run it). Measured on the 5070 Ti: such lanes read 0 – a min reduction (identity -1) gives 0 in a
   3-quad wave, max / or / sum are right. 325 of the 436 reduction programs have a min reduction. Needs the reduction
   recognised as a whole (`docs/wave64-on-wave32.md`, "Vertex and pixel shaders").
+- Merged as PR #133. On the RX 9070 (64-lane waves) the native-form digest of the 26 698 programs equals `main`'s (the
+  forms test run on both); the three GPU tests pass, also with `XCL_SPLIT_WAVE64=1`; XDefiant and Minecraft run with
+  and without `XCL_SPLIT_WAVE64=1` (the forced split form starts with a cold shader cache: XDefiant black while compiling).
 
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
