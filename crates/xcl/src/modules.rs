@@ -52,6 +52,17 @@ pub fn register_mapped(m: Arc<MappedModule>) {
     MAPPED.write().unwrap().push(m);
 }
 
+/// The image at `base` failed to load: it is no longer found (by name, base, address), so a
+/// later load maps it again – as Windows' loader unloads a DLL that failed.
+pub fn unregister_mapped(base: usize) {
+    MAPPED.write().unwrap().retain(|m| m.base != base);
+    for i in 0..RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES) {
+        if RANGE_BASE[i].load(Ordering::Acquire) == base {
+            RANGE_BASE[i].store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Lock-free: base of the mapped image containing `addr`.
 pub fn image_base_for_addr(addr: usize) -> Option<usize> {
     let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
