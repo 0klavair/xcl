@@ -11,6 +11,7 @@
 //! description: the same PC layout, so the same texels). The CPU never sees these textures
 //! (on the console it could, but GPU-owned targets are not CPU-written).
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -34,6 +35,18 @@ struct Arena {
 unsafe impl Send for Arena {}
 
 static ARENAS: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
+static PLACED_TEXTURES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// A texture backed by one of the aliasable D3D12 heaps.
+pub(super) fn is_placed_texture(resource: usize) -> bool {
+    PLACED_TEXTURES.lock().unwrap().as_ref().is_some_and(|textures| textures.contains(&resource))
+}
+
+pub(super) fn forget(resource: usize) {
+    if let Some(textures) = PLACED_TEXTURES.lock().unwrap().as_mut() {
+        textures.remove(&resource);
+    }
+}
 
 /// Whether a console texture with these D3D12_RESOURCE_FLAGS is the GPU's (render target,
 /// depth buffer, UAV).
@@ -87,5 +100,9 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let (heap, offset) = arena_for(dev, va, info.SizeInBytes as usize)?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset as usize, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
-    (hr >= 0 && !(*ppv).is_null()).then_some(hr)
+    if hr < 0 || (*ppv).is_null() {
+        return None;
+    }
+    PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    Some(hr)
 }

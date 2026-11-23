@@ -41,6 +41,7 @@ static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 /// the title called PresentX: the fallback guessing is off
 static PRESENTX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PRESENTX_LOCK: Mutex<()> = Mutex::new(());
 
 /// command queue #30 PresentX(planeCount, planes, parameters): plane 0's first resource is
 /// the frame; S_OK always (a console present does not fail for the title).
@@ -48,7 +49,16 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
-    super::frame::mark_flipped((planes as *const u64).read_unaligned());
+    let token = (planes as *const u64).read_unaligned();
+    let _present = PRESENTX_LOCK.lock().unwrap();
+    present_x_frame(queue, plane_count, planes);
+    // The title can use flip statistics to decide when to reuse its buffer.
+    // Queue our copy before reporting the flip.
+    super::frame::mark_flipped(token);
+    0
+}
+
+unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -75,11 +85,11 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     let count = (planes.add(8) as *const u32).read_unaligned();
     let list = (planes.add(0x10) as *const usize).read_unaligned();
     if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
-        return 0;
+        return;
     }
     let res = (list as *const usize).read_unaligned();
     if res == 0 {
-        return 0;
+        return;
     }
     {
         let mut p = PRESENTED.lock().unwrap();
@@ -112,19 +122,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    {
-        let mut c = CANDIDATE.lock().unwrap();
-        if c.map(|(_, r)| r) != Some(res) {
-            add_ref(res);
-            if let Some((_, old)) = c.replace((queue as usize, res)) {
-                release(old);
-            }
-        } else if let Some(cur) = c.as_mut() {
-            cur.0 = queue as usize;
-        }
-    }
-    present_now(Duration::ZERO);
-    0
+    present_now(Duration::ZERO, Some((queue as usize, res)));
 }
 
 thread_local! {
@@ -287,7 +285,7 @@ pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     }
     // no console present call seen recently → present on submissions (rate limited)
     if now_ms().saturating_sub(LAST_BOUNDARY_MS.load(Ordering::Relaxed)) > 500 {
-        present_now(Duration::from_millis(15));
+        present_now(Duration::from_millis(15), None);
     }
 }
 
@@ -298,7 +296,7 @@ pub fn on_queue_console_method(_info: &StubInfo, _caller: usize) {
     }
     BOUNDARIES.fetch_add(1, Ordering::Relaxed);
     LAST_BOUNDARY_MS.store(now_ms(), Ordering::Relaxed);
-    unsafe { present_now(Duration::from_millis(4)) };
+    unsafe { present_now(Duration::from_millis(4), None) };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -451,6 +449,7 @@ struct Presenter {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    copy_source: Option<ID3D12Resource>,
     value: u64,
     event: HANDLE,
     last: Instant,
@@ -483,7 +482,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
-    Some(Presenter { queue, sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence, value: 0, event, last: Instant::now() - Duration::from_secs(1) })
+    Some(Presenter { queue, sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence, copy_source: None, value: 0, event, last: Instant::now() - Duration::from_secs(1) })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
@@ -532,7 +531,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -543,8 +542,21 @@ unsafe fn present_now(min_interval: Duration) {
         }
     }
     let _reset = Reset;
-    let Some((queue, res)) = *CANDIDATE.lock().unwrap() else { return };
-    let Ok(mut guard) = PRESENTER.try_lock() else { return };
+    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
+        let raw = res as *mut c_void;
+        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
+        (queue, src.clone(), PRESENTER.lock().unwrap())
+    } else {
+        let Ok(guard) = PRESENTER.try_lock() else { return };
+        if PRESENTX.load(Ordering::Relaxed) {
+            return;
+        }
+        let candidate = CANDIDATE.lock().unwrap();
+        let Some((queue, res)) = *candidate else { return };
+        let raw = res as *mut c_void;
+        let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
+        (queue, src.clone(), guard)
+    };
     if guard.is_none() {
         *guard = new_presenter(queue);
     }
@@ -552,7 +564,7 @@ unsafe fn present_now(min_interval: Duration) {
     if p.last.elapsed() < min_interval {
         return;
     }
-    let Some(desc) = backbuffer_like(res) else { return };
+    let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
     let Some(fmt) = swap_format(desc.Format) else { return };
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
@@ -562,22 +574,24 @@ unsafe fn present_now(min_interval: Duration) {
     if p.fence.GetCompletedValue() < p.value {
         let _ = p.fence.SetEventOnCompletion(p.value, p.event);
         WaitForSingleObject(p.event, 100);
+        if p.fence.GetCompletedValue() < p.value {
+            return;
+        }
     }
+    p.copy_source = None;
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
     }
     let Some(sc) = p.sc.clone() else { return };
-    let rraw = res as *mut c_void;
-    let Some(src) = ID3D12Resource::from_raw_borrowed(&rraw) else { return };
     let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
     let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
     p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, src);
+    p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
-    let dump = due.then(|| readback_copy(&p.list, src, &desc)).flatten();
+    let dump = due.then(|| readback_copy(&p.list, &src, &desc)).flatten();
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
     let rt_dump: Vec<_> = if due && trace_frame() {
@@ -603,6 +617,7 @@ unsafe fn present_now(min_interval: Duration) {
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
+    p.copy_source = Some(src);
     p.value += 1;
     let _ = q.Signal(&p.fence, p.value);
     let _ = sc.Present(0, DXGI_PRESENT(0));
