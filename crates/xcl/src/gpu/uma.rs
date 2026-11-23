@@ -310,8 +310,8 @@ impl Uma {
         if !self.has_sparse() {
             return None;
         }
-        let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
-        let align = align.max(GRAIN).next_power_of_two();
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+        let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
         let lo = self.title_sparse_start();
@@ -524,12 +524,12 @@ impl Uma {
 
     #[track_caller]
     fn alloc_where(&self, size: usize, align: usize, window: Option<usize>, zero: bool) -> Option<*mut u8> {
-        let size = (size.max(1) + GRAIN - 1) & !(GRAIN - 1);
-        let align = align.max(GRAIN).next_power_of_two();
+        let size = size.max(1).checked_next_multiple_of(GRAIN)?;
+        let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.inner.lock().unwrap();
         let found = g.free.iter().filter(|(&o, _)| window.is_none_or(|k| o / WINDOW == k)).find_map(|(&o, &l)| {
-            let at = ((self.base + o + align - 1) & !(align - 1)) - self.base;
-            (at + size <= o + l).then_some((o, l, at))
+            let at = self.base.checked_add(o)?.checked_next_multiple_of(align)? - self.base;
+            (at.checked_add(size).is_some_and(|end| end <= o + l)).then_some((o, l, at))
         });
         let Some((start, len, at)) = found else {
             if Self::tracing() {
