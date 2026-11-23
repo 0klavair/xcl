@@ -13,8 +13,9 @@
 //! ~0.6 ms spun): at each event it releases the type's internal semaphore (origin) or sets its
 //! event, and signals the title's ancillary handles. Not locked to the monitor's vblank.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -65,12 +66,28 @@ pub fn next_deadline(base: i64, interval: i64, offset: i64, after: i64) -> i64 {
     first + ((after - first) / interval + 1) * interval
 }
 
+/// The title's ancillary handles of a frame event, duplicated. Closed when neither the schedule
+/// nor the clock thread holds them any more: the thread signals them outside the clock's lock,
+/// and a handle closed under it meanwhile could be another object's by then (#103).
+struct Handles(Vec<HANDLE>);
+
+impl Drop for Handles {
+    fn drop(&mut self) {
+        for &h in &self.0 {
+            unsafe { CloseHandle(h) };
+        }
+    }
+}
+
+unsafe impl Send for Handles {}
+unsafe impl Sync for Handles {}
+
 struct Kind {
     /// semaphore (origin) or auto-reset event the clock signals
     internal: HANDLE,
     offset_us: u32,
     /// the title's ancillary handles, duplicated
-    extra: Vec<HANDLE>,
+    extra: Arc<Handles>,
     scheduled: bool,
 }
 
@@ -87,10 +104,15 @@ unsafe impl Send for Clock {}
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-static ISSUED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// (token, qpc of the origin it was issued at)
+static ISSUED: Mutex<Vec<(u64, i64)>> = Mutex::new(Vec::new());
 /// (token, origin qpc, flip qpc)
 static FLIPPED: Mutex<Vec<(u64, i64, i64)>> = Mutex::new(Vec::new());
 static LAST_ORIGIN: AtomicI64 = AtomicI64::new(0);
+/// qpc of the origins the clock released and no WaitFrameEventX has consumed yet (the origin
+/// semaphore counts up to ORIGIN_SEMAPHORE_MAX): each token gets its own frame's origin, not
+/// the latest one (#103 – with 2–3 frames in flight the statistics named a newer frame's)
+static ORIGINS: Mutex<VecDeque<i64>> = Mutex::new(VecDeque::new());
 static THREAD: AtomicBool = AtomicBool::new(false);
 
 pub fn qpc() -> i64 {
@@ -139,7 +161,7 @@ fn with<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
                 }
             },
             offset_us: 0,
-            extra: Vec::new(),
+            extra: Arc::new(Handles(Vec::new())),
             scheduled: false,
         };
         Clock { interval_us: 0, active: false, kinds: [kind(0), kind(1), kind(2)], generation: 0, base_qpc: 0 }
@@ -237,14 +259,12 @@ pub unsafe extern "system" fn schedule_frame_event_x(_this: *mut std::ffi::c_voi
         }
         let interval = c.interval_us.max(1);
         let k = &mut c.kinds[ty as usize];
-        for h in k.extra.drain(..) {
-            CloseHandle(h);
-        }
+        // the previous handles close with their last holder (the clock thread may be signalling them)
+        k.extra = Arc::new(Handles(dups));
         if unschedule {
             k.scheduled = false;
         } else {
             k.offset_us = offset_us % interval;
-            k.extra = dups;
             k.scheduled = true;
         }
         c.generation += 1;
@@ -270,7 +290,7 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
     let internal = with(|c| ((ty as usize) < TYPES && c.kinds[ty as usize].scheduled).then(|| c.kinds[ty as usize].internal as usize));
     let Some(internal) = internal else { return E_INVALIDARG };
     let token_in = if token.is_null() { 0 } else { *token };
-    if ty == 0 && token_in != 0 && (!ISSUED.lock().unwrap().contains(&token_in) || flags & TOKEN_ON_TIMEOUT != 0) {
+    if ty == 0 && token_in != 0 && (!ISSUED.lock().unwrap().iter().any(|e| e.0 == token_in) || flags & TOKEN_ON_TIMEOUT != 0) {
         return E_INVALIDARG;
     }
     let extra = match ancillary(block) {
@@ -297,20 +317,26 @@ pub unsafe extern "system" fn wait_frame_event_x(_this: *mut std::ffi::c_void, t
         return hr;
     }
     let issue = index == -2 || (index == -1 && flags & TOKEN_ON_TIMEOUT != 0);
-    if issue && ty == 0 && token_in == 0 {
-        let mut t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
-        if t == 0 {
-            t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
-        }
-        {
-            let mut issued = ISSUED.lock().unwrap();
+    if ty == 0 && issue {
+        // the origin this wait consumed (a timeout with TOKEN_ON_TIMEOUT: now)
+        let origin = if index == -2 { ORIGINS.lock().unwrap().pop_front() } else { None }.unwrap_or_else(qpc);
+        let mut issued = ISSUED.lock().unwrap();
+        if token_in != 0 {
+            if let Some(e) = issued.iter_mut().find(|e| e.0 == token_in) {
+                e.1 = origin;
+            }
+        } else {
+            let mut t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
+            if t == 0 {
+                t = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) & TOKEN_MASK;
+            }
             if issued.len() >= KNOWN_TOKENS {
                 issued.remove(0);
             }
-            issued.push(t);
-        }
-        if !token.is_null() {
-            *token = t;
+            issued.push((t, origin));
+            if !token.is_null() {
+                *token = t;
+            }
         }
     }
     hr
@@ -321,8 +347,10 @@ pub fn mark_flipped(token: u64) {
     if token == 0 {
         return;
     }
+    // the frame's own origin (a token XCL did not issue: the latest origin)
+    let origin = ISSUED.lock().unwrap().iter().rev().find(|e| e.0 == token).map(|e| e.1).unwrap_or_else(|| LAST_ORIGIN.load(Ordering::Relaxed));
     let mut f = FLIPPED.lock().unwrap();
-    f.push((token, LAST_ORIGIN.load(Ordering::Relaxed), qpc()));
+    f.push((token, origin, qpc()));
     if f.len() > FLIPPED_KEEP {
         let n = f.len() - FLIPPED_KEEP;
         f.drain(..n);
@@ -399,7 +427,7 @@ fn clock_thread() {
                         if d - last[i] < interval / 2 {
                             d += interval; // this point of the frame already fired
                         }
-                        (d, i, k.internal as usize, k.extra.iter().map(|&h| h as usize).collect::<Vec<_>>())
+                        (d, i, k.internal as usize, Arc::clone(&k.extra))
                     })
                     .min_by_key(|e| e.0)
                     .map(|e| (c.generation, e))
@@ -413,14 +441,22 @@ fn clock_thread() {
             }
             last[ty] = deadline;
             if ty == 0 {
-                LAST_ORIGIN.store(qpc(), Ordering::Relaxed);
-                ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut());
+                let now = qpc();
+                LAST_ORIGIN.store(now, Ordering::Relaxed);
+                // an origin the semaphore cannot hold (ORIGIN_SEMAPHORE_MAX pending) is lost to the title too
+                if ReleaseSemaphore(internal as HANDLE, 1, std::ptr::null_mut()) != 0 {
+                    let mut o = ORIGINS.lock().unwrap();
+                    o.push_back(now);
+                    while o.len() > ORIGIN_SEMAPHORE_MAX as usize {
+                        o.pop_front();
+                    }
+                }
             } else {
                 SetEvent(internal as HANDLE);
             }
-            for h in extra {
-                if SetEvent(h as HANDLE) == 0 {
-                    ReleaseSemaphore(h as HANDLE, 1, std::ptr::null_mut());
+            for &h in &extra.0 {
+                if SetEvent(h) == 0 {
+                    ReleaseSemaphore(h, 1, std::ptr::null_mut());
                 }
             }
         }
@@ -430,6 +466,9 @@ fn clock_thread() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the clock is one per process: the tests that run it take turns
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     #[test]
     fn console_intervals_and_deadlines() {
@@ -445,6 +484,7 @@ mod tests {
     /// tokens; a flipped token has statistics, an unknown one does not.
     #[test]
     fn origin_events_issue_tokens_and_flips_have_statistics() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             let dev = std::ptr::null_mut();
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
@@ -471,4 +511,60 @@ mod tests {
             assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
         }
     }
+
+    /// Each flipped frame reports its own origin, not the latest one (frames in flight), and the
+    /// ancillary handles of a frame event rescheduled while the clock fires stay valid until
+    /// the clock thread is done with them (#103).
+    #[test]
+    fn statistics_name_each_frames_origin_and_rescheduled_handles_outlive_the_clock_tick() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let dev = std::ptr::null_mut();
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 16667, 1, 0), S_FALSE);
+            let hr = schedule_frame_event_x(dev, 0, 0, std::ptr::null(), 0);
+            assert!(hr == STARTED_CLOCK || hr == S_FALSE, "{hr:#x}");
+            // three frames in flight, flipped after the third origin
+            let mut tokens = [0u64; 3];
+            for t in tokens.iter_mut() {
+                assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, t), S_OK);
+            }
+            for &t in &tokens {
+                mark_flipped(t);
+            }
+            let mut origins = Vec::new();
+            for &t in &tokens {
+                let (mut n, mut st) = (1u32, [0u8; 0x40]);
+                assert_eq!(frame_statistics_x(dev, t, 0, &mut n, st.as_mut_ptr()), S_OK);
+                let origin = i64::from_le_bytes(st[0x10..0x18].try_into().unwrap());
+                let flip = i64::from_le_bytes(st[0x18..0x20].try_into().unwrap());
+                assert!(origin <= flip);
+                origins.push(origin);
+            }
+            assert!(origins[0] < origins[1] && origins[1] < origins[2], "each frame its own origin: {origins:?}");
+            let spread = (origins[2] - origins[0]) * 1_000_000 / qpf();
+            assert!((20_000..=100_000).contains(&spread), "two intervals apart: {spread} µs");
+
+            // a type-1 event with an ancillary event, scheduled and unscheduled while the clock
+            // fires it (offset 0: at the origin) – the thread must never signal a closed handle
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let list = [ev];
+            let mut signaled = 0i32;
+            let mut block = [0u8; 0x18];
+            block[..4].copy_from_slice(&1u32.to_le_bytes());
+            block[8..16].copy_from_slice(&(list.as_ptr() as usize).to_le_bytes());
+            block[16..24].copy_from_slice(&(&mut signaled as *mut i32 as usize).to_le_bytes());
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() < std::time::Duration::from_millis(120) {
+                assert_eq!(schedule_frame_event_x(dev, 1, 0, block.as_ptr(), 0), S_FALSE);
+                std::thread::sleep(std::time::Duration::from_micros(300));
+                assert_eq!(schedule_frame_event_x(dev, 1, 0, std::ptr::null(), UNSCHEDULE), S_FALSE);
+            }
+            CloseHandle(ev);
+            // the clock still runs
+            let mut t = 0u64;
+            assert_eq!(wait_frame_event_x(dev, 0, 200, std::ptr::null(), 0, &mut t), S_OK);
+            assert_eq!(set_frame_interval_x(dev, std::ptr::null_mut(), 0, 0, 0), S_FALSE, "stops the clock");
+        }
+    }
 }
+
