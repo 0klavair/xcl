@@ -211,7 +211,21 @@ unsafe extern "system" fn factory_qi(p: *mut c_void, riid: *const GUID, out: *mu
     if !riid.is_null() && same(&*riid, &IID_FACTORY_X1) {
         return query(p, &IID_FACTORY_X1, riid, out, no_ref);
     }
-    query(p, &IID_FACTORY, riid, out, no_ref)
+    let hr = query(p, &IID_FACTORY, riid, out, no_ref);
+    if hr == E_NOINTERFACE && !riid.is_null() {
+        // A refused factory IID fails far away in the title (rax=0x80004002); name it here
+        // so the run log shows the cause (#161).
+        let g = &*riid;
+        warn_once(
+            "DStorageGetFactory",
+            format_args!(
+                "refused IID {:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} (E_NOINTERFACE)",
+                g.data1, g.data2, g.data3,
+                g.data4[0], g.data4[1], g.data4[2], g.data4[3], g.data4[4], g.data4[5], g.data4[6], g.data4[7]
+            ),
+        );
+    }
+    hr
 }
 
 unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
@@ -1178,6 +1192,23 @@ mod tests {
         b[0x28..0x30].copy_from_slice(&offset.to_le_bytes());
         b[0x30..0x34].copy_from_slice(&src_size.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn a_refused_factory_iid_returns_e_nointerface_and_clears_out() {
+        unsafe {
+            // The two IIDs the factory answers.
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let mut fx = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY_X1, &mut fx), S_OK);
+            // An IID the factory does not answer: refused with E_NOINTERFACE, out pointer
+            // cleared, and (per #161) the refusal is named in the log by warn_once.
+            let unknown = GUID::from_u128(0xdead_beef_0000_4000_8000_001122334455);
+            let mut p = 1usize as *mut c_void; // non-null on entry, must be cleared
+            assert_eq!(DStorageGetFactory(&unknown, &mut p), E_NOINTERFACE);
+            assert!(p.is_null(), "a refused QueryInterface clears the out pointer");
+        }
     }
 
     #[test]
