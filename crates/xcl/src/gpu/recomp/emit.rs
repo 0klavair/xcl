@@ -2425,6 +2425,16 @@ impl Em {
             }
             s
         };
+        let hb = |i: usize| -> String {
+            let mut s = half(i);
+            if m.abs[i.min(2)] {
+                s = format!("({s} & 0x7FFFu)");
+            }
+            if m.neg[i.min(2)] {
+                s = format!("({s} ^ 0x8000u)");
+            }
+            s
+        };
         let si = |i: usize| format!("(((int)({} << 16)) >> 16)", half(i));
         let fr = |e: String| -> String {
             let mut s = match m.omod {
@@ -2486,9 +2496,9 @@ impl Em {
             "v_cvt_f16_i16" => fr(format!("(float){}", si(0))),
             "v_cvt_u16_f16" => format!("(cvt_u32({}) > 0xFFFFu ? 0xFFFFu : cvt_u32({}))", fh(0), fh(0)),
             "v_cvt_i16_f16" => format!("((uint)clamp(cvt_i32({}), -32768, 32767) & 0xFFFFu)", fh(0)),
-            // f16 → unorm16 / snorm16: round(clamp(x) * range), like v_cvt_pknorm_*_f32
-            "v_cvt_norm_u16_f16" => format!("((uint)round(saturate({}) * 65535.0f) & 0xFFFFu)", fh(0)),
-            "v_cvt_norm_i16_f16" => format!("((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu)", fh(0)),
+            // f16 → unorm16 / snorm16: exact RNE on raw binary16 bits (avoids fp32 double-rounding & clamp(NaN))
+            "v_cvt_norm_u16_f16" => format!("cvt_norm_u16_f16({})", hb(0)),
+            "v_cvt_norm_i16_f16" => format!("cvt_norm_i16_f16({})", hb(0)),
             "v_add_nc_u16" | "v_add_u16" => format!("(({a} + {b}) & 0xFFFFu)"),
             "v_sub_nc_u16" | "v_sub_u16" => format!("(({a} - {b}) & 0xFFFFu)"),
             "v_subrev_nc_u16" | "v_subrev_u16" => format!("(({b} - {a}) & 0xFFFFu)"),
@@ -2902,25 +2912,21 @@ impl Em {
             "v_cvt_pknorm_u16_f32" => format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", fs(0), fs(1)),
             // packed f16 sources: op_sel[0]/[1] pick each source's half; result fills all 32 bits
             "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
-                let hf = |i: usize| {
+                let hb = |i: usize| {
                     let s = u.get(i).map(String::as_str).unwrap_or("0u");
-                    let mut s = if m.opsel >> i & 1 == 1 { format!("f16tof32({s} >> 16)") } else { format!("f16tof32({s} & 0xFFFFu)") };
+                    let mut s = if m.opsel >> i & 1 == 1 { format!("({s} >> 16)") } else { format!("({s} & 0xFFFFu)") };
                     if m.abs[i] {
-                        s = format!("abs({s})");
+                        s = format!("({s} & 0x7FFFu)");
                     }
                     if m.neg[i] {
-                        s = format!("(-{s})");
+                        s = format!("({s} ^ 0x8000u)");
                     }
                     s
                 };
                 if name == "v_cvt_pknorm_i16_f16" {
-                    format!(
-                        "((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) | (((uint)(int)round(clamp({}, -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) << 16)",
-                        hf(0),
-                        hf(1)
-                    )
+                    format!("(cvt_norm_i16_f16({}) | (cvt_norm_i16_f16({}) << 16))", hb(0), hb(1))
                 } else {
-                    format!("(uint)round(saturate({}) * 65535.0f) | ((uint)round(saturate({}) * 65535.0f) << 16)", hf(0), hf(1))
+                    format!("(cvt_norm_u16_f16({}) | (cvt_norm_u16_f16({}) << 16))", hb(0), hb(1))
                 }
             }
             "v_mul_hi_i32_i24" => format!("(uint)(((int64_t)i24({a}) * (int64_t)i24({b})) >> 32)"),
@@ -4855,6 +4861,29 @@ uint perm_b32(uint s0, uint s1, uint sel) {
     return r;
 }
 uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
+// Exact binary16 → unorm16/snorm16 (round-to-nearest-even, NaN → 0, ±Inf/≥1 → ±scale, subnormals exact).
+// Avoids fp32 double-rounding (e.g. 0x3801 * 65535 = 32799.4995 → 32799, not 32800) and DXIL clamp(NaN).
+uint cvt_norm_f16(uint h, uint scale) {
+    if ((h & 0x7FFFu) > 0x7C00u) return 0u;
+    uint exp = (h >> 10) & 0x1Fu;
+    uint frac = h & 0x3FFu;
+    if (exp >= 15u) return scale;
+    uint m = exp == 0u ? frac : (1024u | frac);
+    uint s = exp == 0u ? 24u : (25u - exp);
+    uint prod = m * scale;
+    uint q = prod >> s;
+    uint rem = prod & ((1u << s) - 1u);
+    uint half_bit = 1u << (s - 1u);
+    return q + (uint)(rem > half_bit || (rem == half_bit && (q & 1u) != 0u));
+}
+uint cvt_norm_u16_f16(uint h) {
+    if ((h & 0x8000u) != 0u) return 0u;
+    return cvt_norm_f16(h, 65535u);
+}
+uint cvt_norm_i16_f16(uint h) {
+    uint r = cvt_norm_f16(h, 32767u);
+    return ((h & 0x8000u) != 0u ? (uint)(-(int)r) : r) & 0xFFFFu;
+}
 float frexp_mant(float x) { float e; return (isinf(x) || isnan(x)) ? x : frexp(x, e); }
 int frexp_exp(float x) { float e; frexp(x, e); return (isinf(x) || isnan(x)) ? 0 : (int)e; }
 // f64 frexp pair: input = mant * 2^exp with |mant| in [0.5, 1); denormals are normalized.
