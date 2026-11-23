@@ -67,6 +67,8 @@ pub struct Vfs {
     game_root_lc: String,
     /// XCL's data folder for the title, absolute and lower-case.
     data_root_lc: String,
+    pls_root: PathBuf,
+    pls_root_lc: String,
     overlay: String,
     mounts: Vec<(String, String)>,
     whiteouts: Mutex<HashSet<String>>,
@@ -165,9 +167,13 @@ impl Vfs {
         mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         let data_root = data_dir.to_string_lossy();
         let data_root = full_path(&data_root).unwrap_or_else(|| data_root.into_owned());
+        let pls_root = Path::new(&data_root).join("pls");
+        let pls_root_lc = strip_verbatim(&norm(&pls_root.to_string_lossy())).to_lowercase();
         Vfs {
             game_root_lc: game_root.to_lowercase(),
             data_root_lc: trim_sep(&norm(&data_root)).to_lowercase(),
+            pls_root,
+            pls_root_lc,
             game_root,
             overlay: trim_sep(&norm(&overlay_dir.to_string_lossy())),
             mounts,
@@ -181,6 +187,14 @@ impl Vfs {
 
     pub fn game_root(&self) -> &str {
         &self.game_root
+    }
+
+    /// Find the quota root for a path already translated by this VFS.
+    pub(crate) fn pls_root_for(&self, translated: &str) -> Option<&Path> {
+        let path = translated.to_lowercase();
+        path.strip_prefix(&self.pls_root_lc)
+            .filter(|rest| rest.is_empty() || rest.starts_with('\\'))
+            .map(|_| self.pls_root.as_path())
     }
 
     fn apply_mounts(&self, p: &str) -> Option<String> {
