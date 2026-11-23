@@ -83,11 +83,30 @@ pub unsafe fn submit_callback(queue: *mut c_void, port: u32, ctx: *mut c_void, c
 pub type XAsyncWork = unsafe extern "system" fn(*mut XAsyncBlock) -> HRESULT;
 type Completion = unsafe extern "system" fn(*mut XAsyncBlock);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Operation in progress; not yet completing.
+    Pending,
+    /// `XAsyncComplete` claimed completion and is running optional cleanup / finalizing header.
+    Completing,
+    /// Operation finished; if `result_size > 0`, result has not yet been claimed.
+    Done,
+    /// `XAsyncGetResult` claimed the result and is running `OP_GET_RESULT` + `OP_CLEANUP`.
+    Consuming,
+    /// Result has been consumed and cleaned up (or `result_size == 0` / error was cleaned up).
+    Consumed,
+}
+
 struct Inner {
     status: HRESULT,
     result_size: usize,
-    done: bool,
-    cleaned: bool,
+    phase: Phase,
+}
+
+impl Inner {
+    fn is_done(&self) -> bool {
+        !matches!(self.phase, Phase::Pending | Phase::Completing)
+    }
 }
 
 pub struct State {
@@ -191,8 +210,8 @@ unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
     };
     if hr != E_PENDING {
         // providers that finish synchronously in DoWork may not call XAsyncComplete
-        let done = s.inner.lock().unwrap().done;
-        if !done {
+        let pending = s.inner.lock().unwrap().phase == Phase::Pending;
+        if pending {
             XAsyncComplete(b, hr, 0);
         }
     }
@@ -226,7 +245,7 @@ pub unsafe extern "system" fn XAsyncBegin(
         context: context as usize,
         identity: identity as usize,
         work: 0,
-        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, done: false, cleaned: false }),
+        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
     register_state(b, s.clone());
@@ -251,10 +270,9 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
         return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
     };
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
-    if q.is_terminated() {
+    if !taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
         return E_ABORT;
     }
-    taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize });
     S_OK
 }
 
@@ -268,39 +286,41 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         return;
     }
     let Lookup::Active(s) = lookup(b) else { return };
-    // Snapshot callback/queue before publishing completion so a waiter woken from
-    // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
-    let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    // Atomically claim completion while keeping `is_done() == false` until `OP_CLEANUP` and
+    // `write_header` finish, so waiters/pollers cannot destroy `b` or race on `FLAG_CONSUMED`.
     let (status, cleanup_now);
     {
         let mut g = s.inner.lock().unwrap();
-        if g.done {
+        if g.phase != Phase::Pending {
             return;
         }
+        g.phase = Phase::Completing;
         status = result;
         g.status = status;
         g.result_size = if status >= 0 { required } else { 0 };
-        g.done = true;
         cleanup_now = g.result_size == 0;
-        if cleanup_now {
-            g.cleaned = true;
-        }
     }
-    // Persist the finalized status into `b.internal` under `ACTIVE` before removing `s` so
-    // any concurrent reader that misses `ACTIVE` observes the completed header.
+    // Snapshot callback/queue before publishing completion so a waiter woken from
+    // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
+    let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    if cleanup_now {
+        call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
+    }
+    // Persist the finalized status into `b.internal` under `ACTIVE`, remove `s` if no payload
+    // remains, and publish `Done`/`Consumed` (lock order: `ACTIVE` -> `s.inner`) before
+    // submitting the completion callback or waking waiters.
     {
         let mut map = active_map().lock().unwrap();
         write_header(b, BlockHeader { status, flags: FLAG_DONE, id: s.id });
         if cleanup_now && map.get(&(b as usize)).is_some_and(|cur| cur.id == s.id) {
             map.remove(&(b as usize));
         }
-    }
-    if cleanup_now {
-        call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
+        let mut g = s.inner.lock().unwrap();
+        g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
     if cb != 0 {
         if let Some(q) = taskqueue::queue_from(queue_ptr) {
-            taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
+            let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
     s.cv.notify_all();
@@ -315,11 +335,11 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
         Lookup::Active(s) => {
             let mut g = s.inner.lock().unwrap();
             if wait {
-                while !g.done {
+                while !g.is_done() {
                     g = s.cv.wait(g).unwrap();
                 }
             }
-            if g.done { g.status } else { E_PENDING }
+            if g.is_done() { g.status } else { E_PENDING }
         }
         Lookup::Finished(h) => h.status,
         Lookup::Invalid => E_INVALIDARG,
@@ -334,7 +354,7 @@ pub unsafe extern "system" fn XAsyncGetResultSize(b: *mut XAsyncBlock, size: *mu
     match lookup(b) {
         Lookup::Active(s) => {
             let g = s.inner.lock().unwrap();
-            if !g.done {
+            if !g.is_done() {
                 return E_PENDING;
             }
             if !size.is_null() {
@@ -378,37 +398,41 @@ pub unsafe extern "system" fn XAsyncGetResult(
             S_OK
         }
         Lookup::Active(s) => {
-            let (status, need, cleaned) = {
-                let g = s.inner.lock().unwrap();
-                if !g.done {
+            let (status, need) = {
+                let mut g = s.inner.lock().unwrap();
+                if !g.is_done() {
                     return E_PENDING;
                 }
-                (g.status, g.result_size, g.cleaned)
+                if !identity.is_null() && s.identity != 0 && identity as usize != s.identity {
+                    return E_INVALIDARG;
+                }
+                if g.status < 0 {
+                    return g.status;
+                }
+                if g.result_size > 0 {
+                    if g.phase != Phase::Done {
+                        return E_ILLEGAL_METHOD_CALL;
+                    }
+                    if size < g.result_size || buffer.is_null() {
+                        return E_NOT_SUFFICIENT_BUFFER;
+                    }
+                    // Atomically claim the single result-consumption / OP_CLEANUP slot.
+                    g.phase = Phase::Consuming;
+                }
+                (g.status, g.result_size)
             };
-            if !identity.is_null() && s.identity != 0 && identity as usize != s.identity {
-                return E_INVALIDARG;
-            }
-            if status < 0 {
-                return status;
-            }
             if need > 0 {
-                if cleaned {
-                    return E_ILLEGAL_METHOD_CALL;
-                }
-                if size < need || buffer.is_null() {
-                    return E_NOT_SUFFICIENT_BUFFER;
-                }
                 let hr = call_provider(&s, OP_GET_RESULT, b, buffer, size);
                 if !used.is_null() {
                     *used = need;
                 }
-                s.inner.lock().unwrap().cleaned = true;
                 call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
                 let mut map = active_map().lock().unwrap();
                 write_header(b, BlockHeader { status, flags: FLAG_DONE | FLAG_CONSUMED, id: s.id });
                 if map.get(&(b as usize)).is_some_and(|cur| cur.id == s.id) {
                     map.remove(&(b as usize));
                 }
+                s.inner.lock().unwrap().phase = Phase::Consumed;
                 return hr;
             }
             if !used.is_null() {
@@ -425,7 +449,7 @@ pub unsafe extern "system" fn XAsyncCancel(b: *mut XAsyncBlock) {
         return f(o, b);
     }
     let Lookup::Active(s) = lookup(b) else { return };
-    if s.inner.lock().unwrap().done {
+    if s.inner.lock().unwrap().phase != Phase::Pending {
         return;
     }
     // Cancellation is the provider's to do, as in libHttpClient's XAsyncCancel: one that
@@ -449,7 +473,7 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
         context: 0,
         identity: 0,
         work,
-        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, done: false, cleaned: false }),
+        inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
         cv: Condvar::new(),
     });
     register_state(b, s);
@@ -531,8 +555,13 @@ where
     F: FnOnce() -> Result<PayloadBuf, HRESULT> + Send + 'static,
 {
     let p = Box::into_raw(Box::new(Payload { result: Mutex::new(None), work: Mutex::new(Some(Box::new(work))) }));
-    // On failure XAsyncBegin completes the block, which runs OP_CLEANUP and frees `p`.
-    XAsyncBegin(b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize)
+    let hr = XAsyncBegin(b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
+    if hr < 0 {
+        // SAFETY: `XAsyncBegin` rejected the call before adopting `p`, so `OP_CLEANUP` will
+        // never run; reclaim the `Box<Payload>` allocated above to avoid leaking it.
+        drop(Box::from_raw(p));
+    }
+    hr
 }
 
 #[cfg(test)]
@@ -749,6 +778,452 @@ mod tests {
             b.queue = q;
             assert_eq!(begin_with(&mut b, 9, || -> Result<Vec<u8>, HRESULT> { panic!("work ran on a terminated queue") }), S_OK);
             assert_eq!(XAsyncGetStatus(&mut b, true), E_ABORT);
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn terminate_manual_completion_port_with_delayed_async_does_not_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        static CB_HITS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "system" fn count_cb(_b: *mut XAsyncBlock) {
+            CB_HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        unsafe extern "system" fn delayed_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_BEGIN {
+                return XAsyncSchedule((*data).async_, 60_000);
+            }
+            S_OK
+        }
+
+        // Stress across both Manual/Manual and ThreadPool/Manual queues.
+        for iter in 0..50 {
+            let work_mode = if iter % 2 == 0 { taskqueue::MODE_MANUAL } else { taskqueue::MODE_THREAD_POOL };
+            unsafe {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(taskqueue::XTaskQueueCreate(work_mode, taskqueue::MODE_MANUAL, &mut q), S_OK);
+                let before = CB_HITS.load(Ordering::SeqCst);
+                let mut b = Box::new(std::mem::zeroed::<XAsyncBlock>());
+                b.queue = q;
+                b.callback = count_cb as usize;
+                assert_eq!(
+                    XAsyncBegin(&mut *b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), delayed_provider as usize),
+                    S_OK
+                );
+
+                let q_addr = q as usize;
+                let (tx, rx) = mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    let hr = taskqueue::XTaskQueueTerminate(q_addr as *mut c_void, true, std::ptr::null_mut(), 0);
+                    let _ = tx.send(hr);
+                });
+                let hr = rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_else(|_| panic!("XTaskQueueTerminate deadlocked on iter {iter}"));
+                handle.join().unwrap();
+                assert_eq!(hr, S_OK);
+                assert_eq!(XAsyncGetStatus(&mut *b, false), E_ABORT);
+                assert_eq!(CB_HITS.load(Ordering::SeqCst), before, "completion callback must not run on terminated queue");
+                assert!(taskqueue::XTaskQueueIsEmpty(q, PORT_WORK));
+                assert!(taskqueue::XTaskQueueIsEmpty(q, PORT_COMPLETION));
+                taskqueue::XTaskQueueCloseHandle(q);
+            }
+        }
+
+        // Also verify already-terminated ThreadPool queue does not invoke completion callback on XAsyncRun/begin_with.
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_THREAD_POOL, taskqueue::MODE_THREAD_POOL, &mut q), S_OK);
+            assert_eq!(taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0), S_OK);
+            let before = CB_HITS.load(Ordering::SeqCst);
+            let mut b1: XAsyncBlock = std::mem::zeroed();
+            b1.queue = q;
+            b1.callback = count_cb as usize;
+            assert_eq!(XAsyncRun(&mut b1, run_work as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b1, true), E_ABORT);
+
+            let mut b2: XAsyncBlock = std::mem::zeroed();
+            b2.queue = q;
+            b2.callback = count_cb as usize;
+            assert_eq!(begin_with(&mut b2, 77, || Ok(b"never".to_vec())), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b2, true), E_ABORT);
+
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(CB_HITS.load(Ordering::SeqCst), before, "completion callback ran on already-terminated queue");
+            taskqueue::XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn complete_finishes_cleanup_and_header_before_publishing_done() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct Ctx {
+            cleanup_done: AtomicBool,
+            cleanup_calls: AtomicU32,
+        }
+        unsafe extern "system" fn slow_cleanup_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            let ctx = &*((*data).context as *const Ctx);
+            if op == OP_CLEANUP {
+                std::thread::yield_now();
+                ctx.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                ctx.cleanup_done.store(true, Ordering::SeqCst);
+            }
+            S_OK
+        }
+
+        // Part 1: zero-payload completion must finish OP_CLEANUP and write FLAG_DONE before waiters observe completion.
+        for _ in 0..50 {
+            let ctx = Arc::new(Ctx { cleanup_done: AtomicBool::new(false), cleanup_calls: AtomicU32::new(0) });
+            let b = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<XAsyncBlock>() }));
+            unsafe {
+                assert_eq!(
+                    XAsyncBegin(b, Arc::as_ptr(&ctx) as *mut c_void, std::ptr::null(), std::ptr::null(), slow_cleanup_provider as usize),
+                    S_OK
+                );
+            }
+            let barrier = Arc::new(Barrier::new(3));
+            let b_addr = b as usize;
+            let ctx_poll = ctx.clone();
+            let bar_poll = barrier.clone();
+            let poller = std::thread::spawn(move || {
+                bar_poll.wait();
+                loop {
+                    let hr = unsafe { XAsyncGetStatus(b_addr as *mut XAsyncBlock, false) };
+                    if hr != E_PENDING {
+                        assert_eq!(hr, S_OK);
+                        assert!(ctx_poll.cleanup_done.load(Ordering::SeqCst), "status published before OP_CLEANUP finished");
+                        let hdr = unsafe { read_header(b_addr as *mut XAsyncBlock) }.expect("header missing");
+                        assert_ne!(hdr.flags & FLAG_DONE, 0, "status published before FLAG_DONE written");
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            let ctx_wait = ctx.clone();
+            let bar_wait = barrier.clone();
+            let waiter = std::thread::spawn(move || {
+                bar_wait.wait();
+                let hr = unsafe { XAsyncGetStatus(b_addr as *mut XAsyncBlock, true) };
+                assert_eq!(hr, S_OK);
+                assert!(ctx_wait.cleanup_done.load(Ordering::SeqCst), "waiter woke before OP_CLEANUP finished");
+            });
+            barrier.wait();
+            unsafe { XAsyncComplete(b, S_OK, 0) };
+            poller.join().unwrap();
+            waiter.join().unwrap();
+            assert_eq!(ctx.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert!(!active_map().lock().unwrap().contains_key(&b_addr));
+            unsafe { drop(Box::from_raw(b)) };
+        }
+
+        // Part 2: non-empty payload completion must write FLAG_DONE before publishing `done`,
+        // so an immediate `XAsyncGetResult` cannot have its `FLAG_CONSUMED` overwritten.
+        unsafe extern "system" fn payload_4b_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            if op == OP_GET_RESULT {
+                std::ptr::copy_nonoverlapping(b"xyzw".as_ptr(), (*data).buffer as *mut u8, 4);
+            }
+            S_OK
+        }
+        for _ in 0..50 {
+            let b = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<XAsyncBlock>() }));
+            let id = 0xCAFEusize;
+            unsafe {
+                assert_eq!(
+                    XAsyncBegin(b, std::ptr::null_mut(), id as *const c_void, std::ptr::null(), payload_4b_provider as usize),
+                    S_OK
+                );
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let b_addr = b as usize;
+            let bar_c = barrier.clone();
+            let consumer = std::thread::spawn(move || {
+                bar_c.wait();
+                let mut buf = [0u8; 4];
+                let mut used = 0usize;
+                loop {
+                    let hr = unsafe { XAsyncGetResult(b_addr as *mut XAsyncBlock, id as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, &mut used) };
+                    if hr != E_PENDING {
+                        assert_eq!(hr, S_OK);
+                        assert_eq!(&buf, b"xyzw");
+                        assert_eq!(used, 4);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+            barrier.wait();
+            unsafe { XAsyncComplete(b, S_OK, 4) };
+            consumer.join().unwrap();
+            let mut buf = [0u8; 4];
+            let hr2 = unsafe { XAsyncGetResult(b, id as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, std::ptr::null_mut()) };
+            assert_eq!(hr2, E_ILLEGAL_METHOD_CALL, "FLAG_CONSUMED was clobbered by XAsyncComplete");
+            unsafe { drop(Box::from_raw(b)) };
+        }
+    }
+
+    #[test]
+    fn concurrent_get_result_runs_cleanup_exactly_once() {
+        use std::sync::Barrier;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct Counts {
+            get_result: AtomicU32,
+            cleanup: AtomicU32,
+        }
+        unsafe extern "system" fn counting_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            let c = &*((*data).context as *const Counts);
+            match op {
+                OP_GET_RESULT => {
+                    c.get_result.fetch_add(1, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    std::ptr::copy_nonoverlapping(b"data".as_ptr(), (*data).buffer as *mut u8, 4);
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    c.cleanup.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        // 100 iterations of 4-thread race on a counting provider.
+        const THREADS: usize = 4;
+        for iter in 0..100 {
+            let counts = Arc::new(Counts { get_result: AtomicU32::new(0), cleanup: AtomicU32::new(0) });
+            let b = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<XAsyncBlock>() }));
+            let id = 0x1000 + iter;
+            unsafe {
+                assert_eq!(
+                    XAsyncBegin(b, Arc::as_ptr(&counts) as *mut c_void, id as *const c_void, std::ptr::null(), counting_provider as usize),
+                    S_OK
+                );
+                XAsyncComplete(b, S_OK, 4);
+            }
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let b_addr = b as usize;
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let bar = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4];
+                        let mut used = 0usize;
+                        bar.wait();
+                        let hr = unsafe {
+                            XAsyncGetResult(b_addr as *mut XAsyncBlock, id as *const c_void, 4, buf.as_mut_ptr() as *mut c_void, &mut used)
+                        };
+                        (hr, buf, used)
+                    })
+                })
+                .collect();
+            let mut ok_count = 0usize;
+            let mut illegal_count = 0usize;
+            for h in handles {
+                let (hr, buf, used) = h.join().unwrap();
+                if hr == S_OK {
+                    ok_count += 1;
+                    assert_eq!(&buf, b"data");
+                    assert_eq!(used, 4);
+                } else {
+                    assert_eq!(hr, E_ILLEGAL_METHOD_CALL, "unexpected hr {hr:#x} on iter {iter}");
+                    illegal_count += 1;
+                }
+            }
+            assert_eq!(ok_count, 1, "expected exactly 1 S_OK on iter {iter}");
+            assert_eq!(illegal_count, THREADS - 1);
+            assert_eq!(counts.get_result.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.cleanup.load(Ordering::SeqCst), 1, "OP_CLEANUP ran more than once on iter {iter}");
+            assert!(!active_map().lock().unwrap().contains_key(&b_addr));
+            unsafe { drop(Box::from_raw(b)) };
+        }
+
+        // 50 iterations with real `begin_with` (`Box<Payload>` freed in `OP_CLEANUP`).
+        for iter in 0..50 {
+            let b = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<XAsyncBlock>() }));
+            let id = 0x2000 + iter;
+            unsafe {
+                assert_eq!(begin_with(b, id, || Ok(b"payload!".to_vec())), S_OK);
+                assert_eq!(XAsyncGetStatus(b, true), S_OK);
+            }
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let b_addr = b as usize;
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let bar = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8];
+                        let mut used = 0usize;
+                        bar.wait();
+                        let hr = unsafe {
+                            XAsyncGetResult(b_addr as *mut XAsyncBlock, id as *const c_void, 8, buf.as_mut_ptr() as *mut c_void, &mut used)
+                        };
+                        (hr, buf, used)
+                    })
+                })
+                .collect();
+            let mut ok_count = 0usize;
+            for h in handles {
+                let (hr, buf, used) = h.join().unwrap();
+                if hr == S_OK {
+                    ok_count += 1;
+                    assert_eq!(&buf, b"payload!");
+                    assert_eq!(used, 8);
+                } else {
+                    assert_eq!(hr, E_ILLEGAL_METHOD_CALL);
+                }
+            }
+            assert_eq!(ok_count, 1);
+            unsafe { drop(Box::from_raw(b)) };
+        }
+    }
+
+    #[test]
+    fn begin_with_fixups_drops_payload_on_begin_failure() {
+        use std::sync::atomic::AtomicBool;
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let hr = unsafe {
+            begin_with_fixups(std::ptr::null_mut(), 1, move || {
+                let _keep = &flag;
+                Ok(PayloadBuf { bytes: vec![1, 2, 3], fixups: Vec::new() })
+            })
+        };
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(dropped.load(Ordering::SeqCst), "Payload was leaked when XAsyncBegin returned < 0");
+    }
+
+    #[test]
+    fn complete_synchronously_inside_begin_zero_and_nonempty_payload() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        struct SyncCtx {
+            cleanup_calls: AtomicU32,
+            cb_calls: AtomicU32,
+            cb_saw_hr: AtomicU32,
+            cb_buf: Mutex<Vec<u8>>,
+            payload_size: usize,
+            return_err_after: bool,
+        }
+
+        unsafe extern "system" fn sync_begin_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+            let ctx = &*((*data).context as *const SyncCtx);
+            match op {
+                OP_BEGIN => {
+                    XAsyncComplete((*data).async_, S_OK, ctx.payload_size);
+                    if ctx.return_err_after { crate::util::E_FAIL } else { S_OK }
+                }
+                OP_GET_RESULT => {
+                    std::ptr::copy_nonoverlapping(b"sync".as_ptr(), (*data).buffer as *mut u8, 4);
+                    S_OK
+                }
+                OP_CLEANUP => {
+                    ctx.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        unsafe extern "system" fn immediate_zero_cb(b: *mut XAsyncBlock) {
+            let ctx = &*((*b).context as *const SyncCtx);
+            let hr = XAsyncGetStatus(b, false);
+            ctx.cb_saw_hr.store(hr as u32, Ordering::SeqCst);
+            ctx.cb_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe extern "system" fn immediate_payload_cb(b: *mut XAsyncBlock) {
+            let ctx = &*((*b).context as *const SyncCtx);
+            let mut size = 0usize;
+            assert_eq!(XAsyncGetResultSize(b, &mut size), S_OK);
+            assert_eq!(size, 4);
+            let mut buf = vec![0u8; size];
+            let mut used = 0usize;
+            let hr = XAsyncGetResult(b, 0x42 as *const c_void, buf.len(), buf.as_mut_ptr() as *mut c_void, &mut used);
+            assert_eq!(used, 4);
+            *ctx.cb_buf.lock().unwrap() = buf;
+            ctx.cb_saw_hr.store(hr as u32, Ordering::SeqCst);
+            ctx.cb_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            let mut q = std::ptr::null_mut();
+            assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_IMMEDIATE, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+
+            // (a) Zero-size synchronous completion inside OP_BEGIN with immediate completion callback.
+            let ctx0 = SyncCtx {
+                cleanup_calls: AtomicU32::new(0),
+                cb_calls: AtomicU32::new(0),
+                cb_saw_hr: AtomicU32::new(u32::MAX),
+                cb_buf: Mutex::new(Vec::new()),
+                payload_size: 0,
+                return_err_after: false,
+            };
+            let mut b0: XAsyncBlock = std::mem::zeroed();
+            b0.queue = q;
+            b0.context = &ctx0 as *const SyncCtx as *mut c_void;
+            b0.callback = immediate_zero_cb as usize;
+            assert_eq!(XAsyncBegin(&mut b0, &ctx0 as *const SyncCtx as *mut c_void, std::ptr::null(), std::ptr::null(), sync_begin_provider as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b0, false), S_OK);
+            assert_eq!(ctx0.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(ctx0.cb_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(ctx0.cb_saw_hr.load(Ordering::SeqCst) as i32, S_OK);
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b0 as *mut XAsyncBlock as usize)));
+
+            // (b) Non-empty payload completed inside OP_BEGIN and consumed inline by immediate completion callback.
+            let ctx4 = SyncCtx {
+                cleanup_calls: AtomicU32::new(0),
+                cb_calls: AtomicU32::new(0),
+                cb_saw_hr: AtomicU32::new(u32::MAX),
+                cb_buf: Mutex::new(Vec::new()),
+                payload_size: 4,
+                return_err_after: false,
+            };
+            let mut b4: XAsyncBlock = std::mem::zeroed();
+            b4.queue = q;
+            b4.context = &ctx4 as *const SyncCtx as *mut c_void;
+            b4.callback = immediate_payload_cb as usize;
+            assert_eq!(XAsyncBegin(&mut b4, &ctx4 as *const SyncCtx as *mut c_void, 0x42 as *const c_void, std::ptr::null(), sync_begin_provider as usize), S_OK);
+            assert_eq!(ctx4.cb_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(ctx4.cb_saw_hr.load(Ordering::SeqCst) as i32, S_OK);
+            assert_eq!(*ctx4.cb_buf.lock().unwrap(), b"sync");
+            assert_eq!(ctx4.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(XAsyncGetResult(&mut b4, 0x42 as *const c_void, 4, [0u8; 4].as_mut_ptr() as *mut c_void, std::ptr::null_mut()), E_ILLEGAL_METHOD_CALL);
+            assert!(!active_map().lock().unwrap().contains_key(&(&mut b4 as *mut XAsyncBlock as usize)));
+
+            // (c) Completing inside OP_BEGIN and then returning an error HRESULT does not double-complete or double-cleanup.
+            let ctx_err = SyncCtx {
+                cleanup_calls: AtomicU32::new(0),
+                cb_calls: AtomicU32::new(0),
+                cb_saw_hr: AtomicU32::new(u32::MAX),
+                cb_buf: Mutex::new(Vec::new()),
+                payload_size: 0,
+                return_err_after: true,
+            };
+            let mut b_err: XAsyncBlock = std::mem::zeroed();
+            b_err.queue = q;
+            b_err.context = &ctx_err as *const SyncCtx as *mut c_void;
+            b_err.callback = immediate_zero_cb as usize;
+            assert_eq!(XAsyncBegin(&mut b_err, &ctx_err as *const SyncCtx as *mut c_void, std::ptr::null(), std::ptr::null(), sync_begin_provider as usize), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b_err, false), S_OK);
+            assert_eq!(ctx_err.cleanup_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(ctx_err.cb_calls.load(Ordering::SeqCst), 1);
+
+            taskqueue::XTaskQueueTerminate(q, true, std::ptr::null_mut(), 0);
             taskqueue::XTaskQueueCloseHandle(q);
         }
     }
