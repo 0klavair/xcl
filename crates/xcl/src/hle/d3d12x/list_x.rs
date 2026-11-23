@@ -1226,7 +1226,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         pc::<QueryFn>(this, PC_END_QUERY)(this, h, qty, i);
     }
 
+    let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
+    real::preserve_vtable(this, ext);
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
@@ -1247,12 +1249,10 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
+    let ext_closed = *(this as *const usize);
     let init_pso = super::pso_async::resolve_for_bind(bound_pso);
-    let ext = *(this as *const usize);
     let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, init_pso);
-    if *(this as *const usize) != ext {
-        *(this as *mut usize) = ext;
-    }
+    real::preserve_vtable(this, ext_closed);
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
@@ -1627,13 +1627,11 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::bind::reset(this, alloc);
-    // the PC runtime writes its own vtable into a copy list again on Reset: keep XCL's
+    // the PC runtime writes its own vtable into a list on Reset (copy lists, Agility SDK 1.620+): re-adopt it
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
     let hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(this, PC_RESET)(this, alloc, resolved);
-    if *(this as *const usize) != ext {
-        *(this as *mut usize) = ext;
-    }
+    real::preserve_vtable(this, ext);
     if hr >= 0 && !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
@@ -1744,7 +1742,9 @@ unsafe fn is_buffer(res: usize) -> bool {
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
+    real::preserve_vtable(this, ext);
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);

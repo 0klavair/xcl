@@ -337,24 +337,41 @@ pub fn init() -> Result<String, String> {
     }
     unsafe {
         let cfg = crate::state::config();
+        match crate::gpu::agility::state() {
+            crate::gpu::agility::State::Loaded { version, dir, .. } => {
+                crate::xlog_info!("D3D12: Agility SDK v{version} ({})", dir.display());
+            }
+            crate::gpu::agility::State::Unavailable(reason) => {
+                crate::xlog_warn!("D3D12: Agility SDK unavailable ({reason}) – using inbox D3D12");
+            }
+            crate::gpu::agility::State::NotFound => {}
+        }
         let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
         if debug {
-            let mut dbg: Option<ID3D12Debug> = None;
-            if D3D12GetDebugInterface(&mut dbg).is_ok() {
-                if let Some(d) = dbg {
+            match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                Ok(d) => {
                     d.EnableDebugLayer();
                     crate::xlog_info!("D3D12: debug layer enabled");
+                }
+                Err(e) => {
+                    crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
                 }
             }
         }
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
         // stalled in its first seconds twice.
-        let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-        if std::env::var_os("XCL_DRED").is_some() && D3D12GetDebugInterface(&mut dred).is_ok() {
-            if let Some(d) = dred {
-                d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        if std::env::var_os("XCL_DRED").is_some() {
+            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
+                &CLSID_D3D12DeviceRemovedExtendedData,
+            ) {
+                Ok(d) => {
+                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                Err(e) => {
+                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
+                }
             }
         }
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
@@ -368,18 +385,23 @@ pub fn init() -> Result<String, String> {
                 list = crate::gpu::adapter::candidates(&factory, &crate::gpu::adapter::Selector::Auto);
             }
             for (adapter, desc) in list {
-                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
+                    device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
                     break;
                 }
             }
         }
-        if device.is_none() {
-            let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
-            D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut device).map_err(|e| format!("D3D12CreateDevice(WARP): {e}"))?;
-            name = "WARP (software renderer)".into();
-        }
-        let device = device.ok_or("no device")?;
+        let device = match device {
+            Some(d) => d,
+            None => {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
+                let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
+                    .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
+                name = "WARP (software renderer)".into();
+                d
+            }
+        };
         if debug {
             // the debug layer's messages into XCL's log (they otherwise go to a debugger only)
             if let Ok(q) = device.cast::<ID3D12InfoQueue1>() {
@@ -480,6 +502,26 @@ pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
 
 fn is_ext(v: usize) -> bool {
     EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
+}
+
+fn kind_of(ext: usize) -> Option<Kind> {
+    CLASSES.lock().unwrap().iter().find(|c| c.ext == ext).map(|c| c.kind)
+}
+
+/// If a native D3D12 method (such as `Close` or `Reset` on Agility SDK 1.620+, or copy-list
+/// `Reset`) replaced `this`'s vtable pointer with another native runtime table, adopt the
+/// new table under the same `Kind` so XCL's hooks stay installed while forwarding to the
+/// runtime's current state table.
+pub(super) unsafe fn preserve_vtable(this: *mut c_void, prev_ext: usize) {
+    let cur = *(this as *const usize);
+    if cur == prev_ext || is_ext(cur) {
+        return;
+    }
+    if let Some(kind) = kind_of(prev_ext) {
+        adopt(this, kind);
+    } else {
+        *(this as *mut usize) = prev_ext;
+    }
 }
 
 /// An adopted object gets the extended vtable of another kind (a DMA list: created as a PC
@@ -1764,6 +1806,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::CommandList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
             ("Close", cl_close as usize),
+            ("Reset", cl_reset as usize),
             ("ClearState", cl_clear_state as usize),
             ("DrawInstanced", cl_draw_instanced as usize),
             ("DrawIndexedInstanced", cl_draw_indexed_instanced as usize),
@@ -1830,14 +1873,28 @@ macro_rules! as_usize {
 }
 
 /// Close: a failure is logged with what was recorded (titles stop on it; the PC runtime
-/// refuses some calls only here)
+/// refuses some calls only here). Newer D3D12 runtimes (e.g. Agility SDK 1.620+) swap the
+/// command list's vtable pointer on Close; adopt the runtime's new state vtable so
+/// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
+    preserve_vtable(this, ext);
     if hr < 0 {
         let ty: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
     }
+    hr
+}
+
+/// Reset (PC path): re-adopt the runtime's new open-state vtable if Reset replaced it.
+unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
+    let ext = *(this as *const usize);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
+        std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
+    let hr = f(this, allocator, initial_state);
+    preserve_vtable(this, ext);
     hr
 }
 

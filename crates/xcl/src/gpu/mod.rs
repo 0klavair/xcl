@@ -2,6 +2,7 @@
 //! (decoder / disassembler – the front-end of the shader recompiler).
 
 pub mod adapter;
+pub mod agility;
 pub mod bvh;
 pub mod desc;
 pub mod dxbc;
