@@ -683,6 +683,7 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
     }
+    super::title_textures::list_reset(key);
     // Dynamic-depth-bias PSOs ignore baked RasterizerState depth bias; seed the list with the
     // initial PSO's static bias if non-zero (CreateCommandList resets RSSetDepthBias to 0).
     if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE && pso != 0 {
@@ -698,6 +699,7 @@ pub(super) unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: 
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    super::title_textures::list_reset(list);
     if let Some(old) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list)) {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
@@ -1323,6 +1325,9 @@ pub(super) unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    // what ran is in the textures' states; the list records anew after its Reset below
+    super::title_textures::submitted(&one);
+    super::title_textures::list_reset(this as usize);
     if !sparse_writes.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes);
@@ -1883,6 +1888,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
+    super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
@@ -1974,6 +1980,12 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if uav_transition && !any_uav {
         out.push([2, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    // the states uploads into textures kept in step start from once this list has run
+    if super::title_textures::any() {
+        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
+            out.iter().filter(|b| b[0] == 0).map(|b| ((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], D3D12_RESOURCE_STATES(b[6] as i32))).collect();
+        super::title_textures::note_transitions(this as usize, &t);
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
