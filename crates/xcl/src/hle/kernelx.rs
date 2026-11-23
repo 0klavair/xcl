@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation as fnd;
 use windows_sys::Win32::System::LibraryLoader as ll;
 use windows_sys::Win32::System::Memory as mem;
+use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading as thr;
 
 use crate::modules;
@@ -71,6 +72,8 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         SetThreadName,
         GetThreadName,
         SetThreadpoolAffinityMask,
+        SetThreadAffinityMask,
+        SetThreadGroupAffinity,
         QueryProcessorSchedulingStatistics,
         GetConsoleType,
         OutputDebugStringA,
@@ -1162,6 +1165,60 @@ pub unsafe extern "system" fn SetThreadpoolAffinityMask(_pool: *mut c_void, _mas
     1
 }
 
+/// An affinity mask the PC takes. The title sees the PC's processors, so a mask made from them
+/// passes unchanged. A console mask (its 7 cores / 14 threads) that names processors outside the
+/// process's affinity – a PC with fewer processors, or a process limited to some – makes Windows
+/// fail the call (ERROR_INVALID_PARAMETER) when none of its processors is there or any is outside
+/// the process's mask: it is cut to the processors there are, and when none is left, each console
+/// processor goes to the PC's processor at its index modulo their count.
+pub fn fit_affinity_mask(mask: usize, allowed: usize) -> usize {
+    if mask == 0 || allowed == 0 || mask & !allowed == 0 {
+        return mask;
+    }
+    if mask & allowed != 0 {
+        return mask & allowed;
+    }
+    let pcs: Vec<u32> = (0..usize::BITS).filter(|b| allowed >> b & 1 != 0).collect();
+    (0..usize::BITS).filter(|b| mask >> b & 1 != 0).fold(0, |m, b| m | 1 << pcs[b as usize % pcs.len()])
+}
+
+/// The process's affinity mask; 0 (masks pass unchanged) with more than one processor group.
+fn process_affinity() -> usize {
+    unsafe {
+        if thr::GetActiveProcessorGroupCount() != 1 {
+            return 0;
+        }
+        let (mut process, mut system) = (0usize, 0usize);
+        if thr::GetProcessAffinityMask(thr::GetCurrentProcess(), &mut process, &mut system) == 0 {
+            return 0;
+        }
+        process
+    }
+}
+
+fn fitted_affinity(mask: usize, what: &str) -> usize {
+    static LOGGED: std::sync::Mutex<std::collections::BTreeSet<usize>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let allowed = process_affinity();
+    let fit = fit_affinity_mask(mask, allowed);
+    if fit != mask && LOGGED.lock().unwrap_or_else(|e| e.into_inner()).insert(mask) {
+        crate::xlog_info!("{what}: mask {mask:#x} names processors outside the process's {allowed:#x} – {fit:#x}");
+    }
+    fit
+}
+
+pub unsafe extern "system" fn SetThreadAffinityMask(h: HANDLE, mask: usize) -> usize {
+    thr::SetThreadAffinityMask(h, fitted_affinity(mask, "SetThreadAffinityMask"))
+}
+
+pub unsafe extern "system" fn SetThreadGroupAffinity(h: HANDLE, a: *const GROUP_AFFINITY, prev: *mut GROUP_AFFINITY) -> BOOL {
+    if a.is_null() || (*a).Group != 0 {
+        return thr::SetThreadGroupAffinity(h, a, prev);
+    }
+    let mut fit = *a;
+    fit.Mask = fitted_affinity(fit.Mask, "SetThreadGroupAffinity");
+    thr::SetThreadGroupAffinity(h, &fit, prev)
+}
+
 pub unsafe extern "system" fn QueryProcessorSchedulingStatistics(out: *mut [u64; 3]) {
     if out.is_null() {
         return;
@@ -1551,6 +1608,43 @@ pub unsafe extern "system" fn DisableThreadLibraryCalls(h: usize) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affinity_masks_outside_the_process_are_fitted() {
+        // a mask from the PC's processors is the title's choice
+        assert_eq!(fit_affinity_mask(0x3F, 0xFF), 0x3F);
+        assert_eq!(fit_affinity_mask(0, 0xF), 0);
+        // the console's 7 cores on a 4-processor PC: the ones there are
+        assert_eq!(fit_affinity_mask(0x7F, 0xF), 0xF);
+        // only processors the PC lacks: dealt onto the PC's by index
+        assert_eq!(fit_affinity_mask(1 << 6, 0xF), 1 << 2);
+        assert_eq!(fit_affinity_mask(0x3000, 0xF), 0x3);
+        assert_eq!(fit_affinity_mask(1 << 20, 0b1010_1010), 0b10);
+    }
+
+    /// Windows refuses a mask none of whose processors the process has (ERROR_INVALID_PARAMETER);
+    /// the title's call gets the processors there are. (Only XCL's answer is checked: Wine's own
+    /// may differ.)
+    #[test]
+    fn set_thread_affinity_mask_takes_console_masks() {
+        let allowed = process_affinity();
+        if allowed == 0 || allowed == usize::MAX {
+            println!("SKIPPED set_thread_affinity_mask_takes_console_masks: every processor bit is taken");
+            return;
+        }
+        let missing = !allowed & allowed.wrapping_add(1);
+        let first = allowed & allowed.wrapping_neg();
+        std::thread::spawn(move || unsafe {
+            let me = thr::GetCurrentThread();
+            assert_ne!(SetThreadAffinityMask(me, missing), 0, "{missing:#x} in a {allowed:#x} process");
+            assert_eq!(thr::SetThreadAffinityMask(me, allowed), fit_affinity_mask(missing, allowed));
+            let mut a: GROUP_AFFINITY = std::mem::zeroed();
+            a.Mask = missing | first;
+            assert_eq!(SetThreadGroupAffinity(me, &a, std::ptr::null_mut()), 1);
+        })
+        .join()
+        .unwrap();
+    }
 
     /// The GDK thunks' device type lookup: RegOpenKeyW(HKLM\…\OEM) + RegQueryValueExW(ConsoleMode).
     #[test]
