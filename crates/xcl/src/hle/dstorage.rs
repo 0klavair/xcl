@@ -34,12 +34,12 @@ use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
 use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, SetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use crate::util::{HRESULT, S_OK};
 
@@ -640,8 +640,12 @@ enum Entry {
         dest_pages: Option<Vec<usize>>,
         src_pages: Option<Vec<usize>>,
     },
-    /// refused at enqueue: counts as a failed request
-    Refused(HRESULT),
+    /// refused at enqueue: reported in queue order by the worker
+    Refused {
+        hr: HRESULT,
+        req: Request,
+        file: Option<Arc<FileInner>>,
+    },
     Status(Arc<StatusInner>, u32),
     /// a fence (one reference held) and the value it gets
     Signal(FenceRef, u64),
@@ -675,6 +679,7 @@ struct QueueInner {
     pending: Mutex<Pending>,
     cancels: Mutex<Vec<CancelRule>>,
     worker: Mutex<Option<mpsc::Sender<Vec<Entry>>>>,
+    worker_active: (Mutex<bool>, Condvar),
     closed: AtomicBool,
     error_event: usize,
     errors: Mutex<(u32, Option<FirstError>)>,
@@ -702,6 +707,9 @@ impl QueueInner {
         // Lock `worker` before `pending` so concurrent `Submit()` calls always enqueue
         // batches to the channel in strict `seq` order.
         let mut w = self.worker.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let batch = std::mem::take(&mut self.pending.lock().unwrap().entries);
         if batch.is_empty() {
             return;
@@ -709,20 +717,45 @@ impl QueueInner {
         if w.is_none() {
             let (tx, rx) = mpsc::channel::<Vec<Entry>>();
             let q = Arc::clone(self);
+            *self.worker_active.0.lock().unwrap() = true;
             let started = std::thread::Builder::new().name("xcl-dstorage".into()).spawn(move || q.run(rx));
             if started.is_err() {
+                *self.worker_active.0.lock().unwrap() = false;
+                self.worker_active.1.notify_all();
+                // Release `worker` before dropping `batch` so fence `Release` cannot re-enter under lock.
+                drop(w);
+                drop(batch);
                 return;
             }
             *w = Some(tx);
         }
-        let _ = w.as_ref().unwrap().send(batch);
+        let sent = w.as_ref().unwrap().send(batch);
+        // Release `worker` before dropping any unsent `batch` returned in `Err`.
+        drop(w);
+        drop(sent);
     }
 
     fn run(&self, rx: mpsc::Receiver<Vec<Entry>>) {
+        struct ActiveGuard<'a>(&'a QueueInner);
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                *self.0.worker_active.0.lock().unwrap() = false;
+                self.0.worker_active.1.notify_all();
+            }
+        }
+        let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
         for batch in rx {
             for e in batch {
+                if self.closed.load(Ordering::Acquire) {
+                    if let Entry::Status(s, i) = e {
+                        if let Some(slot) = s.slots.get(i as usize) {
+                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
+                        }
+                    }
+                    continue;
+                }
                 match e {
                     Entry::Request { seq, req, file, dest_pages, src_pages } => {
                         if self.is_cancelled(seq, req.tag) {
@@ -736,7 +769,8 @@ impl QueueInner {
                             }
                         }
                     }
-                    Entry::Refused(hr) => {
+                    Entry::Refused { hr, req, file } => {
+                        self.fail(hr, req, file.as_deref());
                         if since_status >= 0 {
                             since_status = hr;
                         }
@@ -762,6 +796,14 @@ impl QueueInner {
     fn enqueue(self: &Arc<Self>, e: Entry) {
         let n = {
             let mut p = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            if let Entry::Status(ref s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_PENDING, Ordering::Release);
+                }
+            }
             p.entries.push(e);
             p.entries.len()
         };
@@ -774,6 +816,9 @@ impl QueueInner {
     fn enqueue_request(self: &Arc<Self>, req: Request, file: Option<Arc<FileInner>>, dest_pages: Option<Vec<usize>>, src_pages: Option<Vec<usize>>) {
         let n = {
             let mut p = self.pending.lock().unwrap();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
             let seq = p.next_seq;
             p.next_seq += 1;
             p.entries.push(Entry::Request { seq, req, file, dest_pages, src_pages });
@@ -847,6 +892,7 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         pending: Mutex::new(Pending { entries: Vec::new(), next_seq: 1 }),
         cancels: Mutex::new(Vec::new()),
         worker: Mutex::new(None),
+        worker_active: (Mutex::new(false), Condvar::new()),
         closed: AtomicBool::new(false),
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
@@ -870,12 +916,16 @@ unsafe extern "system" fn queue_add_ref(p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
-    let last = (*(p as *const Object<QueueInner>)).refs.load(Ordering::Acquire) == 1;
-    if last {
-        // the worker ends with its channel
-        queue(p).worker.lock().unwrap().take();
+    let obj = p as *mut Object<QueueInner>;
+    let n = (*obj).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if n == 0 {
+        let obj = Box::from_raw(obj);
+        // Drop the channel sender so the worker thread exits and drops its
+        // Arc<QueueInner> (breaking the worker <-> queue cycle).
+        obj.inner.worker.lock().unwrap().take();
+        drop(obj);
     }
-    release::<QueueInner>(p)
+    n
 }
 
 unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) {
@@ -886,8 +936,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
     if let Err(hr) = r.check(q.source_memory) {
         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
-        q.fail(hr, r, None);
-        return q.enqueue(Entry::Refused(hr));
+        return q.enqueue(Entry::Refused { hr, req: r, file: None });
     }
     let file = if r.memory_source() {
         None
@@ -895,8 +944,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         // only a file this factory opened
         let f = r.source as *mut c_void;
         if !crate::gpu::shader::readable(f as usize, 8) || *(f as *const *const usize) != file_vtbl().as_ptr() {
-            q.fail(E_FILE_HANDLE, r, None);
-            return q.enqueue(Entry::Refused(E_FILE_HANDLE));
+            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None });
         }
         Some(Arc::clone(inner::<FileInner>(f)))
     };
@@ -904,8 +952,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                q.fail(hr, r, file.as_deref());
-                return q.enqueue(Entry::Refused(hr));
+                return q.enqueue(Entry::Refused { hr, req: r, file });
             }
         }
     } else {
@@ -915,8 +962,7 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
         match snapshot_page_array(r.source, r.source_page_offset, r.source_size) {
             Ok(pages) => Some(pages),
             Err(hr) => {
-                q.fail(hr, r, file.as_deref());
-                return q.enqueue(Entry::Refused(hr));
+                return q.enqueue(Entry::Refused { hr, req: r, file });
             }
         }
     } else {
@@ -927,22 +973,26 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
     let q = queue(p);
-    if q.closed.load(Ordering::Acquire) || array.is_null() {
+    if q.closed.load(Ordering::Acquire)
+        || array.is_null()
+        || !crate::gpu::shader::readable(array as usize, std::mem::size_of::<usize>())
+        || *(array as *const *const usize) != status_vtbl().as_ptr()
+    {
         return;
     }
     let s = Arc::clone(inner::<StatusInner>(array));
-    if let Some(slot) = s.slots.get(index as usize) {
-        slot.store(E_PENDING, Ordering::Release);
-    }
     q.enqueue(Entry::Status(s, index));
 }
 
 unsafe extern "system" fn queue_enqueue_signal(p: *mut c_void, fence: *mut c_void, value: u64) {
     let q = queue(p);
-    if q.closed.load(Ordering::Acquire) || fence.is_null() {
+    if q.closed.load(Ordering::Acquire) || fence.is_null() || !crate::gpu::shader::readable(fence as usize, std::mem::size_of::<usize>()) {
         return;
     }
     let vt = *(fence as *const *const usize);
+    if vt.is_null() || !crate::gpu::shader::readable(vt as usize, (FENCE_SIGNAL + 1) * std::mem::size_of::<usize>()) {
+        return;
+    }
     let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
     add(fence);
     q.enqueue(Entry::Signal(FenceRef(fence as usize), value));
@@ -977,10 +1027,19 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
 
 unsafe extern "system" fn queue_close(p: *mut c_void) {
     let q = queue(p);
-    if q.closed.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    for e in std::mem::take(&mut q.pending.lock().unwrap().entries) {
+    // Lock `worker` then `pending` (same order as `submit`) so no racing enqueue or submit
+    // can push new pending entries or spawn a new worker after `closed` is set.
+    let drained = {
+        let mut w = q.worker.lock().unwrap();
+        let mut pend = q.pending.lock().unwrap();
+        if q.closed.swap(true, Ordering::AcqRel) {
+            Vec::new()
+        } else {
+            w.take();
+            std::mem::take(&mut pend.entries)
+        }
+    };
+    for e in drained {
         if let Entry::Status(s, i) = e {
             if let Some(slot) = s.slots.get(i as usize) {
                 slot.store(E_QUEUE_CLOSED, Ordering::Release);
@@ -988,11 +1047,23 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
-    q.worker.lock().unwrap().take();
+    // Wait outside queue locks so no in-flight worker request can still touch caller buffers
+    // after `Close()` returns (including for concurrent `Close()` callers).
+    let (lock, cvar) = &q.worker_active;
+    let mut active = lock.lock().unwrap();
+    while *active {
+        active = cvar.wait(active).unwrap();
+    }
 }
 
+/// Returns a duplicated event handle owned by the caller (who closes it with `CloseHandle`).
 unsafe extern "system" fn queue_get_error_event(p: *mut c_void) -> HANDLE {
-    queue(p).error_event as HANDLE
+    let mut h: HANDLE = std::ptr::null_mut();
+    let me = GetCurrentProcess();
+    if DuplicateHandle(me, queue(p).error_event as HANDLE, me, &mut h, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
+        return std::ptr::null_mut();
+    }
+    h
 }
 
 /// DSTORAGE_ERROR_RECORD (0x290): failure count u32 @0, then the first failure: HRESULT @8,
@@ -1002,25 +1073,31 @@ unsafe extern "system" fn queue_retrieve_error_record(p: *mut c_void, out: *mut 
     if out.is_null() {
         return;
     }
+    let q = queue(p);
     let mut rec = [0u8; ERROR_RECORD_BYTES];
-    let e = queue(p).errors.lock().unwrap();
-    match &e.1 {
-        Some(f) => {
-            rec[0..4].copy_from_slice(&e.0.to_le_bytes());
-            rec[8..12].copy_from_slice(&f.hr.to_le_bytes());
-            rec[0xC..0x10].copy_from_slice(&COMMAND_REQUEST.to_le_bytes());
-            rec[0x10..0x18].copy_from_slice(&f.request.options.to_le_bytes());
-            rec[0x18..0x20].copy_from_slice(&f.request.destination.to_le_bytes());
-            rec[0x20..0x24].copy_from_slice(&f.request.destination_size.to_le_bytes());
-            if f.request.memory_source() {
-                rec[0x238..0x240].copy_from_slice(&f.request.source.to_le_bytes());
-            } else {
-                for (i, c) in f.file.iter().take(0x103).enumerate() {
-                    rec[0x24 + 2 * i..0x26 + 2 * i].copy_from_slice(&c.to_le_bytes());
+    {
+        let mut e = q.errors.lock().unwrap();
+        match &e.1 {
+            Some(f) => {
+                rec[0..4].copy_from_slice(&e.0.to_le_bytes());
+                rec[8..12].copy_from_slice(&f.hr.to_le_bytes());
+                rec[0xC..0x10].copy_from_slice(&COMMAND_REQUEST.to_le_bytes());
+                rec[0x10..0x18].copy_from_slice(&f.request.options.to_le_bytes());
+                rec[0x18..0x20].copy_from_slice(&f.request.destination.to_le_bytes());
+                rec[0x20..0x24].copy_from_slice(&f.request.destination_size.to_le_bytes());
+                if f.request.memory_source() {
+                    rec[0x238..0x240].copy_from_slice(&f.request.source.to_le_bytes());
+                } else {
+                    for (i, c) in f.file.iter().take(0x103).enumerate() {
+                        rec[0x24 + 2 * i..0x26 + 2 * i].copy_from_slice(&c.to_le_bytes());
+                    }
                 }
             }
+            None => rec[0xC..0x10].copy_from_slice(&NO_COMMAND.to_le_bytes()),
         }
-        None => rec[0xC..0x10].copy_from_slice(&NO_COMMAND.to_le_bytes()),
+        e.0 = 0;
+        e.1 = None;
+        ResetEvent(q.error_event as HANDLE);
     }
     std::ptr::copy_nonoverlapping(rec.as_ptr(), out, ERROR_RECORD_BYTES);
 }
@@ -1355,6 +1432,163 @@ mod tests {
             assert!(dst[plain.len()..].iter().all(|&b| b == 0), "trailing padding zeroed");
 
             queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn error_record_resets_after_retrieval_and_event_is_duplicated() {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // Caller owns and closes the returned error event handle without breaking the queue.
+            let ev1 = queue_get_error_event(q);
+            assert!(!ev1.is_null());
+            assert_ne!(ev1 as usize, queue(q).error_event, "GetErrorEvent must return a duplicated handle");
+            assert_eq!(WaitForSingleObject(ev1, 0), WAIT_TIMEOUT);
+            assert_ne!(CloseHandle(ev1), 0);
+
+            let ev2 = queue_get_error_event(q);
+            assert!(!ev2.is_null());
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_TIMEOUT);
+
+            // Trigger a refused request -> reported in queue order on Submit().
+            let mut dst = [0u8; 8];
+            let src = [0u8; 4];
+            queue_enqueue_request(q, request(SOURCE_MEMORY_BIT, dst.as_mut_ptr() as u64, 8, src.as_ptr() as u64, 0, 4).as_ptr());
+            queue_enqueue_status(q, s, 0);
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_TIMEOUT, "error event must not signal before Submit");
+            queue_submit(q);
+            let start = std::time::Instant::now();
+            while !status_is_complete(s, 0) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert_eq!(status_get_hresult(s, 0), E_DESTINATION_SIZE);
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_OBJECT_0, "error event must signal on failure");
+
+            let mut rec = [0u8; ERROR_RECORD_BYTES];
+            queue_retrieve_error_record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 1);
+            assert_eq!(i32::from_le_bytes(rec[8..12].try_into().unwrap()), E_DESTINATION_SIZE);
+            assert_eq!(u32::from_le_bytes(rec[0xC..0x10].try_into().unwrap()), COMMAND_REQUEST);
+            assert_eq!(WaitForSingleObject(ev2, 0), WAIT_TIMEOUT, "RetrieveErrorRecord must reset error event");
+
+            // Second retrieval sees cleared state.
+            rec.fill(0xAA);
+            queue_retrieve_error_record(q, rec.as_mut_ptr());
+            assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 0);
+            assert_eq!(u32::from_le_bytes(rec[0xC..0x10].try_into().unwrap()), NO_COMMAND);
+
+            assert_ne!(CloseHandle(ev2), 0);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    #[test]
+    fn queue_release_concurrent_breaks_worker_cycle() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+
+            for _ in 0..32 {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+                let mut s = std::ptr::null_mut();
+                assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+                let weak = Arc::downgrade(queue(q));
+
+                // Start the worker thread with a buffer-free status entry.
+                queue_enqueue_status(q, s, 0);
+                queue_submit(q);
+
+                // Race two Release() calls from refs == 2.
+                assert_eq!(queue_add_ref(q), 2);
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let q_addr = q as usize;
+                let b2 = Arc::clone(&barrier);
+                let t = std::thread::spawn(move || {
+                    b2.wait();
+                    queue_release(q_addr as *mut c_void);
+                });
+                barrier.wait();
+                queue_release(q);
+                t.join().unwrap();
+
+                // Worker must exit and drop the final Arc<QueueInner>.
+                let start = std::time::Instant::now();
+                while weak.upgrade().is_some() && start.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                assert!(weak.upgrade().is_none(), "concurrent Release leaked QueueInner / worker thread");
+                status_release(s);
+            }
+        }
+    }
+
+    #[test]
+    fn queue_validates_status_and_fence_pointers_and_closed_rejects_work() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&8u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+
+            // Foreign object pointer (wrong vtable) must be ignored safely by EnqueueStatus.
+            let bogus_vtbl: [usize; 4] = [0; 4];
+            let mut bogus_obj: [*const usize; 2] = [bogus_vtbl.as_ptr(), std::ptr::null()];
+            queue_enqueue_status(q, bogus_obj.as_mut_ptr() as *mut c_void, 0);
+            // Null-vtable fence must be ignored safely by EnqueueSignal.
+            let mut null_vtbl_fence: [*const usize; 1] = [std::ptr::null()];
+            queue_enqueue_signal(q, null_vtbl_fence.as_mut_ptr() as *mut c_void, 1);
+            assert!(queue(q).pending.lock().unwrap().entries.is_empty());
+
+            // Pending status fails with E_QUEUE_CLOSED on Close().
+            queue_enqueue_status(q, s, 0);
+            queue_close(q);
+            assert_eq!(status_get_hresult(s, 0), E_QUEUE_CLOSED);
+
+            // Subsequent EnqueueStatus / Submit on closed queue do not mutate status or spawn a worker.
+            inner::<StatusInner>(s).slots[1].store(S_OK, Ordering::Release);
+            queue_enqueue_status(q, s, 1);
+            queue_submit(q);
+            assert_eq!(status_get_hresult(s, 1), S_OK);
+            assert!(queue(q).pending.lock().unwrap().entries.is_empty());
+            assert!(queue(q).worker.lock().unwrap().is_none());
+
             queue_release(q);
             status_release(s);
         }
