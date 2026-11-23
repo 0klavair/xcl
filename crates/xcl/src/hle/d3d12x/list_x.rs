@@ -34,7 +34,6 @@ use super::real;
 const PC_GET_TYPE: usize = 8;
 const PC_CLOSE: usize = 9;
 const PC_RESET: usize = 10;
-const PC_DRAW_INDEXED: usize = 13;
 const PC_COPY_BUFFER_REGION: usize = 15;
 const PC_COPY_TEXTURE_REGION: usize = 16;
 const PC_COPY_RESOURCE: usize = 17;
@@ -228,6 +227,18 @@ impl PendingWait {
     }
 }
 
+/// Recorded `OMSetRenderTargets` state for `KickoffX` restoration and `XCL_TRACE_FRAME`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderTargets {
+    /// Requested `NumRenderTargetDescriptors` (clamped to D3D12 max 8; 0 if `handles` is empty).
+    num_targets: u32,
+    /// Saved descriptor handles: 1 base handle when `single != 0` and `num_targets > 0`,
+    /// otherwise `num_targets` handles.
+    handles: Vec<usize>,
+    single: i32,
+    dsv: Option<usize>,
+}
+
 /// What console code set on a list that a PC Reset clears: `KickoffX` closes, submits and
 /// resets the PC list mid-recording, and on the console a kickoff leaves the list's state as it
 /// was – so it is set again (descriptor heaps above all: translated shaders index the bound
@@ -241,8 +252,7 @@ struct Bindings {
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     vertex_buffers: std::collections::BTreeMap<u32, D3D12_VERTEX_BUFFER_VIEW>,
-    /// (handles, single range, depth-stencil handle)
-    render_targets: Option<(Vec<usize>, i32, Option<usize>)>,
+    render_targets: Option<RenderTargets>,
     /// slot → the title's (address, bytes, stride) of the vertex buffer (`XCL_TRACE_FRAME`)
     vertex_titles: std::collections::BTreeMap<u32, (u64, u32, u32)>,
     /// the title's (address, bytes, format) of the index buffer (`XCL_TRACE_FRAME`)
@@ -262,8 +272,8 @@ pub(super) fn state_summary(list: *mut c_void) -> String {
             b.stencil,
             b.viewports.len(),
             b.scissors.len(),
-            b.render_targets.as_ref().map(|(h, _, d)| (h.len(), d.is_some())),
-            b.render_targets.as_ref().and_then(|(_, _, d)| *d).map_or(String::new(), |d| format!(", DSV {d:#x}"))
+            b.render_targets.as_ref().map(|rt| (rt.num_targets as usize, rt.dsv.is_some())),
+            b.render_targets.as_ref().and_then(|rt| rt.dsv).map_or(String::new(), |d| format!(", DSV {d:#x}"))
         );
     });
     out
@@ -357,7 +367,7 @@ fn vbs_first(list: *mut c_void) -> Option<(u32, (u64, u32, u32))> {
 /// The depth-stencil view handle a list last bound (`XCL_TRACE_FRAME`).
 pub(super) fn bound_dsv(list: *mut c_void) -> Option<usize> {
     let mut d = None;
-    with_bindings(list, |b| d = b.render_targets.as_ref().and_then(|(_, _, h)| *h));
+    with_bindings(list, |b| d = b.render_targets.as_ref().and_then(|rt| rt.dsv));
     d
 }
 
@@ -422,10 +432,13 @@ pub(super) unsafe extern "system" fn om_set_stencil_ref_x(this: *mut c_void, r: 
 
 /// OMSetRenderTargets as the PC list got it (`real::cl_om_set_render_targets`)
 pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
-    let count = if single != 0 { n.min(1) } else { n } as usize;
-    let handles = if rtvs.is_null() { Vec::new() } else { std::slice::from_raw_parts(rtvs, count).to_vec() };
+    let num_targets = if rtvs.is_null() { 0 } else { n.min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) };
+    let read_count = if single != 0 { num_targets.min(1) } else { num_targets } as usize;
+    // SAFETY: `rtvs` is non-null whenever `read_count > 0`, and D3D12 requires at least 1
+    // handle when `RTsSingleHandleToDescriptorRange != 0` or `num_targets` handles otherwise.
+    let handles = if read_count == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_count).to_vec() };
     let d = dsv.as_ref().copied();
-    with_bindings(this, |b| b.render_targets = Some(if n == 0 { (Vec::new(), single, d) } else { (handles, single, d) }));
+    with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
 }
 
 /// Set again what `b` holds (after KickoffX's Reset).
@@ -451,15 +464,15 @@ unsafe fn restore_bindings(this: *mut c_void, b: &Bindings) {
     for (&slot, v) in &b.vertex_buffers {
         pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS)(this, slot, 1, v);
     }
-    if let Some((rts, single, dsv)) = &b.render_targets {
-        let d = dsv.unwrap_or(0);
-        let n = if *single != 0 && !rts.is_empty() { 1 } else { rts.len() as u32 };
+    if let Some(rt) = &b.render_targets {
+        let d = rt.dsv.unwrap_or(0);
+        let (n, rts_ptr) = if rt.handles.is_empty() { (0, std::ptr::null()) } else { (rt.num_targets, rt.handles.as_ptr()) };
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize)>(this, PC_OM_SET_RENDER_TARGETS)(
             this,
             n,
-            if rts.is_empty() { std::ptr::null() } else { rts.as_ptr() },
-            *single,
-            if dsv.is_some() { &d } else { std::ptr::null() },
+            rts_ptr,
+            rt.single,
+            if rt.dsv.is_some() { &d } else { std::ptr::null() },
         );
     }
 }
@@ -1582,10 +1595,9 @@ pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, 
     if count == 0 {
         return;
     }
-    prepare_draw(this);
     let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: pc_va(va), SizeInBytes: count.saturating_mul(stride), Format: format };
     set_index_buffer(this, Some(&view));
-    pc::<unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32)>(this, PC_DRAW_INDEXED)(this, count, 1, 0, 0, 0);
+    super::bind::draw_indexed_instanced(this, count, 1, 0, 0, 0);
     let bound = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).and_then(|s| s.index_buffer));
     set_index_buffer(this, bound.as_ref());
 }
@@ -1626,7 +1638,7 @@ pub(super) unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, ps
         s.bindings = Bindings::default();
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
-    super::bind::reset(this, alloc);
+    super::bind::reset(this, alloc, pso);
     // the PC runtime writes its own vtable into a list on Reset (copy lists, Agility SDK 1.620+): re-adopt it
     let ext = *(this as *const usize);
     let resolved = super::pso_async::resolve_for_bind(pso);
@@ -2460,5 +2472,219 @@ mod tests {
         device_x::forget_base(pso_dyn_zero);
         device_x::forget_base(pso_dyn_static);
         device_x::forget_base(pso_static_only);
+    }
+
+    #[test]
+    fn draw_indexed_x_routes_through_bind_and_restores_index_buffer() {
+        #[repr(C)]
+        struct FakeDrawList {
+            vt: *const usize,
+            refs: AtomicUsize,
+            draws: Mutex<Vec<(u32, u32, u32, i32, u32)>>,
+            index_buffers: Mutex<Vec<Option<D3D12_INDEX_BUFFER_VIEW>>>,
+        }
+
+        unsafe extern "system" fn fake_add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const FakeDrawList)).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
+        unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+            (*(this as *const FakeDrawList)).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+        }
+        unsafe extern "system" fn fake_draw_indexed(this: *mut c_void, ic: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
+            (*(this as *const FakeDrawList)).draws.lock().unwrap().push((ic, inst, si, bv, sinst));
+        }
+        unsafe extern "system" fn fake_set_ib(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
+            let v = view.as_ref().copied();
+            (*(this as *const FakeDrawList)).index_buffers.lock().unwrap().push(v);
+        }
+        unsafe extern "system" fn fake_noop_ptr(_this: *mut c_void, _p: *mut c_void) {}
+        unsafe extern "system" fn fake_noop_uav(_this: *mut c_void, _slot: u32, _va: u64) {}
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[13] = fake_draw_indexed as usize;
+        orig_vt[25] = fake_noop_ptr as usize; // SetPipelineState
+        orig_vt[30] = fake_noop_ptr as usize; // SetGraphicsRootSignature
+        orig_vt[42] = fake_noop_uav as usize; // SetGraphicsRootUnorderedAccessView
+        orig_vt[43] = fake_set_ib as usize;
+
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+
+        let fake = Box::new(FakeDrawList {
+            // SAFETY: `ext_vt` has 65 entries so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            draws: Mutex::new(Vec::new()),
+            index_buffers: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakeDrawList as *mut c_void;
+
+        let orig_ib = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: 0x0000_0001_0000_1000,
+            SizeInBytes: 64,
+            Format: DXGI_FORMAT_R16_UINT,
+        };
+
+        unsafe {
+            ia_set_index_buffer_x(list_ptr, &orig_ib);
+            fake.index_buffers.lock().unwrap().clear();
+
+            // 1. Untranslated (PC) PSO: routes through bind::draw_indexed_instanced -> DrawIndexedInstanced,
+            // records DRAW_ARGS, binds temp IB, then restores orig_ib.
+            super::super::bind::reset(list_ptr, 0x7400_0100, 0);
+            let before = super::super::bind::counts_snapshot();
+            draw_indexed_x(list_ptr, 0x0000_0001_0000_2000, DXGI_FORMAT_R16_UINT, 6, 0);
+            let after = super::super::bind::counts_snapshot();
+            assert_eq!(super::super::bind::last_draw_args(), (true, 6, 1, 0, 0));
+            assert!(after[2] > before[2], "DRAWS_PC must increment via bind::draw_indexed_instanced");
+            assert_eq!(*fake.draws.lock().unwrap(), vec![(6, 1, 0, 0, 0)]);
+            let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
+            assert_eq!(ibs.len(), 2);
+            assert_eq!(ibs[0].unwrap().BufferLocation, 0x0000_0001_0000_2000);
+            assert_eq!(ibs[0].unwrap().SizeInBytes, 12);
+            assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R16_UINT);
+            assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+            assert_eq!(ibs[1].unwrap().SizeInBytes, orig_ib.SizeInBytes);
+
+            // 2. Translated graphics PSO: enters bind::graphics_bound translated path (DRAWS or
+            // DRAWS_SKIPPED, NOT DRAWS_PC) instead of bypassing bind.rs directly to PC slot 13.
+            let translated_pso = 0x7400_0055usize;
+            real::register_translated_graphics_for_test(translated_pso);
+            super::super::bind::reset(list_ptr, 0x7400_0100, translated_pso);
+            let before = super::super::bind::counts_snapshot();
+            draw_indexed_x(list_ptr, 0x0000_0001_0000_3000, DXGI_FORMAT_R32_UINT, 12, 0);
+            let after = super::super::bind::counts_snapshot();
+            assert_eq!(super::super::bind::last_draw_args(), (true, 12, 1, 0, 0));
+            assert_eq!(
+                (after[0] + after[1]) - (before[0] + before[1]),
+                1,
+                "translated graphics PSO must go through bind::graphics_bound (DRAWS or DRAWS_SKIPPED)"
+            );
+            assert_eq!(after[2], before[2], "translated graphics PSO must not take the PC draw path");
+            let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
+            assert_eq!(ibs.len(), 2);
+            assert_eq!(ibs[0].unwrap().SizeInBytes, 48);
+            assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R32_UINT);
+            assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
+
+            // 3. Zero count or invalid format returns early without touching IB or draws.
+            let draws_before = fake.draws.lock().unwrap().len();
+            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R16_UINT, 0, 0);
+            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R8_UINT, 3, 0);
+            assert_eq!(fake.draws.lock().unwrap().len(), draws_before);
+            assert!(fake.index_buffers.lock().unwrap().is_empty());
+
+            real::forget_pso_for_test(translated_pso);
+        }
+
+        super::super::bind::forget(list_ptr);
+        on_release(list_ptr as usize);
+    }
+
+    #[test]
+    fn kickoff_x_render_targets_preserve_mrt_count_for_single_descriptor_range() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct RtCall {
+            n: u32,
+            handles: Vec<usize>,
+            rtvs_was_null: bool,
+            single: i32,
+            dsv: Option<usize>,
+        }
+
+        #[repr(C)]
+        struct FakeRtList {
+            vt: *const usize,
+            calls: Mutex<Vec<RtCall>>,
+        }
+
+        unsafe extern "system" fn fake_om_set_render_targets(
+            this: *mut c_void,
+            n: u32,
+            rtvs: *const usize,
+            single: i32,
+            dsv: *const usize,
+        ) {
+            let read_n = if rtvs.is_null() {
+                0
+            } else if single != 0 {
+                n.min(1) as usize
+            } else {
+                n as usize
+            };
+            let handles = if read_n == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_n).to_vec() };
+            (*(this as *const FakeRtList)).calls.lock().unwrap().push(RtCall {
+                n,
+                handles,
+                rtvs_was_null: rtvs.is_null(),
+                single,
+                dsv: dsv.as_ref().copied(),
+            });
+        }
+
+        let mut orig_vt = [0usize; 64];
+        orig_vt[PC_OM_SET_RENDER_TARGETS] = fake_om_set_render_targets as usize;
+        let mut ext_vt = [0usize; 2];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+
+        let fake = Box::new(FakeRtList {
+            // SAFETY: `ext_vt` has 2 entries so `.add(1)` has `orig_vt` at `-1` as `real::orig_fn` expects.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            calls: Mutex::new(Vec::new()),
+        });
+        let list_ptr = &*fake as *const FakeRtList as *mut c_void;
+
+        let restore = || {
+            let b = LISTS.lock().unwrap().as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings.clone();
+            unsafe { restore_bindings(list_ptr, &b) };
+        };
+
+        unsafe {
+            // 1. Single contiguous descriptor range for 4 MRTs + DSV: only 1 handle exists at `rtvs`,
+            //    yet restore_bindings must pass `n = 4` (not 1!) to OMSetRenderTargets.
+            let single_base = [0x1000usize];
+            let dsv_val = 0x9000usize;
+            note_render_targets(list_ptr, 4, single_base.as_ptr(), 1, &dsv_val);
+            assert!(
+                state_summary(list_ptr).contains("render targets Some((4, true))"),
+                "state_summary should report full MRT count: {}",
+                state_summary(list_ptr)
+            );
+            restore();
+
+            // 2. Oversized count with single range is clamped to D3D12 max (8).
+            note_render_targets(list_ptr, 12, single_base.as_ptr(), 1, std::ptr::null());
+            restore();
+
+            // 3. Separate handles (single == 0) for 3 MRTs.
+            let multi = [0x2000usize, 0x2020, 0x2040];
+            note_render_targets(list_ptr, 3, multi.as_ptr(), 0, std::ptr::null());
+            restore();
+
+            // 4. Depth-only (n == 0, rtvs == null, dsv != null).
+            note_render_targets(list_ptr, 0, std::ptr::null(), 0, &dsv_val);
+            restore();
+
+            // 5. Null rtvs pointer with non-zero n must safely restore n == 0, null pointer.
+            note_render_targets(list_ptr, 4, std::ptr::null(), 1, std::ptr::null());
+            restore();
+        }
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                RtCall { n: 4, handles: vec![0x1000], rtvs_was_null: false, single: 1, dsv: Some(0x9000) },
+                RtCall { n: 8, handles: vec![0x1000], rtvs_was_null: false, single: 1, dsv: None },
+                RtCall { n: 3, handles: vec![0x2000, 0x2020, 0x2040], rtvs_was_null: false, single: 0, dsv: None },
+                RtCall { n: 0, handles: vec![], rtvs_was_null: true, single: 0, dsv: Some(0x9000) },
+                RtCall { n: 0, handles: vec![], rtvs_was_null: true, single: 1, dsv: None },
+            ]
+        );
+
+        on_release(list_ptr as usize);
     }
 }

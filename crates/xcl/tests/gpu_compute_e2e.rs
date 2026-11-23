@@ -7,12 +7,16 @@
 //! waves (NVIDIA) the backend has to run it as two wave32 halves, or the driver refuses the
 //! pipeline. The pipeline counters are checked, so the test cannot pass on a fallback path.
 
+use std::sync::Mutex;
+
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use xcl::gpu::rdna2::encode;
 use xcl::gpu::recomp::runner;
-use xcl::hle::d3d12x::real;
+use xcl::hle::d3d12x::{pso_async, real};
+
+static SERIAL: Mutex<()> = Mutex::new(());
 
 fn le(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
@@ -110,6 +114,7 @@ fn program() -> Vec<u8> {
 
 #[test]
 fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if xcl::gpu::recomp::dxc::location().is_err() {
         println!("no DXC – skipping");
         runner::skip_test("no DXC");
@@ -146,6 +151,10 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
     let real_raw = xcl::hle::d3d12x::pso_async::resolve_wait(pso.as_raw() as usize) as *mut std::ffi::c_void;
     let after = real::stats();
     assert_eq!(after.translated_pipelines, before.translated_pipelines + 1, "PSO was not built from the translated shader: {:?}", after.translation_errors);
+    assert!(
+        real::is_translated_compute(real_raw as usize),
+        "resolved compute PSO must be registered in TRANSLATED_COMPUTE"
+    );
     let pso = unsafe { ID3D12PipelineState::from_raw_borrowed(&real_raw) }.unwrap().clone();
     let rs_raw = real::pso_root_signature(pso.as_raw() as usize).expect("root signature of the translated PSO") as *mut std::ffi::c_void;
     let rs = unsafe { ID3D12RootSignature::from_raw_borrowed(&rs_raw) }.unwrap().clone();
@@ -164,4 +173,83 @@ fn console_wave64_compute_through_the_pso_hook_dispatch_and_read_back() {
             assert_eq!(out[at + 1], (px | py << 16) as u32, "({x}, {y}): value of thread {} through LDS", 127 - i);
         }
     }
+}
+
+/// Cold DXIL cache: `CreateComputePipelineState` returns a stand-in immediately and compiles
+/// the real compute PSO on the background worker. The real PSO (and NOT the stand-in) must be
+/// registered in `TRANSLATED_COMPUTE` once the background build completes.
+#[test]
+fn async_compute_pso_registers_real_pso_and_not_standin() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        println!("no DXC – skipping");
+        runner::skip_test("no DXC");
+        return;
+    }
+    if xcl::hle::d3d12x::backend() != xcl::hle::d3d12x::Backend::Real {
+        println!("no real D3D12 device – skipping");
+        runner::skip_test("no GPU");
+        return;
+    }
+    if !pso_async::enabled() {
+        println!("XCL_ASYNC_PSO=0 – skipping");
+        return;
+    }
+
+    struct ColdCache(std::path::PathBuf, Option<std::ffi::OsString>);
+    impl Drop for ColdCache {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(prev) => std::env::set_var("XCL_DXIL_CACHE", prev),
+                None => std::env::remove_var("XCL_DXIL_CACHE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let cold = ColdCache(
+        std::env::temp_dir().join(format!("xcl-async-compute-pso-{}", std::process::id())),
+        std::env::var_os("XCL_DXIL_CACHE"),
+    );
+    let _ = std::fs::remove_dir_all(&cold.0);
+    std::env::set_var("XCL_DXIL_CACHE", &cold.0);
+
+    let raw = real::device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }.unwrap().clone();
+
+    // Distinct minimal console CS so neither disk nor in-memory DXIL cache already holds it.
+    let code: Vec<u8> = [
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 0)][..], None),
+        ("S_ENDPGM", "ENC_SOPP", &[][..], None),
+    ]
+    .iter()
+    .flat_map(|(n, e, f, l)| encode(n, e, f, *l).unwrap_or_else(|x| panic!("{n}: {x}")))
+    .collect();
+    let blob = console_cs(&code, 2 << 1 | 1 << 7, [8, 8, 1]);
+
+    let game_rs: ID3D12RootSignature = unsafe {
+        let mut ser = None;
+        D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).unwrap();
+        let ser = ser.unwrap();
+        dev.CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize())).unwrap()
+    };
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: std::mem::ManuallyDrop::new(Some(game_rs)),
+        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: blob.as_ptr() as _, BytecodeLength: blob.len() },
+        ..Default::default()
+    };
+    let pso: Result<ID3D12PipelineState, _> = unsafe { dev.CreateComputePipelineState(&desc) };
+    unsafe { std::mem::ManuallyDrop::drop(&mut desc.pRootSignature) };
+    let pso = pso.expect("CreateComputePipelineState stand-in");
+    let standin_raw = pso.as_raw() as usize;
+
+    assert!(!real::is_translated_compute(standin_raw), "stand-in compute PSO must not be registered in TRANSLATED_COMPUTE");
+    let real_raw = pso_async::resolve_wait(standin_raw);
+    assert_ne!(real_raw, standin_raw, "cold DXIL cache must build compute PSO asynchronously behind a stand-in");
+    assert!(real::is_translated_compute(real_raw), "background-built real compute PSO must be registered in TRANSLATED_COMPUTE");
+    assert!(!real::is_translated_compute(standin_raw), "stand-in must remain unregistered after background build");
+    assert!(real::pso_root_signature(real_raw).is_some(), "real compute PSO must have an ABI root signature");
+
+    // Releasing the stand-in must release and forget the background-built real PSO too.
+    drop(pso);
+    assert!(!real::is_translated_compute(real_raw), "forgetting released async compute PSO must clean up TRANSLATED_COMPUTE");
 }

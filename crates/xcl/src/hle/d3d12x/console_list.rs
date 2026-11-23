@@ -766,6 +766,14 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 4;
                 match pso {
                     Some(p) if (*p).translated => {
+                        // a pipeline still being built in the background is waited for; if
+                        // the background translation failed, skip instead of binding XCL's
+                        // ABI root signature onto the stand-in
+                        let real = super::pso_async::resolve_wait((*p).pc);
+                        if !super::real::is_translated_compute(real) {
+                            out.skipped_dispatches += 1;
+                            continue;
+                        }
                         let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
@@ -775,8 +783,6 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
-                        // a pipeline still being built in the background is waited for
-                        let real = super::pso_async::resolve_wait((*p).pc);
                         // the pipeline's own root signature when it has static samplers
                         let own = super::real::pso_root_signature(real).or(((*p).rs != 0).then_some((*p).rs)).map(|r| r as *mut c_void);
                         match own.as_ref().and_then(|r| ID3D12RootSignature::from_raw_borrowed(r)) {
