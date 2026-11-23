@@ -779,6 +779,22 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
   CPU-side trace finds no hit where brute force does (likely the builder's GPU output is not read back through the
   CPU view since the sparse windows of PR #40). To look at.
 
+## PRs #46 (merged) and #43 (held), 2026-11-23
+- **#46** (grooving6) float compares test NaN explicitly (the AMD driver gave a later `a < b` the unordered result
+  of an earlier `!(a >= b)`); f64 floor / ceil / trunc / fract / ldexp / sqrt / rsq / cvt past the f32 and int64
+  ranges. Held on 2026-11-22 because Unicorn Overlord's title screen stayed black with it; on current `main`
+  (2026-11-23) Unicorn renders its intro and scenes with it (frame dumps), so merged. The prelude changed: every
+  title's shaders compile again on their first run (XDefiant black for minutes – not a bug).
+- **#43** (Lum7nt, MSAA layouts in `hle::xg`) held again. A local comparison with the console's `xg_xs.dll` (XDefiant's
+  copy; 1 536 MSAA descs: 8 formats, 4 sizes, 2x / 4x / 8x, arrays 1 / 6, 8 layout / flag combinations) – 744 the
+  same, 480 UAV descs the console accepts and the PR refuses, 72 RT + DS descs the other way round, 216 with another
+  metadata plane (plane 1 mip0 +0x48), and 3 729 of 9 874 texel / sample offsets different (depth: almost all;
+  colour: 1 in 6). `verify_console_msaa_offsets` only prints the console's layout. `main` keeps E_NOTIMPL for MSAA
+  (the PC's allocation info) – safe.
+- `XCL_SAMPLE_XG` versions in annn: XDefiant's `xg_xs.dll` passes all of `xg_oracle`; Unicorn Overlord's (a newer game
+  OS) differs in 184 render-target cases at plane 1 +0x10 (console 0x2000, ours 0) – a newer library, to look at.
+- `dxc::cache_tests::concurrent_cache_misses_compile_once` can fail under load (a 200 ms timing bound), passes alone.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
