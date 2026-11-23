@@ -3716,6 +3716,21 @@ impl Em {
                 let [x, y, z] = cs.threads;
                 // split wave64: the same group in hardware wave32s (a console wave = two of them)
                 let hw_lanes = if self.x64() { 32 } else { lanes };
+                // 2-D / 3-D groups: the PC driver need not form its waves from consecutive
+                // thread indices (AMD RDNA4 lays them out in 2 x 2 quads: lanes 0, 1, 4, 5, 8 …
+                // of an 8 x 8 group; NVIDIA differs too), the console does – a hardware wave
+                // takes the next `lanes` console threads as it arrives, lane l the l-th of them
+                let reorder = !self.x64() && y * z > 1;
+                if reorder {
+                    // console threads handed to waves so far: the program's top LDS word while
+                    // the waves take their threads (the console's LDS starts undefined; D3D12's
+                    // 32 KB has no room for another word next to a full `xcl_lds`)
+                    if self.uses_lds && !self.x64_lds() {
+                        h.push_str("#define XCL_WT xcl_lds[8191u]\n");
+                    } else {
+                        h.push_str("groupshared uint xcl_wt;\n#define XCL_WT xcl_wt\n");
+                    }
+                }
                 let _ = writeln!(
                     h,
                     "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
@@ -3724,6 +3739,14 @@ impl Em {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
+                } else if reorder {
+                    let t = x * y * z;
+                    let _ = writeln!(
+                        h,
+                        "    if (gi == 0u) XCL_WT = 0u;\n    GroupMemoryBarrierWithGroupSync();\n    lane_id = WaveGetLaneIndex();\n    {{\n        bool full = WaveActiveCountBits(true) == {lanes}u;\n        uint base = {}u;\n        if (WaveIsFirstLane() && full) InterlockedAdd(XCL_WT, {lanes}u, base);\n        uint xcl_tid = WaveReadLaneFirst(base) + lane_id;\n        gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n        gi = xcl_tid;\n    }}\n    GroupMemoryBarrierWithGroupSync(); // all waves have their threads before the program writes LDS",
+                        t & !(lanes - 1),
+                        x * y
+                    );
                 } else {
                     h.push_str("    lane_id = WaveGetLaneIndex();\n");
                 }
