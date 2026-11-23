@@ -2326,6 +2326,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    super::list_x::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -2345,6 +2346,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
+    if hr >= 0 {
+        super::list_x::on_pc_reset(this);
+    }
     hr
 }
 
