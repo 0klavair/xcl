@@ -361,6 +361,7 @@ type FnMoveFileWithProgressW = unsafe extern "system" fn(*const u16, *const u16,
 type FnCopyFileExW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
 type FnCopyFileW = unsafe extern "system" fn(*const u16, *const u16, i32) -> i32;
 type FnCopyFile2 = unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> i32;
+type FnReplaceFileW = unsafe extern "system" fn(*const u16, *const u16, *const u16, u32, *const c_void, *const c_void) -> i32;
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
@@ -369,6 +370,7 @@ static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_2: AtomicUsize = AtomicUsize::new(0);
+static O_REPLACE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn bool_result(r: Result<(), u32>) -> i32 {
     match r {
@@ -537,6 +539,42 @@ unsafe extern "system" fn hk_copy_file_2(src: *const u16, dst: *const u16, param
         Err(e) => return crate::util::hresult_from_win32(e),
     };
     orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), params)
+}
+
+/// ReplaceFileW – the usual "write a temporary file, then replace" save. Console paths outside
+/// the game folder are translated; when the game folder is involved, the backup and the
+/// replacement go through the copy and move hooks, so the game's own files are not touched.
+unsafe extern "system" fn hk_replace_file_w(replaced: *const u16, replacement: *const u16, backup: *const u16, flags: u32, excl: *const c_void, res: *const c_void) -> i32 {
+    let orig = orig!(O_REPLACE_FILE_W as FnReplaceFileW);
+    let (Some(g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(replaced, replacement, backup, flags, excl, res) };
+    let (Some(target), Some(source)) = (from_wide_ptr(replaced), from_wide_ptr(replacement)) else {
+        return orig(replaced, replacement, backup, flags, excl, res);
+    };
+    let backup_path = from_wide_ptr(backup);
+    let is_game = |p: &str| matches!(v.classify(p), Target::Game { .. });
+    if is_game(&target) || is_game(&source) || backup_path.as_deref().is_some_and(is_game) {
+        drop(g); // the calls below go through their own hooks
+        use windows_sys::Win32::Storage::FileSystem::{CopyFileW, MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING};
+        if let Some(b) = &backup_path {
+            if CopyFileW(replaced, wide(b).as_ptr(), 0) == 0 {
+                return 0;
+            }
+        }
+        return MoveFileExW(replacement, replaced, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    }
+    let r = (|| -> Result<(String, String, Option<String>), u32> {
+        let (rt, _) = source_of(v, &target)?;
+        let (rs, _) = source_of(v, &source)?;
+        let rb = backup_path.as_deref().map(|b| dest_of(v, b)).transpose()?;
+        Ok((rt, rs, rb))
+    })();
+    match r {
+        Ok((rt, rs, rb)) => {
+            let rb = rb.map(|b| wide(&b));
+            orig(wide(&rt).as_ptr(), wide(&rs).as_ptr(), rb.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()), flags, excl, res)
+        }
+        Err(e) => bool_result(Err(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -790,6 +828,7 @@ pub fn install() -> Result<(), String> {
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
         ("CopyFileW", hk_copy_file_w as usize, &O_COPY_FILE_W),
         ("CopyFile2", hk_copy_file_2 as usize, &O_COPY_FILE_2),
+        ("ReplaceFileW", hk_replace_file_w as usize, &O_REPLACE_FILE_W),
         ("FindFirstFileExW", hk_find_first_ex_w as usize, &O_FIND_FIRST_EX_W),
         ("FindFirstFileW", hk_find_first_w as usize, &O_FIND_FIRST_W),
         ("FindFirstFileA", hk_find_first_a as usize, &O_FIND_FIRST_A),
