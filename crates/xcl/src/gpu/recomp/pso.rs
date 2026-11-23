@@ -431,10 +431,13 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
-/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in its FSSM stage descriptor):
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
 /// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
 /// registers. None: not a console compute shader.
 pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    if let Some(f) = fspx(blob) {
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+    }
     let sh = xbox::parse(blob)?;
     let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
     match interface(blob, &sh, f)? {
@@ -448,14 +451,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
-        let r = f.rsrc2;
-        let cs = super::CsInterface {
-            threads: f.threads,
-            user_sgprs: (r >> 1) & 31,
-            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
-            tg_size: (r >> 10) & 1 == 1,
-            tid_components: ((r >> 11) & 3) + 1,
-        };
+        let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
         let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
