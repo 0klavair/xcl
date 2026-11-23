@@ -2504,6 +2504,63 @@ fn gpu_unified_memory_arena() {
     }
 }
 
+/// An NGG program (mesh mode) reading title memory above the first window: its vertex table
+/// is in window 1, decoys sit at the same offset in window 0. Translated with the title's
+/// windows (`translate_mesh`'s `mem_windows`, as `pso::console_mesh` now does) it reads window
+/// 1; with one window – what MS / GS programs got before – it read the decoys.
+#[test]
+fn gpu_mesh_mode_reads_memory_windows() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, MsInterface, MESH_HEADER};
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement {
+        name: name.into(),
+        index: 0,
+        system_value: sv,
+        component_type: 3,
+        register: reg,
+        mask: 0xF,
+        rw_mask: 0xF,
+        stream: 0,
+    };
+    let ms = MsInterface { outputs: vec![sig("SV_Position", 1, 0)], threads: 64, max_vertices: 64, max_primitives: 64 };
+    let list: Vec<(&str, &str, Vec<(&str, u64)>, Option<u32>)> = vec![
+        ("V_MBCNT_LO_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", 128)], None),
+        ("V_MBCNT_HI_U32_B32", "ENC_VOP3", vec![("VDST", 0), ("SRC0", 193), ("SRC1", V)], None), // thread
+        ("S_MOV_B32", "ENC_SOP1", vec![("SDST", 124), ("SSRC0", 255)], Some(1 << 12 | 3)), // 1 primitive, 3 vertices
+        ("S_SENDMSG", "ENC_SOPP", vec![("SIMM16", 9)], None),
+        ("V_CMPX_GT_U32", "ENC_VOPC", vec![("SRC0", 131), ("VSRC1", 0)], None), // threads 0..2
+        ("BUFFER_LOAD_DWORDX4", "ENC_MUBUF", vec![("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("EXP", "ENC_EXP", vec![("TGT", 12), ("EN", 0xF), ("VSRC0", 10), ("VSRC1", 11), ("VSRC2", 12), ("VSRC3", 13), ("DONE", 1)], None),
+    ];
+    let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
+    let code = prog(&refs);
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    for (i, (x, y)) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (0.0, -1.0)].iter().enumerate() {
+        for (k, v) in [*x, *y, 0.0, 1.0].iter().enumerate() {
+            *word(w1 + 0x100 + 16 * i as u64 + 4 * k as u64) = f(*v);
+            *word(w0 + 0x100 + 16 * i as u64 + 4 * k as u64) = f(9.0); // must not be read
+        }
+    }
+    let mut st = KernelState::default();
+    // V#: the vertex table in window 1, stride 16, 3 records
+    st.sgpr[16..20].copy_from_slice(&[(w1 + 0x100) as u32, ((w1 >> 32) as u32) & 0xFFFF | 16 << 16, 3, 0]);
+    let vd = ms.vert_dwords();
+    let positions = |windows: u32| -> Vec<[f32; 4]> {
+        let t = super::translate_mesh(&code, ms.clone(), true, runner::split_wave64(), windows).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let cs = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let r = runner::run_in_arena(&cs, &st, &arena).unwrap();
+        assert_eq!((r.raw[0], r.raw[1]), (3, 1), "GS_ALLOC_REQ counts ({windows} windows)");
+        (0..3).map(|v| std::array::from_fn(|c| f32::from_bits(r.raw[MESH_HEADER + v * vd + c]))).collect()
+    };
+    assert_eq!(positions(2), vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window 1");
+    assert_eq!(positions(1)[0], [9.0; 4], "one window: window 0 at the same offset (the old MS / GS translation)");
+}
+
 /// Memory above 4 GiB: two UMA windows 4 GiB apart; every access kind picks its window from
 /// the high address bits (V#, SGPR pair, 64-bit VGPR address, SADDR pair) and reaches the
 /// right one – s_load, buffer load / store, global load / store / atomic in window 1 next to
@@ -3058,9 +3115,14 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
         let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
         assert!(wrong.is_empty(), "lanes (got [vcc, s[10:11], exec], want): {wrong:?}");
     };
-    run(&translate_geometry(&code, g.clone(), true).unwrap());
+    run(&translate_geometry(&code, g.clone(), true, 1).unwrap());
+    // with a title's four memory windows (`pso::console_geometry`): all of them declared and
+    // the program still compiles
+    let windowed = translate_geometry(&code, g.clone(), true, 4).unwrap();
+    assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
+    super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false).unwrap();
+    let native = translate_geometry(&code, g, false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
@@ -4712,21 +4774,21 @@ fn mesh_split_wave64_form() {
     let lane = prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V)], None)]);
     let branch = prog(&[("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)], None)]);
     for code in [&lane, &branch] {
-        let native = super::translate_mesh(code, ms.clone(), true, false).unwrap();
+        let native = super::translate_mesh(code, ms.clone(), true, false, 1).unwrap();
         assert!(native.hlsl.contains("[WaveSize(64)]") && native.hlsl.contains("[numthreads(128, 1, 1)]") && !native.hlsl.contains("xcl_x_"));
-        let split = super::translate_mesh(code, ms.clone(), true, true).unwrap();
+        let split = super::translate_mesh(code, ms.clone(), true, true, 1).unwrap();
         assert!(split.complete(), "{:?}", split.unsupported_why);
         assert!(split.hlsl.contains("[WaveSize(32)]") && split.hlsl.contains("[numthreads(128, 1, 1)]"));
         assert!(split.hlsl.contains("uint xcl_tid = xcl_x_thread(gi);") && split.hlsl.contains("#define XCL_X_SPIN 1"));
         assert!(split.hlsl.contains("xcl_x_ballot(true)"));
         // a wave32 program is not split
-        let w32 = super::translate_mesh(code, ms.clone(), false, true).unwrap();
+        let w32 = super::translate_mesh(code, ms.clone(), false, true, 1).unwrap();
         assert!(w32.hlsl.contains("[WaveSize(32)]") && !w32.hlsl.contains("xcl_x_"));
         if super::dxc::location().is_ok() {
             super::dxc::compile(&split.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", split.hlsl));
         }
     }
-    assert!(super::translate_mesh(&lane, ms, true, true).unwrap().hlsl.contains("xcl_x_rla_uniform("));
+    assert!(super::translate_mesh(&lane, ms, true, true, 1).unwrap().hlsl.contains("xcl_x_rla_uniform("));
 }
 
 /// Operations whose result spans both 32-lane halves of a wave64 – what the split form

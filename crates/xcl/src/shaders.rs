@@ -758,10 +758,9 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                     };
                     for p in &f.programs {
                         let code = &f.data[p.offset..p.offset + p.len];
-                        // as `pso` translates: VS / PS / CS with the title's memory windows
-                        // (`console_translation`), MS with one (`translate_mesh`)
-                        let mem_windows = if matches!(mode, recomp::Mode::Mesh(_)) { 1 } else { windows };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows, ..Default::default() };
+                        // as `pso` translates: with the title's memory windows (`console_translation`,
+                        // `translate_mesh`)
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
