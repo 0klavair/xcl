@@ -89,7 +89,8 @@ pub const XG: &str = "xg_xs.dll";
 pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
 pub const MINUSERX: &str = "minuserx.dll";
-/// the console's audio processor (APU memory, its channel, SHAPE contexts) and decoder (xapu)
+/// the console's audio processor (APU memory, its channel, SHAPE contexts), decoder (xapu) and
+/// DSP (chad)
 pub const ACPHAL: &str = "acphal.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
@@ -174,7 +175,7 @@ fn build(config: &Config) -> Registry {
     let g = idx(XG);
     routes.push((XG.into(), Route::Hle(g)));
     let ap = idx(ACPHAL);
-    for p in ["acphal.dll", "xapu.dll"] {
+    for p in ["acphal.dll", "xapu.dll", "chad.dll"] {
         routes.push((p.into(), Route::Hle(ap)));
     }
     let gi = idx(GAMEINPUT);
