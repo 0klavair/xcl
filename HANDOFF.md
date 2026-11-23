@@ -812,6 +812,23 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
 - **#72** f64 abs / neg on the sign bit (DXIL's `-x` is `fsub -0.0, x`: a NaN's sign is up to the driver; NVIDIA kept it)
   – cherry-picked without **#71** (GPU tests as independent wave32 halves), which #67 superseded.
 
+## PRs #74–#79 (merged), 2026-11-23
+- **#74** (certified-retart) `gpu_dispatch_matches_native_wave64_reference` skips without an SM 6.6 GPU.
+- **#75** (certified-retart) optional D3D12 Agility SDK at run time (`gpu::agility`, `ID3D12SDKConfiguration1::
+  CreateDeviceFactory`): Windows 10's inbox D3D12Core stops at SM 6.5. Searched: `%XCL_D3D12_DIR%` (only it, when set),
+  `<xcl.exe dir>\D3D12`, `<xcl.exe dir>`, `%LOCALAPPDATA%\XCL\D3D12`; none → inbox D3D12 as before. All device
+  creation goes through `agility::create_device`. Agility 1.620+ swaps a list's vtable on Close / Reset: `real::
+  preserve_vtable` re-adopts the new native table (command list Close / Reset – Reset is now overridden on PC lists
+  too –, KickoffX, console Reset, DMA Close). `pe.rs`: checked RVA arithmetic, reads bounded to their section.
+  Checked on Windows 11 without an Agility SDK (the fallback): workspace tests, Unicorn Overlord, XDefiant.
+- **#76 / #77** XNetworking: no struct padding copied into the default security info; certificate verification
+  fails closed (no URL / host, GetLastError 0, malformed pins, unknown thumbprint types, pinned plain-HTTP loopback).
+- **#78** (gefydev) `tests/gpu_compute_e2e.rs`: a console compute shader in the retail container layout through
+  `CreateComputePipelineState` on the backend device, dispatched (`runner::dispatch_on`) and read back – a 16 x 8
+  group, so it also covers the native lane reorder of 2-D groups; passes natively and with `XCL_SPLIT_WAVE64=1`.
+- **#79** `ds_write_addtid_b32` / `ds_read_addtid_b32` (M0[15:0] + offset + 4 · lane); on merge also kept below
+  the split wave64 exchange (`XCL_X_LDS_TOP`).
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
