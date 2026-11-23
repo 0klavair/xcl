@@ -94,7 +94,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 let d = modules::describe_address(vt);
                 if d.contains('+') { format!(" (vtable {d})") } else { String::new() }
             };
-            let regs = [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp)];
+            let regs = [
+                ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx),
+                ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+                ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
+                ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
+            ];
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
@@ -240,6 +245,16 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn is_writable(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
+    found
+        && m.State == MEM_COMMIT
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+}
+
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
@@ -276,14 +291,43 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
     }
     match what {
         ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::Clwb | ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {}
+        ConsoleOnly::Clwb => {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
+                code.fill(0x90);
+                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
+            }
+        }
+        ConsoleOnly::Monitorx => {}
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+        }
         ConsoleOnly::Clzero => {
             let line = (ctx.Rax as usize) & !63;
-            if crate::gpu::shader::readable(line, 64) {
+            if is_writable(line, 64) {
                 std::ptr::write_bytes(line as *mut u8, 0, 64);
             } else {
                 return 0; // the real instruction faults there too
             }
+        }
+        ConsoleOnly::ClzeroLoop { end_reg } => {
+            let regs: [&u64; 16] = [
+                &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
+                &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
+            ];
+            let end = *regs[end_reg as usize & 15] as usize;
+            let start = ctx.Rax as usize;
+            if end > start && (end - start) < 2 * 1024 * 1024 * 1024 {
+                let bytes = end - start;
+                if is_writable(start, bytes) {
+                    std::ptr::write_bytes(start as *mut u8, 0, bytes);
+                } else {
+                    return 0;
+                }
+            }
+            ctx.Rax = end as u64;
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
