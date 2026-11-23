@@ -260,8 +260,40 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             }
         }
     }
+    // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB
+    // reservation of 64 KiB pages, 2.2 GB of large pages with a graphics protection) is plain
+    // memory here. Textures the title places in it are kept in step with it
+    // (`d3d12x::title_textures`), which needs its CPU writes to be seen: it is write-watched
+    // like a graphics reservation. Without that such a texture was uploaded once, empty, and
+    // never again (the game's glyph atlas: its menus lost their x-height letters).
+    if gpu_visible_fallback(addr, t, p) {
+        let q = reserve_watched(size, t, p);
+        if !q.is_null() {
+            trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            return q;
+        }
+    }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+    q
+}
+
+/// Whether a VirtualAlloc that reached the plain-memory fallback is GPU-visible title memory
+/// (a reservation with MEM_GRAPHICS, MEM_LARGE_PAGES / MEM_64K_PAGES or a PAGE_GRAPHICS_*
+/// protection, at no fixed address), which is reserved write-watched (`reserve_watched`).
+fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
+    addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0)
+}
+
+/// Plain memory for GPU-visible title memory, write-watched and recorded with the graphics
+/// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
+/// Windows refuses it.
+unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
+    let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+    if !q.is_null() {
+        GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+    }
     q
 }
 
@@ -1999,6 +2031,46 @@ mod tests {
             fnd::SetLastError(0);
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    /// GPU-visible title memory that reaches the plain-memory fallback (64 KiB pages, large
+    /// pages, a graphics protection) is write-watched: a texture placed there sees the CPU's
+    /// writes. The fallback is called directly: through `VirtualAlloc` these sizes land in a
+    /// unified-memory window whenever one has room (once any test has made the windows).
+    #[test]
+    fn gpu_visible_fallback_memory_is_write_watched() {
+        let null = std::ptr::null();
+        // (MEM_64K_PAGES | MEM_RESERVE; MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT with a
+        // PAGE_GRAPHICS_* protection; MEM_GRAPHICS | MEM_RESERVE | MEM_COMMIT)
+        let gpu = [(0x2040_2000u32, mem::PAGE_READWRITE), (0x2000_3000, 0x2404), (MEM_GRAPHICS | 0x3000, mem::PAGE_READWRITE)];
+        for &(t, p) in &gpu {
+            assert!(gpu_visible_fallback(null, t, p), "flags {t:#x} protect {p:#x}");
+        }
+        // plain memory stays plain: CPU-only reservations, commits at a fixed address
+        assert!(!gpu_visible_fallback(null, 0x3000, mem::PAGE_READWRITE));
+        assert!(!gpu_visible_fallback(null, 0x1000, 0x2404), "a commit without a reservation");
+        assert!(!gpu_visible_fallback(0x1_0000 as *const c_void, 0x2040_2000, mem::PAGE_READWRITE), "a fixed address");
+        unsafe {
+            for (t, p) in gpu {
+                let size = 0x40_0000;
+                let q = reserve_watched(size, t, p);
+                assert!(!q.is_null(), "flags {t:#x}");
+                let a = q as usize;
+                assert!(in_graphics_reservation(a), "flags {t:#x}: a fallback allocation is watched");
+                if t & 0x1000 == 0 {
+                    assert!(!VirtualAlloc((a + 0x2_0000) as *const c_void, 0x1_0000, 0x1000, mem::PAGE_READWRITE).is_null());
+                }
+                let mut buf = [std::ptr::null_mut::<c_void>(); 16];
+                let (mut n, mut gran) = (buf.len(), 0u32);
+                assert_eq!(mem::GetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
+                ((a + 0x2_1234) as *mut u8).write_volatile(7);
+                n = buf.len();
+                assert_eq!(mem::GetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
+                assert_eq!(&buf[..n], &[(a + 0x2_1000) as *mut c_void], "flags {t:#x}: the written page is reported");
+                assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
+                assert!(!in_graphics_reservation(a));
+            }
         }
     }
 
