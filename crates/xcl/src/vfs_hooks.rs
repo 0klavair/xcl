@@ -358,6 +358,7 @@ type FnCreateDirW = unsafe extern "system" fn(*const u16, *const c_void) -> i32;
 type FnPathW = unsafe extern "system" fn(*const u16) -> i32;
 type FnMoveFileExW = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
 type FnMoveFileWithProgressW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, u32) -> i32;
+type FnMoveFileWithProgressA = unsafe extern "system" fn(*const u8, *const u8, *const c_void, *const c_void, u32) -> i32;
 type FnCopyFileExW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
 type FnCopyFileW = unsafe extern "system" fn(*const u16, *const u16, i32) -> i32;
 type FnCopyFile2 = unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> i32;
@@ -367,6 +368,9 @@ static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
+static O_MOVE_FILE_A: AtomicUsize = AtomicUsize::new(0);
+static O_MOVE_FILE_EX_A: AtomicUsize = AtomicUsize::new(0);
+static O_MOVE_FILE_PROGRESS_A: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_2: AtomicUsize = AtomicUsize::new(0);
@@ -445,12 +449,35 @@ unsafe extern "system" fn hk_move_file_ex_w(src: *const u16, dst: *const u16, fl
     move_file(src, dst, flags, |s, d, f| orig(s, d, f))
 }
 
-/// MoveFileW, MoveFileA, MoveFileExA and MoveFileWithProgressA reach MoveFileWithProgressW
-/// without going through MoveFileExW. (MoveFileExW may call it too: the guard then lets the
-/// inner call through.)
+/// MoveFileW reaches MoveFileWithProgressW without going through MoveFileExW (Windows 11; under
+/// Wine the ANSI moves do too). Where MoveFileExW calls it, the guard lets the inner call through.
 unsafe extern "system" fn hk_move_file_with_progress_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
     let orig = orig!(O_MOVE_FILE_PROGRESS_W as FnMoveFileWithProgressW);
     move_file(src, dst, flags, |s, d, f| orig(s, d, prog, data, f))
+}
+
+/// kernel32's MoveFileA / MoveFileExA / MoveFileWithProgressA reach none of kernelbase's W move
+/// entries on Windows 11 (an internal helper does the work), so they are hooked themselves: the
+/// paths become wide and the move goes the MoveFileWithProgressW way.
+unsafe fn move_file_a(src: *const u8, dst: *const u8, prog: *const c_void, data: *const c_void, flags: u32, orig: impl Fn() -> i32) -> i32 {
+    let Some(s) = from_ansi_ptr(src) else { return orig() };
+    let d = from_ansi_ptr(dst).map(|d| wide(&d));
+    hk_move_file_with_progress_w(wide(&s).as_ptr(), d.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()), prog, data, flags)
+}
+
+unsafe extern "system" fn hk_move_file_a(src: *const u8, dst: *const u8) -> i32 {
+    let orig = orig!(O_MOVE_FILE_A as unsafe extern "system" fn(*const u8, *const u8) -> i32);
+    move_file_a(src, dst, std::ptr::null(), std::ptr::null(), 0x2 /* COPY_ALLOWED, as MoveFileW */, || orig(src, dst))
+}
+
+unsafe extern "system" fn hk_move_file_ex_a(src: *const u8, dst: *const u8, flags: u32) -> i32 {
+    let orig = orig!(O_MOVE_FILE_EX_A as unsafe extern "system" fn(*const u8, *const u8, u32) -> i32);
+    move_file_a(src, dst, std::ptr::null(), std::ptr::null(), flags, || orig(src, dst, flags))
+}
+
+unsafe extern "system" fn hk_move_file_with_progress_a(src: *const u8, dst: *const u8, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
+    let orig = orig!(O_MOVE_FILE_PROGRESS_A as FnMoveFileWithProgressA);
+    move_file_a(src, dst, prog, data, flags, || orig(src, dst, prog, data, flags))
 }
 
 unsafe fn move_file(src: *const u16, dst: *const u16, flags: u32, orig: impl Fn(*const u16, *const u16, u32) -> i32) -> i32 {
@@ -836,14 +863,23 @@ pub fn install() -> Result<(), String> {
         ("FindNextFileA", hk_find_next_a as usize, &O_FIND_NEXT_A),
         ("FindClose", hk_find_close as usize, &O_FIND_CLOSE),
     ];
+    // ANSI entries kernel32 implements without calling a hooked kernelbase function (after the
+    // kernelbase list: their hooks call MoveFileWithProgressW's trampoline)
+    let k32: &[(&str, usize, &AtomicUsize)] = &[
+        ("MoveFileA", hk_move_file_a as usize, &O_MOVE_FILE_A),
+        ("MoveFileExA", hk_move_file_ex_a as usize, &O_MOVE_FILE_EX_A),
+        ("MoveFileWithProgressA", hk_move_file_with_progress_a as usize, &O_MOVE_FILE_PROGRESS_A),
+    ];
     let mut errors = Vec::new();
-    for (name, det, slot) in list {
-        if let Err(e) = unsafe { hook(kb, name, *det, slot) } {
-            errors.push(e);
+    for (module, list) in [(kb, list), ("kernel32.dll", k32)] {
+        for (name, det, slot) in list {
+            if let Err(e) = unsafe { hook(module, name, *det, slot) } {
+                errors.push(e);
+            }
         }
     }
     if errors.is_empty() {
-        crate::xlog_info!("VFS: {} file hooks active", list.len());
+        crate::xlog_info!("VFS: {} file hooks active", list.len() + k32.len());
         Ok(())
     } else {
         Err(errors.join("; "))
