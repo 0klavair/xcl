@@ -87,6 +87,7 @@ const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
 pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
 pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
+pub const XACCESSIBILITY: Guid = g(0x3e241977_6237_41e9_8559_102c2d9983f1);
 pub const XGAMEUI: Guid = g(0xdfcd4649_4ff8_4043_ba07_35d607df98b0);
 const XSTORE: Guid = g(0x0dd112ac_7c24_448c_b92b_3960fb5bd30c);
 const XAPPBROADCAST: Guid = g(0x186d5592_a72d_45fb_9560_11aed0e6647a);
@@ -294,6 +295,11 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
         None if c == XASYNC => {
             note(c, i, "XAsync: XCL (fallback – no system xgameruntime.dll)".into());
             *out = xcl_xasync_object() as *const Obj as *mut c_void;
+            S_OK
+        }
+        None if c == XACCESSIBILITY => {
+            note(c, i, "XAccessibility: XCL (fallback – no system xgameruntime.dll)".into());
+            *out = xcl_xaccessibility_object() as *const Obj as *mut c_void;
             S_OK
         }
         None => {
@@ -622,6 +628,21 @@ fn xcl_xasync_object() -> &'static Obj {
     static O: OnceLock<&'static Obj> = OnceLock::new();
     O.get_or_init(|| {
         let mut ifaces = layout(Class { name: "XAsync", clsid: XASYNC, impls: xasync_impls(), forward: &[] });
+        object(ifaces.remove(0))
+    })
+}
+
+/// Built-in XAccessibility COM object used as a fallback when Gaming Services
+/// (`System32\xgameruntime.dll`) is not installed on the host.
+fn xcl_xaccessibility_object() -> &'static Obj {
+    static O: OnceLock<&'static Obj> = OnceLock::new();
+    O.get_or_init(|| {
+        let mut ifaces = layout(Class {
+            name: "XAccessibility",
+            clsid: XACCESSIBILITY,
+            impls: named![XClosedCaptionGetProperties, XClosedCaptionSetEnabled, XHighContrastGetMode],
+            forward: &[],
+        });
         object(ifaces.remove(0))
     })
 }
@@ -1851,6 +1872,40 @@ mod tests {
             assert_ts(xa);
             assert_eq!(set_ts(xa, false), S_OK);
             assert!(!is_ts(xa));
+        }
+    }
+
+    #[test]
+    fn xcl_xaccessibility_fallback_vtable_covers_captions_and_high_contrast() {
+        let _g = accessibility::ACCESSIBILITY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let iid = g(0xd722b373_8c4d_4692_9e51_d6ad9b37aa7d);
+        unsafe {
+            // Built-in fallback object serves slots 3..=5 and stubs speech slots as E_NOTIMPL.
+            let acc = xcl_xaccessibility_object() as *const Obj as *mut c_void;
+            let get_props: unsafe extern "system" fn(*mut c_void, *mut accessibility::XClosedCaptionProperties) -> HRESULT = slot(acc, 3);
+            let set_enabled: unsafe extern "system" fn(*mut c_void, u8) -> HRESULT = slot(acc, 4);
+            let get_hc: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT = slot(acc, 5);
+            let speech_pos: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = slot(acc, 6);
+
+            assert_eq!(set_enabled(acc, 1), S_OK);
+            let mut props: accessibility::XClosedCaptionProperties = std::mem::zeroed();
+            assert_eq!(get_props(acc, &mut props), S_OK);
+            assert_eq!(props.enabled, 1);
+            assert_eq!(props.font_scale, 1.0);
+            assert_eq!(set_enabled(acc, 0), S_OK);
+            assert_eq!(get_props(acc, &mut props), S_OK);
+            assert_eq!(props.enabled, 0);
+
+            let mut hc = u32::MAX;
+            assert_eq!(get_hc(acc, &mut hc), S_OK);
+            assert!(hc <= accessibility::XHIGH_CONTRAST_MODE_OTHER);
+
+            assert_eq!(speech_pos(acc, 0), E_NOTIMPL);
+
+            // QueryApiImpl succeeds whether backed by host System32\xgameruntime.dll or XCL fallback.
+            let (hr, queried) = query(XACCESSIBILITY, iid);
+            assert_eq!(hr, S_OK);
+            assert!(!queried.is_null());
         }
     }
 }

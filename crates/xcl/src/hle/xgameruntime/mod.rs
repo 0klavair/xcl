@@ -3,6 +3,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod accessibility;
 pub mod api;
 pub mod gamesave;
 pub mod gdk_table;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::util::{write_cstr_out, E_INVALIDARG, E_NOT_FOUND, E_NOT_SUFFICIENT_BUFFER, E_NOT_SUPPORTED, HRESULT, S_OK};
+use accessibility::*;
 use gamesave::*;
 use networking::*;
 use taskqueue::*;
@@ -156,6 +158,10 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XUserFindForDevice,
         XUserFindControllerForUserWithUiAsync,
         XUserFindControllerForUserWithUiResult,
+        // accessibility
+        XClosedCaptionGetProperties,
+        XClosedCaptionSetEnabled,
+        XHighContrastGetMode,
         // store (offline)
         XStoreCreateContext,
         XStoreCloseContextHandle,
