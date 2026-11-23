@@ -1824,14 +1824,21 @@ impl Em {
             }
             "v_interp_p2_f32" => {
                 let v = self.vreg(vdst);
-                self.line(&format!("if ({act}) {v} = asuint({src});"));
+                // (float): the value of an int / uint input, not its bits (see v_interp_mov_f32)
+                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
             }
             "v_interp_mov_f32" => {
                 if ij != 2 {
                     return Err("v_interp_mov p10/p20");
                 }
                 let v = self.vreg(vdst);
-                self.line(&format!("if ({act}) {v} = asuint({src});"));
+                // The value of an int / uint input, converted (#107 made it a bit copy, which is what
+                // the ISA does): XDefiant's UI PS reads its RenderType (an int input) this way and
+                // compares it with 1 / 2 – with the bits its text took those branches and drew
+                // nothing, with the converted value (never 1 or 2) it draws the text (red; whether
+                // the console's is another colour is not known). Open: why those branches draw
+                // nothing (they sample the font with gradients from ds_swizzle derivatives).
+                self.line(&format!("if ({act}) {v} = asuint((float){src});"));
             }
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);

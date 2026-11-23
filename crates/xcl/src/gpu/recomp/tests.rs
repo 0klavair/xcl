@@ -4048,7 +4048,10 @@ fn retail_translation_survey() {
                                 eprintln!("dxc start {} ({} KB)", r.name, t.hlsl.len() / 1024);
                             }
                             let t1 = std::time::Instant::now();
-                            let r = super::dxc::compile(&t.hlsl, "main", profile, &[]);
+                            // XCL_DXC_ARGS="-O1 …": extra DXC arguments (comparing optimisation levels)
+                            let args = std::env::var("XCL_DXC_ARGS").unwrap_or_default();
+                            let args: Vec<&str> = args.split_whitespace().collect();
+                            let r = super::dxc::compile(&t.hlsl, "main", profile, &args);
                             // the specific message (validation failures list it after "validation errors")
                             let first = |e: &str| {
                                 e.lines().find(|l| l.contains("error") && !l.contains("validation errors")).or_else(|| e.lines().find(|l| l.contains("error"))).unwrap_or(e.lines().next().unwrap_or("")).to_string()
@@ -5597,7 +5600,9 @@ fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
 }
 
 #[test]
-fn ps_interp_preserves_integer_and_float_inputs() {
+/// int / uint PS inputs read through v_interp_mov / p2 give their value converted to float (#107
+/// made it a bit copy; XDefiant's UI text vanished with it – see `v_interp_mov_f32` in emit.rs).
+fn ps_interp_converts_integer_inputs_and_compiles() {
     use super::PsInterface;
     let ps_code = prog(&[
         ("V_INTERP_P1_F32", "ENC_VINTRP", &[("VDST", 4), ("VSRC", 0), ("ATTR", 0), ("ATTRCHAN", 0)], None),
@@ -5620,11 +5625,9 @@ fn ps_interp_preserves_integer_and_float_inputs() {
     };
     let pt = translate(&ps_code, &Options { mode: Mode::Pixel(psi), wave64: true, ..Default::default() }).unwrap();
     assert!(pt.complete(), "{:?}\n{}", pt.unsupported_why, pt.hlsl);
-    assert!(!pt.hlsl.contains("asuint((float)xi.a"), "integer PS inputs must not be cast through float:\n{}", pt.hlsl);
-    assert!(pt.hlsl.contains("asuint(xi.a0[0])"), "{}", pt.hlsl);
-    assert!(pt.hlsl.contains("asuint(xi.a1[0])"), "{}", pt.hlsl);
-    assert!(pt.hlsl.contains("asuint(xi.a1[1])"), "{}", pt.hlsl);
-    assert!(pt.hlsl.contains("asuint(xi.a2[0])"), "{}", pt.hlsl);
+    for read in ["asuint((float)xi.a0[0])", "asuint((float)xi.a1[0])", "asuint((float)xi.a1[1])", "asuint((float)xi.a2[0])"] {
+        assert!(pt.hlsl.contains(read), "{read}:\n{}", pt.hlsl);
+    }
     if super::dxc::location().is_ok() {
         super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", pt.hlsl));
     }

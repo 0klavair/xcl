@@ -897,6 +897,24 @@ opens its "Xbox network unavailable" dialog – input arrives), Unicorn Overlord
 - **#109** device removal checked before GPU readbacks are mapped (GetCompletedValue = UINT64_MAX after a removal).
 - README: "What is missing" removed, a "Controls" section (gamepad recommended; keyboard / mouse as a gamepad).
 
+## XDefiant's UI text: the #107 regression (2026-11-23)
+- Bisected (warm cache): `668f550` text, `c813f08` (#107 alone) none. Cause: `v_interp_mov_f32` / `v_interp_p2_f32`
+  of int / uint PS inputs as a bit copy (`asuint(xi.aN[c])`) instead of the value converted to float. Reverted
+  (with a note at `v_interp_mov_f32`); #107's test now checks the conversion.
+- What it means: XDefiant's UI PS (`000f5c62725d684f_ps`, inputs UserBig / UserSmall / RenderType (int4) / Color)
+  reads RenderType with `v_interp_mov` and compares it with 1 and 2 (`v_cmpx_eq_u32`): RenderType 1 samples
+  the font with `image_sample_d`, 2 takes four `image_sample_lz` taps at offsets from ds_swizzle derivatives.
+  With the bits (what the ISA does) the text takes those branches and draws nothing; with the converted value
+  (never 1 or 2) it takes the default branch and draws the text in red. If the console's text is not red
+  (yellow?), the real bug is in those branches: tried and not it – a helper-lane-aware `ballot` in pixel
+  shaders (quad reads + WaveActiveBitOr, entry EXEC live lanes only) and not zeroing ds_swizzle sources.
+- Tools on the user's desktop: `xdtest.sh` (runs XDefiant, counts red pixels in the frame dumps),
+  `xd_cold_dxil\` (a DXIL cache with the current HLSL), `bisect\` (a git worktree) + `trrr\target-bisect\`.
+- DXC compile time (measured on the way, for the optimisation work): -O3 / -O1 / -O0 on 258 random programs
+  349 / 304 / 235 s – the optimiser is not the cost; programs with `pc` blocks (13–17 %) take 53–75 % of it
+  (DXC's loop passes: unroll ~30 %, jump threading ~18 %, indvars ~12 % on the slowest); the largest program
+  (29 000 instructions, 6.5 MB HLSL) peaks at ~0.6 GB in DXC. `XCL_DXC_ARGS` passes DXC arguments in the survey.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
@@ -1352,12 +1370,10 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   `dxc::wait_for_memory` held each compile up to a minute while less than 6 GB of commit was left, and with
   XDefiant's own ~10 GB committed only ~4 GB were: its last ~160 shaders came a few a minute (it looked hung at
   ~1600). Now a compile goes at once with 6 GB left, else alone (one at a time). After a cold-cache run
-  XDefiant's logo was once missing even after the compiles seemed done. **Checked 2026-11-23, not a bug:** two runs
-  with an empty `XCL_DXIL_CACHE` (native, and `XCL_SPLIT_WAVE64=1`), 1 756 shaders compiled each, frame dumps
-  every 2 s: the logo comes at ~70 s, the red text and "Witaj" ~15 s later, by themselves, and stay; the log
-  counts 0 draws with PC (stand-in) pipelines – draws wait for a pipeline still being built (`resolve_wait` in
-  `bind::graphics_bound`). The title creates the text's pipelines after the logo's, so their compiles come in a
-  later burst; a restart in between just finds them cached.
+  XDefiant's logo / UI text was missing at times. Cold-cache runs (empty `XCL_DXIL_CACHE`, 1 756 shaders) show
+  the logo at ~70 s and the text ~15 s later, by themselves; draws wait for pipelines still being built
+  (`resolve_wait` in `bind::graphics_bound`, 0 draws with stand-ins). The text missing for good (also warm) on
+  2026-11-23 was the #107 regression below, not the cache.
 - **The title's graphics memory in video memory (PR #40, 2026-11-22)**: XMem graphics allocations, physical pages,
   D3D12 buffer heaps and the console descriptor heaps live in the sparse windows 0..2 (`Uma::for_runtime`); window 3
   is 512 MB of coherent system RAM (XCL's arena pool, readback / write-back heaps). GPU writes reach the CPU's view
@@ -1631,9 +1647,7 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   6.45–6.64× → 4.09–4.34×. Test `gpu_split_wave64_lane_local_masks` (fails if the local word lands in the wrong half).
   Merged 2026-11-23 (#94) after: workspace tests on the RX 9070 natively and with `XCL_SPLIT_WAVE64=1`, and
   XDefiant run in the split form on AMD (`XCL_SPLIT_WAVE64=1`, every wave64 compute / mesh program split): its
-  title screen right with a warm cache. With a cold cache it shows only the logo and the A / Y glyphs for a while
-  (the text's pipelines compile in a later burst, ~15 s after the logo's) – then the whole title screen; checked
-  with an empty `XCL_DXIL_CACHE`, see the cold-cache note in the XDefiant section. Also merged: #92 (the VFS hook guard keeps
+  title screen right with a warm cache. With a cold cache the title screen's text comes ~15 s after the logo. Also merged: #92 (the VFS hook guard keeps
   GetLastError – GNU builds' TLS access reset it), #93 (under Wine PEB.ImageBaseAddress stays the real image).
 - Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
   waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
