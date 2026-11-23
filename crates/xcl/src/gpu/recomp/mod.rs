@@ -61,6 +61,7 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+pub mod upper_lanes;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -473,7 +474,9 @@ pub struct Options {
     /// the GPU runs only 32-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`
     /// < 64, e.g. NVIDIA): each console wave of a wave64 kernel / compute / mesh / geometry
     /// program runs as two hardware wave32 halves that exchange masks and lane values through
-    /// groupshared memory (`docs/wave64-on-wave32.md`). No effect on wave32 programs, VS / PS.
+    /// groupshared memory (`docs/wave64-on-wave32.md`). A wave64 VS / PS (wave size picked by
+    /// the driver) gets the values of lanes 32..63 it reads where a 32-lane wave lacks them
+    /// (`upper_lanes`). No effect on wave32 programs.
     pub split_wave64: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
@@ -1081,38 +1084,27 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
     }
 }
 
-/// Instructions of a wave64 program that break when the GPU runs it in waves of 32 lanes
-/// (VS / PS: the driver picks the wave size): reads of a lane ≥ 32 or of a lane chosen at run
-/// time. A wave32 program in 64-lane waves is handled (the halves act as separate waves).
+/// Cross-lane reads of a wave64 program that are still wrong when the GPU runs it in waves of
+/// 32 lanes (VS / PS: the driver picks the wave size), by kind: reads of a lane ≥ 32 – or of a
+/// lane chosen at run time – whose value `upper_lanes` cannot follow. The form for 32-lane
+/// GPUs (`Options::split_wave64`) resolves the others. A wave32 program in 64-lane waves is
+/// handled (the halves act as separate waves).
 pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
-    let mut out = BTreeSet::new();
+    wave_lane_reads(code).0
+}
+
+/// `wave_hazards` and the kinds of reads `upper_lanes` resolves.
+pub fn wave_lane_reads(code: &[u8]) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+    let mut insts = Vec::new();
     let mut off = 0;
     while off + 4 <= code.len() {
         let Ok(d) = rdna2::decode(&code[off..], off as u64) else { break };
         off += d.len;
-        match d.inst.name {
-            "V_READLANE_B32" | "V_WRITELANE_B32" => {
-                let lane = rdna2::field_value(d.enc, &d.words, "SRC1").unwrap_or(0);
-                match lane {
-                    0..=105 => {
-                        out.insert("v_readlane/writelane: lane number from an SGPR");
-                    }
-                    160..=192 => {
-                        out.insert("v_readlane/writelane: lane ≥ 32");
-                    }
-                    255 if d.literal.is_some_and(|l| l & 63 >= 32) => {
-                        out.insert("v_readlane/writelane: lane ≥ 32");
-                    }
-                    _ => {}
-                }
-            }
-            "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => {
-                out.insert("ds_(b)permute: arbitrary lane");
-            }
-            _ => {}
-        }
+        insts.push(d);
     }
-    out
+    rdna2::resolve_far_jumps(&mut insts);
+    let a = upper_lanes::analyze(&insts);
+    (a.hazards(&insts), a.resolved())
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
@@ -1341,6 +1333,15 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     // continues from the ES into the GS through s_setpc: left as it is)
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    }
+    // a wave64 VS / PS on a GPU with 32-lane waves only: what lanes 32..63 hold where the
+    // program reads them (the driver may still pick 64 lanes: decided at run time); only a
+    // program with a read to change gets the form
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
+        let a = upper_lanes::analyze(&insts);
+        if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
+            em.upper = Some(a);
+        }
     }
     em.max_vgpr = insts
         .iter()

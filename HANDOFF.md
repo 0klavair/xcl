@@ -1690,7 +1690,31 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   title screen right with a warm cache. With a cold cache the title screen's text comes ~15 s after the logo. Also merged: #92 (the VFS hook guard keeps
   GetLastError – GNU builds' TLS access reset it), #93 (under Wine PEB.ImageBaseAddress stays the real image).
 - Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
-  waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
+  waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there). Done next (below).
+
+## Wave64 VS / PS in 32-lane waves (NVIDIA), 2026-11-23
+- Census of the 749 flagged programs (748 PS, 1 VS; `retail_wave64_graphics_lane_census`, ignored): 1 082 reads in
+  436 programs are a whole-wave reduction (identity into the lanes outside the mask, DPP8 xor
+  1/2/4, row_mirror, `v_permlanex16`, `v_readlane` 32 for the upper half; min_u32 / max_u32 / or_b32) – right on
+  NVIDIA only because lane 32 reads lane 0 and those ops are idempotent; 355 reads in 353 programs are waterfall
+  reads (`v_readlane v, s_ff1(mask & EXEC)`), lane < 32 – right; 200 reads in 11 programs are SGPR spill slots in
+  lanes 32..47 – wrong (the write is lost, the read gets slot lane & 31). No `ds_bpermute`.
+- `upper_lanes.rs`: a forward pass over the program follows what the console's lanes 32..63 hold (EXEC's upper word
+  through the SGPRs as 0 / all ones / anything; per VGPR lane ≥ 32 unwritten / a constant / a spill slot / unknown,
+  evaluating whole-wave moves, selects, integer min / max / logic / add and their DPP forms). With `split_wave64`
+  a wave64 VS / PS reads a constant lane as the constant and a slot from a scalar shadow its `v_writelane`s also
+  write, when `WaveGetLaneCount() < 64` (`xcl_hw32`); spill slots < 32 (287 PS, 3 540 reads) come from their shadows
+  at any wave size – a lane a partial wave did not launch loses its slot. `wave_hazards` now reports only reads the
+  pass cannot follow: 0 in the pack (was 749 programs). Native HLSL (no `split_wave64`) identical for all 26 698
+  programs, and so is the 32-lane form of every other mode (digests, `retail_wave64_graphics_lane_forms`).
+- Tests on the RTX 5070 Ti: `gpu_wave64_ps_whole_wave_reductions` (the pack's reduction as min and as a sum, and the
+  waterfall read, per hardware wave against a console wave of the same lanes), `gpu_wave64_ps_spill_slots` (full
+  target and a 6-pixel triangle), `gpu_wave64_vs_spill_slots_and_identity` (3 vertices). With the old form all three
+  fail there: slots 32..47 sum to slots 0..15, the sum reduction doubles, the VS keeps only its 3 lanes' slots.
+- Not exact yet, on every GPU: whole-wave code in a partial wave reads lanes the PC never launched (the console's
+  inactive lanes run it). Measured on the 5070 Ti: such lanes read 0 – a min reduction (identity -1) gives 0 in a
+  3-quad wave, max / or / sum are right. 325 of the 436 reduction programs have a min reduction. Needs the reduction
+  recognised as a whole (`docs/wave64-on-wave32.md`, "Vertex and pixel shaders").
 
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
@@ -1705,6 +1729,6 @@ Little is left to do without the exe – the rest needs an actual run of the gam
    pipe/packer configuration for the _X modes (`texture::CONSOLE_PIPES`), MSAA.
 4. Audio: Opus is decoded (0x704F voices); with the exe check how the title feeds it (voice format, buffer framing, or a
    console API); XMA2 low priority (the game has none).
-5. Smaller: 749 wave64 programs at risk in a 32-wide wave (only if they show up), `image_sample_o` with an offset from a VGPR,
+5. Smaller: whole-wave reductions in partial waves (325 PS with a min reduction, every GPU), `image_sample_o` with an offset from a VGPR,
    smaller HLSL, further XGameRuntime APIs (XGameUI, XNetworking…), GameInput → system GameInput.dll,
    mapping physical pages at the game's address.
