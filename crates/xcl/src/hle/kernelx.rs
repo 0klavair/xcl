@@ -51,6 +51,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         XMemVirtualAlloc,
         XMemAllocatePhysicalPages,
         XMemMapPhysicalPages,
+        XMemMapPhysicalPagesScatter,
         XMemFreePhysicalPages,
         XMemTransferMemory,
         XMemGetWorkingSetStatistics,
@@ -99,6 +100,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
 // ---------------------------------------------------------------------------------------
 
 pub const MEM_GRAPHICS: u32 = 0x1000_0000;
+mod placeholders;
 pub const MEM_TITLE: u32 = 0x4000_0000;
 const STD_ALLOC_MASK: u32 = 0x1000 | 0x2000 | 0x8_0000 | 0x10_0000 | 0x20_0000 | 0x100_0000;
 const STD_PROTECT_MASK: u32 = 0xFF | 0x100 | 0x200 | 0x400;
@@ -168,6 +170,10 @@ unsafe fn commit_sparse(a: usize, n: usize, p: u32) -> *mut c_void {
 }
 
 pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: u32, p: u32) -> *mut c_void {
+    if let Some(q) = placeholders::alloc(addr, size, t, sanitize_protect(p)) {
+        trace_mem("VirtualAlloc (placeholder)", addr as usize, size, t as u64, p, q as usize);
+        return q;
+    }
     let uma = crate::gpu::uma::get();
     // committing inside one of the title's reservations in a sparse window
     if !addr.is_null() && t & 0x1000 != 0 && uma.is_some_and(|u| u.is_sparse(addr as usize)) {
@@ -246,6 +252,9 @@ fn trace_mem(what: &str, addr: usize, size: usize, flags: u64, protect: u32, got
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    if let Some(ok) = placeholders::free(addr, size, t) {
+        return ok;
+    }
     // the title's reservations in a sparse window: decommit (and on release give the address
     // space back); their video memory goes with it
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.is_sparse(addr as usize)) {
@@ -436,6 +445,51 @@ pub unsafe extern "system" fn XMemFree(p: *mut c_void, attrs: u64) {
     }
 }
 
+/// The exe's exported data `__XMemAllocationHooks__` {alloc, free, …}: the allocator functions
+/// of a title that replaces XMem's, which the console's runtime libraries call for the memory
+/// they need (`runtime_alloc`). Titles see there what the runtime allocates – and may supply the
+/// memory themselves.
+static TITLE_HOOKS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+
+pub unsafe fn adopt_title_hooks(main: &crate::modules::MappedModule) {
+    let Some(crate::pe::ExportTarget::Rva(rva)) = main.exports.by_name.get("__XMemAllocationHooks__") else { return };
+    let p = (main.base + *rva as usize) as *const usize;
+    let (alloc, free) = (p.read_unaligned(), p.add(1).read_unaligned());
+    let inside = |f: usize| f > main.base && f < main.base + main.size;
+    if inside(alloc) && inside(free) {
+        TITLE_HOOKS[1].store(free, Ordering::Release);
+        TITLE_HOOKS[0].store(alloc, Ordering::Release);
+        crate::xlog_info!("XMem: the title has allocation hooks ({}, {})", crate::modules::describe_address(alloc), crate::modules::describe_address(free));
+    }
+}
+
+/// XALLOC_ATTRIBUTES of a descriptor heap's memory: object type 4, 64 KiB pages and alignment,
+/// allocator 0x80 (the D3D runtime), graphics memory. The retail game's heap class (its alloc hook for
+/// allocator 0x80 compares object type and size) gives the memory of its heaps this way and
+/// asserts that they start there.
+pub const D3D_DESCRIPTOR_HEAP: u64 = 4 | 1 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
+
+/// XALLOC_ATTRIBUTES of a display target's memory: 4 MiB pages (the retail game's hook for its back buffers
+/// takes every request with them), allocator 0x80, graphics memory.
+pub const D3D_DISPLAY_TARGET: u64 = 2 << 14 | 0x80 << 16 | 16 << 24 | 1 << 29;
+
+/// What the title's allocation hook gives a console runtime library (None: no hook, or null).
+pub unsafe fn runtime_alloc(size: usize, attrs: u64) -> Option<usize> {
+    let f = TITLE_HOOKS[0].load(Ordering::Acquire);
+    if f == 0 {
+        return None;
+    }
+    let p = std::mem::transmute::<usize, XMemAllocFn>(f)(size, attrs) as usize;
+    (p != 0).then_some(p)
+}
+
+pub unsafe fn runtime_free(p: usize, attrs: u64) {
+    let f = TITLE_HOOKS[1].load(Ordering::Acquire);
+    if f != 0 {
+        std::mem::transmute::<usize, XMemFreeFn>(f)(p as *mut c_void, attrs);
+    }
+}
+
 /// `void* XMemVirtualAlloc(void* address, SIZE_T size, DWORD type, XALLOC_ATTRIBUTES attributes,
 /// DWORD protect)`: VirtualAlloc with an allocator's attributes – a graphics memory type is
 /// GPU-visible memory (as MEM_GRAPHICS: sparse VRAM pool).
@@ -606,10 +660,22 @@ struct Away {
 }
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
+/// Page numbers count 4 KiB frames, as on the console: a 64 KiB page's is a multiple of 16 (a retail game
+/// packs them shifted right by 4). Index 0 of unified memory is page 16 - 0 means "no page".
+const FRAMES: usize = PHYS_PAGE >> 12;
+
+fn page_number(index: usize) -> usize {
+    (index + 1) * FRAMES
+}
+
+fn page_index(page: usize) -> Option<usize> {
+    page.is_multiple_of(FRAMES).then(|| (page / FRAMES).checked_sub(1)).flatten()
+}
+
 /// The home address of page `page` if it belongs to a live allocation.
 fn page_home(page: usize) -> Option<usize> {
     let u = crate::gpu::uma::get()?;
-    let index = page.checked_sub(1)?;
+    let index = page_index(page)?;
     let blocks = PHYS_BLOCKS.lock().ok()?;
     let (&first, &(count, live)) = blocks.range(..=index).next_back()?;
     (live > 0 && index < first.checked_add(count)?)
@@ -717,7 +783,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     };
     let first = (block - u.base()) / PHYS_PAGE;
     for i in 0..n {
-        *arr.add(i) = first + i + 1;
+        *arr.add(i) = page_number(first + i);
     }
     PHYS_BLOCKS.lock().unwrap().insert(first, (n, n));
     1
@@ -739,7 +805,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     }
     let mut g = PHYS_BLOCKS.lock().unwrap();
     for i in 0..n {
-        let Some(page) = (*arr.add(i)).checked_sub(1) else { continue };
+        let Some(page) = page_index(*arr.add(i)) else { continue };
         // the block holding this page
         let Some((&first, &(count, _))) = g.range(..=page).next_back() else { continue };
         if page >= first + count {
@@ -773,7 +839,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
     // consecutive pages at their home (or no address chosen): that UMA memory itself
-    let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i) == Some(pages[i]));
+    let consecutive = pages[0] != 0 && (1..n).all(|i| pages[0].checked_add(i * FRAMES) == Some(pages[i]));
     let home = if consecutive { page_home(pages[0]).filter(|_| page_home(pages[n - 1]).is_some()) } else { None };
     if va.is_null() || home == Some(va as usize) {
         let Some(home) = home else {
@@ -825,6 +891,16 @@ pub unsafe extern "system" fn XMemAllocatePhysicalPages(_attrs: u64, num: *mut u
 /// `void* XMemMapPhysicalPages(void* address, SIZE_T count, ULONG64* pages)`
 pub unsafe extern "system" fn XMemMapPhysicalPages(va: *mut c_void, n: usize, arr: *mut u64) -> *mut c_void {
     MapTitlePhysicalPages(va, n, 0, 0, arr as *mut usize)
+}
+
+/// `BOOL XMemMapPhysicalPagesScatter(void** addresses, SIZE_T count, ULONG64* pages)`: one 64 KiB
+/// page at each address (page 0: the address is unmapped)
+pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut c_void, n: usize, pages: *mut u64) -> BOOL {
+    if addresses.is_null() || pages.is_null() {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    (0..n).all(|i| !MapTitlePhysicalPages(*addresses.add(i), 1, 0, 0, pages.add(i) as *mut usize).is_null()) as BOOL
 }
 
 /// `BOOL XMemFreePhysicalPages(SIZE_T count, ULONG64* pages)`
@@ -1348,6 +1424,34 @@ mod tests {
     }
 
     #[test]
+    fn xmem_placeholder_split_replace_and_coalesce() {
+        unsafe {
+            // The title splits a placeholder, replaces each piece with a physical-page
+            // reservation, then maps pages at those exact GPU-visible addresses.
+            let grain = PHYS_PAGE;
+            let base = XMemVirtualAlloc(std::ptr::null(), 3 * grain, 0x42000, 7, mem::PAGE_NOACCESS);
+            assert!(!base.is_null());
+            let split = VirtualFree(base, grain, 0x8002);
+            if split == 0 {
+                VirtualFree(base, 0, mem::MEM_RELEASE);
+            }
+            assert_eq!(split, 1, "split a placeholder without releasing its address space");
+            let rest = base.byte_add(grain);
+            assert_eq!(VirtualFree(rest, grain, 0x8002), 1);
+            assert_eq!(XMemVirtualAlloc(base, grain, 0x20406000, 0x27, 0x1004), base);
+            assert!(XMemVirtualAlloc(rest, 2 * grain, 0x20406000, 0x27, 0x1004).is_null(), "replacement must match one placeholder");
+            if let Some(u) = crate::gpu::uma::get() {
+                assert!(u.is_title_address(base as usize), "replacement stays GPU-visible");
+            }
+            assert_eq!(VirtualAlloc(base, grain, mem::MEM_COMMIT, mem::PAGE_READWRITE), base);
+            *(base as *mut u32) = 0x12345678;
+            assert_eq!(VirtualFree(base, grain, 0x8002), 1, "return a replacement to a placeholder");
+            assert_eq!(VirtualFree(base, 3 * grain, 0x8001), 1, "coalesce adjacent placeholders");
+            assert_eq!(VirtualFree(base, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
     fn xmem_alignment_and_zeroing() {
         let attrs = |align_log2: u64, mtype: u64| (align_log2 << 24) | (mtype << 29);
         assert_eq!(XAllocAttrs::decode(attrs(8, 0)).alignment, 8);
@@ -1390,7 +1494,8 @@ mod tests {
             let mut n = 3usize;
             let mut pages = [0usize; 3];
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
-            assert_eq!(pages[1], pages[0] + 1);
+            // 4 KiB frame numbers: multiples of 16, consecutive pages 16 apart
+            assert!(pages[0].is_multiple_of(16) && pages[1] == pages[0] + 16);
             let p = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr());
             assert!(!p.is_null() && u.contains(p as usize) && (p as usize - u.base()) % PHYS_PAGE == 0);
             *(p as *mut u32).add(PHYS_PAGE / 4) = 0x55AA; // page 1
@@ -1403,15 +1508,21 @@ mod tests {
             // scattered pages: refused
             let mut scattered = [pages[2], pages[0]];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, scattered.as_mut_ptr()).is_null());
+            // … but one by one they go to addresses of their own
+            let at = [u.base() + PHYS_PAGE * page_index(pages[0]).unwrap(), u.base() + PHYS_PAGE * page_index(pages[2]).unwrap()].map(|a| a as *mut c_void);
+            let mut ids = [pages[0] as u64, pages[2] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            ids[1] += 1;
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 2, ids.as_mut_ptr()), 0, "not a page number");
             // Page numbers must refer to one registered allocation; arithmetic is checked before
             // constructing an address inside the reserved UMA region.
-            let mut outside = [u.size() / PHYS_PAGE + 1];
+            let mut outside = [page_number(u.size() / PHYS_PAGE)];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 1, 0, 4, outside.as_mut_ptr()).is_null());
             let mut wrapping = [usize::MAX];
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, wrapping.as_mut_ptr()).is_null());
             // freed: the block is gone (other tests use UMA at the same time, so not `u.used()`)
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
-            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&(pages[0] - 1)));
+            assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
         }
     }

@@ -67,6 +67,10 @@ const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_00000000004
 const IID_FACTORY: GUID = GUID::from_u128(0xfb3b54ac_bf82_463a_b777_73195837864d);
 const IID_FILE: GUID = GUID::from_u128(0x43704f9f_27c6_4a9f_8815_d16527894df4);
 const IID_QUEUE: GUID = GUID::from_u128(0xa3f6649a_8c2c_4b3a_8b6e_10186a04b9bc);
+/// The factory and queue of a newer SDK (a retail game): the same first methods; the factory's slot 10
+/// creates a queue from a 0x20-byte desc (a u64 @0x18 more) with `IID_QUEUE_X1`.
+const IID_FACTORY_X1: GUID = GUID::from_u128(0x62959d11_d45f_4884_a0a3_f7862ea243ae);
+const IID_QUEUE_X1: GUID = GUID::from_u128(0x3c02cb0c_c050_4195_99a1_a1ce94ba33c5);
 const IID_STATUS_ARRAY: GUID = GUID::from_u128(0xcd66d752_2786_44f7_9070_e2a6fdad3f1b);
 
 /// Console `DSTORAGE_REQUEST_OPTIONS` bitfields (Xbox Series X|S `dstorage_xs.h`):
@@ -189,6 +193,8 @@ pub unsafe extern "system" fn DStorageGetFactory(riid: *const GUID, out: *mut *m
                 factory_set_cpu_affinity as usize,
                 factory_set_debug_flags as usize,
                 factory_set_staging_buffer_size as usize,
+                factory_unknown as usize,
+                factory_create_queue1 as usize,
             ],
             16,
         );
@@ -202,7 +208,28 @@ unsafe extern "system" fn static_ref(_p: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn factory_qi(p: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    if !riid.is_null() && same(&*riid, &IID_FACTORY_X1) {
+        return query(p, &IID_FACTORY_X1, riid, out, no_ref);
+    }
     query(p, &IID_FACTORY, riid, out, no_ref)
+}
+
+unsafe extern "system" fn factory_unknown(_p: *mut c_void) -> HRESULT {
+    warn_once("IDStorageFactoryX::#9", format_args!("called – answering E_NOTIMPL"));
+    E_NOTIMPL
+}
+
+/// Slot 10 of the newer factory: CreateQueue with a 0x20-byte desc – the 0x18 of
+/// `factory_create_queue`, then a u64 (a retail game: 1).
+unsafe extern "system" fn factory_create_queue1(p: *mut c_void, desc: *const u8, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    if !desc.is_null() {
+        let extra = (desc.add(0x18) as *const u64).read_unaligned();
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("DirectStorage: CreateQueue (0x20 desc), u64 @0x18 = {extra:#x}");
+        }
+    }
+    factory_create_queue(p, desc, riid, out)
 }
 
 unsafe extern "system" fn factory_set_cpu_affinity(_p: *mut c_void, _mask: u64) -> HRESULT {
@@ -908,6 +935,9 @@ unsafe fn queue<'a>(p: *mut c_void) -> &'a Arc<QueueInner> {
 }
 
 unsafe extern "system" fn queue_qi(p: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    if !riid.is_null() && same(&*riid, &IID_QUEUE_X1) {
+        return query(p, &IID_QUEUE_X1, riid, out, add_ref::<QueueInner>);
+    }
     query(p, &IID_QUEUE, riid, out, add_ref::<QueueInner>)
 }
 

@@ -109,6 +109,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             return 0x7C1_0002;
         }
     };
+    unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");

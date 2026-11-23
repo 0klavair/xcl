@@ -736,6 +736,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (0, dev_qi_x as usize),
                 (8, x::create_command_queue_x as usize),
                 (25, x::get_resource_allocation_info_x as usize),
+                (26, x::get_custom_heap_properties_x as usize),
                 (29, dev_create_placed_resource_x as usize),
                 // CreateCommittedResource at its PC index too (XDefiant): console code uses the
                 // buffer's GPU address as a CPU pointer – it goes into unified memory
@@ -764,6 +765,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (62, dev_create_compute_pso_x as usize),
                 (66, x::serialize_pso_x as usize),
                 (67, x::deserialize_pso_x as usize),
+                (70, dev_create_srv_at_x as usize),
+                (71, dev_create_uav_at_x as usize),
                 (73, x::create_command_list_x as usize),
                 (74, x::register_page_pool_x as usize),
                 (75, x::unregister_page_pool_x as usize),
@@ -775,10 +778,14 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
+                (108, x::get_resource_allocation_info2_x as usize),
+                (127, dev_create_committed_resource_layout_x as usize),
+                (133, x::create_placed_resource_layout_x as usize),
             ]
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
+        Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -1690,6 +1697,84 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
 }
 
+/// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
+/// per address and desc – titles make views of the same memory again and again.
+unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
+    type Key = (u64, [u8; 0x38]);
+    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
+        return std::ptr::null_mut();
+    }
+    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
+    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    x[0x34..].fill(0);
+    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+        return r as *mut c_void;
+    }
+    let mut r = std::ptr::null_mut();
+    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
+    if hr < 0 || r.is_null() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
+        }
+        r = std::ptr::null_mut();
+    }
+    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    r
+}
+
+/// device #70 (a retail game): a shader resource view of memory, without a resource object:
+/// (resource desc, { the PC's SRV desc; GPU address @0x28; … }, destination).
+unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u8, view: *const u8, cpu: u64) {
+    if view.is_null() || !crate::gpu::shader::readable(view as usize, 0x40) {
+        return;
+    }
+    let va = (view.add(0x28) as *const u64).read_unaligned();
+    let v = (view as *const D3D12_SHADER_RESOURCE_VIEW_DESC).read_unaligned();
+    if v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        return super::console_heap::write(&slot, &words);
+    }
+    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+}
+
+/// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
+/// the counter's address @0x30; … }).
+unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u8, view: *const u8, cpu: u64) {
+    if view.is_null() || !crate::gpu::shader::readable(view as usize, 0x40) {
+        return;
+    }
+    let va = (view.add(0x28) as *const u64).read_unaligned();
+    let v = (view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC).read_unaligned();
+    if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+        let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        return super::console_heap::write(&slot, &words);
+    }
+    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+}
+
+/// V# of `n` elements from element `first` of the buffer at `va`.
+fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+    let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
+    let (stride, elem) = match (raw, stride) {
+        (true, _) => (0, 4),
+        (false, 0) => {
+            let e = crate::gpu::desc::format_bytes(fmt);
+            (e, e)
+        }
+        (false, s) => (s, s),
+    };
+    let records = if stride == 0 { n.saturating_mul(4) } else { n };
+    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+}
+
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
@@ -1747,6 +1832,57 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));
+}
+
+/// device #127 (a retail game): CreateCommittedResource with a barrier layout in the initial state's place
+/// – the arguments of the PC's CreateCommittedResource3 (heap properties, flags, desc, layout,
+/// clear value, protected session, castable formats, riid, resource).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_committed_resource_layout_x(
+    this: *mut c_void,
+    props: usize,
+    flags: u32,
+    desc: usize,
+    layout: u32,
+    clear: usize,
+    _protected: usize,
+    _castable: u32,
+    _formats: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    note_newer_device_method(127);
+    let state = super::device_x::layout_state(layout) as usize;
+    if flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 != 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        return create_display_target(this, props, desc, state, clear, riid, ppv);
+    }
+    dev_create_committed_resource_x(this, props, flags as usize, desc, state, clear, riid, ppv)
+}
+
+/// A display target: its console memory comes from the title's allocation hook, as the console
+/// runtime's does (a retail game gives its back buffers one block and asserts that it is used up); on the
+/// PC it is a resource of its own.
+unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let d = super::device_x::pc_resource_desc(&x);
+    let hr = dev_create_committed_resource(this, props, 0, d.as_ptr() as usize, state, clear, riid, ppv);
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        crate::xlog_warn!("D3D12.X: display target: {hr:#x}; desc {x:02x?}");
+        return hr;
+    }
+    let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size()) as usize;
+    let at = if size > 0 { crate::hle::kernelx::runtime_alloc(size, crate::hle::kernelx::D3D_DISPLAY_TARGET) } else { None };
+    if let Some(p) = at {
+        note_title_address(*ppv as usize, p);
+    }
+    crate::xlog_info!(
+        "D3D12.X: display target {}x{} format {}: {size:#x} bytes of the title's memory at {:#x}",
+        u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+        u32::from_le_bytes(x[0x18..0x1C].try_into().unwrap()),
+        u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()),
+        at.unwrap_or(0)
+    );
+    hr
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -1886,6 +2022,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::PipelineState => v.push(("Release", pso_release as usize)),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
+        Kind::Fence => v.push(("Signal", fence_signal as usize)),
         _ => {}
     }
     v
@@ -3200,6 +3337,28 @@ fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     Some(out)
 }
 
+/// The stream's subobjects up to the first of a type XCL does not know (logged): a console
+/// shader in front of it must still be found.
+fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: pipeline stream: unknown subobject type {ty} at {off:#x} of {:#x} - the rest is not read", buf.len());
+            }
+            break;
+        };
+        let poff = if palign == 8 { 8 } else { 4 };
+        let Some(p) = buf.get(off + poff..off + poff + psize) else { break };
+        out.push((ty, p));
+        off += (poff + psize + 7) & !7;
+    }
+    out
+}
+
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
     shader_bytes(&b)
@@ -3408,6 +3567,141 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
+enum StreamPipeline {
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
+    /// neither with console shaders (or not readable)
+    Unknown,
+}
+
+/// A pipeline stream with a console VS (+ PS / GS) or CS as the plain pipeline desc, which is
+/// translated like any other (`dev_create_graphics_pso`). The stream itself must not reach the
+/// driver: AMD's shader compiler fails on the console's stripped DXIL and takes the device with
+/// it (0x887A0020 at the retail game's first graphics pipeline). Depth bounds, view instancing and the
+/// float depth bias' fraction have no place in the plain desc.
+unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return StreamPipeline::Unknown;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return StreamPipeline::Unknown;
+    }
+    let subs = known_subobjects(std::slice::from_raw_parts(base as *const u8, size));
+    let console = |ty: u32| subs.iter().find(|s| s.0 == ty).and_then(|s| payload_shader(s.1)).is_some_and(is_console);
+    if console(6) {
+        let mut c: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::mem::zeroed();
+        for (ty, p) in &subs {
+            match ty {
+                0 => put(&mut c.pRootSignature, p),
+                6 => put(&mut c.CS, p),
+                18 => put(&mut c.NodeMask, p),
+                _ => {}
+            }
+        }
+        return StreamPipeline::Compute(Box::new(c));
+    }
+    if !console(1) {
+        return StreamPipeline::Unknown;
+    }
+    let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::mem::zeroed();
+    // what a stream leaves out has the PC's defaults
+    g.SampleMask = u32::MAX;
+    g.SampleDesc.Count = 1;
+    g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    g.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    g.RasterizerState.DepthClipEnable = true.into();
+    for rt in &mut g.BlendState.RenderTarget {
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_ZERO;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = 15;
+    }
+    let keep = D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: D3D12_STENCIL_OP_KEEP, StencilDepthFailOp: D3D12_STENCIL_OP_KEEP, StencilPassOp: D3D12_STENCIL_OP_KEEP, StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS };
+    g.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable: true.into(),
+        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+        DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+        StencilEnable: false.into(),
+        StencilReadMask: 0xFF,
+        StencilWriteMask: 0xFF,
+        FrontFace: keep,
+        BackFace: keep,
+    };
+    for (ty, p) in &subs {
+        match ty {
+            0 => put(&mut g.pRootSignature, p),
+            1 => put(&mut g.VS, p),
+            2 => put(&mut g.PS, p),
+            3 => put(&mut g.DS, p),
+            4 => put(&mut g.HS, p),
+            5 => put(&mut g.GS, p),
+            7 => put(&mut g.StreamOutput, p),
+            8 => put(&mut g.BlendState, p),
+            9 => put(&mut g.SampleMask, p),
+            10 => put(&mut g.RasterizerState, p),
+            // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
+            11 | 21 => put(&mut g.DepthStencilState, p),
+            12 => put(&mut g.InputLayout, p),
+            13 => put(&mut g.IBStripCutValue, p),
+            14 => put(&mut g.PrimitiveTopologyType, p),
+            15 => {
+                let mut rt: D3D12_RT_FORMAT_ARRAY = std::mem::zeroed();
+                put(&mut rt, p);
+                g.RTVFormats = rt.RTFormats;
+                g.NumRenderTargets = rt.NumRenderTargets;
+            }
+            16 => put(&mut g.DSVFormat, p),
+            17 => put(&mut g.SampleDesc, p),
+            18 => put(&mut g.NodeMask, p),
+            20 => put(&mut g.Flags, p),
+            26 => {
+                let mut d: D3D12_DEPTH_STENCIL_DESC2 = std::mem::zeroed();
+                put(&mut d, p);
+                let face = |f: &D3D12_DEPTH_STENCILOP_DESC1| D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: f.StencilFailOp, StencilDepthFailOp: f.StencilDepthFailOp, StencilPassOp: f.StencilPassOp, StencilFunc: f.StencilFunc };
+                g.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: d.DepthEnable,
+                    DepthWriteMask: d.DepthWriteMask,
+                    DepthFunc: d.DepthFunc,
+                    StencilEnable: d.StencilEnable,
+                    StencilReadMask: d.FrontFace.StencilReadMask,
+                    StencilWriteMask: d.FrontFace.StencilWriteMask,
+                    FrontFace: face(&d.FrontFace),
+                    BackFace: face(&d.BackFace),
+                };
+            }
+            27 | 28 => {
+                // RASTERIZER1 / 2: fill, cull, winding, depth bias (float), clamp, slope, depth clip
+                let mut d: D3D12_RASTERIZER_DESC1 = std::mem::zeroed();
+                put(&mut d, p);
+                g.RasterizerState = D3D12_RASTERIZER_DESC {
+                    FillMode: d.FillMode,
+                    CullMode: d.CullMode,
+                    FrontCounterClockwise: d.FrontCounterClockwise,
+                    DepthBias: d.DepthBias as i32,
+                    DepthBiasClamp: d.DepthBiasClamp,
+                    SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                    DepthClipEnable: d.DepthClipEnable,
+                    ..Default::default()
+                };
+            }
+            _ => {}
+        }
+    }
+    StreamPipeline::Graphics(Box::new(g))
+}
+
+/// The bytes of a stream payload as a desc field (no references counted: the desc only borrows).
+unsafe fn put<T>(to: &mut T, from: &[u8]) {
+    let n = std::mem::size_of::<T>().min(from.len());
+    std::ptr::copy_nonoverlapping(from.as_ptr(), to as *mut T as *mut u8, n);
+}
+
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
@@ -3421,6 +3715,11 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         }
     } else if let Some(hr) = translated {
         return hr;
+    }
+    match stream_pipeline(desc) {
+        StreamPipeline::Graphics(d) => return dev_create_graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv),
+        StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
+        StreamPipeline::Unknown => {}
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
@@ -3645,8 +3944,9 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // The same runtime moves the command list's console methods too: Unicorn Overlord records its
 // texture uploads with CopyTextureRegionX at #85 (the older layout's #83; its #85 is
 // SetPredicationBufferX, which dropped them – every texture stayed zero). From #85 on the
-// list's console methods sit two slots later (`NEWER_LIST_SLOTS`); where the shift starts
-// below #83 is not known (no title seen calling those slots on the newer layout).
+// list's console methods sit two slots later (`NEWER_LIST_SLOTS`), and from #72 on as well: a retail game
+// calls Write64BitValueBottomOfPipeX at #72 and Wait64BitValueX at #74. Where the shift starts
+// below #72 is not known.
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
@@ -3657,7 +3957,15 @@ pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 8] = [(85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
+const NEWER_LIST_SLOTS: [(usize, usize); 13] = [(72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
+
+/// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
+/// records its first lists before any queue call could tell).
+pub(super) fn note_newer_device_method(slot: usize) {
+    if !QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (device method #{slot} called)");
+    }
+}
 
 /// Whether `p` is a fence the title created.
 fn is_fence(p: usize) -> bool {
@@ -3689,7 +3997,11 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            f(this, a1, a2) as u32 as usize
+            let hr = f(this, a1, a2);
+            if older == 14 && hr >= 0 {
+                super::fence_x::note_queue_signal(a1, a2 as u64);
+            }
+            hr as u32 as usize
         }
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
@@ -3763,7 +4075,19 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
     const PC_SIGNAL: usize = 14;
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    f(this, fence, value)
+    let hr = f(this, fence, value);
+    if hr >= 0 {
+        super::fence_x::note_queue_signal(fence as usize, value);
+    }
+    hr
+}
+
+/// Fence::Signal (CPU)
+unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    let hr = f(this, value);
+    super::fence_x::note_cpu_signal(this as usize);
+    hr
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {

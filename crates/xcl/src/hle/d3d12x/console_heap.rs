@@ -33,6 +33,17 @@ use windows::Win32::Graphics::Direct3D12::*;
 pub const SLOT: u32 = 32;
 pub const SAMPLER_SLOT: u32 = 16;
 
+/// Whose memory a heap's slots are in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Memory {
+    /// a sparse VRAM allocation in window 0
+    Sparse,
+    /// committed system RAM
+    Uma,
+    /// the title's (its allocation hook gave it: `kernelx::runtime_alloc`)
+    Title,
+}
+
 struct Heap {
     obj: usize,
     shadow: usize,
@@ -47,8 +58,7 @@ struct Heap {
     pages: Vec<u32>,
     /// shader visible as the title made it
     visible: bool,
-    /// backed by a sparse VRAM allocation in window 0 (rather than committed system RAM)
-    sparse: bool,
+    memory: Memory,
 }
 
 impl Heap {
@@ -201,6 +211,24 @@ pub fn in_global(obj: usize) -> bool {
     HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.pages.is_empty())
 }
 
+/// Memory for a heap of `bytes` from the title's allocation hook – where the title expects the
+/// heap then. Only what descriptor tables can address (window 0) and is committed; anything else
+/// goes back to the title.
+unsafe fn title_memory(u: &crate::gpu::uma::Uma, bytes: usize) -> Option<usize> {
+    use crate::hle::kernelx::{runtime_alloc, runtime_free, D3D_DESCRIPTOR_HEAP};
+    let p = runtime_alloc(bytes, D3D_DESCRIPTOR_HEAP)?;
+    let readable = crate::gpu::shader::readable(p, bytes);
+    if readable && u.window_of(p) == Some(0) && u.window_of(p + bytes - 1) == Some(0) {
+        return Some(p);
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        crate::xlog_warn!("console descriptor heap: the title's memory {p:#x} ({bytes:#x} bytes) not used (window {:?}, committed {readable})", u.window_of(p));
+    }
+    runtime_free(p, D3D_DESCRIPTOR_HEAP);
+    None
+}
+
 /// `obj` is a PC heap from `pc_cpu` / `pc_gpu` (increment `inc`; `pc_gpu` 0 when not shader
 /// visible) with 2·`n` view descriptors or `n` samplers: give it `n` console slots in
 /// unified memory. `shared`: its views go to the shared heap (`shared_heap`), a page at a
@@ -211,15 +239,17 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
     // Descriptor tables are 32-bit console addresses (high dword 0): must live in window 0.
     // On the sparse-window path, `sparse::alloc_in(0, ...)` commits fresh zeroed pages so we
     // avoid touching unused pages with `write_bytes` (which would mark them dirty for write-watch).
-    let (p, sparse) = if u.is_sparse_window(0) {
+    let (p, memory) = if let Some(p) = unsafe { title_memory(u, bytes as usize) } {
+        (p as *mut u8, Memory::Title)
+    } else if u.is_sparse_window(0) {
         let Some((addr, _)) = (unsafe { super::sparse::alloc_in(0, bytes as usize, 256) }) else {
             return false;
         };
-        (addr as *mut u8, true)
+        (addr as *mut u8, Memory::Sparse)
     } else {
         let Some(p) = u.alloc_in(0, bytes as usize, 256) else { return false };
         unsafe { std::ptr::write_bytes(p, 0, bytes as usize) };
-        (p, false)
+        (p, Memory::Uma)
     };
     {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -227,14 +257,18 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
             crate::xlog_info!(
                 "console descriptor heap {obj:#x}: {n} {} slots at {} {:#x}, {}",
                 if sampler { "sampler" } else { "view" },
-                if sparse { "sparse VRAM" } else { "UMA" },
+                match memory {
+                    Memory::Sparse => "sparse VRAM",
+                    Memory::Uma => "UMA",
+                    Memory::Title => "the title's memory",
+                },
                 p as usize - u.base(),
                 if visible { "shader visible" } else { "CPU only" }
             );
         }
     }
     let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, sparse });
+    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, memory });
     true
 }
 
@@ -248,10 +282,16 @@ pub fn unregister(obj: usize) {
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
         }
-        if h.sparse {
-            unsafe { super::sparse::free(h.shadow) };
-        } else if let Some(u) = crate::gpu::uma::get() {
-            u.free(h.shadow);
+        match h.memory {
+            Memory::Sparse => {
+                unsafe { super::sparse::free(h.shadow) };
+            }
+            Memory::Uma => {
+                if let Some(u) = crate::gpu::uma::get() {
+                    u.free(h.shadow);
+                }
+            }
+            Memory::Title => unsafe { crate::hle::kernelx::runtime_free(h.shadow, crate::hle::kernelx::D3D_DESCRIPTOR_HEAP) },
         }
     }
 }

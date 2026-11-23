@@ -1719,6 +1719,25 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   forms test run on both); the three GPU tests pass, also with `XCL_SPLIT_WAVE64=1`; XDefiant and Minecraft run with
   and without `XCL_SPLIT_WAVE64=1` (the forced split form starts with a cold shader cache: XDefiant black while compiling).
 
+## Retail game bring-up, 2026-11-23
+
+Not playable: it starts, shows its first frame (8.3 s, 3840x2160; what is on it was not looked at) and dies at ~20 s
+out of memory while compiling pipelines. **Always run it with `XCL_NETWORK=0`**: its crash reporter sends a minidump
+to an outside server at every crash (`hle/netoff.rs`: the title's WinHTTP / Winsock calls fail, loopback passes).
+- Done: placeholder `VirtualAlloc` (`kernelx/placeholders.rs`); `XMemMapPhysicalPagesScatter`; physical page numbers are
+  4 KiB frames (step 16); the title's `__XMemAllocationHooks__` (exported by it and Fortnite) give descriptor heaps and
+  display targets their memory; device #26, #70, #71, #108, #127, #133; DirectStorage's newer factory / queue; pipeline
+  streams with console shaders are translated as plain descs (raw, they removed the device); fence #12
+  (`fence_x.rs`); 1D / 3D textures in `xg.rs`; the newer list layout's shift by two covers #72 - #84 too and
+  is also noticed from device #108 / #127 / #133.
+- `xg_oracle` passes with XDefiant's library. Fortnite's is newer (UAVs 4KB_S) and fails two tests, as before.
+  `XGSuggestSwizzleMode` is inferred: no library at hand exports it.
+- Open: memory - 17.5 GB of commit was free, XCL took 28.7 GB, +10 GB in the 2nd second (probably sparse memory kept in
+  RAM and VRAM, not broken down); ~4.5 GB of `VirtualAlloc` with PAGE_GRAPHICS_* protection is plain memory, so
+  shaders get empty buffers and GPU writes / waits there are dropped; one list fails to Close; queue #35, list #131 /
+  #132 / #139 and allocator #9 are stubs; MSAA layouts.
+- XDefiant, Fortnite, Unicorn Overlord and Minecraft were **not** run after these changes (only the test suites).
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

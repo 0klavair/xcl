@@ -19,6 +19,7 @@ pub mod gameinput;
 pub mod kbm;
 pub mod kernelx;
 pub mod mfplat;
+pub mod netoff;
 pub mod opus;
 pub mod user;
 pub mod xaudio2;
@@ -94,7 +95,7 @@ pub const ACPHAL: &str = "acphal.dll";
 pub const GAMEINPUT: &str = "gameinput.dll";
 
 fn build(config: &Config) -> Registry {
-    let modules = vec![
+    let mut modules = vec![
         HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
@@ -107,6 +108,12 @@ fn build(config: &Config) -> Registry {
         HleModule::new(ACPHAL, acphal::exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
     ];
+    let offline = netoff::enabled();
+    if offline {
+        let mut m = HleModule::new(netoff::NETOFF, netoff::exports(), &[SELF]);
+        m.ordinals = netoff::ordinals().into_iter().collect();
+        modules.push(m);
+    }
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
     // user aliases first – they take precedence
@@ -175,6 +182,12 @@ fn build(config: &Config) -> Registry {
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
+    }
+    if offline {
+        let n = idx(netoff::NETOFF);
+        for p in ["winhttp.dll", "ws2_32.dll"] {
+            routes.push((p.into(), Route::Hle(n)));
+        }
     }
     Registry { modules, routes }
 }

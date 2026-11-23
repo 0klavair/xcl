@@ -14,6 +14,7 @@ pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+mod fence_x;
 pub mod frame;
 pub mod guard;
 pub mod layout;
@@ -54,6 +55,7 @@ fn exports_fns() -> Vec<(&'static str, usize)> {
         D3D12GetInterface,
         D3D10CreateBlob,
         D3D12XboxSetProcessDebugFlags,
+        D3D12ConfigureVirtualMemoryX,
     ]
 }
 
@@ -231,5 +233,16 @@ pub unsafe extern "system" fn D3D10CreateBlob(size: usize, out: *mut *mut c_void
 }
 
 pub unsafe extern "system" fn D3D12XboxSetProcessDebugFlags(_flags: u32) -> HRESULT {
+    S_OK
+}
+
+/// How the console splits the title's GPU virtual address space (a 32-byte configuration;
+/// the retail game's second dword is a count of 16 GiB units + 2). The PC's GPU addresses come from its
+/// own device, so there is nothing to configure – but a title asserts (`int3`) on a failure.
+pub unsafe extern "system" fn D3D12ConfigureVirtualMemoryX(config: *const c_void) -> HRESULT {
+    if !config.is_null() && crate::gpu::shader::readable(config as usize, 32) {
+        let w: Vec<u32> = (0..8).map(|k| (config as *const u32).add(k).read_unaligned()).collect();
+        crate::xlog_info!("D3D12ConfigureVirtualMemoryX: {w:x?} – accepted (nothing to configure on the PC)");
+    }
     S_OK
 }

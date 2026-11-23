@@ -62,7 +62,15 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
         0 | 100 | 10000 => d[1], // NORMAL, HIGH, GLOBAL_REALTIME
         _ => 100,
     };
-    [pc_list_type(d[0]), priority, d[2], if d[3] == 0 { 0 } else { 1 }]
+    // flags: the PC has only DISABLE_GPU_TIMEOUT (1); the console's others (a retail game: 2, 3 on
+    // compute queues) are dropped – the PC refuses them with E_INVALIDARG
+    if d[2] & !1 != 0 {
+        static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: command queue flags {:#x} (type {}) – the console-only bits are dropped", d[2], d[0]);
+        }
+    }
+    [pc_list_type(d[0]), priority, d[2] & 1, if d[3] == 0 { 0 } else { 1 }]
 }
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
@@ -684,6 +692,50 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
     ret
 }
 
+/// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
+/// D3D12_RESOURCE_ALLOCATION_INFO1* each) -> {size, alignment} of them all, returned like #25's;
+/// each resource's {offset, alignment, size} goes to the last argument when there is one.
+pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
+    real::note_newer_device_method(108);
+    let ret = if real::is_adopted(a) { b } else { a } as *mut [u64; 2];
+    let (mut size, mut align) = (0u64, 0u64);
+    for k in 0..n as usize {
+        let mut r = [0u64; 2];
+        let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
+        let (x, y) = if real::is_adopted(a) { (a, &mut r as *mut _ as *mut c_void) } else { (&mut r as *mut _ as *mut c_void, b) };
+        get_resource_allocation_info_x(x, y, mask, 1, d);
+        if r[0] == u64::MAX || r[1] == 0 {
+            size = u64::MAX;
+            break;
+        }
+        let offset = size.next_multiple_of(r[1]);
+        if !infos.is_null() {
+            *infos.add(k) = [offset, r[1], r[0]];
+        }
+        size = offset + r[0];
+        align = align.max(r[1]);
+    }
+    if !ret.is_null() {
+        *ret = [size, align];
+    }
+    ret
+}
+
+/// device #26 GetCustomHeapProperties(node mask, heap type) -> D3D12_HEAP_PROPERTIES (20 bytes),
+/// returned through a hidden pointer - like #25 called the C way (a retail game: return buffer, device,
+/// ...) or the C++ way.
+pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void, b: *mut c_void, mask: u32, ty: u32) -> *mut [u32; 5] {
+    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
+    type F = unsafe extern "system" fn(*mut c_void, *mut [u32; 5], u32, u32) -> *mut [u32; 5];
+    let pc: F = std::mem::transmute(real::orig_fn(this, 26));
+    let mut r = [0u32; 5];
+    pc(this, &mut r, mask, ty);
+    if !ret.is_null() {
+        *ret = r;
+    }
+    ret
+}
+
 /// Resources the title placed at an address an earlier one was placed at: on the console they
 /// share that memory (aliasing – transient render targets reuse it). Logged (first 16).
 fn note_alias(va: usize, x: &[u8; 0x38]) {
@@ -761,6 +813,30 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         );
     }
     hr
+}
+
+/// device #133 (a retail game): CreatePlacedResourceX with a barrier layout (D3D12_BARRIER_LAYOUT, seen:
+/// 0xFFFFFFFF = undefined for a buffer) in the initial state's place.
+pub(super) unsafe extern "system" fn create_placed_resource_layout_x(this: *mut c_void, va: u64, desc: *const u8, layout: u32, clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    real::note_newer_device_method(133);
+    create_placed_resource_x(this, va, desc, layout_state(layout), clear, riid, ppv)
+}
+
+/// The resource state (D3D12_RESOURCE_STATES) of a D3D12_BARRIER_LAYOUT (undefined: COMMON).
+pub(super) fn layout_state(layout: u32) -> u32 {
+    match layout {
+        1 => 0xAC3, // generic read
+        2 => 0x4,   // render target
+        3 => 0x8,   // unordered access
+        4 => 0x10,  // depth write
+        5 => 0x20,  // depth read
+        6 => 0xC0,  // shader resource (all stages)
+        7 => 0x800, // copy source
+        8 => 0x400, // copy dest
+        9 => 0x2000, // resolve source
+        10 => 0x1000, // resolve dest
+        _ => 0,
+    }
 }
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
