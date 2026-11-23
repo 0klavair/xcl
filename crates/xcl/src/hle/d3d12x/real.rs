@@ -328,6 +328,19 @@ fn wave32_only(device: *mut c_void) -> bool {
     }
 }
 
+/// A wave64 VS / PS may run in 32-lane waves here (`pso::graphics_wave32`: the driver picks
+/// the wave size of graphics shaders): the split flag for VS / PS translation. Unknown
+/// device: assume so.
+fn graphics_wave32(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return true;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
+        crate::gpu::recomp::pso::graphics_wave32_for_device(dev)
+    }
+}
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -2928,9 +2941,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
-    // a GPU with 32-lane waves runs a wave64 VS / PS in waves of 32: the lanes 32..63 it
-    // reads come from `upper_lanes` (split_wave64)
-    let split = wave32_only(this);
+    // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
+    // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
+    // (split_wave64)
+    let split = graphics_wave32(this);
     let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
         Ok(b) => b,
         Err(e) => {
@@ -3486,7 +3500,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -3520,7 +3534,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
-        two_pass_ps(shader_bytes(&d.PS), wave32_only(this)),
+        two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {

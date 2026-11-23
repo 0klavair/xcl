@@ -33,7 +33,7 @@ fn wave64_hardware() -> bool {
 
 /// `o` for a program run on this adapter (the split wave64 form where it is needed).
 fn on_gpu(o: Options) -> Options {
-    Options { split_wave64: runner::split_wave64(), ..o }
+    Options { split_wave64: runner::split_for(&o.mode), ..o }
 }
 
 /// `runner::mesh_draw` needs mesh shaders (not every adapter with wave64 has them).
@@ -142,6 +142,10 @@ fn geometry_wave_path_selection_preserves_native_wave64() {
     assert!(super::pso::wave32_only(32, 32));
     assert!(!super::pso::wave32_only(32, 64));
     assert!(!super::pso::wave32_only(64, 64));
+    // a VS / PS: the driver picks, so any range with 32 lanes gets the 32-lane form (#42)
+    assert!(super::pso::graphics_wave32(32, 32));
+    assert!(super::pso::graphics_wave32(32, 64));
+    assert!(!super::pso::graphics_wave32(64, 64));
 }
 
 #[test]
@@ -1845,7 +1849,7 @@ fn gpu_wave64_ps_spill_slots() {
     assert_eq!(covered.len(), 6);
     // the 32-lane form keeps slots < 32 whatever the wave size, slots ≥ 32 in 32-lane waves;
     // the native form (GPUs with 64-lane waves) still loses the slots of lanes not launched
-    let (lo, hi) = (runner::split_wave64(), runner::wave64_supported() == Ok(false));
+    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
     for (i, p) in covered {
         println!("pixel {i}, partial wave: {:?} (want {want:?})", &p[..2]);
         if lo {
@@ -1891,7 +1895,7 @@ fn gpu_wave64_vs_spill_slots_and_identity() {
     // as in `gpu_wave64_ps_spill_slots`: slots < 32 in the 32-lane form; slots ≥ 32 and the
     // identity in lane 32 in 32-lane waves (in a 64-lane wave of three vertices, lane 32 was
     // not launched either)
-    let (lo, hi) = (runner::split_wave64(), runner::wave64_supported() == Ok(false));
+    let (lo, hi) = (runner::graphics_wave32(), runner::wave64_supported() == Ok(false));
     println!("{:?} (want {want:?})", px[0]);
     for (i, p) in px.iter().enumerate() {
         if lo {
