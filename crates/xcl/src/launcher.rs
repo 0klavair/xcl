@@ -353,6 +353,21 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let environment = crate::preflight::run(&boot.config.d3d12_adapter);
     crate::preflight::print(&environment);
 
+    // the console's CPU is a Zen 2: its titles are compiled for it and fault with an illegal
+    // instruction (0xC000001D) on a PC without its extensions – said here instead
+    let missing = missing_console_cpu_features();
+    if !missing.is_empty() {
+        if std::env::var_os("XCL_SKIP_CPU_CHECK").is_some() {
+            println!("  WARNING: this CPU lacks {} (XCL_SKIP_CPU_CHECK set, continuing)", missing.join(", "));
+        } else {
+            eprintln!(
+                "xcl: this CPU lacks {}: Xbox Series X|S games are compiled for the console's Zen 2 CPU\n     and need them (they would stop with an illegal instruction). XCL_SKIP_CPU_CHECK=1 runs anyway.",
+                missing.join(", ")
+            );
+            return 2;
+        }
+    }
+
     let mut cmdline = quote(&exe.to_string_lossy());
     for a in args {
         cmdline.push(' ');
@@ -367,6 +382,30 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     };
     summarize(&boot, code, &environment);
     code as i32
+}
+
+/// Instruction set extensions of the console's Zen 2 that this CPU does not have (titles are
+/// compiled for them: AVX2, FMA, F16C, BMI1 / BMI2, LZCNT, POPCNT, MOVBE, SSE4.2).
+pub fn missing_console_cpu_features() -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    macro_rules! need {
+        ($($feature:tt => $name:literal),* $(,)?) => {
+            $(if !std::arch::is_x86_feature_detected!($feature) { missing.push($name); })*
+        };
+    }
+    need!(
+        "sse4.2" => "SSE4.2",
+        "popcnt" => "POPCNT",
+        "avx" => "AVX",
+        "avx2" => "AVX2",
+        "fma" => "FMA",
+        "f16c" => "F16C",
+        "bmi1" => "BMI1",
+        "bmi2" => "BMI2",
+        "lzcnt" => "LZCNT",
+        "movbe" => "MOVBE",
+    );
+    missing
 }
 
 fn spawn_host(cmdline: &str, cwd: &Path, boot_path: &Path) -> Result<u32, String> {

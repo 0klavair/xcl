@@ -216,17 +216,43 @@ unsafe extern "system" fn gs_failure(cookie: usize, ret: usize) {
 /// First-chance C++ exceptions (0xE06D7363), the first 16: type, what() and where they were
 /// thrown. One nobody catches ends the process through std::terminate → abort → __fastfail
 /// (0xC0000409), which leaves no other trace (a static initializer in a title DLL's DllMain).
+/// The C string at `p`, at most `max` bytes, read only as far as the memory is readable (a
+/// vectored handler faulting on an unmapped byte after a title's string would turn the
+/// exception it looks at into a fatal one).
+unsafe fn bounded_cstr(p: usize, max: usize) -> String {
+    let mut bytes = Vec::new();
+    let mut a = p;
+    while bytes.len() < max {
+        // readability is checked page by page: at the start and at every page crossed
+        if (a == p || a & 0xFFF == 0) && !crate::gpu::shader::readable(a, 1) {
+            break;
+        }
+        let b = *(a as *const u8);
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        a += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     const CPP: i32 = 0xE06D_7363_u32 as i32;
     const THREAD_NAME: i32 = 0x406D_1388;
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
+        return 0;
+    }
     let rec = &*(*info).ExceptionRecord;
     // the debugger's thread-name exception (THREADNAME_INFO: 0x1000, name, thread id, flags):
     // the name goes to SetThreadDescription, where tools – and XCL's thread dump – see it
     if rec.ExceptionCode == THREAD_NAME && rec.NumberParameters >= 3 && rec.ExceptionInformation[0] == 0x1000 {
         let (name, tid) = (rec.ExceptionInformation[1], rec.ExceptionInformation[2] as u32);
-        if name != 0 && crate::gpu::shader::readable(name, 1) {
-            let n: Vec<u16> = std::ffi::CStr::from_ptr(name as *const std::ffi::c_char).to_string_lossy().encode_utf16().chain([0]).collect();
-            name_thread(tid, &n);
+        if name != 0 {
+            let n: Vec<u16> = bounded_cstr(name, 256).encode_utf16().chain([0]).collect();
+            if n.len() > 1 {
+                name_thread(tid, &n);
+            }
         }
         return 0;
     }
@@ -253,19 +279,20 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
                 let td = rd32(base + first as usize + 4);
                 if td > 0 {
                     let p = base + td as usize + 16;
-                    if crate::gpu::shader::readable(p, 64) {
-                        name = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy().into_owned();
+                    if crate::gpu::shader::readable(p, 1) {
+                        name = bounded_cstr(p, 256);
                     }
                 }
             }
         }
     }
-    // std::exception { vfptr, const char* what, … }
+    // std::exception { vfptr, const char* what, … } – for other thrown types the second word is
+    // whatever the object holds: read as a string only where it points at readable memory
     let mut what = String::new();
     if object != 0 && crate::gpu::shader::readable(object + 8, 8) {
         let s = (object as *const usize).add(1).read_unaligned();
-        if s != 0 && crate::gpu::shader::readable(s, 1) {
-            what = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char).to_string_lossy().chars().take(200).collect();
+        if s != 0 {
+            what = bounded_cstr(s, 200);
         }
     }
     let ctx = &*(*info).ContextRecord;
@@ -413,16 +440,22 @@ pub fn dump_threads() {
             if te.th32OwnerProcessID == pid && te.th32ThreadID != me {
                 let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
                 if !h.is_null() {
-                    if SuspendThread(h) != u32::MAX {
-                        // CONTEXT must be 16-byte aligned
-                        let mut buf = vec![0u8; std::mem::size_of::<CONTEXT>() + 16];
-                        let ctx = ((buf.as_mut_ptr() as usize + 15) & !15) as *mut CONTEXT;
-                        (*ctx).ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
-                        if GetThreadContext(h, ctx) != 0 {
-                            let frames: Vec<String> = unwind(&mut *ctx, 14).into_iter().map(modules::describe_address).collect();
-                            lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
-                        }
+                    // CONTEXT must be 16-byte aligned
+                    #[repr(align(16))]
+                    struct Aligned(CONTEXT);
+                    let mut c: Aligned = std::mem::zeroed();
+                    c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+                    // only the context is taken while the thread is suspended: the unwinding
+                    // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
+                    // formatting (heap) take locks the suspended thread may hold (#106)
+                    let got = SuspendThread(h) != u32::MAX && {
+                        let ok = GetThreadContext(h, &mut c.0) != 0;
                         ResumeThread(h);
+                        ok
+                    };
+                    if got {
+                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
                 }
@@ -500,6 +533,10 @@ pub fn watch_writes(addr: usize) {
         while start.elapsed().as_secs() < 60 {
             unsafe {
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 let mut e: THREADENTRY32 = std::mem::zeroed();
                 e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 let mut ok = Thread32First(snap, &mut e) != 0;
@@ -512,14 +549,17 @@ pub fn watch_writes(addr: usize) {
                             struct Aligned(CONTEXT);
                             let mut c: Aligned = std::mem::zeroed();
                             c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
-                            SuspendThread(h);
-                            if GetThreadContext(h, &mut c.0) != 0 {
-                                c.0.Dr0 = addr as u64;
-                                // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
-                                c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
-                                SetThreadContext(h, &c.0);
+                            if SuspendThread(h) != u32::MAX {
+                                if GetThreadContext(h, &mut c.0) != 0 {
+                                    c.0.Dr0 = addr as u64;
+                                    // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
+                                    c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
+                                    SetThreadContext(h, &c.0);
+                                }
+                                ResumeThread(h);
+                            } else {
+                                armed.remove(&e.th32ThreadID);
                             }
-                            ResumeThread(h);
                             windows_sys::Win32::Foundation::CloseHandle(h);
                         }
                     }
@@ -666,6 +706,10 @@ pub fn start_probes() {
         loop {
             unsafe {
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 let mut e: THREADENTRY32 = std::mem::zeroed();
                 e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 let mut ok = Thread32First(snap, &mut e) != 0;
@@ -677,12 +721,15 @@ pub fn start_probes() {
                             struct Aligned(CONTEXT);
                             let mut c: Aligned = std::mem::zeroed();
                             c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
-                            SuspendThread(h);
-                            if GetThreadContext(h, &mut c.0) != 0 {
-                                arm_context(&mut c.0);
-                                SetThreadContext(h, &c.0);
+                            if SuspendThread(h) != u32::MAX {
+                                if GetThreadContext(h, &mut c.0) != 0 {
+                                    arm_context(&mut c.0);
+                                    SetThreadContext(h, &c.0);
+                                }
+                                ResumeThread(h);
+                            } else {
+                                armed.remove(&e.th32ThreadID);
                             }
-                            ResumeThread(h);
                             windows_sys::Win32::Foundation::CloseHandle(h);
                         }
                     }
@@ -698,6 +745,24 @@ pub fn start_probes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
+        unsafe {
+            let s = b"hello\0tail";
+            assert_eq!(bounded_cstr(s.as_ptr() as usize, 64), "hello");
+            assert_eq!(bounded_cstr(s.as_ptr() as usize, 3), "hel");
+            assert_eq!(bounded_cstr(0, 64), "");
+            // a string running to the end of a page followed by an unmapped one
+            use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualAlloc(p as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            std::ptr::write_bytes(p as *mut u8, b'x', 0x1000);
+            assert_eq!(bounded_cstr(p + 0x1000 - 4, 64), "xxxx");
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn finds_both_cookie_checks() {
