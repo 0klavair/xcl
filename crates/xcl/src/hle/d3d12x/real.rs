@@ -1585,6 +1585,24 @@ pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+/// graphics pipelines given the generated rect list GS (`rect_list_gs`)
+static RECT_LIST_GS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `pso` (as `is_translated_graphics` takes it: a stand-in resolved) draws rect lists
+/// whole with the generated GS. Its draws must not be expanded to two triangles a rect as well:
+/// each half is three corners of the rect and the GS would complete both.
+pub fn has_rect_list_gs(pso: usize) -> bool {
+    pso != 0 && RECT_LIST_GS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+/// Note `pso`, made from `copy`, if it kept the generated rect list GS (`rect_gs`; a pipeline
+/// made again without it, `retry_without_rect_gs`, did not).
+fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool) {
+    if pso != 0 && rect_gs && !copy.GS.pShaderBytecode.is_null() {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -1594,6 +1612,13 @@ pub fn is_translated_compute(pso: usize) -> bool {
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn register_rect_list_gs_for_test(pso: usize) {
+    if pso != 0 {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -1614,6 +1639,9 @@ fn forget_pso(pso: usize) {
         s.remove(&pso);
     }
     if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
+    if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
@@ -3344,6 +3372,16 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     copy.VS = bytecode(&vs_dxil);
     copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
+    // it each rect is drawn as the triangle of its three vertices
+    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
+        rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("rect list drawn as triangles: {e}"))).ok()
+    } else {
+        None
+    };
+    if let Some(gs) = &rect_gs {
+        copy.GS = bytecode(gs);
+    }
     pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
@@ -3352,7 +3390,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some(), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
     if hr < 0 {
         note_translation_error(format!(
             "the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
@@ -3367,6 +3405,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -3546,6 +3585,7 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    pc_topology_type(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -3615,6 +3655,11 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    graphics_pso(this, desc, riid, ppv, false)
+}
+
+/// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
+unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
@@ -3628,7 +3673,8 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     } else if let Some(hr) = translated {
         return hr;
     }
-    let hr = finish_pso(this, f, desc, riid, ppv);
+    let pc = untranslated_stream_desc(desc, stream);
+    let hr = finish_pso(this, f, pc.as_ref().map_or(desc, |g| g as *const _ as *const c_void), riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return hr;
     }
@@ -4032,8 +4078,55 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
+/// The console's pipeline topology type of rect lists (draws of topology 17, `list_x::RECT_LIST`).
+const RECT_LIST_TYPE: i32 = 19;
+
+/// `create(copy)`, and once more without the generated rect list GS (`rect_gs`) when the driver
+/// refuses the pipeline with it: each rect is then drawn as the triangle of its three vertices,
+/// as without the GS, rather than not at all (the untranslated fallback's dummy shaders).
+fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool, mut create: impl FnMut(&D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT) -> HRESULT {
+    let hr = create(copy);
+    if hr >= 0 || !rect_gs {
+        return hr;
+    }
+    note_translation_error(format!("the driver rejected the PSO with the rect list GS ({hr:#x}): rect list drawn as triangles"));
+    copy.GS = D3D12_SHADER_BYTECODE::default();
+    create(copy)
+}
+
+/// What an untranslated pipeline from a stream is made from: a rect list's (type 19, which
+/// `stream_pipeline` keeps for `translated_graphics_pso`) with the PC's topology type, as the
+/// stream path made it before; None: `desc` as it is.
+unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<D3D12_GRAPHICS_PIPELINE_STATE_DESC> {
+    if !stream || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let mut g = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        return None;
+    }
+    pc_topology_type(&mut g);
+    Some(g)
+}
+
+/// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused
+/// for a PS that reads flat or is not a console one (its inputs' modes are not known).
+fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    use crate::gpu::recomp::pso;
+    if let Some(p) = ps {
+        if !pso::is_console(p) {
+            return Err("a PC pixel shader".into());
+        }
+        if pso::ps_reads_flat(p)? {
+            return Err("the PS reads a flat attribute".into());
+        }
+    }
+    pso::rect_list_gs(vs)
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
-/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists; UNDEFINED (a stream
+/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
+/// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
 /// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
 fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
@@ -4172,7 +4265,11 @@ unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
             _ => {}
         }
     }
-    pc_topology_type(&mut g);
+    // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
+    // becomes the PC's in graphics_pso)
+    if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        pc_topology_type(&mut g);
+    }
     StreamPipeline::Graphics(Box::new(g))
 }
 
@@ -4197,7 +4294,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return dev_create_graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv),
+        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }
@@ -4730,6 +4827,85 @@ pub fn stop_if_device_removed() {
         crate::log::flush();
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rect_list_pso_tests {
+    use super::*;
+
+    const REFUSED: HRESULT = 0x8007_0057u32 as i32;
+
+    fn with_gs(gs: &[u8]) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC { GS: D3D12_SHADER_BYTECODE { pShaderBytecode: gs.as_ptr() as _, BytecodeLength: gs.len() }, ..Default::default() }
+    }
+
+    /// A pipeline the driver refuses with the rect list GS is made again without it, once; one
+    /// it accepts keeps the GS, and a refused pipeline without a rect list GS is not retried.
+    #[test]
+    fn a_refused_rect_list_gs_is_retried_without_it() {
+        let gs = [0u8; 4];
+        let mut copy = with_gs(&gs);
+        let mut calls = Vec::new();
+        let hr = retry_without_rect_gs(&mut copy, true, |c| {
+            calls.push(c.GS.pShaderBytecode.is_null());
+            if c.GS.pShaderBytecode.is_null() {
+                0
+            } else {
+                REFUSED
+            }
+        });
+        assert_eq!((hr, calls), (0, vec![false, true]));
+        let mut copy = with_gs(&gs);
+        let mut n = 0;
+        assert_eq!(
+            retry_without_rect_gs(&mut copy, true, |_| {
+                n += 1;
+                0
+            }),
+            0
+        );
+        assert!(n == 1 && !copy.GS.pShaderBytecode.is_null());
+        let mut n = 0;
+        assert_eq!(
+            retry_without_rect_gs(&mut copy, false, |_| {
+                n += 1;
+                REFUSED
+            }),
+            REFUSED
+        );
+        assert!(n == 1 && !copy.GS.pShaderBytecode.is_null());
+    }
+
+    /// `has_rect_list_gs`: a pipeline made with the rect list GS, not one made again without it
+    /// (or never given it), and not once its address is forgotten.
+    #[test]
+    fn pipelines_with_the_rect_list_gs_are_known_until_forgotten() {
+        let gs = [0u8; 4];
+        let (kept, dropped, none) = (0x7E57_1000usize, 0x7E57_2000usize, 0x7E57_3000usize);
+        let mut copy = with_gs(&gs);
+        note_rect_list_gs(kept, &copy, true);
+        assert!(retry_without_rect_gs(&mut copy, true, |c| if c.GS.pShaderBytecode.is_null() { 0 } else { REFUSED }) == 0);
+        note_rect_list_gs(dropped, &copy, true);
+        note_rect_list_gs(none, &with_gs(&gs), false);
+        assert!(has_rect_list_gs(kept) && !has_rect_list_gs(dropped) && !has_rect_list_gs(none) && !has_rect_list_gs(0));
+        forget_pso(kept);
+        assert!(!has_rect_list_gs(kept));
+    }
+
+    /// An untranslated rect list pipeline from a stream gets the PC's topology type (TRIANGLE),
+    /// as at 956a476; other types, and a direct CreateGraphicsPipelineState, are left as they are.
+    #[test]
+    fn untranslated_stream_rect_lists_get_the_pcs_topology_type() {
+        let at = |t: i32| D3D12_GRAPHICS_PIPELINE_STATE_DESC { PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(t), ..Default::default() };
+        let desc = |g: &D3D12_GRAPHICS_PIPELINE_STATE_DESC| g as *const _ as *const c_void;
+        let (rect, tri) = (at(RECT_LIST_TYPE), at(3));
+        unsafe {
+            let g = untranslated_stream_desc(desc(&rect), true).expect("a stream's rect list");
+            assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            assert!(untranslated_stream_desc(desc(&tri), true).is_none());
+            assert!(untranslated_stream_desc(desc(&rect), false).is_none());
         }
     }
 }
