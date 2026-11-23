@@ -17,15 +17,22 @@
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
-use crate::util::{HRESULT, S_OK};
+use windows_sys::core::GUID;
 
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
+use crate::util::{E_NOINTERFACE, E_NOTIMPL, E_POINTER, HRESULT, S_OK};
+
 const GAMEINPUT_E_DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 const GAMEINPUT_E_READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
+
+// Verified GameInput v0 interface GUIDs (Windows SDK / GDK `GameInput.h`).
+const IID_IUNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+const IID_IGAMEINPUT: GUID = GUID::from_u128(0x11be2a7e_4254_445a_9c09_ffc40f006918);
+const IID_IGAMEINPUT_READING: GUID = GUID::from_u128(0x2156947a_e1fa_4de0_a30b_d812931dbd8d);
+const IID_IGAMEINPUT_DEVICE: GUID = GUID::from_u128(0x31dd86fb_4c1b_408a_868f_439b3cd47125);
 
 // GameInputKind
 const KIND_CONTROLLER: u32 = 0xE;
@@ -196,7 +203,10 @@ fn xinput_pad() -> Option<GamepadState> {
         }
     }
     if connected {
-        crate::xlog_info!("GameInput: the PC's controller was disconnected (keyboard{} still play)", if super::kbm::enabled() { " and mouse" } else { "" });
+        crate::xlog_info!(
+            "GameInput: the PC's controller was disconnected{}",
+            if super::kbm::enabled() { " (keyboard and mouse still play)" } else { "" }
+        );
         PAD_CONNECTED.store(false, Ordering::Relaxed);
         LAST_SEARCH.store(now_us(), Ordering::Relaxed);
     }
@@ -273,12 +283,35 @@ unsafe fn keyboard() -> u32 {
     KEYS.iter().filter(|(k, _)| GetAsyncKeyState(*k) as u16 & 0x8000 != 0).fold(0, |b, (_, g)| b | g)
 }
 
+/// Merge host keyboard/mouse input (only when `keyboard_mouse` is enabled) and scripted
+/// test presses (`XCL_PRESS_AT` / `XCL_PRESS_A_AT`) into `s`.
+fn merge_host_inputs(
+    s: &mut GamepadState,
+    keyboard_mouse: bool,
+    read_keyboard: impl FnOnce() -> u32,
+    apply_kbm: impl FnOnce(&mut GamepadState),
+    read_scripted: impl FnOnce() -> u32,
+) {
+    if keyboard_mouse {
+        s.buttons |= read_keyboard();
+        apply_kbm(s);
+    }
+    s.buttons |= read_scripted();
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
-    s.buttons |= unsafe { keyboard() };
-    super::kbm::apply(&mut s);
-    s.buttons |= scripted();
+    merge_host_inputs(
+        &mut s,
+        super::kbm::enabled(),
+        || {
+            // SAFETY: `keyboard()` queries foreground window and async key states via Win32.
+            unsafe { keyboard() }
+        },
+        super::kbm::apply,
+        scripted,
+    );
     {
         // the first presses of each button: worth a line (is input arriving at all?)
         static SEEN: AtomicU32 = AtomicU32::new(0);
@@ -390,7 +423,7 @@ fn device() -> *mut Object {
             "IGameInputDevice",
             24,
             &[
-                (0, qi as usize),
+                (0, device_qi as usize),
                 (1, add_ref as usize),
                 (2, release as usize),
                 (3, get_device_info as usize),
@@ -415,7 +448,7 @@ fn input() -> *mut Object {
             "IGameInput",
             24,
             &[
-                (0, qi as usize),
+                (0, input_qi as usize),
                 (1, add_ref as usize),
                 (2, release as usize),
                 (3, get_current_timestamp as usize),
@@ -487,12 +520,32 @@ fn new_reading(state: GamepadState) -> *mut Reading {
 
 // ---- shared methods ----
 
-unsafe extern "system" fn qi(this: *mut Object, _iid: *const c_void, out: *mut *mut c_void) -> HRESULT {
+fn guid_eq(a: &GUID, b: &GUID) -> bool {
+    (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
+}
+
+/// Validate `iid` against `IID_IUNKNOWN` and `own`, enforcing COM out-pointer semantics.
+///
+/// # Safety
+/// `out` must be null or valid for writes; `iid` must be null or valid for reads as a `GUID`.
+unsafe fn qi_for(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void, own: &GUID, on_ok: impl FnOnce()) -> HRESULT {
     if out.is_null() {
         return E_POINTER;
     }
-    *out = this as *mut c_void;
-    S_OK
+    if !iid.is_null() && (guid_eq(&*iid, own) || guid_eq(&*iid, &IID_IUNKNOWN)) {
+        on_ok();
+        *out = this;
+        return S_OK;
+    }
+    *out = std::ptr::null_mut();
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn input_qi(this: *mut Object, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    qi_for(this as *mut c_void, iid, out, &IID_IGAMEINPUT, || {})
+}
+unsafe extern "system" fn device_qi(this: *mut Object, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    qi_for(this as *mut c_void, iid, out, &IID_IGAMEINPUT_DEVICE, || {})
 }
 unsafe extern "system" fn add_ref(_this: *mut c_void) -> u32 {
     1
@@ -585,8 +638,108 @@ static TOKENS: AtomicU64 = AtomicU64::new(0);
 type ReadingCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Reading, bool);
 type DeviceCallback = unsafe extern "system" fn(u64, *mut c_void, *mut Object, u64, u32, u32);
 
-/// reading callbacks: (token, context, callback)
-static READING_CALLBACKS: Mutex<Vec<(u64, usize, usize)>> = Mutex::new(Vec::new());
+enum CallbackKind {
+    Reading { ctx: usize, cb: ReadingCallback },
+    Device,
+}
+
+#[derive(Default)]
+struct CallbackState {
+    stopped: bool,
+    in_flight: usize,
+    running_threads: Vec<ThreadId>,
+}
+
+struct CallbackEntry {
+    token: u64,
+    kind: CallbackKind,
+    state: Mutex<CallbackState>,
+    done: Condvar,
+}
+
+struct CallbackGuard<'a> {
+    entry: &'a CallbackEntry,
+    tid: ThreadId,
+}
+
+impl Drop for CallbackGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_flight = st.in_flight.saturating_sub(1);
+        if let Some(pos) = st.running_threads.iter().position(|&t| t == self.tid) {
+            st.running_threads.swap_remove(pos);
+        }
+        self.entry.done.notify_all();
+    }
+}
+
+impl CallbackEntry {
+    fn new(token: u64, kind: CallbackKind) -> Self {
+        Self {
+            token,
+            kind,
+            state: Mutex::new(CallbackState::default()),
+            done: Condvar::new(),
+        }
+    }
+
+    fn try_enter(&self) -> Option<CallbackGuard<'_>> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.stopped {
+            return None;
+        }
+        let tid = std::thread::current().id();
+        st.in_flight += 1;
+        st.running_threads.push(tid);
+        Some(CallbackGuard { entry: self, tid })
+    }
+
+    /// Prevent future invocations; returns `true` when no invocation is currently in flight.
+    fn stop_and_is_idle(&self) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.stopped = true;
+        st.in_flight == 0
+    }
+
+    /// Stop future invocations and wait up to `timeout_us` for in-flight invocations on other
+    /// threads to finish. Re-entrant calls from inside the callback itself return `true`
+    /// immediately rather than deadlocking.
+    fn unregister(&self, timeout_us: u64) -> bool {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.stopped = true;
+        let other_in_flight = |s: &CallbackState| s.running_threads.iter().any(|&t| t != me);
+        if !other_in_flight(&st) {
+            return true;
+        }
+        if timeout_us == 0 {
+            return false;
+        }
+        let deadline = Instant::now().checked_add(Duration::from_micros(timeout_us));
+        while other_in_flight(&st) {
+            match deadline {
+                Some(end) => {
+                    let Some(rem) = end.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    let (guard, wait_res) = self.done.wait_timeout(st, rem).unwrap_or_else(|e| e.into_inner());
+                    st = guard;
+                    if other_in_flight(&st) && wait_res.timed_out() {
+                        return false;
+                    }
+                }
+                None => {
+                    // `timeout_us` overflows `Instant` (e.g. `u64::MAX`): wait indefinitely.
+                    st = self.done.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Registered callbacks (reading callbacks and pending/in-flight async device callbacks).
+static CALLBACKS: Mutex<Vec<Arc<CallbackEntry>>> = Mutex::new(Vec::new());
 
 /// RegisterReadingCallback(device, kind, analog threshold, context, callback, &token)
 unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mut c_void, kind: u32, _threshold: f32, context: *mut c_void, cb: Option<ReadingCallback>, token: *mut u64) -> HRESULT {
@@ -596,10 +749,32 @@ unsafe extern "system" fn register_reading_callback(_this: *mut Object, dev: *mu
         *token = t;
     }
     if let Some(cb) = cb.filter(|_| kind & KINDS != 0 && ours(dev)) {
-        READING_CALLBACKS.lock().unwrap().push((t, context as usize, cb as usize));
+        let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Reading { ctx: context as usize, cb }));
+        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
         start_poller();
     }
     S_OK
+}
+
+fn dispatch_reading_callbacks(s: GamepadState) {
+    let cbs: Vec<Arc<CallbackEntry>> = CALLBACKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|c| matches!(c.kind, CallbackKind::Reading { .. }))
+        .cloned()
+        .collect();
+    for entry in cbs {
+        let CallbackKind::Reading { ctx, cb } = entry.kind else { continue };
+        let Some(_guard) = entry.try_enter() else { continue };
+        let r = new_reading(s);
+        // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
+        // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
+        unsafe {
+            cb(entry.token, ctx as *mut c_void, r, false);
+            reading_release(r);
+        }
+    }
 }
 
 /// A thread that calls the reading callbacks when the gamepad's state changes.
@@ -610,21 +785,13 @@ fn start_poller() {
             crate::eh::arm_current_thread();
             let mut last = GamepadState::default();
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(4));
+                std::thread::sleep(Duration::from_millis(4));
                 let s = poll();
                 if s == last {
                     continue;
                 }
                 last = s;
-                let cbs = READING_CALLBACKS.lock().unwrap().clone();
-                for (t, ctx, cb) in cbs {
-                    let r = new_reading(s);
-                    let f: ReadingCallback = unsafe { std::mem::transmute(cb) };
-                    unsafe {
-                        f(t, ctx as *mut c_void, r, false);
-                        reading_release(r);
-                    }
-                }
+                dispatch_reading_callbacks(s);
             }
         });
     });
@@ -643,12 +810,21 @@ unsafe extern "system" fn register_device_callback(_this: *mut Object, dev: *mut
     if enumeration == ENUM_BLOCKING {
         cb(t, context, device(), now_us(), STATUS, 0);
     } else {
-        let (ctx, f) = (context as usize, cb as usize);
-        let _ = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
-            let f: DeviceCallback = unsafe { std::mem::transmute(f) };
+        let entry = Arc::new(CallbackEntry::new(t, CallbackKind::Device));
+        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&entry));
+        let ctx = context as usize;
+        let spawned = std::thread::Builder::new().name("xcl-gameinput-enum".into()).spawn(move || {
             crate::eh::arm_current_thread();
-            unsafe { f(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
+            if let Some(_guard) = entry.try_enter() {
+                // SAFETY: `cb` and `ctx` were registered by the caller; `_guard` keeps
+                // `UnregisterCallback` blocked until `cb` returns so `ctx` stays valid.
+                unsafe { cb(t, ctx as *mut c_void, device(), now_us(), STATUS, 0) };
+            }
+            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
         });
+        if spawned.is_err() {
+            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != t);
+        }
     }
     S_OK
 }
@@ -670,12 +846,25 @@ unsafe extern "system" fn register_other_callback4(_this: *mut Object, _a: *mut 
 }
 
 unsafe extern "system" fn stop_callback(_this: *mut Object, token: u64) {
-    READING_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
+    let entry = CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.token == token).cloned();
+    if let Some(entry) = entry {
+        if entry.stop_and_is_idle() {
+            CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != token);
+        }
+    }
 }
 
-unsafe extern "system" fn unregister_callback(_this: *mut Object, token: u64, _timeout_us: u64) -> bool {
-    READING_CALLBACKS.lock().unwrap().retain(|c| c.0 != token);
-    true
+unsafe extern "system" fn unregister_callback(_this: *mut Object, token: u64, timeout_us: u64) -> bool {
+    let entry = CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.token == token).cloned();
+    let Some(entry) = entry else {
+        return true;
+    };
+    if entry.unregister(timeout_us) {
+        CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.token != token);
+        true
+    } else {
+        false
+    }
 }
 
 /// FindDeviceFromId(&APP_LOCAL_DEVICE_ID, &device)
@@ -699,13 +888,10 @@ unsafe extern "system" fn set_focus_policy(_this: *mut Object, _policy: u32) {}
 
 // ---- IGameInputReading ----
 
-unsafe extern "system" fn reading_qi(this: *mut Reading, _iid: *const c_void, out: *mut *mut c_void) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
-    }
-    reading_add_ref(this);
-    *out = this as *mut c_void;
-    S_OK
+unsafe extern "system" fn reading_qi(this: *mut Reading, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    qi_for(this as *mut c_void, iid, out, &IID_IGAMEINPUT_READING, || {
+        reading_add_ref(this);
+    })
 }
 unsafe extern "system" fn reading_add_ref(this: *mut Reading) -> u32 {
     (*this).refs.fetch_add(1, Ordering::AcqRel) + 1
@@ -834,5 +1020,331 @@ mod tests {
         let v = parse_presses("14:A, 18.5:down,20:Rb,junk,3:NOPE", "1,2.5");
         assert_eq!(v, vec![(1.0, A), (2.5, A), (14.0, A), (18.5, DPAD_DOWN), (20.0, RIGHT_SHOULDER)]);
         assert!(parse_presses("", "").is_empty());
+    }
+
+    #[test]
+    fn keyboard_mouse_config_gates_keyboard_and_kbm_but_keeps_scripted() {
+        let mut s = GamepadState { buttons: B, left_x: 0.25, ..Default::default() };
+        let mut keyboard_called = false;
+        let mut kbm_called = false;
+        let mut scripted_called = false;
+
+        merge_host_inputs(
+            &mut s,
+            false,
+            || {
+                keyboard_called = true;
+                MENU
+            },
+            |st| {
+                kbm_called = true;
+                st.left_x = 1.0;
+                st.buttons |= X;
+            },
+            || {
+                scripted_called = true;
+                A
+            },
+        );
+        assert!(!keyboard_called, "keyboard() must not run when keyboard_mouse = false");
+        assert!(!kbm_called, "kbm::apply() must not run when keyboard_mouse = false");
+        assert!(scripted_called, "scripted() must still run when keyboard_mouse = false");
+        assert_eq!(s.buttons, B | A);
+        assert_eq!(s.left_x, 0.25);
+
+        let mut s2 = GamepadState::default();
+        merge_host_inputs(
+            &mut s2,
+            true,
+            || MENU,
+            |st| {
+                st.left_x = -1.0;
+                st.buttons |= Y;
+            },
+            || A,
+        );
+        assert_eq!(s2.buttons, MENU | Y | A);
+        assert_eq!(s2.left_x, -1.0);
+    }
+
+    #[test]
+    fn query_interface_validates_iids_and_refcounts() {
+        type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        const UNKNOWN_IID: GUID = GUID::from_u128(0xdeadbeef_1234_5678_9abc_def012345678);
+
+        unsafe fn call_qi(obj: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+            let vtbl = *(obj as *const *const usize);
+            let f: QiFn = std::mem::transmute(*vtbl);
+            f(obj, iid, out)
+        }
+
+        unsafe {
+            let sentinel = 0x1234usize as *mut c_void;
+
+            // IGameInput
+            let g = input() as *mut c_void;
+            let mut out = sentinel;
+            assert_eq!(call_qi(g, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(out, g);
+            out = sentinel;
+            assert_eq!(call_qi(g, &IID_IGAMEINPUT, &mut out), S_OK);
+            assert_eq!(out, g);
+            for bad in [&IID_IGAMEINPUT_DEVICE, &IID_IGAMEINPUT_READING, &UNKNOWN_IID] {
+                out = sentinel;
+                assert_eq!(call_qi(g, bad, &mut out), E_NOINTERFACE);
+                assert!(out.is_null(), "failed QueryInterface must zero *out");
+            }
+            out = sentinel;
+            assert_eq!(call_qi(g, std::ptr::null(), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert_eq!(call_qi(g, &IID_IGAMEINPUT, std::ptr::null_mut()), E_POINTER);
+
+            // IGameInputDevice
+            let d = device() as *mut c_void;
+            out = sentinel;
+            assert_eq!(call_qi(d, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(out, d);
+            out = sentinel;
+            assert_eq!(call_qi(d, &IID_IGAMEINPUT_DEVICE, &mut out), S_OK);
+            assert_eq!(out, d);
+            for bad in [&IID_IGAMEINPUT, &IID_IGAMEINPUT_READING, &UNKNOWN_IID] {
+                out = sentinel;
+                assert_eq!(call_qi(d, bad, &mut out), E_NOINTERFACE);
+                assert!(out.is_null());
+            }
+            out = sentinel;
+            assert_eq!(call_qi(d, std::ptr::null(), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert_eq!(call_qi(d, &IID_IGAMEINPUT_DEVICE, std::ptr::null_mut()), E_POINTER);
+
+            // IGameInputReading (refcounted)
+            let r = new_reading(GamepadState::default());
+            let rp = r as *mut c_void;
+            out = sentinel;
+            assert_eq!(call_qi(rp, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(out, rp);
+            assert_eq!((*r).refs.load(Ordering::Acquire), 2);
+            out = sentinel;
+            assert_eq!(call_qi(rp, &IID_IGAMEINPUT_READING, &mut out), S_OK);
+            assert_eq!(out, rp);
+            assert_eq!((*r).refs.load(Ordering::Acquire), 3);
+            for bad in [&IID_IGAMEINPUT, &IID_IGAMEINPUT_DEVICE, &UNKNOWN_IID] {
+                out = sentinel;
+                assert_eq!(call_qi(rp, bad, &mut out), E_NOINTERFACE);
+                assert!(out.is_null());
+                assert_eq!((*r).refs.load(Ordering::Acquire), 3, "failed QI must not AddRef");
+            }
+            out = sentinel;
+            assert_eq!(call_qi(rp, std::ptr::null(), &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            assert_eq!((*r).refs.load(Ordering::Acquire), 3);
+            assert_eq!(call_qi(rp, &IID_IGAMEINPUT_READING, std::ptr::null_mut()), E_POINTER);
+            assert_eq!((*r).refs.load(Ordering::Acquire), 3);
+
+            assert_eq!(reading_release(r), 2);
+            assert_eq!(reading_release(r), 1);
+            assert_eq!(reading_release(r), 0);
+        }
+    }
+
+    struct CallbackGate {
+        entered: (Mutex<bool>, Condvar),
+        proceed: (Mutex<bool>, Condvar),
+        calls: AtomicU32,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl CallbackGate {
+        fn new() -> Self {
+            Self {
+                entered: (Mutex::new(false), Condvar::new()),
+                proceed: (Mutex::new(false), Condvar::new()),
+                calls: AtomicU32::new(0),
+                finished: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn on_callback(&self) {
+            let n = self.calls.fetch_add(1, Ordering::AcqRel);
+            if n == 0 {
+                {
+                    let mut e = self.entered.0.lock().unwrap();
+                    *e = true;
+                    self.entered.1.notify_all();
+                }
+                let mut p = self.proceed.0.lock().unwrap();
+                while !*p {
+                    p = self.proceed.1.wait(p).unwrap();
+                }
+                self.finished.store(true, Ordering::Release);
+            }
+        }
+
+        fn wait_entered(&self) {
+            let mut e = self.entered.0.lock().unwrap();
+            while !*e {
+                e = self.entered.1.wait(e).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let mut p = self.proceed.0.lock().unwrap();
+            *p = true;
+            self.proceed.1.notify_all();
+        }
+    }
+
+    unsafe extern "system" fn gated_reading_cb(_token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
+        let gate = &*(ctx as *const CallbackGate);
+        gate.on_callback();
+    }
+
+    unsafe extern "system" fn gated_device_cb(_token: u64, ctx: *mut c_void, _dev: *mut Object, _ts: u64, _cur: u32, _prev: u32) {
+        let gate = &*(ctx as *const CallbackGate);
+        gate.on_callback();
+    }
+
+    static READING_CB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn unregister_reading_callback_waits_for_in_flight_and_prevents_uaf() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = Arc::new(CallbackGate::new());
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
+                S_OK
+            );
+        }
+
+        let dispatch_thread = std::thread::spawn(|| {
+            dispatch_reading_callbacks(GamepadState { buttons: A, ..Default::default() });
+        });
+        gate.wait_entered();
+
+        // Zero and short timeouts must fail while the callback is still in flight.
+        unsafe {
+            assert!(!unregister_callback(g, token, 0));
+            assert!(!unregister_callback(g, token, 15_000));
+        }
+        assert!(!gate.finished.load(Ordering::Acquire));
+
+        let gate_rel = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            gate_rel.release();
+        });
+
+        // Unregister must wait until the in-flight invocation completes before returning true.
+        let ok = unsafe { unregister_callback(g, token, 5_000_000) };
+        assert!(ok);
+        assert!(gate.finished.load(Ordering::Acquire), "callback must finish before UnregisterCallback returns true");
+        releaser.join().unwrap();
+        dispatch_thread.join().unwrap();
+
+        // Subsequent dispatches must never invoke the unregistered callback again.
+        let calls_before = gate.calls.load(Ordering::Acquire);
+        dispatch_reading_callbacks(GamepadState { buttons: B, ..Default::default() });
+        assert_eq!(gate.calls.load(Ordering::Acquire), calls_before);
+    }
+
+    #[test]
+    fn stop_then_unregister_still_waits_for_in_flight_callback() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gate = Arc::new(CallbackGate::new());
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, Arc::as_ptr(&gate) as *mut c_void, Some(gated_reading_cb), &mut token),
+                S_OK
+            );
+        }
+
+        let dispatch_thread = std::thread::spawn(|| {
+            dispatch_reading_callbacks(GamepadState { buttons: X, ..Default::default() });
+        });
+        gate.wait_entered();
+
+        // StopCallback must not discard tracking while an invocation is still running.
+        unsafe { stop_callback(g, token) };
+        assert!(!gate.finished.load(Ordering::Acquire));
+
+        let gate_rel = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            gate_rel.release();
+        });
+
+        // u64::MAX (UINT64_MAX) must wait indefinitely without overflowing Instant.
+        assert!(unsafe { unregister_callback(g, token, u64::MAX) });
+        assert!(gate.finished.load(Ordering::Acquire));
+        releaser.join().unwrap();
+        dispatch_thread.join().unwrap();
+    }
+
+    #[test]
+    fn self_unregister_from_inside_callback_does_not_deadlock() {
+        let _serial = READING_CB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct SelfCtx {
+            calls: AtomicU32,
+            unreg_ok: std::sync::atomic::AtomicBool,
+        }
+        unsafe extern "system" fn self_unreg_cb(token: u64, ctx: *mut c_void, _reading: *mut Reading, _overflow: bool) {
+            let c = &*(ctx as *const SelfCtx);
+            c.calls.fetch_add(1, Ordering::AcqRel);
+            let ok = unregister_callback(input(), token, u64::MAX);
+            c.unreg_ok.store(ok, Ordering::Release);
+        }
+
+        let ctx = Box::new(SelfCtx {
+            calls: AtomicU32::new(0),
+            unreg_ok: std::sync::atomic::AtomicBool::new(false),
+        });
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_reading_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, 0.0, &*ctx as *const SelfCtx as *mut c_void, Some(self_unreg_cb), &mut token),
+                S_OK
+            );
+        }
+
+        dispatch_reading_callbacks(GamepadState { buttons: Y, ..Default::default() });
+        assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
+        assert!(ctx.unreg_ok.load(Ordering::Acquire));
+
+        // Must not fire again after self-unregister.
+        dispatch_reading_callbacks(GamepadState { buttons: MENU, ..Default::default() });
+        assert_eq!(ctx.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn unregister_async_device_callback_waits_for_enum_thread() {
+        let gate = Arc::new(CallbackGate::new());
+        let g = input();
+        let mut token = 0u64;
+        unsafe {
+            assert_eq!(
+                register_device_callback(g, std::ptr::null_mut(), KIND_GAMEPAD, STATUS, 1, Arc::as_ptr(&gate) as *mut c_void, Some(gated_device_cb), &mut token),
+                S_OK
+            );
+        }
+
+        gate.wait_entered();
+        assert!(!unsafe { unregister_callback(g, token, 0) });
+        assert!(!gate.finished.load(Ordering::Acquire));
+
+        let gate_rel = Arc::clone(&gate);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            gate_rel.release();
+        });
+
+        assert!(unsafe { unregister_callback(g, token, 5_000_000) });
+        assert!(gate.finished.load(Ordering::Acquire));
+        releaser.join().unwrap();
     }
 }
