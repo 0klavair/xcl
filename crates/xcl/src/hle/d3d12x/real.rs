@@ -2355,9 +2355,51 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
 /// CheckFeatureSupport(feature, data, size): console structures can be larger than the PC's
 /// (XDefiant: D3D12_OPTIONS with 0x40 bytes, 0x3C on the PC – and the title stops on the
 /// error). A size the PC refuses is retried with the PC's, the console's extra bytes zero.
+///
+/// A query about one of the console's own formats (116 – 120, `device_x::pc_view_format`) asks
+/// the PC about the format the resource gets there, and the caller's format field is put back.
+/// A retail title asked FORMAT_SUPPORT of D16_UNORM_S8_UINT (118), the PC called it unsupported,
+/// and the title stopped on its assertion.
 unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
-    type F = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
+    let f: CheckFeatureSupportFn = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
+    check_feature_support_x(f, this, feature, data, size)
+}
+
+type CheckFeatureSupportFn = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
+
+/// `dev_check_feature_support` with the PC device's own CheckFeatureSupport `f`.
+pub(super) unsafe fn check_feature_support_x(f: CheckFeatureSupportFn, this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
+    let console = console_format_query(feature, data, size);
+    let hr = check_feature_support_pc(f, this, feature, data, size);
+    if let Some(format) = console {
+        (data as *mut u32).write_unaligned(format);
+    }
+    hr
+}
+
+/// The features whose data starts with a DXGI_FORMAT the caller asks about.
+fn feature_takes_format(feature: i32) -> bool {
+    matches!(
+        D3D12_FEATURE(feature),
+        D3D12_FEATURE_FORMAT_SUPPORT | D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS | D3D12_FEATURE_FORMAT_INFO | D3D12_FEATURE_PLACED_RESOURCE_SUPPORT_INFO
+    )
+}
+
+/// For a format query (`feature_takes_format`) about a console-only format: its PC format written
+/// into `data` in its place, and the console's returned (to be put back after the call).
+unsafe fn console_format_query(feature: i32, data: *mut u8, size: u32) -> Option<u32> {
+    if !feature_takes_format(feature) || data.is_null() || size < 4 {
+        return None;
+    }
+    let format = (data as *const u32).read_unaligned();
+    let pc = super::device_x::pc_view_format(format);
+    (pc != format).then(|| {
+        (data as *mut u32).write_unaligned(pc);
+        format
+    })
+}
+
+unsafe fn check_feature_support_pc(f: CheckFeatureSupportFn, this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
     let hr = f(this, feature, data, size);
     if hr >= 0 {
         adjust_raytracing_options5(feature, data, size);
@@ -4851,5 +4893,111 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod console_format_query_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn console_formats_are_asked_as_the_pcs() {
+        for (console, pc) in [(116u32, 10u32), (117, 10), (118, 45), (119, 46), (120, 47)] {
+            let mut d = [0u32; 3];
+            d[0] = console;
+            let back = unsafe { console_format_query(D3D12_FEATURE_FORMAT_SUPPORT.0, d.as_mut_ptr() as *mut u8, 12) };
+            assert_eq!((back, d[0]), (Some(console), pc));
+        }
+        // a PC format, or a feature without one: untouched
+        let mut d = [45u32, 0, 0];
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_FORMAT_SUPPORT.0, d.as_mut_ptr() as *mut u8, 12) }, None);
+        let mut d = [118u32; 16];
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_D3D12_OPTIONS.0, d.as_mut_ptr() as *mut u8, 64) }, None);
+        assert_eq!(d[0], 118);
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_FORMAT_INFO.0, std::ptr::null_mut(), 8) }, None);
+    }
+
+    /// A hardware device (None: no D3D12 GPU here – skipped).
+    fn device() -> Option<ID3D12Device> {
+        let mut dev: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.ok()?;
+        dev
+    }
+
+    /// CheckFeatureSupport of the PC device as `dev_check_feature_support` reaches it (vtable #13).
+    fn pc_check(dev: &ID3D12Device) -> CheckFeatureSupportFn {
+        unsafe { std::mem::transmute(*(*(dev.as_raw() as *const *const usize)).add(13)) }
+    }
+
+    /// GPU: the queries a title makes of D16_UNORM_S8_UINT (118) and its family succeed with the
+    /// PC format's answers, and the caller's format field is the console's again. Asked as is, the
+    /// PC has no such format.
+    #[test]
+    fn gpu_console_depth_formats_are_supported() {
+        let Some(dev) = device() else { return };
+        let (this, f) = (dev.as_raw(), pc_check(&dev));
+        // the gap: the PC's own answer (unless another test adopted a device, and the vtable it
+        // shares with this one already holds `dev_check_feature_support`)
+        if f as usize != dev_check_feature_support as usize {
+            let mut raw = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(118), ..Default::default() };
+            let hr = unsafe { f(this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut raw as *mut _ as *mut u8, size_of_val(&raw) as u32) };
+            assert!(hr < 0 || raw.Support1.0 == 0, "the PC knows format 118 ({hr:#x}, {:#x})", raw.Support1.0);
+        }
+
+        for (format, need) in [
+            (118, D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL),
+            (119, D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+            (120, D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+            (116, D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+            (117, D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+        ] {
+            let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format), ..Default::default() };
+            let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut s as *mut _ as *mut u8, size_of_val(&s) as u32) };
+            assert!(hr >= 0, "FORMAT_SUPPORT {format}: {hr:#x}");
+            assert_eq!(s.Format.0, format as i32, "the caller's format");
+            assert!(s.Support1.0 & need.0 != 0, "FORMAT_SUPPORT {format}: {:#x}", s.Support1.0);
+        }
+
+        let mut ms = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS { Format: DXGI_FORMAT(118), SampleCount: 4, ..Default::default() };
+        let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS.0, &mut ms as *mut _ as *mut u8, size_of_val(&ms) as u32) };
+        assert!(hr >= 0 && ms.NumQualityLevels >= 1, "MULTISAMPLE_QUALITY_LEVELS 118 ×4: {hr:#x} {}", ms.NumQualityLevels);
+        assert_eq!((ms.Format.0, ms.SampleCount), (118, 4));
+
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO { Format: DXGI_FORMAT(118), PlaneCount: 0 };
+        let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_INFO.0, &mut info as *mut _ as *mut u8, size_of_val(&info) as u32) };
+        assert!(hr >= 0, "FORMAT_INFO 118: {hr:#x}");
+        assert_eq!((info.Format.0, info.PlaneCount), (118, 2));
+
+        // a PC format is asked as it is
+        let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() };
+        assert!(unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut s as *mut _ as *mut u8, size_of_val(&s) as u32) } >= 0);
+        assert_eq!(s.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+
+    /// GPU: allocation info of the console's 116 – 120 textures is a real size – the console's
+    /// (XG), and the PC's for the resource made of the desc (`pc_resource_desc`), both sane.
+    #[test]
+    fn gpu_console_format_allocation_info_is_sane() {
+        let Some(dev) = device() else { return };
+        // (bytes a pixel at least, as XG lays them out: 119 alone is a plain 2-byte format, 120 alone
+        // the stencil plane)
+        for (format, flags, bytes) in [(118u32, 2u32, 3u64), (118, 0, 3), (119, 0, 2), (120, 0, 1), (116, 1, 4), (117, 1, 4)] {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&3u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&1920u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&1080u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            let t = crate::hle::xg::Texture::new(&x).unwrap_or_else(|hr| panic!("XG {format}: {hr:#x}"));
+            let (size, align) = (t.size(), t.alignment());
+            assert!(size >= 1920 * 1080 * bytes && size < 1 << 30 && align.is_power_of_two(), "XG {format}: {size:#x} {align:#x}");
+            let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
+            let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
+            assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
     }
 }
