@@ -2733,7 +2733,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 }
 
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -2750,7 +2750,10 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
-    let vs_c = match console_to_dxil(vs, Stage::Vertex, 0) {
+    // a GPU with 32-lane waves runs a wave64 VS / PS in waves of 32: the lanes 32..63 it
+    // reads come from `upper_lanes` (split_wave64)
+    let split = wave32_only(this);
+    let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("VS: {e}"));
@@ -2760,7 +2763,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let mut samplers = vs_c.samplers;
     let vs_dxil = vs_c.dxil;
     let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil(p, Stage::Pixel, samplers.len() as u32) {
+        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
             Ok(b) => {
                 samplers.extend(b.samplers);
                 Some(b.dxil)
@@ -3204,10 +3207,10 @@ unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
-fn two_pass_ps(ps: Option<&[u8]>) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     match ps {
-        Some(p) if is_console(p) => console_to_dxil(p, Stage::Pixel, 0).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
+        Some(p) if is_console(p) => console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
         Some(p) => Ok((Some(p.to_vec()), Vec::new())),
         None => Ok((None, Vec::new())),
     }
@@ -3269,7 +3272,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps)) {
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, wave32_only(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -3303,7 +3306,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
-        two_pass_ps(shader_bytes(&d.PS)),
+        two_pass_ps(shader_bytes(&d.PS), wave32_only(this)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
