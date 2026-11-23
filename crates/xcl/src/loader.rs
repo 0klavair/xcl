@@ -182,7 +182,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let adj = |va: u64| (va as i64 + delta) as usize;
         let template = adj(t.start_raw);
         let template_len = t.template_len() as usize;
-        let index_ptr = adj(t.address_of_index) as *mut u32;
+        let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
         unsafe {
             tls_install(&module, template, template_len, t.total_len(), index_ptr)?;
             if t.address_of_callbacks != 0 {
