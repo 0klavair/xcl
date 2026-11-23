@@ -103,6 +103,9 @@ pub struct D3d12Stats {
     pub fallback_root_signatures: u64,
     pub presents: u64,
     pub frame_boundaries: u64,
+    /// Optional content evidence from the existing frame-dump readback; no new GPU readback.
+    #[serde(default)]
+    pub last_frame_dump: Option<super::present::FrameDumpSample>,
     /// unified memory region opened as a GPU heap (`gpu::uma`): size, bytes in use, buffer VA
     #[serde(default)]
     pub uma_mb: u64,
@@ -292,6 +295,7 @@ pub fn stats() -> D3d12Stats {
         fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
         presents,
         frame_boundaries: boundaries,
+        last_frame_dump: super::present::last_frame_dump(),
         uma_mb: crate::gpu::uma::get().map(|u| (u.size() >> 20) as u64).unwrap_or(0),
         uma_used_kb: crate::gpu::uma::get().map(|u| (u.used() >> 10) as u64).unwrap_or(0),
         uma_gpu_va: match uma_gpu_va() {
