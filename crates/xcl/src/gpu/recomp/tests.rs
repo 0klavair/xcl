@@ -5179,7 +5179,7 @@ fn round_mode_classification_and_lowering() {
 
 #[test]
 fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
-    if !gpu_ready_wave32() {
+    if !gpu_ready() {
         return;
     }
     // Two golden vectors where fused FMA and non-fused multiply-then-add disagree:
@@ -5236,7 +5236,7 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
 
 #[test]
 fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
-    if !gpu_ready_wave32() {
+    if !gpu_ready() {
         return;
     }
     let code = prog(&[
@@ -5337,7 +5337,7 @@ fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
 
 #[test]
 fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
-    if !gpu_ready_wave32() {
+    if !gpu_ready() {
         return;
     }
     // Compile a wave32 kernel containing the recompiler PRELUDE and exercise `mad_nf_f16` directly.
