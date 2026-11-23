@@ -25,6 +25,9 @@ struct State {
     /// the graphics root signature's layout and arguments
     layout_gfx: Option<Arc<Layout>>,
     args_gfx: Vec<u8>,
+    /// the title's graphics root signature (a PC object), bound before a draw with an
+    /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
+    rs_gfx: usize,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
@@ -78,6 +81,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
@@ -92,6 +96,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.args.clear();
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
     });
 }
 
@@ -151,6 +156,7 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout_gfx = layout;
+        s.rs_gfx = rs as usize;
     });
 }
 
@@ -369,7 +375,14 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
         }
-        return Some(list); // a PC pipeline: its own root signature and arguments
+        // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
+        // the title's root signature, which nothing else binds on the PC list – a draw without
+        // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+            list.SetGraphicsRootSignature(r);
+        }
+        return Some(list);
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
