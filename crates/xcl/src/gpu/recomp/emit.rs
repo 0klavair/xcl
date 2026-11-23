@@ -42,13 +42,19 @@ pub(super) struct Em {
     pub static_used: Vec<([u32; 4], bool)>,
     /// highest VGPR the program references (v_movrel* ranges)
     pub max_vgpr: u64,
+    /// program contains an f16 VALU/interp instruction whose rounding obeys `MODE[3:2]`
+    has_f16_round_op: bool,
+    /// program contains an f64 instruction whose rounding obeys `MODE[3:2]`
+    has_f64_round_op: bool,
+    /// program writes a non-default `MODE[3:2]` and uses f16 ops (emits `xcl_fp16_rm`)
+    dynamic_f16_rm: bool,
 }
 
 /// Instructions without an effect in this execution model.
 const NOOPS: &[&str] = &[
     "s_nop", "s_waitcnt", "s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt", "s_waitcnt_depctr",
     "s_inst_prefetch", "s_clause", "s_code_end", "s_setprio", "s_sleep", "s_icache_inv", "s_dcache_inv", "s_gl1_inv", "s_ttracedata",
-    "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_round_mode", "s_setreg_imm32_b32", "s_setreg_b32", "s_sendmsg", "s_sendmsghalt",
+    "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
 
@@ -283,6 +289,106 @@ enum Dst {
     Null,
 }
 
+/// Decode `OPR_HWREG` (`SIMM16` of `s_setreg*`): `(id, offset, width)`.
+/// `id == 1` is `HW_REG_MODE`, where `[1:0]` is `FP_ROUND_MODE_SP` (f32) and `[3:2]` is
+/// `FP_ROUND_MODE_DP` (f64 and f16).
+fn decode_hwreg(simm16: u16) -> (u32, u32, u32) {
+    let id = (simm16 & 0x3F) as u32;
+    let offset = ((simm16 >> 6) & 0x1F) as u32;
+    let width = (((simm16 >> 11) & 0x1F) + 1) as u32;
+    (id, offset, width)
+}
+
+/// Bits of `MODE[1:0]` (sp) and `MODE[3:2]` (dp/f16) touched by a `s_setreg*` `SIMM16`.
+/// Returns `(sp_mask, dp_mask)` (each 2 bits) and `offset`. Non-`MODE` registers return `(0, 0, 0)`.
+fn hwreg_mode_round_masks(simm16: u16) -> (u32, u32, u32) {
+    let (id, offset, width) = decode_hwreg(simm16);
+    if id != 1 {
+        return (0, 0, 0);
+    }
+    let covers = |b: u32| b >= offset && b < offset + width;
+    let sp = (covers(0) as u32) | ((covers(1) as u32) << 1);
+    let dp = (covers(2) as u32) | ((covers(3) as u32) << 1);
+    (sp, dp, offset)
+}
+
+/// Immediate value written to `MODE[base +: 2]` (masked to `mask`) by `s_setreg_imm32_b32`.
+fn hwreg_imm_field(imm: u32, offset: u32, base: u32, mask: u32) -> u32 {
+    let mut v = 0u32;
+    if mask & 1 != 0 {
+        v |= (imm >> (base - offset)) & 1;
+    }
+    if mask & 2 != 0 {
+        v |= ((imm >> (base + 1 - offset)) & 1) << 1;
+    }
+    v
+}
+
+/// Instructions whose f16 output rounding obeys `MODE[3:2]` (`FP_ROUND_MODE_DP`).
+fn is_f16_rounded_op(name: &str) -> bool {
+    matches!(
+        name,
+        "v_interp_p2_f16"
+            | "v_cvt_f16_f32"
+            | "v_fma_mixlo_f16"
+            | "v_fma_mixhi_f16"
+            | "v_pk_add_f16"
+            | "v_pk_mul_f16"
+            | "v_pk_fma_f16"
+            | "v_pk_fmac_f16"
+            | "v_pk_min_f16"
+            | "v_pk_max_f16"
+            | "v_add_f16"
+            | "v_sub_f16"
+            | "v_subrev_f16"
+            | "v_mul_f16"
+            | "v_min_f16"
+            | "v_max_f16"
+            | "v_fma_f16"
+            | "v_med3_f16"
+            | "v_min3_f16"
+            | "v_max3_f16"
+            | "v_frexp_mant_f16"
+            | "v_mad_f16"
+            | "v_fmac_f16"
+            | "v_fmamk_f16"
+            | "v_fmaak_f16"
+            | "v_ldexp_f16"
+            | "v_rcp_f16"
+            | "v_rsq_f16"
+            | "v_sqrt_f16"
+            | "v_log_f16"
+            | "v_exp_f16"
+            | "v_sin_f16"
+            | "v_cos_f16"
+            | "v_fract_f16"
+            | "v_floor_f16"
+            | "v_ceil_f16"
+            | "v_trunc_f16"
+            | "v_rndne_f16"
+            | "v_cvt_f16_u16"
+            | "v_cvt_f16_i16"
+    )
+}
+
+/// Instructions whose f64 rounding obeys `MODE[3:2]` (`FP_ROUND_MODE_DP`).
+fn is_f64_rounded_op(name: &str) -> bool {
+    name.contains("_f64")
+        && !name.starts_with("v_cmp_")
+        && !name.starts_with("v_cmpx_")
+        && !matches!(name, "v_cvt_f32_f64" | "v_cvt_i32_f64" | "v_cvt_u32_f64" | "v_frexp_exp_i32_f64")
+}
+
+/// HLSL expression converting float expression `e` to a 16-bit half (`0..=0xFFFF`).
+/// Uses `f32_to_f16_rm(..., xcl_fp16_rm)` only when the shader changes `MODE[3:2]`.
+fn to_f16_expr(dynamic_rm: bool, e: &str) -> String {
+    if dynamic_rm {
+        format!("f32_to_f16_rm({e}, xcl_fp16_rm)")
+    } else {
+        format!("(f32tof16({e}) & 0xFFFFu)")
+    }
+}
+
 impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
@@ -303,7 +409,53 @@ impl Em {
             static_ss: BTreeMap::new(),
             static_used: Vec::new(),
             max_vgpr: 0,
+            has_f16_round_op: false,
+            has_f64_round_op: false,
+            dynamic_f16_rm: false,
         }
+    }
+
+    /// Pre-scan the program for f16/f64 rounding-sensitive ops and non-default `MODE[3:2]` writes.
+    /// Shaders that set `MODE[3:2]` without f16/f64 ops pay zero HLSL overhead; shaders that set
+    /// `MODE[3:2]` with f16 ops (and no f64 ops) track `xcl_fp16_rm` dynamically.
+    pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
+        let mut writes_nonzero_dp = false;
+        for d in insts {
+            let name = d.inst.name.to_ascii_lowercase();
+            if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
+                break;
+            }
+            if is_f16_rounded_op(&name) {
+                self.has_f16_round_op = true;
+            }
+            if is_f64_rounded_op(&name) {
+                self.has_f64_round_op = true;
+            }
+            match name.as_str() {
+                "s_round_mode" => {
+                    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                    if (simm >> 2) & 3 != 0 {
+                        writes_nonzero_dp = true;
+                    }
+                }
+                "s_setreg_imm32_b32" => {
+                    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                    let (_, dp_mask, off) = hwreg_mode_round_masks(simm);
+                    if dp_mask != 0 && hwreg_imm_field(d.literal.unwrap_or(0), off, 2, dp_mask) != 0 {
+                        writes_nonzero_dp = true;
+                    }
+                }
+                "s_setreg_b32" => {
+                    let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                    let (_, dp_mask, _) = hwreg_mode_round_masks(simm);
+                    if dp_mask != 0 {
+                        writes_nonzero_dp = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.dynamic_f16_rm = writes_nonzero_dp && self.has_f16_round_op && !self.has_f64_round_op;
     }
 
     pub fn take(&mut self) -> String {
@@ -647,6 +799,23 @@ impl Em {
                 }
                 Flow::Next
             }
+            "s_round_mode" => {
+                // MODE[3:0] = SIMM16[3:0]: [1:0] = f32 (SP), [3:2] = f64/f16 (DP).
+                // 0 = RNE (HLSL default), 1 = +inf, 2 = -inf, 3 = RTZ.
+                let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+                let sp = (simm & 3) as u32;
+                let dp = ((simm >> 2) & 3) as u32;
+                if sp != 0 {
+                    self.unsupported(d, "non-default f32 round mode");
+                } else if dp != 0 && self.has_f64_round_op {
+                    self.unsupported(d, "non-default f64 round mode");
+                } else if self.dynamic_f16_rm {
+                    self.line(&format!("xcl_fp16_rm = {dp}u;"));
+                } else {
+                    *self.ignored.entry(name.to_string()).or_default() += 1;
+                }
+                Flow::Next
+            }
             _ => {
                 let Some(t) = rdna2::branch_target(d) else {
                     if NOOPS.contains(&name) {
@@ -674,7 +843,68 @@ impl Em {
 
     // ---------------------------------------------------------------- scalar ALU
 
+    fn setreg(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        let simm = rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) as u16;
+        let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
+        if sp_mask == 0 && dp_mask == 0 {
+            *self.ignored.entry(name.to_string()).or_default() += 1;
+            return Ok(());
+        }
+        if name == "s_setreg_imm32_b32" {
+            let imm = d.literal.ok_or("literal")?;
+            let sp = hwreg_imm_field(imm, off, 0, sp_mask);
+            let dp = hwreg_imm_field(imm, off, 2, dp_mask);
+            if sp != 0 {
+                return Err("non-default f32 round mode");
+            }
+            if dp_mask != 0 && dp != 0 && self.has_f64_round_op {
+                return Err("non-default f64 round mode");
+            }
+            if dp_mask != 0 && self.dynamic_f16_rm {
+                if dp_mask == 3 {
+                    self.line(&format!("xcl_fp16_rm = {dp}u;"));
+                } else {
+                    let keep = (!dp_mask) & 3;
+                    self.line(&format!("xcl_fp16_rm = (xcl_fp16_rm & {keep}u) | {dp}u;"));
+                }
+            } else {
+                *self.ignored.entry(name.to_string()).or_default() += 1;
+            }
+            return Ok(());
+        }
+        if sp_mask != 0 {
+            return Err("dynamic f32 round mode");
+        }
+        if self.has_f64_round_op {
+            return Err("dynamic f64 round mode");
+        }
+        if self.dynamic_f16_rm {
+            let sd = Self::field(d, "SDST");
+            let src = self.code32(sd, None, false).ok_or("register")?;
+            let stmt = match dp_mask {
+                3 => {
+                    let sh = 2 - off;
+                    let expr = if sh == 0 { format!("({src} & 3u)") } else { format!("(({src} >> {sh}u) & 3u)") };
+                    format!("xcl_fp16_rm = {expr};")
+                }
+                1 => {
+                    let sh = 2 - off;
+                    let bit = if sh == 0 { format!("({src} & 1u)") } else { format!("(({src} >> {sh}u) & 1u)") };
+                    format!("xcl_fp16_rm = (xcl_fp16_rm & 2u) | {bit};")
+                }
+                _ => format!("xcl_fp16_rm = (xcl_fp16_rm & 1u) | (({src} & 1u) << 1);"),
+            };
+            self.line(&stmt);
+        } else {
+            *self.ignored.entry(name.to_string()).or_default() += 1;
+        }
+        Ok(())
+    }
+
     fn salu(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
+        if matches!(name, "s_setreg_imm32_b32" | "s_setreg_b32") {
+            return self.setreg(d, name);
+        }
         if matches!(name, "s_movrels_b32" | "s_movrels_b64" | "s_movreld_b32" | "s_movreld_b64" | "s_movrelsd_2_b32") {
             return self.smovrel(d, name);
         }
@@ -1496,7 +1726,7 @@ impl Em {
             "v_interp_p2_f16" => {
                 let v = self.vreg(vdst);
                 let hi = rdna2::field_value(d.enc, &d.words, "OP_SEL").unwrap_or(0) >> 3 & 1 == 1;
-                let h = format!("(f32tof16((float){src}) & 0xFFFFu)");
+                let h = to_f16_expr(self.dynamic_f16_rm, &format!("(float){src}"));
                 let e = if hi { format!("({v} & 0xFFFFu) | ({h} << 16)") } else { format!("({v} & 0xFFFF0000u) | {h}") };
                 self.line(&format!("if ({act}) {v} = {e};"));
             }
@@ -2159,7 +2389,11 @@ impl Em {
             }
         };
         let si = |i: usize, hi: bool| format!("(((int)({} << 16)) >> 16)", h(i, hi));
-        let fr = |e: String| if clamp { format!("(f32tof16(saturate({e})) & 0xFFFFu)") } else { format!("(f32tof16({e}) & 0xFFFFu)") };
+        let dyn_rm = self.dynamic_f16_rm;
+        let fr = |e: String| {
+            let s = if clamp { format!("saturate({e})") } else { e };
+            to_f16_expr(dyn_rm, &s)
+        };
         let t = self.t();
         // dot products: one 32-bit result
         let dot: Option<String> = match name {
@@ -2335,6 +2569,7 @@ impl Em {
             s
         };
         let si = |i: usize| format!("(((int)({} << 16)) >> 16)", half(i));
+        let dyn_rm = self.dynamic_f16_rm;
         let fr = |e: String| -> String {
             let mut s = match m.omod {
                 1 => format!("(({e}) * 2.0f)"),
@@ -2345,7 +2580,7 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            format!("(f32tof16({s}) & 0xFFFFu)")
+            to_f16_expr(dyn_rm, &s)
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let cur = match &dst {
@@ -2374,7 +2609,10 @@ impl Em {
             "v_frexp_mant_f16" => fr(format!("frexp_mant({})", fh(0))),
             "v_frexp_exp_i16_f16" => format!("((uint)frexp_exp({}) & 0xFFFFu)", fh(0)),
             "v_cndmask_b16" => return Err("VALU 16-bit"),
-            "v_mad_f16" => fr(format!("mad_nf({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_mad_f16" => {
+                let rm = if dyn_rm { "xcl_fp16_rm" } else { "0u" };
+                fr(format!("mad_nf_f16({}, {}, {}, {rm})", fh(0), fh(1), fh(2)))
+            }
             "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
             "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
             "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
@@ -2655,7 +2893,7 @@ impl Em {
                 fr(format!("f16tof32({h})"))
             }
             "v_cvt_f16_f32" => {
-                let h = format!("(f32tof16({}) & 0xFFFFu)", fs(0));
+                let h = to_f16_expr(self.dynamic_f16_rm, &fs(0));
                 if m.opsel >> 3 & 1 == 1 {
                     format!("({cur} & 0xFFFFu) | ({h} << 16)")
                 } else if d.variant == Variant::Sdwa {
@@ -2699,8 +2937,8 @@ impl Em {
                 }
                 match name {
                     "v_fma_mix_f32" => format!("asuint({e})"),
-                    "v_fma_mixlo_f16" => format!("({cur} & 0xFFFF0000u) | (f32tof16({e}) & 0xFFFFu)"),
-                    _ => format!("({cur} & 0xFFFFu) | (f32tof16({e}) << 16)"),
+                    "v_fma_mixlo_f16" => format!("({cur} & 0xFFFF0000u) | {}", to_f16_expr(self.dynamic_f16_rm, &e)),
+                    _ => format!("({cur} & 0xFFFFu) | ({} << 16)", to_f16_expr(self.dynamic_f16_rm, &e)),
                 }
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => fr(format!("rcp({})", fs(0))),
@@ -3494,6 +3732,9 @@ impl Em {
         h.push_str(PRELUDE_MEM);
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
+        }
+        if self.dynamic_f16_rm {
+            h.push_str("static uint xcl_fp16_rm = 0u;\n");
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);
@@ -4532,6 +4773,37 @@ uint sat_i32(int64_t r) { return select(r > (int64_t)0x7FFFFFFF, 0x7FFFFFFFu, se
 float div_fixup(float q, float d, float n) { return select(or(or(isnan(d), isnan(n)), or(d == 0.0f, or(isinf(d), isinf(n)))), n / d, q); }
 float fma_legacy(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : mad(a, b, c); }
 float mad_nf(float a, float b, float c) { precise float p = a * b; precise float r = p + c; return r; }
+// IEEE-754 binary32 -> binary16 under RDNA2 MODE[3:2]: 0 = RNE, 1 = +inf, 2 = -inf, 3 = RTZ.
+uint f32_to_f16_rm(float f, uint rm) {
+    uint x = asuint(f);
+    uint sign = (x >> 16) & 0x8000u;
+    uint ax = x & 0x7FFFFFFFu;
+    if (ax >= 0x7F800000u) return sign | select(ax == 0x7F800000u, 0x7C00u, 0x7E00u | ((ax >> 13) & 0x01FFu));
+    if (ax == 0u) return sign;
+    bool away = or(rm == 0u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
+    if (ax >= 0x47800000u) return sign | select(away, 0x7C00u, 0x7BFFu);
+    if (ax < 0x33800000u) {
+        bool inc = select(rm == 0u, ax > 0x33000000u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
+        return sign | (uint)inc;
+    }
+    uint h, rem, half_bit;
+    if (ax >= 0x38800000u) {
+        h = (((ax >> 23) - 112u) << 10) | ((ax >> 13) & 0x3FFu);
+        rem = ax & 0x1FFFu;
+        half_bit = 0x1000u;
+    } else {
+        uint sh = 126u - (ax >> 23);
+        uint sig = 0x00800000u | (ax & 0x007FFFFFu);
+        h = sig >> sh;
+        half_bit = 1u << (sh - 1u);
+        rem = sig & ((1u << sh) - 1u);
+    }
+    bool rne_inc = or(rem > half_bit, and(rem == half_bit, (h & 1u) != 0u));
+    bool dir_inc = and(rem != 0u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
+    bool inc = select(rm == 0u, rne_inc, dir_inc);
+    return sign | (h + (uint)inc);
+}
+float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; float p16 = f16tof32(f32_to_f16_rm(p, rm)); precise float r = p16 + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
 uint med3u(uint a, uint b, uint c) { return max(min(a, b), min(max(a, b), c)); }
 int med3i(int a, int b, int c) { return max(min(a, b), min(max(a, b), c)); }
