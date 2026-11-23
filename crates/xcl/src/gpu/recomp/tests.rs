@@ -1842,6 +1842,18 @@ fn draw_vsi() -> super::VsInterface {
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
 /// form of `upper_lanes`).
 fn draw_console(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]]) -> Vec<[f32; 4]> {
+    draw_console_views(vs, ps, tris_px, &[], &[], &[])
+}
+
+/// `draw_console` with initial SGPRs and textures / samplers (see `runner::ViewTexture`).
+fn draw_console_views(
+    vs: Option<&[u8]>,
+    ps: Option<&[u8]>,
+    tris_px: &[[f32; 2]],
+    sgprs: &[u32],
+    textures: &[runner::ViewTexture],
+    samplers: &[windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC],
+) -> Vec<[f32; 4]> {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
     let pass_vs = prog(&[
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
@@ -1875,7 +1887,70 @@ fn draw_console(vs: Option<&[u8]>, ps: Option<&[u8]>, tris_px: &[[f32; 2]]) -> V
         runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 },
         runner::VertexElement { semantic: "COLOR", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 8 },
     ];
-    runner::draw(&vsb, &psb, &layout, &verts, 24, &[], &[], 16, [-1.0; 4]).unwrap()
+    runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
+}
+
+/// `image_sample_o` in a pixel shader, implicit LOD between two mips (trilinear): the console
+/// moves each mip's texel coordinate by the offset in that mip's texels. A 4-level texture
+/// (8², 4², 2², 1²; level k texel x holds 100·k + x), point min / mag, linear mip, clamp;
+/// u = v = pixel centre · 2^0.25 / 8 gives LOD 0.25; offset (+1, 0).
+#[test]
+fn gpu_ps_image_sample_offset_implicit_lod_between_mips() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC};
+    let scale = 2f32.powf(0.25) / 8.0;
+    let ps = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 129)], None), // offset x +1, y 0
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
+        ("IMAGE_SAMPLE_O", "ENC_MIMG", &[("VDATA", 8), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 8), ("VSRC1", 8), ("VSRC2", 8), ("VSRC3", 8), ("DONE", 1), ("VM", 1)], None),
+    ]);
+    let mut data = Vec::new();
+    for k in 0..4u32 {
+        let n = 8 >> k;
+        for _y in 0..n {
+            for x in 0..n {
+                data.extend_from_slice(&[(100 * k + x) as f32; 4].map(f32::to_le_bytes).concat());
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 8,
+        Height: 8,
+        DepthOrArraySize: 1,
+        MipLevels: 4,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 4, ..Default::default() };
+    let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 16 };
+    // S#: clamp u / v / w, point min / mag, MIP_FILTER linear (2), LOD 0..15.99, sampler 0
+    let s_sharp = [2 | 2 << 3 | 2 << 6, 0xFFF << 12, 2 << 26, 0];
+    let mut sgprs = vec![0u32; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&s_sharp);
+    let px = draw_console_views(None, Some(&ps), &[[0.0, 0.0], [0.0, 32.0], [32.0, 0.0]], &sgprs, &[tex], &[crate::gpu::desc::sampler_d3d12(&s_sharp, false)]);
+    for y in 0..16 {
+        for x in 0..16 {
+            let u = (x as f32 + 0.5) * scale;
+            let texel = |size: f32| ((u * size).floor() + 1.0).clamp(0.0, size - 1.0);
+            let want = 0.75 * texel(8.0) + 0.25 * (100.0 + texel(4.0));
+            let got = px[y * 16 + x][0];
+            assert!((got - want).abs() < 0.02, "pixel ({x},{y}) = {got}, expected {want}");
+        }
+    }
 }
 
 /// 48 SGPR spill slots in lanes 0..47 of v30 (`v_writelane` / `v_readlane`, as 287 retail
