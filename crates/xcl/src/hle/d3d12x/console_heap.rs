@@ -90,6 +90,12 @@ pub const PAGE_SLOTS: u32 = 256;
 /// a page with no place in the shared heap yet
 const UNMAPPED: u32 = u32::MAX;
 
+/// PC descriptors of page `p` of a heap of `n` slots: 2 per slot, and the last page only as
+/// long as the heap (a heap of a few slots takes a few descriptors, not a whole page's).
+fn page_descriptors(n: u32, p: u32) -> u32 {
+    2 * n.saturating_sub(p * PAGE_SLOTS).clamp(1, PAGE_SLOTS)
+}
+
 /// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`.
 fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) -> Option<u32> {
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
@@ -172,7 +178,7 @@ fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
     let p = (k / PAGE_SLOTS) as usize;
     let mut first = *h.pages.get(p)?;
     if first == UNMAPPED {
-        first = reserve_global(2 * PAGE_SLOTS)?;
+        first = reserve_global(page_descriptors(h.n, p as u32))?;
         h.pages[p] = first;
     }
     Some((first, p as u32 * PAGE_SLOTS))
@@ -239,8 +245,8 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
-        for &f in h.pages.iter().filter(|&&f| f != UNMAPPED) {
-            release_global(f, 2 * PAGE_SLOTS);
+        for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
+            release_global(f, page_descriptors(h.n, p as u32));
         }
         if h.sparse {
             unsafe { super::sparse::free(h.shadow) };
@@ -542,5 +548,14 @@ mod tests {
         for &o in &objs {
             unregister(o);
         }
+        // a heap smaller than a page takes 2 descriptors per slot, as it did when a heap's
+        // whole range was reserved (a title with many small heaps must not fill the shared heap)
+        assert_eq!((page_descriptors(4, 0), page_descriptors(N, 0), page_descriptors(N, N / PAGE_SLOTS)), (8, 2 * PAGE_SLOTS, 2 * (N % PAGE_SLOTS)));
+        assert!(register(0xB100, 4, 0x10_0000, 0, 32, false, true, true) && register(0xB101, 4, 0x20_0000, 0, 32, false, true, true));
+        let (a, b) = (slot(start(0xB100).unwrap()).unwrap(), slot(start(0xB101).unwrap()).unwrap());
+        assert!(a.shared_srv != 0 && b.shared_srv != 0);
+        assert_eq!(a.index.abs_diff(b.index), 8, "two heaps of 4 slots lie 8 descriptors apart");
+        unregister(0xB100);
+        unregister(0xB101);
     }
 }
