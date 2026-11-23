@@ -293,7 +293,7 @@ fn inputs() -> Vec<u32> {
 fn run_both(c: &IDxcCompiler3, body: &str) -> Result<(Vec<u32>, Vec<u32>), String> {
     let src = kernel(body);
     let blob = console_compile(c, &src, &["-E", "main", "-T", "cs_6_6", "-enable-16bit-types", "-D", "XCL_CONSOLE=1"])?;
-    let translated = pso::console_to_dxil(&blob, pso::Stage::Compute, 0).map_err(|e| format!("translation: {e}"))?;
+    let translated = pso::console_to_dxil_for(&blob, pso::Stage::Compute, 0, runner::split_wave64()).map_err(|e| format!("translation: {e}"))?;
     // the console run: the buffer at 0x1_0000, its address the one root argument – in user
     // SGPRs or in a table at 0x100, as XCL passes them on a console list's dispatch
     let (table_at, base) = (0x100usize, 0x1_0000usize);

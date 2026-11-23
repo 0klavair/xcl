@@ -61,6 +61,8 @@ struct Gpu {
     value: u64,
     adapter: String,
     wave64: bool,
+    /// 32-lane waves (`[WaveSize(32)]`: the split wave64 form; WARP has neither 32 nor 64)
+    wave32: bool,
     /// mesh shader tier 1 or higher (`mesh_draw`)
     mesh: bool,
 }
@@ -103,6 +105,7 @@ fn init() -> Result<Gpu, String> {
             return Err(format!("{name}: no wave operations/int64"));
         }
         let wave64 = o1.WaveLaneCountMin <= 64 && o1.WaveLaneCountMax >= 64;
+        let wave32 = o1.WaveLaneCountMin <= 32 && o1.WaveLaneCountMax >= 32;
         let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
         let mesh = dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32).is_ok()
             && o7.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0;
@@ -110,7 +113,7 @@ fn init() -> Result<Gpu, String> {
             dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
         let rs = root_signature(&dev, false)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
-        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, mesh })
+        Ok(Gpu { dev, queue, rs, fence, value: 0, adapter: name, wave64, wave32, mesh })
     }
 }
 
@@ -350,6 +353,39 @@ pub fn wave64_supported() -> Result<bool, String> {
     gpu.as_ref().map(|x| x.wave64).map_err(|x| x.clone())
 }
 
+/// Whether wave64 programs need the split form here (`Options::split_wave64`): the
+/// adapter runs only 32-lane waves. False without a usable GPU.
+pub fn split_wave64() -> bool {
+    wave64_supported() == Ok(false)
+}
+
+/// Whether wave64 programs run on this adapter at all: natively (64-lane waves) or split (32).
+pub fn wave64_programs_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.wave64 || x.wave32).map_err(|x| x.clone())
+}
+
+/// `Options` for programs run on this adapter: the split wave64 form where it is needed.
+pub fn options(mode: super::Mode) -> super::Options {
+    super::Options { mode, split_wave64: split_wave64(), ..Default::default() }
+}
+
+/// A split wave64 kernel stores the upper half's SGPRs too: both halves must end with the
+/// same scalar state (they would otherwise have branched differently).
+fn split_halves_agree(raw: &[u32]) -> Result<(), String> {
+    let at = super::KERNEL_SPLIT_SGPRS;
+    if raw[at + KERNEL_SGPRS] != super::KERNEL_SPLIT_MAGIC {
+        return Ok(());
+    }
+    let differ: Vec<String> = (0..KERNEL_SGPRS).filter(|&i| raw[i] != raw[at + i]).map(|i| format!("s{i}: {:#x} / {:#x}", raw[i], raw[at + i])).collect();
+    if differ.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("split wave64: the halves ended with different SGPRs (lower / upper): {}", differ.join(", ")))
+    }
+}
+
 /// Whether the adapter runs mesh shaders (`mesh_draw`); an integrated RDNA2 GPU, for one,
 /// reports wave64 but no mesh shader tier.
 pub fn mesh_shaders_supported() -> Result<bool, String> {
@@ -514,6 +550,7 @@ pub fn run_with_statics(
             .map(|l| raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec())
             .collect();
         drop(bound);
+        split_halves_agree(&raw)?;
         Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: mem_out, textures: tex_out })
     }
 }
@@ -534,7 +571,7 @@ pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(K
 
 /// Translate + compile + run RDNA2 code as a kernel, with test textures and samplers.
 pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
-    let t = super::translate(code, &super::Options::default())?;
+    let t = super::translate(code, &options(super::Mode::Kernel))?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }
@@ -544,7 +581,7 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
 
 /// Translate + compile + run RDNA2 code as a kernel.
 pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
-    let opt = super::Options::default();
+    let opt = options(super::Mode::Kernel);
     let t = super::translate(code, &opt)?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
@@ -1172,6 +1209,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let raw = std::slice::from_raw_parts(q as *const u32, KERNEL_RES_DWORDS).to_vec();
         readback.Unmap(0, None);
         let vgpr = (0..KERNEL_LANES).map(|l| raw[KERNEL_SGPRS + l * KERNEL_VGPRS..KERNEL_SGPRS + (l + 1) * KERNEL_VGPRS].to_vec()).collect();
+        split_halves_agree(&raw)?;
         Ok(KernelResult { sgpr: raw[..KERNEL_SGPRS].to_vec(), vgpr, scc: raw[KERNEL_SCC_SLOT], raw, mem: Vec::new(), textures: Vec::new() })
     }
 }

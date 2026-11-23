@@ -74,7 +74,11 @@ pub const KERNEL_LANES: usize = 64;
 pub const KERNEL_SCC_SLOT: usize = 125;
 /// first dword of the export area in `res`: 64 targets × 64 lanes × 4 components
 pub const KERNEL_EXPORTS: usize = KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS;
-pub const KERNEL_RES_DWORDS: usize = KERNEL_EXPORTS + 64 * KERNEL_LANES * 4;
+/// split wave64 (`Options::split_wave64`): the upper half's SGPRs (+ SCC slot), then
+/// `KERNEL_SPLIT_MAGIC` – the runner checks both halves ended with the same scalar state
+pub const KERNEL_SPLIT_SGPRS: usize = KERNEL_EXPORTS + 64 * KERNEL_LANES * 4;
+pub const KERNEL_SPLIT_MAGIC: u32 = 0x5741_5645;
+pub const KERNEL_RES_DWORDS: usize = KERNEL_SPLIT_SGPRS + KERNEL_SGPRS + 1;
 
 /// Vertex shader interface.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -465,10 +469,11 @@ pub struct Options {
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
     /// two independent halves – the wave-size independent form VS/PS always get (tests)
     pub hw_wave: u32,
-    /// geometry mode: emulate one logical wave64 with two native wave32 phases
-    pub geometry_wave32: bool,
-    /// mesh mode: run a logical wave64 mesh program as two native wave32 halves
-    pub mesh_wave32: bool,
+    /// the GPU runs only 32-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax`
+    /// < 64, e.g. NVIDIA): each console wave of a wave64 kernel / compute / mesh / geometry
+    /// program runs as two hardware wave32 halves that exchange masks and lane values through
+    /// groupshared memory (`docs/wave64-on-wave32.md`). No effect on wave32 programs, VS / PS.
+    pub split_wave64: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -483,7 +488,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, geometry_wave32: false, mesh_wave32: false, static_sampler_base: 0, mem_windows: 1, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true }
     }
 }
 
@@ -1076,8 +1081,9 @@ pub fn wave_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 }
 
 /// Operations that cannot be split into two independent native wave32 halves while
-/// preserving one logical wave64. Split geometry and split mesh translation reject these
-/// rather than silently changing cross-half lane or mask semantics.
+/// preserving one logical wave64. The split form (`Options::split_wave64`) exchanges masks
+/// and lane values between the halves and needs no such list; a program without any of these
+/// could run as two independent halves without exchanges (a possible fast path).
 pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
     let mut mask_regs = BTreeSet::from([106u64, 107, 126, 127]); // VCC and EXEC
@@ -1160,27 +1166,14 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
     out
 }
 
-/// Translate a complete ES+GS program for the adapter-selected geometry path.
-pub fn translate_geometry(code: &[u8], interface: GsInterface, geometry_wave32: bool) -> Result<Translation, String> {
-    if geometry_wave32 {
-        let hazards = geometry_wave32_hazards(code);
-        if !hazards.is_empty() {
-            return Err(format!("geometry program requires unsupported cross-half wave64 semantics: {hazards:?}"));
-        }
-    }
-    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, geometry_wave32, ..Default::default() })
+/// Translate a complete ES+GS program; `split_wave64`: for a GPU with 32-lane waves only.
+pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: bool) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, ..Default::default() })
 }
 
-/// Translate an NGG mesh program; a wave64 program split into wave32 halves is refused
-/// when it needs cross-half semantics, as for split geometry.
-pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, mesh_wave32: bool) -> Result<Translation, String> {
-    if wave64 && mesh_wave32 {
-        let hazards = geometry_wave32_hazards(code);
-        if !hazards.is_empty() {
-            return Err(format!("mesh program requires unsupported cross-half wave64 semantics: {hazards:?}"));
-        }
-    }
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, mesh_wave32, ..Default::default() })
+/// Translate an NGG mesh program; `split_wave64`: for a GPU with 32-lane waves only.
+pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
@@ -1372,7 +1365,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             // smaller for DXC and the driver on big programs)
             emit_structured(&ctx, &mut em, &mut code, 0, u64::MAX, None, 0, None, &BTreeSet::new(), 1, &mut blocks, &mut flags);
         } else {
-            if gs_jump.is_some() && opt.geometry_wave32 {
+            if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
                 code.push_str("    uint pc = xcl_entry_pc;\n");
             } else {
                 code.push_str("    uint pc = 0;\n");
