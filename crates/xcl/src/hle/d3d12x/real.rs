@@ -1497,6 +1497,24 @@ pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+/// graphics pipelines given the generated rect list GS (`rect_list_gs`)
+static RECT_LIST_GS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `pso` (as `is_translated_graphics` takes it: a stand-in resolved) draws rect lists
+/// whole with the generated GS. Its draws must not be expanded to two triangles a rect as well:
+/// each half is three corners of the rect and the GS would complete both.
+pub fn has_rect_list_gs(pso: usize) -> bool {
+    pso != 0 && RECT_LIST_GS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+/// Note `pso`, made from `copy`, if it kept the generated rect list GS (`rect_gs`; a pipeline
+/// made again without it, `retry_without_rect_gs`, did not).
+fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool) {
+    if pso != 0 && rect_gs && !copy.GS.pShaderBytecode.is_null() {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -1526,6 +1544,9 @@ fn forget_pso(pso: usize) {
         s.remove(&pso);
     }
     if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
+    if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
@@ -3289,6 +3310,7 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -4759,6 +4781,22 @@ mod rect_list_pso_tests {
             REFUSED
         );
         assert!(n == 1 && !copy.GS.pShaderBytecode.is_null());
+    }
+
+    /// `has_rect_list_gs`: a pipeline made with the rect list GS, not one made again without it
+    /// (or never given it), and not once its address is forgotten.
+    #[test]
+    fn pipelines_with_the_rect_list_gs_are_known_until_forgotten() {
+        let gs = [0u8; 4];
+        let (kept, dropped, none) = (0x7E57_1000usize, 0x7E57_2000usize, 0x7E57_3000usize);
+        let mut copy = with_gs(&gs);
+        note_rect_list_gs(kept, &copy, true);
+        assert!(retry_without_rect_gs(&mut copy, true, |c| if c.GS.pShaderBytecode.is_null() { 0 } else { REFUSED }) == 0);
+        note_rect_list_gs(dropped, &copy, true);
+        note_rect_list_gs(none, &with_gs(&gs), false);
+        assert!(has_rect_list_gs(kept) && !has_rect_list_gs(dropped) && !has_rect_list_gs(none) && !has_rect_list_gs(0));
+        forget_pso(kept);
+        assert!(!has_rect_list_gs(kept));
     }
 
     /// An untranslated rect list pipeline from a stream gets the PC's topology type (TRIANGLE),
