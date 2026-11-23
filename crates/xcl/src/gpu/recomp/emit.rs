@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
 
@@ -42,6 +43,9 @@ pub(super) struct Em {
     /// split wave64: pc → SGPRs whose whole value may be read after that instruction
     /// (`x64_masks`); a mask written to none of them stays in its half (no exchange)
     pub x64_whole_live: BTreeMap<u64, u128>,
+    /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
+    /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
+    pub upper: Option<super::upper_lanes::UpperLanes>,
     /// pc of the instruction being emitted
     cur_pc: u64,
     /// MIMG instruction address → its sampler's S# when the code builds it from constants
@@ -450,6 +454,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             x64_whole_live: BTreeMap::new(),
+            upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
             static_used: Vec::new(),
@@ -3334,7 +3339,21 @@ impl Em {
             "v_readlane_b32" => {
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                self.line(&format!("uint {t} = {rla}({a}, {b} & {wmask}u);"));
+                let read = format!("{rla}({a}, {b} & {wmask}u)");
+                // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
+                // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
+                // not have been launched)
+                let slot = super::upper_lanes::slot(d);
+                match (self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied(), slot) {
+                    (Some(Read::Const(c)), Some(_)) => self.line(&format!("uint {t} = {c:#010x}u; if (!xcl_hw32) {t} = {read};")),
+                    (Some(Read::Const(c)), None) => {
+                        self.line(&format!("uint {t} = {read};"));
+                        self.line(&format!("{t} = select(and(xcl_hw32, ({b} & 63u) >= 32u), {c:#010x}u, {t});"));
+                    }
+                    (Some(Read::Shadow), Some((v, l))) if l < 32 => self.line(&format!("uint {t} = xcl_sh{v}_{l};")),
+                    (Some(Read::Shadow), Some((v, l))) => self.line(&format!("uint {t} = xcl_sh{v}_{l}; if (!xcl_hw32) {t} = {read};")),
+                    _ => self.line(&format!("uint {t} = {read};")),
+                }
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -3343,6 +3362,11 @@ impl Em {
                 if let Dst::V(n) = &dst {
                     let v = self.vreg(*n);
                     self.line(&format!("if (lane_id == ({b} & {wmask}u)) {v} = {a};"));
+                    // a spill slot some read takes from its shadow (`upper_lanes`)
+                    let slot = super::upper_lanes::slot(d).filter(|s| self.upper.as_ref().is_some_and(|u| u.shadows.contains(s)));
+                    if let Some((v, l)) = slot {
+                        self.line(&format!("xcl_sh{v}_{l} = {a};"));
+                    }
                 }
                 return Ok(());
             }
@@ -3768,6 +3792,10 @@ impl Em {
                     "rla"
                 };
                 self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
+                // a 32-lane wave of a wave64 VS / PS: lanes 32..63 hold a constant (`upper_lanes`)
+                if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
+                    self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
+                }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
@@ -4025,6 +4053,13 @@ impl Em {
         if self.x64() {
             self.x64_prelude(&mut h);
         }
+        if let Some(u) = &self.upper {
+            // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
+            h.push_str("// the wave has 32 lanes: it is a console wave whose lanes 32..63 are not populated\nstatic bool xcl_hw32 = false;\n");
+            for (v, l) in &u.shadows {
+                let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
+            }
+        }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
         h.push_str(PRELUDE_MEM);
@@ -4098,6 +4133,9 @@ impl Em {
                 out_struct(&mut h, "XclOut", &vs.outputs);
                 h.push_str("XclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
+                if self.upper.is_some() {
+                    h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
+                }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 for &v in &self.vgprs {
@@ -4405,6 +4443,9 @@ impl Em {
                 }
                 h.push_str("};\nXclOut main(XclIn xi)\n{\n    XclOut xo = (XclOut)0;\n    bool xcl_live = false;\n");
                 h.push_str(if self.opt.wave64 { "    lane_id = WaveGetLaneIndex();\n" } else { "    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n" });
+                if self.upper.is_some() {
+                    h.push_str("    xcl_hw32 = WaveGetLaneCount() < 64u;\n");
+                }
                 load_sgprs(&mut h);
                 h.push_str("    uint scc = 0u;\n    { uint2 e0 = ballot(true); exec_lo = e0.x; exec_hi = e0.y; }\n");
                 let sys = |bit: u32| ps_input_vgpr(ps.input_ena, bit);

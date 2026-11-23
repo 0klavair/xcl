@@ -304,6 +304,8 @@ struct RecompAgg {
     graphics_wave32: usize,
     graphics_wave64: usize,
     wave_hazards: BTreeMap<String, usize>,
+    /// … and the reads of lanes ≥ 32 the 32-lane form resolves (kind → programs)
+    wave_resolved: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
 }
@@ -337,6 +339,9 @@ impl RecompAgg {
         for (k, v) in o.wave_hazards {
             *self.wave_hazards.entry(k).or_default() += v;
         }
+        for (k, v) in o.wave_resolved {
+            *self.wave_resolved.entry(k).or_default() += v;
+        }
         for (k, (a, b)) in o.by_mode {
             let e = self.by_mode.entry(k).or_default();
             e.0 += a;
@@ -366,9 +371,15 @@ impl RecompAgg {
         if matches!(label, "VS" | "PS") {
             if wave64 {
                 self.graphics_wave64 += 1;
-                let hz = recomp::wave_hazards(code);
+                let (hz, resolved) = recomp::wave_lane_reads(code);
                 for k in &hz {
                     *self.wave_hazards.entry(k.to_string()).or_default() += 1;
+                }
+                for k in &resolved {
+                    *self.wave_resolved.entry(k.to_string()).or_default() += 1;
+                }
+                if !resolved.is_empty() {
+                    *self.wave_resolved.entry("(programs)".into()).or_default() += 1;
                 }
                 if !hz.is_empty() {
                     *self.wave_hazards.entry("(programs at risk)".into()).or_default() += 1;
@@ -1061,8 +1072,8 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             println!("  {k:<60} {v:>6}");
         }
         println!(
-            "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}",
-            rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards
+            "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
+            rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
         );
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
