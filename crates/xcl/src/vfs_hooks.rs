@@ -834,6 +834,54 @@ unsafe fn collect(pattern: &str) -> Vec<WIN32_FIND_DATAW> {
     out
 }
 
+fn collect_game_entries(
+    v: &vfs::Vfs,
+    rel: &str,
+    collect_fn: impl Fn(&str) -> Vec<WIN32_FIND_DATAW>,
+) -> Result<Vec<WIN32_FIND_DATAW>, u32> {
+    let (dir_rel, pattern) = match rel.rsplit_once('\\') {
+        Some((d, p)) => (d.to_string(), p.to_string()),
+        None => (String::new(), rel.to_string()),
+    };
+    if !dir_rel.is_empty() && !v.is_dir(&dir_rel) {
+        return Err(vfs::ERROR_PATH_NOT_FOUND);
+    }
+    let wildcard = pattern.contains('*') || pattern.contains('?');
+    if !wildcard && !v.visible_in_overlay(rel) && v.is_whiteout(rel) {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
+    let join = |base: String| if pattern.is_empty() { base } else { format!("{base}\\{pattern}") };
+    let mut items: Vec<WIN32_FIND_DATAW> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if v.needs_merge(&dir_rel) || v.visible_in_overlay(rel) {
+        for d in collect_fn(&join(v.overlay_path(&dir_rel))) {
+            let n = name_of(&d);
+            if n.eq_ignore_ascii_case(".xcl_whiteouts") {
+                continue;
+            }
+            if seen.insert(n.to_lowercase()) {
+                items.push(d);
+            }
+        }
+    }
+    if dir_rel.is_empty() || !v.is_whiteout(&dir_rel) {
+        for d in collect_fn(&join(v.original_path(&dir_rel))) {
+            let n = name_of(&d);
+            let child = if dir_rel.is_empty() { n.clone() } else { format!("{dir_rel}\\{n}") };
+            if n != "." && n != ".." && v.is_whiteout(&child) {
+                continue;
+            }
+            if seen.insert(n.to_lowercase()) {
+                items.push(d);
+            }
+        }
+    }
+    if items.is_empty() {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
+    Ok(items)
+}
+
 /// Some(handle) when the VFS handled the call; None to pass through.
 unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Result<HANDLE, u32>> {
     let v = vfs::get()?;
@@ -845,41 +893,10 @@ unsafe fn find_first_vfs(path: &str, out: *mut WIN32_FIND_DATAW) -> Option<Resul
             Some(if h == INVALID_HANDLE_VALUE { Err(windows_sys::Win32::Foundation::GetLastError()) } else { Ok(h) })
         }
         Target::Game { rel } => {
-            let (dir_rel, pattern) = match rel.rsplit_once('\\') {
-                Some((d, p)) => (d.to_string(), p.to_string()),
-                None => (String::new(), rel.clone()),
+            let items = match collect_game_entries(v, &rel, |p| collect(p)) {
+                Ok(items) => items,
+                Err(e) => return Some(Err(e)),
             };
-            let wildcard = pattern.contains('*') || pattern.contains('?');
-            if !wildcard && !v.visible_in_overlay(&rel) && v.is_whiteout(&rel) {
-                return Some(Err(vfs::ERROR_FILE_NOT_FOUND));
-            }
-            let join = |base: String| if pattern.is_empty() { base } else { format!("{base}\\{pattern}") };
-            let mut items: Vec<WIN32_FIND_DATAW> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            if v.needs_merge(&dir_rel) || v.visible_in_overlay(&rel) {
-                for d in collect(&join(v.overlay_path(&dir_rel))) {
-                    let n = name_of(&d);
-                    if n.eq_ignore_ascii_case(".xcl_whiteouts") {
-                        continue;
-                    }
-                    if seen.insert(n.to_lowercase()) {
-                        items.push(d);
-                    }
-                }
-            }
-            for d in collect(&join(v.original_path(&dir_rel))) {
-                let n = name_of(&d);
-                let child = if dir_rel.is_empty() { n.clone() } else { format!("{dir_rel}\\{n}") };
-                if n != "." && n != ".." && v.is_whiteout(&child) {
-                    continue;
-                }
-                if seen.insert(n.to_lowercase()) {
-                    items.push(d);
-                }
-            }
-            if items.is_empty() {
-                return Some(Err(vfs::ERROR_FILE_NOT_FOUND));
-            }
             *out = items[0];
             let h = Box::into_raw(Box::new(MergedFind { items, pos: 1 })) as HANDLE;
             MERGED.lock().unwrap().get_or_insert_with(HashSet::new).insert(h as usize);
@@ -1340,5 +1357,56 @@ mod tests {
         assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
         assert_eq!(validate_replace_targets(v, "G:\\data\\gone.txt", "T:\\ext.txt"), Err(vfs::ERROR_FILE_NOT_FOUND));
         assert_eq!(validate_replace_targets(v, "G:\\data\\hello.txt", "T:\\ext.txt"), Ok(()));
+    }
+
+    fn real_collect(pattern: &str) -> Vec<WIN32_FIND_DATAW> {
+        use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileExW, FindNextFileW};
+        let mut out = Vec::new();
+        // SAFETY: zeroed WIN32_FIND_DATAW and NUL-terminated UTF-16 pattern passed to Win32 FindFirstFileExW/FindNextFileW/FindClose.
+        unsafe {
+            let mut d: WIN32_FIND_DATAW = std::mem::zeroed();
+            let h = FindFirstFileExW(wide(pattern).as_ptr(), 0, &mut d as *mut _ as *mut c_void, 0, std::ptr::null(), 0);
+            if h == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            loop {
+                out.push(d);
+                if FindNextFileW(h, &mut d) == 0 {
+                    break;
+                }
+            }
+            FindClose(h);
+        }
+        out
+    }
+
+    #[test]
+    fn find_first_on_whited_out_and_recreated_directory() {
+        let f = HookFixture::new("find_dir");
+        let v = &f.vfs;
+
+        let mut before: Vec<String> = collect_game_entries(v, "data\\*", real_collect)
+            .unwrap()
+            .iter()
+            .map(name_of)
+            .collect();
+        before.sort();
+        assert_eq!(before, vec![".", "..", "gone.txt", "hello.txt"]);
+
+        // Removing `data` must make wildcard listing fail with ERROR_PATH_NOT_FOUND (no "." / "..").
+        assert_eq!(v.remove_dir("data"), Ok(()));
+        assert_eq!(collect_game_entries(v, "data\\*", real_collect).err(), Some(vfs::ERROR_PATH_NOT_FOUND));
+        assert_eq!(collect_game_entries(v, "data\\hello.txt", real_collect).err(), Some(vfs::ERROR_PATH_NOT_FOUND));
+        assert_eq!(collect_game_entries(v, "data", real_collect).err(), Some(vfs::ERROR_FILE_NOT_FOUND));
+
+        // Recreating `data` makes it listable again as an empty directory (only "." and "..").
+        assert_eq!(v.create_dir("data"), Ok(()));
+        let mut after: Vec<String> = collect_game_entries(v, "data\\*", real_collect)
+            .unwrap()
+            .iter()
+            .map(name_of)
+            .collect();
+        after.sort();
+        assert_eq!(after, vec![".", ".."]);
     }
 }
