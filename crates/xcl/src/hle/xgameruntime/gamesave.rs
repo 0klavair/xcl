@@ -192,6 +192,9 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuotaResult(b: *mut XAsyncBlo
 
 pub unsafe extern "system" fn XGameSaveDeleteContainer(p: *mut Provider, name: *const u8) -> HRESULT {
     let (Some(pr), Some(n)) = (provider(p), from_cstr_ptr(name)) else { return E_INVALIDARG };
+    if n.is_empty() || n.len() > 256 {
+        return E_GS_INVALID_CONTAINER_NAME;
+    }
     let _ = std::fs::remove_dir_all(pr.root.join(enc(&n)));
     S_OK
 }
@@ -685,6 +688,51 @@ mod tests {
             assert_eq!(XGameSaveDeleteContainer(p, b"slot/1\0".as_ptr()), S_OK);
             assert_eq!(XGameSaveGetContainerInfo(p, b"slot/1\0".as_ptr(), std::ptr::null_mut(), Some(count_containers)), E_GS_CONTAINER_NOT_FOUND);
             let root = (*p).root.clone();
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn delete_container_rejects_empty_name_without_wiping_provider_root() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-empty-del-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot1\0".as_ptr(), &mut c), S_OK);
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Save 1\0".as_ptr(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), b"keepme".as_ptr(), 6), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+
+            // Empty and overlong names must be rejected without touching the provider root or any container.
+            assert_eq!(XGameSaveDeleteContainer(p, b"\0".as_ptr()), E_GS_INVALID_CONTAINER_NAME);
+            let overlong = format!("{}\0", "a".repeat(257));
+            assert_eq!(XGameSaveDeleteContainer(p, overlong.as_ptr()), E_GS_INVALID_CONTAINER_NAME);
+
+            let mut blk: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XGameSaveDeleteContainerAsync(p, b"\0".as_ptr(), &mut blk), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut blk, true), E_GS_INVALID_CONTAINER_NAME);
+            assert_eq!(XGameSaveDeleteContainerResult(&mut blk), E_GS_INVALID_CONTAINER_NAME);
+
+            assert!(root.is_dir(), "provider root must still exist");
+            let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateContainerInfo(p, &mut list as *mut _ as *mut c_void, Some(count_containers)), S_OK);
+            assert_eq!(list, vec![("slot1".to_string(), "Save 1".to_string(), 1, 6)]);
+
+            let names = [b"data\0".as_ptr()];
+            let mut n = 1u32;
+            let mut buf = vec![0u64; 32];
+            assert_eq!(XGameSaveReadBlobData(c, names.as_ptr(), &mut n, 256, buf.as_mut_ptr() as *mut Blob), S_OK);
+            assert_eq!(n, 1);
+            let b0 = &*(buf.as_ptr() as *const Blob);
+            assert_eq!(std::slice::from_raw_parts(b0.data, 6), b"keepme");
+
+            XGameSaveCloseContainer(c);
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
