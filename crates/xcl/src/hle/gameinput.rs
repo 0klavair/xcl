@@ -169,7 +169,15 @@ fn xinput_pad() -> Option<GamepadState> {
     }
     for k in (0..4).map(|i| (first + i) % 4) {
         let mut x = XInputState::default();
-        if unsafe { get(k, &mut x) } == 0 {
+        let r = unsafe { get(k, &mut x) };
+        if r != 0 && r != 1167 {
+            // not ERROR_DEVICE_NOT_CONNECTED: worth a line (once)
+            static ODD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ODD.swap(true, Ordering::Relaxed) {
+                crate::xlog_warn!("GameInput: XInputGetState({k}) → {r}");
+            }
+        }
+        if r == 0 {
             if !connected || k != first {
                 crate::xlog_info!("GameInput: the PC's controller (XInput slot {k}) is the title's gamepad");
             }

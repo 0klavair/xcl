@@ -112,6 +112,16 @@ fn is_device(p: &str) -> bool {
     if l.starts_with("\\\\.\\") || l.starts_with("\\\\?\\globalroot") {
         return true;
     }
+    // "\\?\" / "\??\" names that are not a drive path or UNC: device interfaces
+    // ("\\?\hid#vid_045e&pid_…#{guid}" – XInput opens the controller this way, SetupAPI
+    // hands them out), volumes ("\\?\Volume{…}") – never files of the title
+    if let Some(r) = l.strip_prefix("\\\\?\\").or_else(|| l.strip_prefix("\\??\\")) {
+        let b = r.as_bytes();
+        let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+        if !drive && !r.starts_with("unc\\") {
+            return true;
+        }
+    }
     let base = l.trim_end_matches(':');
     matches!(base, "con" | "nul" | "prn" | "aux" | "conin$" | "conout$" | "clock$")
         || (base.len() == 4 && (base.starts_with("com") || base.starts_with("lpt")) && base.as_bytes()[3].is_ascii_digit())
@@ -594,6 +604,9 @@ mod tests {
         assert_eq!(v.classify("g:/data/hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("GAME:\\data\\hello.txt"), Target::Game { rel: "data\\hello.txt".into() });
         assert_eq!(v.classify("G:\\"), Target::Game { rel: String::new() });
+        // device interfaces (XInput opens the controller by one) are never the title's files
+        assert_eq!(v.classify("\\\\?\\hid#vid_045e&pid_0b12&ig_00#8&1a2b3c&0&0000#{ec87f1e3-c13b-4100-b5f7-8b84d54260cb}"), Target::Pass);
+        assert_eq!(v.classify("\\??\\USB#VID_045E&PID_0B12#3033#{a5dcbf10-6530-11d2-901f-00c04fb951ed}"), Target::Pass);
         // "GAME:\x" absolutised by a runtime as if it were relative
         let mangled = format!("\\\\?\\{}\\GAME:\\data\\hello.txt", f.game().display());
         assert_eq!(v.classify(&mangled), Target::Game { rel: "data\\hello.txt".into() });
