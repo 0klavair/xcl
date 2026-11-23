@@ -5181,6 +5181,35 @@ fn bench_split_wave64() {
     }
 }
 
+/// TG_SIZE (the SGPR after the group ids): the group's wave count | the thread's wave index
+/// << 6. A group that is not a multiple of the wave size has a last, partial wave: 96 threads
+/// are 2 console waves of 64 (3 of 32), not 96 / 64 = 1.
+#[test]
+fn gpu_compute_tg_size_counts_a_partial_last_wave() {
+    if !gpu_ready() {
+        return;
+    }
+    // global_store_dword [v0 * 4], s2 (TG_SIZE: user SGPRs s0, s1, no group ids)
+    let p = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 4), ("SADDR", 0x7D)], None),
+    ]);
+    for (threads, wave64) in [(96u32, true), (96, false), (64, true), (40, false), (128, true)] {
+        let lanes = if wave64 { 64 } else { 32 };
+        let cs = super::CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: true, tid_components: 1 };
+        let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        let waves = threads.div_ceil(lanes);
+        for (k, &got) in mem.iter().take(threads as usize).enumerate() {
+            assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");
+        }
+    }
+}
+
 /// v_fract_f32 at the edges, as RDNA computes it (x - floor(x) kept below 1.0): ±inf gives
 /// NaN and a NaN stays NaN – a `min()` clamp returned 0.99999994 there on NVIDIA (HLSL min
 /// returns its non-NaN operand); a tiny negative value rounds to the largest float below 1.
