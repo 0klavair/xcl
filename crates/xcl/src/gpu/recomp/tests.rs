@@ -468,8 +468,8 @@ fn f64_class_compare_vopc_and_vop3() {
     // SRC0 is the 64-bit f64 operand (VGPR/SGPR pair), SRC1 stays a plain 32-bit mask;
     // abs/neg act on the double operand only
     assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v12) >> fclass64(abs(asdouble(v10, v11)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v13) >> fclass64((-asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v13) >> fclass64(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     // mask destinations go through the shared compare/write-mask path: vcc, an SGPR pair, exec
     assert!(t.hlsl.contains("vcc_lo = t") && t.hlsl.contains("vcc_hi = t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("s20 = t") && t.hlsl.contains("s21 = t"), "{}", t.hlsl);
@@ -567,8 +567,8 @@ fn frexp_f64_instructions() {
     // the source pair becomes a double; the mantissa stays f64, the exponent is one dword
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(v10, v11))"), "{}", t.hlsl);
     assert!(t.hlsl.contains("(uint)frexp_exp_d(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("frexp_mant_d((-asdouble(v10, v11)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("frexp_exp_d(abs(asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("frexp_mant_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("frexp_exp_d(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
     // the f64 pair of inline −1.0 = 0xBFF0000000000000
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(0x00000000u, 0xBFF00000u))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
@@ -585,7 +585,7 @@ fn rndne_f64_instructions() {
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
     assert!(t.hlsl.contains("round_ne_d(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("round_ne_d((-asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("round_ne_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
