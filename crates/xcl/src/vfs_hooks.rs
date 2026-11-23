@@ -39,7 +39,9 @@ impl Guard {
 }
 impl Drop for Guard {
     fn drop(&mut self) {
+        let e = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         IN_HOOK.with(|c| c.set(false));
+        unsafe { windows_sys::Win32::Foundation::SetLastError(e) };
     }
 }
 
