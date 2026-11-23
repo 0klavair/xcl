@@ -935,6 +935,26 @@ opens its "Xbox network unavailable" dialog – input arrives), Unicorn Overlord
   thread geometry; the FSPX path carries the real one. Its wave64 rendezvous is #67; R9G9B9E5 UAVs were not needed here.
 - Not yet: a title using FSR4 (none of the four run here ships it; the dump with it has no executable).
 
+## PRs #110–#130 (2026-11-23)
+Merged after workspace tests with the retail samples (also `XCL_SPLIT_WAVE64=1`), the retail survey (26 698 / 26 698),
+the FSR4 GPU probe, Unicorn Overlord and XDefiant:
+- #110 Ogg Opus end trimming and pre-skip; #115 `xcl run` checks the PC first (SM 6.6, mesh shaders, wave width,
+  DXC, xgameruntime.dll) and keeps it in `report.json → environment`; #116 a game-report issue form;
+  #117 cube T#s as cube arrays (slice from the face coordinate, resinfo layers); #118 command-list Reset and indexed
+  draws transactional; #119 OMOD on f64 / conversions, integer clamp on unsigned / packed adds and dots (its clamped
+  8-bit dots keep `dot4_u8` / `dot4_i8`: DXC had an internal error on `(int64_t)dot4add_i8packed(a, b, 0)`);
+  #121 queue #18 before the layout is known writes 8 bytes; #122 video-memory arenas never overlap (straddling
+  placements merge arenas; XDefiant logs one at ~78 s); #124 MS / GS translated with the title's memory windows;
+  #127 CPU check at start (AVX2, FMA, F16C, BMI1/2, LZCNT, POPCNT, MOVBE, SSE4.2; `XCL_SKIP_CPU_CHECK=1`), bounded reads
+  in the exception logger, thread dump outside the suspended thread, PE directory bounds; #129 frame statistics with
+  each frame's own origin, ancillary handles kept alive while the clock signals them.
+- Held: **#123** (memory window from the full 64-bit address) – with it the AMD shader compiler (`amdxc64.dll+0xe8f875`,
+  access violation) crashes XDefiant ~10 s in, creating the pipeline of CS `8e4af296b9d7fd9c` (2 552 instructions);
+  reverting only #123 runs. **#128** (f16 add / fma rounded once under a directed mode, #111) – its own GPU test fails
+  on the RX 9070 (`v_sub_f16` under mode 0x4: 0x30804001, expected 0x3C01).
+- Closed: #120 (#73 was done by #91; would make 0xC programs incomplete), #126 (= #119), #130 (= #121 + #122), #125
+  (a process report, not project documentation).
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
