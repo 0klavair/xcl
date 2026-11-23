@@ -38,7 +38,7 @@ next steps:
 
 ## What works
 
-✅ done and verified · 🟡 works, with a gap listed under *What is missing*
+✅ done and verified
 
 ### Running the game's code
 
@@ -54,7 +54,7 @@ next steps:
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – an XInput controller, and keyboard and mouse as a gamepad (WASD left stick, mouse right stick, mouse buttons triggers, wheel bumpers; `keyboard_mouse`, `mouse_sensitivity` in `xcl.toml`) | unit tests |
+| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
 | **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
 
 ### Graphics
@@ -76,16 +76,17 @@ next steps:
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
 
-## What is missing
+## Controls
 
-| Not done yet | Not planned |
-|---|---|
-| MSAA textures in the console's tiled layout | Xbox Live, Store licensing (offline by design) |
-| | decrypting XVC packages or any DRM |
-| | console SDK headers / binaries in the repository |
+A **gamepad is recommended**: console games are made for one, and their menus and controls expect it.
 
-Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
-classes asked for, shader statistics, audio formats, crash) – the to-do list for the next step.
+- **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
+  game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
+- **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
+  buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
+  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
+  the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
+  used together.
 
 ## Building and usage
 
@@ -121,6 +122,8 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - XCL works on **unpacked** game files you own; it contains nothing for decrypting or
   circumventing DRM.
 - **The game folder is never modified** – writes go to the overlay.
+- Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
+  classes asked for, shader statistics, audio formats, crash).
 - Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).

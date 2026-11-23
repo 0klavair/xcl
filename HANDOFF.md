@@ -886,6 +886,17 @@ opens its "Xbox network unavailable" dialog – input arrives), Unicorn Overlord
   bound the ABI on the stand-in, a failed build bound it anyway); the initial PSO of CreateCommandList / Reset /
   ClearState is tracked; DrawIndexedX goes through `bind`; KickoffX keeps multiple render targets.
 
+## PRs #107–#109 (merged), README controls, 2026-11-23
+- **#107** (raylitebull) recompiler: integer PS inputs not converted through float in `v_interp_mov / p2`,
+  `ds_swizzle` / `ds_bpermute` give 0 from inactive source lanes, exact `ldexp_f`, 32-bit literals in the high
+  word of f64 operands, NaN in SNORM / pknorm → 0 and negative → 0 in the small unsigned floats, signed BFE with an
+  arithmetic shift, `v_cmp_class_f16` without the f16 round trip, BVH triangle test without `det²`. Retail pack:
+  still 26 698 / 26 698; DXC on every 150th record (179 variants): 0 errors. Prelude changed: titles recompile.
+- **#108** (certified-retart) XGameSave async container delete runs in the queued work (serialized with blob
+  updates by `SAVE_MUTATION`); conflict with #95's identical check resolved for #108's form.
+- **#109** device removal checked before GPU readbacks are mapped (GetCompletedValue = UINT64_MAX after a removal).
+- README: "What is missing" removed, a "Controls" section (gamepad recommended; keyboard / mouse as a gamepad).
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
