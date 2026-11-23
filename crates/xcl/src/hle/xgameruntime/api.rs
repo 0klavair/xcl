@@ -795,6 +795,7 @@ fn xpls() -> Vec<(&'static str, usize)> {
 fn xpackage() -> Vec<(&'static str, usize)> {
     let mut v = named![
         XPackageGetCurrentProcessPackageIdentifier,
+        XPackageGetIdentifier,
         XPackageIsPackagedProcess,
         XPackageCreateInstallationMonitor,
         XPackageGetInstallationProgress,
@@ -825,7 +826,6 @@ fn xpackage() -> Vec<(&'static str, usize)> {
         ("XPackageMountWithUiAsync", mount_with_ui_async as usize),
         ("XPackageMountWithUiResult", mount_with_ui_result as usize),
         ("XPackageEnumeratePackages", enumerate_packages as usize),
-        ("XPackageGetIdentifier", XPackageGetCurrentProcessPackageIdentifier as usize),
     ]);
     v
 }
@@ -1164,10 +1164,54 @@ unsafe extern "system" fn enumerate_packages(kind: u32, _scope: u32, ctx: *mut c
     S_OK
 }
 
+/// Match the OS user locale against the package's declared `MicrosoftGame.Config` `<Resources>`
+/// languages: exact match (case-insensitive, `-`/`_` normalized), then primary-language subtag
+/// match, then the first declared language; falls back to the raw OS locale only when none are
+/// declared.
+fn select_user_locale(os_locale: &str, declared: &[String]) -> String {
+    if declared.is_empty() {
+        return os_locale.to_string();
+    }
+    let norm_eq = |a: &str, b: &str| {
+        a.len() == b.len()
+            && a.bytes().zip(b.bytes()).all(|(x, y)| {
+                let nx = if x == b'_' { b'-' } else { x.to_ascii_lowercase() };
+                let ny = if y == b'_' { b'-' } else { y.to_ascii_lowercase() };
+                nx == ny
+            })
+    };
+    if let Some(exact) = declared.iter().find(|l| norm_eq(l, os_locale)) {
+        return exact.clone();
+    }
+    fn primary(s: &str) -> &str {
+        s.split(['-', '_']).next().unwrap_or("")
+    }
+    let os_primary = primary(os_locale);
+    if !os_primary.is_empty() {
+        if let Some(lang) = declared.iter().find(|l| primary(l).eq_ignore_ascii_case(os_primary)) {
+            return lang.clone();
+        }
+    }
+    declared[0].clone()
+}
+
+fn package_languages() -> &'static [String] {
+    static LANGUAGES: OnceLock<Vec<String>> = OnceLock::new();
+    LANGUAGES
+        .get_or_init(|| {
+            crate::state::boot()
+                .and_then(|b| crate::manifest::load(&b.game_root))
+                .map(|m| m.languages)
+                .unwrap_or_default()
+        })
+        .as_slice()
+}
+
 unsafe extern "system" fn XPackageGetUserLocale(size: usize, buf: *mut u8) -> HRESULT {
     let mut w = [0u16; 85];
     let n = windows_sys::Win32::Globalization::GetUserDefaultLocaleName(w.as_mut_ptr(), w.len() as i32);
-    let loc = if n > 1 { String::from_utf16_lossy(&w[..n as usize - 1]) } else { "en-US".into() };
+    let os_loc = if n > 1 { String::from_utf16_lossy(&w[..n as usize - 1]) } else { "en-US".into() };
+    let loc = select_user_locale(&os_loc, package_languages());
     crate::util::write_cstr_out(&loc, buf, size, std::ptr::null_mut())
 }
 
@@ -1631,7 +1675,7 @@ mod tests {
 
         // XPackage main: XPackageGetIdentifier at slot 27.
         let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
-        assert_eq!(pm.targets[27], XPackageGetCurrentProcessPackageIdentifier as usize);
+        assert_eq!(pm.targets[27], XPackageGetIdentifier as usize);
 
         // XSystem v3 (6fd71f09): XSystemGetAppSpecificDeviceId is at slot 4 (not SandboxId).
         let s3 = own(&XSYSTEM, &XSYSTEM_V3_IID).expect("XSystem v3");
@@ -1797,10 +1841,51 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
             let mut out_dev = [0xFFu8; 32];
             assert_eq!(find_ctrl_res(dev, &mut b, &mut out_dev), S_OK);
-            assert_eq!(out_dev, [0u8; 32]);
+            assert_eq!(out_dev, crate::hle::gameinput::gamepad_device_id());
+            assert_ne!(out_dev, [0u8; 32]);
 
             XUserCloseHandle(user);
         }
+    }
+
+    #[test]
+    fn xpackage_get_identifier_slot_27_uses_three_args() {
+        unsafe {
+            let (hr, pkg) = query(XPACKAGE, XPACKAGE);
+            assert_eq!(hr, S_OK);
+            let get_id: unsafe extern "system" fn(*mut c_void, *const u8, usize, *mut u8) -> HRESULT = slot(pkg, 27);
+            let want = package_identifier();
+            let mut buf = [0u8; 128];
+            assert_eq!(get_id(pkg, b"G:\\\0".as_ptr(), buf.len(), buf.as_mut_ptr()), S_OK);
+            assert_eq!(crate::util::from_cstr_ptr(buf.as_ptr()).as_deref(), Some(want.as_str()));
+
+            // Null path_or_name also returns the current package identifier.
+            buf.fill(0);
+            assert_eq!(get_id(pkg, std::ptr::null(), buf.len(), buf.as_mut_ptr()), S_OK);
+            assert_eq!(crate::util::from_cstr_ptr(buf.as_ptr()).as_deref(), Some(want.as_str()));
+
+            // Short or null buffer returns E_NOT_SUFFICIENT_BUFFER without dereferencing `size` as a pointer.
+            assert_eq!(get_id(pkg, b"G:\\\0".as_ptr(), 4, buf.as_mut_ptr()), crate::util::E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(get_id(pkg, b"G:\\\0".as_ptr(), 64, std::ptr::null_mut()), crate::util::E_NOT_SUFFICIENT_BUFFER);
+        }
+    }
+
+    #[test]
+    fn user_locale_selection_matches_manifest_resources() {
+        let declared: Vec<String> = ["en-US", "fr-FR", "zh-Hans"].into_iter().map(String::from).collect();
+        // 1) Case-insensitive exact match (preserving manifest spelling)
+        assert_eq!(select_user_locale("fr-FR", &declared), "fr-FR");
+        assert_eq!(select_user_locale("fr-fr", &declared), "fr-FR");
+        assert_eq!(select_user_locale("fr_FR", &declared), "fr-FR");
+        // 2) Case-insensitive primary-language subtag match
+        assert_eq!(select_user_locale("fr-CA", &declared), "fr-FR");
+        assert_eq!(select_user_locale("FR_be", &declared), "fr-FR");
+        assert_eq!(select_user_locale("zh-CN", &declared), "zh-Hans");
+        // 3) First declared language fallback
+        assert_eq!(select_user_locale("hr-HR", &declared), "en-US");
+        assert_eq!(select_user_locale("", &declared), "en-US");
+        // 4) Raw OS locale when manifest declares no languages
+        assert_eq!(select_user_locale("hr-HR", &[]), "hr-HR");
     }
 
     #[test]

@@ -4,9 +4,15 @@
 
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::xasync::*;
 use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
+
+/// Prefix for atomic-write temporary files placed alongside blobs/display files.
+/// `enc()` always percent-encodes `~` as `%7E`, so no encoded blob name can ever start with this.
+const TMP_PREFIX: &str = "~xcltmp.";
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -108,11 +114,63 @@ fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.file_type().is_ok_and(|t| t.is_file())
+                && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
+        })
         .map(|e| (dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
         .collect();
     v.sort();
     v
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
+        let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp, dest)
+    }
+}
+
+/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
+fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
+    let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id()));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        replace_file(&tmp, dest)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 unsafe fn provider<'a>(p: *mut Provider) -> Option<&'a Provider> {
@@ -146,9 +204,12 @@ pub unsafe extern "system" fn XGameSaveInitializeProviderAsync(_user: *mut c_voi
 }
 
 pub unsafe extern "system" fn XGameSaveInitializeProviderResult(b: *mut XAsyncBlock, out: *mut *mut Provider) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     let mut p = 0usize;
     let hr = XAsyncGetResult(b, &INIT_ID as *const u8 as *const c_void, 8, &mut p as *mut usize as *mut c_void, std::ptr::null_mut());
-    if hr >= 0 && !out.is_null() {
+    if hr >= 0 {
         *out = p as *mut Provider;
     }
     hr
@@ -236,7 +297,11 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
     let mut n = 0;
     for d in dirs {
         let name = dec(&d.file_name().unwrap_or_default().to_string_lossy());
-        if (exact && name != prefix) || !name.starts_with(prefix) {
+        if exact {
+            if !name.eq_ignore_ascii_case(prefix) {
+                continue;
+            }
+        } else if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
         let blobs = blobs_of(&d);
@@ -289,7 +354,7 @@ pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Prov
 
 unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
     for (name, _, size) in blobs_of(&c.dir) {
-        if !name.starts_with(prefix) {
+        if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
         let cn = CString::new(name).unwrap_or_default();
@@ -320,7 +385,13 @@ fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> 
     } else {
         names
             .iter()
-            .map(|n| all.iter().find(|b| &b.0 == n).map(|b| (b.0.clone(), b.1.clone())).ok_or(E_GS_BLOB_NOT_FOUND))
+            .map(|n| {
+                all.iter()
+                    .find(|b| &b.0 == n)
+                    .or_else(|| all.iter().find(|b| b.0.eq_ignore_ascii_case(n)))
+                    .map(|b| (b.0.clone(), b.1.clone()))
+                    .ok_or(E_GS_BLOB_NOT_FOUND)
+            })
             .collect::<Result<_, _>>()?
     };
     let head = picked.len() * std::mem::size_of::<Blob>();
@@ -468,15 +539,16 @@ fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -
         return crate::util::E_FAIL;
     }
     if let Some(d) = display {
-        let _ = std::fs::write(dir.join("display"), d);
+        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
+            return crate::util::E_FAIL;
+        }
     }
     for (name, data) in ops {
         let path = blobs.join(enc(name));
         match data {
             Some(d) => {
-                // write next to it, then replace: a crash never leaves half a blob
-                let tmp = path.with_extension("xcltmp");
-                if std::fs::write(&tmp, d).is_err() || std::fs::rename(&tmp, &path).is_err() {
+                // write to a unique sibling temp file, sync, then replace atomically
+                if write_atomic(&path, d).is_err() {
                     return crate::util::E_FAIL;
                 }
             }
@@ -694,6 +766,169 @@ mod tests {
     }
 
     #[test]
+    fn atomic_writes_preserve_xcltmp_blobs_and_skip_leftover_temps() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-atomic-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+            let mut c = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slot\0".as_ptr(), &mut c), S_OK);
+
+            // Write a `.xcltmp` blob, a `~xcltmp.*` blob, and a sibling `.dat` blob.
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, b"Atomic\0".as_ptr(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"save.xcltmp\0".as_ptr(), b"orig-xcltmp".as_ptr(), 11), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"~xcltmp.1.0\0".as_ptr(), b"orig-tilde".as_ptr(), 10), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"save.dat\0".as_ptr(), b"dat-v1".as_ptr(), 6), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+
+            // Overwriting `save.dat` must never clobber `save.xcltmp`, and overwriting `save.xcltmp` must succeed.
+            let mut u = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"save.dat\0".as_ptr(), b"dat-v2".as_ptr(), 6), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u, b"save.xcltmp\0".as_ptr(), b"next-xcltmp".as_ptr(), 11), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+            XGameSaveCloseUpdate(u);
+
+            // A simulated crash-leftover temp file in `b/` must never be enumerated as a blob.
+            let blobs_dir = (*c).dir.join("b");
+            let leftover = blobs_dir.join(format!("{TMP_PREFIX}99999.7"));
+            std::fs::write(&leftover, b"partial").unwrap();
+
+            let mut listed: Vec<(String, u32)> = Vec::new();
+            assert_eq!(XGameSaveEnumerateBlobInfo(c, &mut listed as *mut _ as *mut c_void, Some(blob_names)), S_OK);
+            assert_eq!(
+                listed,
+                vec![
+                    ("save.dat".to_string(), 6),
+                    ("save.xcltmp".to_string(), 11),
+                    ("~xcltmp.1.0".to_string(), 10),
+                ]
+            );
+
+            // Verify all three blobs retained their exact contents.
+            let names = [b"save.dat\0".as_ptr(), b"save.xcltmp\0".as_ptr(), b"~xcltmp.1.0\0".as_ptr()];
+            let mut count = 3u32;
+            let mut buf = vec![0u64; 64];
+            assert_eq!(XGameSaveReadBlobData(c, names.as_ptr(), &mut count, 512, buf.as_mut_ptr() as *mut Blob), S_OK);
+            assert_eq!(count, 3);
+            let b0 = &*(buf.as_ptr() as *const Blob);
+            let b1 = &*(buf.as_ptr() as *const Blob).add(1);
+            let b2 = &*(buf.as_ptr() as *const Blob).add(2);
+            assert_eq!(std::slice::from_raw_parts(b0.data, b0.info.size as usize), b"dat-v2");
+            assert_eq!(std::slice::from_raw_parts(b1.data, b1.info.size as usize), b"next-xcltmp");
+            assert_eq!(std::slice::from_raw_parts(b2.data, b2.info.size as usize), b"orig-tilde");
+
+            // Failed atomic replace (dest is an existing directory) removes its temp file.
+            let _ = std::fs::remove_file(&leftover);
+            let blocker = blobs_dir.join("dir_blocker");
+            std::fs::create_dir_all(&blocker).unwrap();
+            assert!(write_atomic(&blocker, b"cannot-replace-dir").is_err());
+            let remaining_tmps: Vec<_> = std::fs::read_dir(&blobs_dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+                .collect();
+            assert!(remaining_tmps.is_empty(), "temp file leaked on failed write_atomic: {remaining_tmps:?}");
+
+            XGameSaveCloseContainer(c);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn case_insensitive_blob_and_container_matching_on_ntfs() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-case-{}\0", std::process::id());
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProvider(std::ptr::null_mut(), cfg.as_ptr(), false, &mut p), S_OK);
+            let root = (*p).root.clone();
+
+            // Write container "SlotMixed" and blob "Meta"
+            let mut c1 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"SlotMixed\0".as_ptr(), &mut c1), S_OK);
+            let mut u1 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c1, b"Display 1\0".as_ptr(), &mut u1), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u1, b"Meta\0".as_ptr(), b"old".as_ptr(), 3), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u1), S_OK);
+            XGameSaveCloseUpdate(u1);
+            XGameSaveCloseContainer(c1);
+
+            // Re-open with lowercase name, overwrite "meta", then query/read using different casings.
+            let mut c2 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateContainer(p, b"slotmixed\0".as_ptr(), &mut c2), S_OK);
+            let mut u2 = std::ptr::null_mut();
+            assert_eq!(XGameSaveCreateUpdate(c2, b"Display 2\0".as_ptr(), &mut u2), S_OK);
+            assert_eq!(XGameSaveSubmitBlobWrite(u2, b"meta\0".as_ptr(), b"fresh".as_ptr(), 5), S_OK);
+            assert_eq!(XGameSaveSubmitUpdate(u2), S_OK);
+            XGameSaveCloseUpdate(u2);
+
+            for query_name in [b"meta\0".as_ptr(), b"Meta\0".as_ptr(), b"META\0".as_ptr()] {
+                let names = [query_name];
+                let mut count = 1u32;
+                let mut buf = vec![0u64; 32];
+                assert_eq!(XGameSaveReadBlobData(c2, names.as_ptr(), &mut count, 256, buf.as_mut_ptr() as *mut Blob), S_OK);
+                assert_eq!(count, 1);
+                let b0 = &*(buf.as_ptr() as *const Blob);
+                assert_eq!(std::slice::from_raw_parts(b0.data, b0.info.size as usize), b"fresh");
+            }
+
+            let mut prefixed_blobs: Vec<(String, u32)> = Vec::new();
+            assert_eq!(
+                XGameSaveEnumerateBlobInfoByName(c2, b"me\0".as_ptr(), &mut prefixed_blobs as *mut _ as *mut c_void, Some(blob_names)),
+                S_OK
+            );
+            assert_eq!(prefixed_blobs.len(), 1);
+            assert!(prefixed_blobs[0].0.eq_ignore_ascii_case("meta"));
+
+            let mut exact_c: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(
+                XGameSaveGetContainerInfo(p, b"slotmixed\0".as_ptr(), &mut exact_c as *mut _ as *mut c_void, Some(count_containers)),
+                S_OK
+            );
+            assert_eq!(exact_c.len(), 1);
+            assert_eq!(exact_c[0].1, "Display 2");
+
+            let mut prefix_c: Vec<(String, String, u32, u64)> = Vec::new();
+            assert_eq!(
+                XGameSaveEnumerateContainerInfoByName(p, b"slot\0".as_ptr(), &mut prefix_c as *mut _ as *mut c_void, Some(count_containers)),
+                S_OK
+            );
+            assert_eq!(prefix_c.len(), 1);
+
+            XGameSaveCloseContainer(c2);
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn initialize_provider_result_rejects_null_out_without_consuming_async() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let cfg = format!("xcl-test-null-out-{}\0", std::process::id());
+            let mut blk: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XGameSaveInitializeProviderAsync(std::ptr::null_mut(), cfg.as_ptr(), false, &mut blk), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut blk, true), S_OK);
+
+            // Passing null `out` must fail with E_INVALIDARG and preserve the completed async result.
+            assert_eq!(XGameSaveInitializeProviderResult(&mut blk, std::ptr::null_mut()), E_INVALIDARG);
+
+            let mut p = std::ptr::null_mut();
+            assert_eq!(XGameSaveInitializeProviderResult(&mut blk, &mut p), S_OK);
+            assert!(!p.is_null());
+            let root = (*p).root.clone();
+            XGameSaveCloseProvider(p);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn delete_container_rejects_empty_name_without_wiping_provider_root() {
         let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
@@ -737,4 +972,5 @@ mod tests {
             let _ = std::fs::remove_dir_all(root);
         }
     }
+
 }
