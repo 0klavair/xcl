@@ -326,6 +326,23 @@ fn crypto_procs() -> Option<&'static CryptoProcs> {
         .as_ref()
 }
 
+fn win32_failure_hr(err: u32) -> HRESULT {
+    if err != 0 {
+        hresult_from_win32(err)
+    } else {
+        crate::util::E_FAIL
+    }
+}
+
+fn policy_status_hr(error: u32) -> HRESULT {
+    let signed = error as HRESULT;
+    if signed < 0 {
+        signed
+    } else {
+        win32_failure_hr(error)
+    }
+}
+
 fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
     let lower = url.to_ascii_lowercase();
     let is_http = lower.starts_with("http://");
@@ -334,10 +351,14 @@ fn url_host_and_is_plain_loopback(url: &str) -> (String, bool) {
         None => url,
     };
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    let host = if authority.starts_with('[') {
-        authority.split(']').next().unwrap_or("").trim_start_matches('[')
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => "",
+        }
     } else {
-        authority.split(':').next().unwrap_or("")
+        hostport.split(':').next().unwrap_or("")
     };
     let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
     (host.to_string(), is_http && loopback)
@@ -366,32 +387,71 @@ unsafe fn extract_chain_certs(chain: *const c_void) -> Vec<*const CertContext> {
     elements.iter().filter(|e| !e.is_null()).map(|&e| (*e).cert_context).filter(|c| !c.is_null()).collect()
 }
 
-/// Verify optional SHA-1 thumbprint pins against the leaf-to-root certificate chain.
-pub unsafe fn verify_thumbprints(security_info: *const XNetworkingSecurityInformation, chain_sha1s: &[Vec<u8>]) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinCheck {
+    NoPins,
+    Matched,
+    Mismatch,
+    InvalidMetadata,
+}
+
+const SHA1_LEN: usize = 20;
+
+unsafe fn validate_thumbprint_metadata(security_info: *const XNetworkingSecurityInformation) -> Result<usize, ()> {
     if security_info.is_null() {
-        return true;
+        return Ok(0);
     }
     let info = std::ptr::read_unaligned(security_info);
-    if info.thumbprint_count == 0 || info.thumbprints.is_null() {
-        return true;
+    if info.thumbprint_count == 0 {
+        return Ok(0);
+    }
+    if info.thumbprints.is_null() {
+        return Err(());
+    }
+    let Some(table_bytes) = info.thumbprint_count.checked_mul(std::mem::size_of::<XNetworkingThumbprint>()) else {
+        return Err(());
+    };
+    if table_bytes > isize::MAX as usize {
+        return Err(());
     }
     for i in 0..info.thumbprint_count {
         let tp = std::ptr::read_unaligned(info.thumbprints.add(i));
-        if tp.thumbprint_buffer.is_null() || tp.thumbprint_buffer_byte_count == 0 {
-            continue;
+        if tp.thumbprint_buffer.is_null() || tp.thumbprint_buffer_byte_count != SHA1_LEN || tp.thumbprint_type > 2 {
+            return Err(());
         }
-        let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, tp.thumbprint_buffer_byte_count);
+    }
+    Ok(info.thumbprint_count)
+}
+
+unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation, chain_sha1s: &[Vec<u8>]) -> PinCheck {
+    let count = match validate_thumbprint_metadata(security_info) {
+        Ok(0) => return PinCheck::NoPins,
+        Ok(n) => n,
+        Err(()) => return PinCheck::InvalidMetadata,
+    };
+    let info = std::ptr::read_unaligned(security_info);
+    for i in 0..count {
+        let tp = std::ptr::read_unaligned(info.thumbprints.add(i));
+        let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
             1 => chain_sha1s.get(1).is_some_and(|c| c.as_slice() == expected),
             2 => chain_sha1s.last().is_some_and(|c| c.as_slice() == expected),
-            _ => chain_sha1s.iter().any(|c| c.as_slice() == expected),
+            _ => return PinCheck::InvalidMetadata,
         };
         if matched {
-            return true;
+            return PinCheck::Matched;
         }
     }
-    false
+    PinCheck::Mismatch
+}
+
+/// Verify optional SHA-1 thumbprint pins against the leaf-to-root certificate chain.
+///
+/// Rejects malformed pin metadata (nonzero count with null array, overflowing count,
+/// null or non-20-byte SHA-1 pin buffers, or unknown `XNetworkingThumbprintType` values).
+pub unsafe fn verify_thumbprints(security_info: *const XNetworkingSecurityInformation, chain_sha1s: &[Vec<u8>]) -> bool {
+    matches!(check_thumbprints(security_info, chain_sha1s), PinCheck::NoPins | PinCheck::Matched)
 }
 
 pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
@@ -401,22 +461,32 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     if request_handle.is_null() {
         return E_INVALIDARG;
     }
+    let Ok(pin_count) = validate_thumbprint_metadata(security_info) else {
+        return E_INVALIDARG;
+    };
     let Some(procs) = crypto_procs() else {
         return crate::util::E_FAIL;
     };
 
     let mut url_buf = [0u16; 2048];
     let mut url_bytes = (url_buf.len() * 2) as u32;
-    let url = if (procs.winhttp_query_option)(request_handle, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) != 0 {
-        let chars = (url_bytes as usize / 2).min(url_buf.len());
-        let trimmed = url_buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
-        String::from_utf16_lossy(&url_buf[..trimmed])
-    } else {
-        String::new()
-    };
+    if (procs.winhttp_query_option)(request_handle, WINHTTP_OPTION_URL, url_buf.as_mut_ptr() as *mut c_void, &mut url_bytes) == 0 {
+        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
+    }
+    let url_bytes = url_bytes as usize;
+    if url_bytes == 0 || url_bytes > url_buf.len() * 2 || (url_bytes & 1) != 0 {
+        return crate::util::E_FAIL;
+    }
+    let chars = url_bytes / 2;
+    let trimmed = url_buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+    let url = String::from_utf16_lossy(&url_buf[..trimmed]);
     let (host, is_plain_loopback) = url_host_and_is_plain_loopback(&url);
+    if host.is_empty() {
+        return crate::util::E_FAIL;
+    }
     if is_plain_loopback {
-        return S_OK;
+        // Plain HTTP has no server certificate and must fail if the caller requires pinning.
+        return if pin_count > 0 { CERT_E_UNTRUSTEDROOT } else { S_OK };
     }
 
     let mut cert: *const CertContext = std::ptr::null();
@@ -429,8 +499,7 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
     ) == 0
         || cert.is_null()
     {
-        let err = windows_sys::Win32::Foundation::GetLastError();
-        return if err != 0 { hresult_from_win32(err) } else { crate::util::E_FAIL };
+        return win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
     }
 
     let para = CertChainPara {
@@ -449,12 +518,13 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
         0,
         std::ptr::null_mut(),
         &mut chain,
-    ) != 0;
+    ) != 0
+        && !chain.is_null();
 
     let mut hr = if got_chain {
         S_OK
     } else {
-        hresult_from_win32(windows_sys::Win32::Foundation::GetLastError())
+        win32_failure_hr(windows_sys::Win32::Foundation::GetLastError())
     };
     if got_chain {
         let host_w = wide(&host);
@@ -462,7 +532,7 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
             cb_size: std::mem::size_of::<SslExtraCertChainPolicyPara>() as u32,
             auth_type: AUTHTYPE_SERVER,
             fdw_checks: 0,
-            server_name: if host.is_empty() { std::ptr::null() } else { host_w.as_ptr() },
+            server_name: host_w.as_ptr(),
         };
         let policy_para = CertChainPolicyPara {
             cb_size: std::mem::size_of::<CertChainPolicyPara>() as u32,
@@ -477,14 +547,16 @@ pub unsafe extern "system" fn XNetworkingVerifyServerCertificate(
             extra_policy_status: std::ptr::null_mut(),
         };
         if (procs.cert_verify_policy)(CERT_CHAIN_POLICY_SSL, chain, &policy_para, &mut status) == 0 {
-            hr = hresult_from_win32(windows_sys::Win32::Foundation::GetLastError());
+            hr = win32_failure_hr(windows_sys::Win32::Foundation::GetLastError());
         } else if status.error != 0 {
-            hr = status.error as HRESULT;
+            hr = policy_status_hr(status.error);
         } else {
             let prints: Vec<Vec<u8>> = extract_chain_certs(chain).into_iter().map(|c| sha1_thumbprint(procs, c)).collect();
-            if !verify_thumbprints(security_info, &prints) {
-                hr = CERT_E_UNTRUSTEDROOT;
-            }
+            hr = match check_thumbprints(security_info, &prints) {
+                PinCheck::NoPins | PinCheck::Matched => S_OK,
+                PinCheck::Mismatch => CERT_E_UNTRUSTEDROOT,
+                PinCheck::InvalidMetadata => E_INVALIDARG,
+            };
         }
         (procs.cert_free_chain)(chain);
     }
@@ -699,5 +771,99 @@ mod tests {
         assert_eq!(url_host_and_is_plain_loopback("https://127.0.0.1:3551/secure"), ("127.0.0.1".into(), false));
         assert_eq!(url_host_and_is_plain_loopback("http://[::1]:8080/test"), ("::1".into(), true));
         assert_eq!(url_host_and_is_plain_loopback("https://social.xboxlive.com/users"), ("social.xboxlive.com".into(), false));
+        assert_eq!(url_host_and_is_plain_loopback("http://user:pass@127.0.0.1:8080/test"), ("127.0.0.1".into(), true));
+        assert_eq!(url_host_and_is_plain_loopback("http://[::1/bad"), ("".into(), false));
+        assert_eq!(url_host_and_is_plain_loopback(""), ("".into(), false));
+    }
+
+    #[test]
+    fn cert_verification_fails_closed_on_malformed_pins_and_zero_win32_errors() {
+        assert_eq!(win32_failure_hr(0), crate::util::E_FAIL);
+        assert!(win32_failure_hr(87) < 0);
+        assert_eq!(policy_status_hr(CERT_E_UNTRUSTEDROOT as u32), CERT_E_UNTRUSTEDROOT);
+        assert_eq!(policy_status_hr(87), hresult_from_win32(87));
+
+        let leaf = vec![0xAAu8; 20];
+        let issuer = vec![0xBBu8; 20];
+        let root = vec![0xCCu8; 20];
+        let chain = vec![leaf.clone(), issuer.clone(), root.clone()];
+
+        unsafe {
+            // Nonzero thumbprint_count with null pointer must fail closed.
+            let null_array = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: std::ptr::null(),
+            };
+            assert_eq!(check_thumbprints(&null_array, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&null_array, &chain));
+            assert_eq!(XNetworkingVerifyServerCertificate(1usize as *mut c_void, &null_array), E_INVALIDARG);
+
+            // Empty pin buffer must fail closed even when paired with a matching pin.
+            let mixed = [
+                XNetworkingThumbprint { thumbprint_type: 0, thumbprint_buffer_byte_count: leaf.len(), thumbprint_buffer: leaf.as_ptr() },
+                XNetworkingThumbprint { thumbprint_type: 0, thumbprint_buffer_byte_count: 0, thumbprint_buffer: leaf.as_ptr() },
+            ];
+            let info_mixed = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: mixed.len(),
+                thumbprints: mixed.as_ptr(),
+            };
+            assert_eq!(check_thumbprints(&info_mixed, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&info_mixed, &chain));
+
+            // Null pin buffer must fail closed.
+            let null_buf = XNetworkingThumbprint { thumbprint_type: 0, thumbprint_buffer_byte_count: 20, thumbprint_buffer: std::ptr::null() };
+            let info_null_buf = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &null_buf,
+            };
+            assert_eq!(check_thumbprints(&info_null_buf, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&info_null_buf, &chain));
+
+            // Unknown thumbprint_type must fail closed even if bytes match the leaf cert.
+            let unknown_type = XNetworkingThumbprint { thumbprint_type: 3, thumbprint_buffer_byte_count: leaf.len(), thumbprint_buffer: leaf.as_ptr() };
+            let info_unknown = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &unknown_type,
+            };
+            assert_eq!(check_thumbprints(&info_unknown, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&info_unknown, &chain));
+            assert_eq!(XNetworkingVerifyServerCertificate(1usize as *mut c_void, &info_unknown), E_INVALIDARG);
+
+            // Valid issuer pin (type 1) matches chain[1].
+            let pin_issuer = XNetworkingThumbprint { thumbprint_type: 1, thumbprint_buffer_byte_count: issuer.len(), thumbprint_buffer: issuer.as_ptr() };
+            let info_issuer = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: 1,
+                thumbprints: &pin_issuer,
+            };
+            assert_eq!(check_thumbprints(&info_issuer, &chain), PinCheck::Matched);
+            assert!(verify_thumbprints(&info_issuer, &chain));
+
+            // Overflowing thumbprint_count must fail closed without dereferencing.
+            let huge_count = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: usize::MAX,
+                thumbprints: &pin_issuer,
+            };
+            assert_eq!(check_thumbprints(&huge_count, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&huge_count, &chain));
+
+            // Non-20-byte SHA-1 pin length must fail closed even when paired with a valid match.
+            let wrong_len = [
+                XNetworkingThumbprint { thumbprint_type: 0, thumbprint_buffer_byte_count: leaf.len(), thumbprint_buffer: leaf.as_ptr() },
+                XNetworkingThumbprint { thumbprint_type: 0, thumbprint_buffer_byte_count: 16, thumbprint_buffer: leaf.as_ptr() },
+            ];
+            let info_wrong_len = XNetworkingSecurityInformation {
+                enabled_http_security_protocol_flags: DEFAULT_TLS_FLAGS,
+                thumbprint_count: wrong_len.len(),
+                thumbprints: wrong_len.as_ptr(),
+            };
+            assert_eq!(check_thumbprints(&info_wrong_len, &chain), PinCheck::InvalidMetadata);
+            assert!(!verify_thumbprints(&info_wrong_len, &chain));
+        }
     }
 }
