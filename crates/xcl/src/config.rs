@@ -56,6 +56,10 @@ pub struct Config {
     pub raytracing: String,
     pub window_width: u32,
     pub window_height: u32,
+    /// The XCL window's position: "auto" (CW_USEDEFAULT – Windows may place it on any monitor),
+    /// "center" (the primary monitor's work area), or "x,y" (top-left of the window, screen
+    /// coordinates; clamped into the nearest monitor's work area). `XCL_WINDOW_POS` overrides.
+    pub window_pos: String,
     /// Answer `XUserGetTokenAndSignature*` with XCL's local placeholder token (for a backend of
     /// your own that accepts it). Off: the request fails as on a console that cannot reach Xbox
     /// Live (0x80072EFD), and titles go their offline way – Xbox Live's and the titles' own
@@ -171,6 +175,7 @@ impl Default for Config {
             raytracing: "auto".into(),
             window_width: 1280,
             window_height: 720,
+            window_pos: "auto".into(),
             xbox_live_tokens: false,
             keyboard_mouse: true,
             mouse_sensitivity: 1.0,
