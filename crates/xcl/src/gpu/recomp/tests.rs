@@ -1668,6 +1668,47 @@ fn rect_list_ps_reads_flat() {
     assert!(!super::pso::reads_flat(&p2).unwrap());
 }
 
+/// `emit::rect_list_gs` on the full-screen pass a downstream build (theaustinayers/xcl, build 5,
+/// via #189) reports from a retail title: positions (−1,1) (−1,−1) (1,−1), texture coordinates
+/// (0,0) (0,1) (1,1), the shared corner v1 and the implied one (1,1) with (1,0). Plain HLSL
+/// VS/PS around the GS. Every pixel must be drawn with its texture coordinate, for w 1 and 2;
+/// without the GS about half are.
+#[test]
+fn gpu_rect_list_fullscreen_order() {
+    if !gpu_ready() {
+        return;
+    }
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let outputs = [el("SV_Position", 0, 1, 3, 0, 0xF), el("TEXCOORD", 0, 0, 3, 1, 0xF)];
+    let vs_hlsl = "struct V { float4 pos : SV_Position; float4 uv : TEXCOORD0; };\nV main(float4 pos : POSITION, float4 uv : TEXCOORD0) { V o; o.pos = pos; o.uv = uv; return o; }\n";
+    let ps_hlsl = "float4 main(float4 pos : SV_Position, float4 uv : TEXCOORD0) : SV_Target { return uv; }\n";
+    let vs = super::dxc::compile(vs_hlsl, "main", "vs_6_6", &[]).unwrap();
+    let ps = super::dxc::compile(ps_hlsl, "main", "ps_6_6", &[]).unwrap();
+    let gs_hlsl = super::emit::rect_list_gs(&outputs).unwrap();
+    let gs = super::dxc::compile(&gs_hlsl, "main", "gs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{gs_hlsl}"));
+    let layout = [
+        runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 0 },
+        runner::VertexElement { semantic: "TEXCOORD", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 16 },
+    ];
+    let (n, clear) = (16usize, [0.0f32, 0.0, 1.0, 0.5]);
+    let corners = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([-1.0, -1.0], [0.0, 1.0]), ([1.0, -1.0], [1.0, 1.0])];
+    for w in [1.0f32, 2.0] {
+        let v: Vec<f32> = corners.iter().flat_map(|&([x, y], [s, t])| [x * w, y * w, 0.0, w, s, t, 0.0, 1.0]).collect();
+        let run = |with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, &v, 32, &[], &[], n as u32, clear).unwrap();
+        let px = run(true);
+        for y in 0..n {
+            for x in 0..n {
+                let want = [(x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32, 0.0, 1.0];
+                let got = px[y * n + x];
+                assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "w {w}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+            }
+        }
+        // the negative control: the three vertices alone draw the lower-left half
+        let drawn = run(false).iter().filter(|p| **p != clear).count();
+        assert!(drawn > n * n / 3 && drawn < n * n * 2 / 3, "w {w}: without the GS {drawn} of {} pixels drawn", n * n);
+    }
+}
+
 /// Console rect lists (DI_PT_RECTLIST) drawn through `emit::rect_list_gs`: three corners of a
 /// screen-aligned rectangle, the corner between the other two at v0 (Mesa radeonsi's blits),
 /// v1 (xf86-video-ati's r600 EXA) or v2. Each covers the whole rectangle and its attribute – the
