@@ -72,7 +72,7 @@ fn enc(name: &str) -> String {
     // Names Windows does not keep as given get one more character escaped: a device name (with
     // any extension) opens the device, "." and ".." are the folder itself and its parent, and a
     // trailing dot or space is dropped.
-    let base = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let base = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
     let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (base.len() == 4 && (base.starts_with("COM") || base.starts_with("LPT")) && base.as_bytes()[3].is_ascii_digit());
     if !name.is_empty() && (device || name.bytes().all(|b| b == b'.')) {
@@ -596,7 +596,7 @@ mod tests {
                 assert_eq!(XGameSaveCreateContainer(p, cname.as_ptr(), &mut c), S_OK);
                 let mut u = std::ptr::null_mut();
                 assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
-                let blobs: [&[u8]; 4] = [b"aux\0", b"CON.dat\0", b"save.\0", b"save \0"];
+                let blobs: [&[u8]; 5] = [b"aux\0", b"CON.dat\0", b"save.\0", b"save \0", b"nul .txt\0"];
                 for (i, name) in blobs.iter().enumerate() {
                     assert_eq!(XGameSaveSubmitBlobWrite(u, name.as_ptr(), b"0123".as_ptr(), i + 1), S_OK);
                 }
@@ -605,7 +605,7 @@ mod tests {
                 let mut names: Vec<(String, u32)> = Vec::new();
                 assert_eq!(XGameSaveEnumerateBlobInfo(c, &mut names as *mut _ as *mut c_void, Some(blob_names)), S_OK);
                 names.sort();
-                let want: Vec<(String, u32)> = vec![("CON.dat".into(), 2), ("aux".into(), 1), ("save ".into(), 4), ("save.".into(), 3)];
+                let want: Vec<(String, u32)> = vec![("CON.dat".into(), 2), ("aux".into(), 1), ("nul .txt".into(), 5), ("save ".into(), 4), ("save.".into(), 3)];
                 assert_eq!(names, want, "{container_name}");
                 XGameSaveCloseContainer(c);
             }
