@@ -6208,6 +6208,51 @@ fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
 }
 
 #[test]
+fn gpu_f16_defaults_to_round_to_nearest_even() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let cases: [(f32, u16); 7] = [
+        (f32::from_bits(3075.0f32.to_bits() - 1), 0x6A01),
+        (3075.0, 0x6A02),
+        (f32::from_bits(3075.0f32.to_bits() + 1), 0x6A02),
+        (3081.0, 0x6A04),
+        (-3075.0, 0xEA02),
+        (65520.0, 0x7C00),
+        (f32::from_bits(0x3300_0001), 0x0001),
+    ];
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    for (lane, &(value, _)) in cases.iter().enumerate() {
+        st.vgpr[lane][0] = value.to_bits();
+    }
+    // 3072 * (1 + 2^-10) is the exact binary16 midpoint 3075.
+    st.vgpr[0][1] = 0xEA00_6A00;
+    st.vgpr[0][2] = 0x3C01_3C01;
+
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    let actual: [u16; 7] = std::array::from_fn(|lane| r.vgpr[lane][10] as u16);
+    let expected = cases.map(|(_, bits)| bits);
+    let product = r.vgpr[0][11] as u16;
+    let packed = r.vgpr[0][12];
+    assert_eq!(
+        (actual, product, packed),
+        (expected, 0x6A02, 0xEA02_6A02),
+        "conversion {actual:04x?}, multiplication {product:04x}, packed multiplication {packed:08x}",
+    );
+}
+
+#[test]
 fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     if !gpu_ready() {
         return;
