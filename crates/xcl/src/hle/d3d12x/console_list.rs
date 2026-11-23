@@ -287,6 +287,11 @@ pub fn pending_blocks() -> (usize, usize) {
     PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))
 }
 
+#[cfg(test)]
+pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
