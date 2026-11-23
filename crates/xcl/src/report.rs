@@ -46,6 +46,9 @@ pub struct Report {
     pub exe: String,
     pub crash: Option<String>,
     pub exit_code: Option<i64>,
+    /// what the PC has of what a run needs (DXC, GPU features), checked by `xcl run` first
+    #[serde(default)]
+    pub environment: Vec<crate::preflight::Check>,
     /// counts of static imports by how they were resolved
     pub imports_by_source: BTreeMap<String, usize>,
     /// imports that ended up as auto-stubs (static analysis)
@@ -122,6 +125,7 @@ pub fn build() -> Report {
         exe: boot.map(|b| b.exe_path.to_string_lossy().into_owned()).unwrap_or_default(),
         crash: CRASH.lock().ok().and_then(|g| g.clone()),
         exit_code: None,
+        environment: Vec::new(),
         imports_by_source: by_source,
         stubbed_imports: stubbed,
         called_stubs: called,
