@@ -373,9 +373,20 @@ fn binary(name: &str, a: Hi, b: Hi) -> Option<Hi> {
         "V_ADD_NC_U32" => |a, b| a.wrapping_add(b),
         _ => return None,
     };
+    // a constant that decides the result whatever the other operand holds
+    let absorbing = |c: u32| match name {
+        "V_AND_B32" | "V_MIN_U32" => c == 0,
+        "V_OR_B32" | "V_MAX_U32" => c == u32::MAX,
+        "V_MIN_I32" => c == i32::MIN as u32,
+        "V_MAX_I32" => c == i32::MAX as u32,
+        _ => false,
+    };
     Some(match (a, b) {
         (Hi::Const(x), Hi::Const(y)) => Hi::Const(f(x, y)),
         (Hi::Unknown | Hi::Shadow, _) | (_, Hi::Unknown | Hi::Shadow) => Hi::Unknown,
+        (Hi::Const(c), Hi::Unwritten) | (Hi::Unwritten, Hi::Const(c)) if absorbing(c) => Hi::Const(c),
+        // x ^ x is 0 whatever x holds, and the operands may be the same register
+        _ if name == "V_XOR_B32" => Hi::Unknown,
         _ => Hi::Unwritten, // computed from a lane nothing wrote
     })
 }
@@ -490,8 +501,8 @@ fn sgpr_outputs(d: &Decoded) -> Vec<(u64, u64)> {
             _ => {}
         }
     }
-    // an SDWA compare with SD = 1 writes its SDST instead of VCC
-    if d.variant == Variant::Sdwa && d.enc.name == "ENC_VOPC" {
+    // an SDWA compare with SD = 1 writes its SDST instead of VCC (v_cmpx: EXEC only)
+    if d.variant == Variant::Sdwa && d.enc.name == "ENC_VOPC" && !d.inst.name.starts_with("V_CMPX") {
         if let Some(e) = ext_encoding(d) {
             let x = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
             out.retain(|&(r, _)| r != 106);
@@ -558,8 +569,8 @@ fn step(d: &Decoded, st: &mut State) {
                 st.lo.remove(&v);
             }
         }
-    } else if name.starts_with("V_MOVREL") {
-        // writes v[dst + m0]: any VGPR
+    } else if name.starts_with("V_MOVREL") || name.starts_with("V_SWAPREL") {
+        // writes v[dst + m0] (v_swaprel also v[src0 + m0]): any VGPR
         st.lo.clear();
         if exec_hi != Word::Zero {
             let all: Vec<u64> = (0..256).collect();
@@ -911,6 +922,43 @@ mod tests {
         // native read, not listed), lane 36 still the spill
         assert_eq!(r, vec![Read::Shadow, Read::Shadow, Read::Native, Read::Shadow]);
         assert_eq!(a.shadows, BTreeSet::from([(96, 5), (96, 36)]));
+    }
+
+    #[test]
+    fn swaprel_writes_any_register() {
+        // v_swaprel_b32 writes v[src0 + m0] and v[dst + m0]: a spill slot is not kept past it
+        let r = reads(&[
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", 20), ("SRC1", 128 + 5)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 128 + 2)], None),
+            ("V_SWAPREL_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 8)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 10), ("SRC1", 128 + 5)], None),
+        ]);
+        assert!(!r.contains(&Read::Shadow), "{r:?}");
+    }
+
+    #[test]
+    fn sdwa_cmpx_writes_exec_not_vcc() {
+        // VCC keeps its old (all ones) value: lane 32 of the select takes v7
+        let r = reads(&[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 193)], None),
+            ("V_CMPX_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", &[("SRC0", 0xF9), ("VSRC0", 1), ("VSRC1", 2), ("SRC0_SEL", 6), ("SRC1_SEL", 6)], None),
+            WWM,
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128 + 2)], None),
+            ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128 + 1), ("VSRC1", 7)], None),
+            RESTORE,
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 6), ("SRC1", 128 + 32)], None),
+        ]);
+        assert!(!r.contains(&Read::Const(1)), "{r:?}");
+    }
+
+    #[test]
+    fn a_constant_decides_an_unwritten_operand() {
+        // v5's lanes 32..63 were never written; 0 & anything is 0
+        let and = reads(&[WWM, ("V_AND_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128), ("VSRC1", 5)], None), RESTORE, READ32]);
+        assert_eq!(and, vec![Read::Const(0)]);
+        // v5 ^ v5 is 0 whatever v5 holds: not "unwritten"
+        let xor = reads(&[WWM, ("V_XOR_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 5), ("VSRC1", 5)], None), RESTORE, READ32]);
+        assert_eq!(xor, vec![Read::Unknown]);
     }
 
     #[test]
