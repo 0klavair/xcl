@@ -17,8 +17,13 @@
 //! each gets a range there, T# word 0 is an index into it – a T# copied anywhere still names
 //! its PC descriptor – and that heap is what lists bind. The title's own PC heap stays as a
 //! CPU-only mirror (where views are made, copies come from and UAV clears take their CPU
-//! handle). Without the shared heap (no room, not made) a heap keeps its own PC heap: SRV at
-//! 2k, UAV at 2k + 1.
+//! handle). A heap gets its place in the shared heap a page of `PAGE_SLOTS` slots at a time,
+//! when a slot of that page is first used: titles make large heaps and fill few slots
+//! (Minecraft: eight view heaps of 73 727 slots – 147 454 PC descriptors each, more in all
+//! than the 1 000 000 an NVIDIA shared heap holds – with a few hundred views in them). A heap
+//! left out of the shared heap would be lost: lists bind only the shared heap for views.
+//! Without the shared heap (it could not be made) a heap keeps its own PC heap: SRV at 2k,
+//! UAV at 2k + 1.
 
 use std::sync::Mutex;
 
@@ -37,8 +42,9 @@ struct Heap {
     pc_gpu: u64,
     inc: u32,
     sampler: bool,
-    /// views in the shared heap: index of slot 0's SRV there, and its CPU / GPU handles
-    first: Option<(u32, u64, u64)>,
+    /// views in the shared heap: the index there of each page's first SRV (`UNMAPPED`: the
+    /// page has no place yet); empty: the heap's views are not in the shared heap
+    pages: Vec<u32>,
     /// shader visible as the title made it
     visible: bool,
     /// backed by a sparse VRAM allocation in window 0 (rather than committed system RAM)
@@ -79,6 +85,11 @@ static GLOBAL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// descriptors of the shared heap at most (the GPU may take more: OPTIONS19)
 const GLOBAL_MAX: u32 = 1 << 21;
 
+/// view slots per page of a heap's place in the shared heap (2 PC descriptors each)
+pub const PAGE_SLOTS: u32 = 256;
+/// a page with no place in the shared heap yet
+const UNMAPPED: u32 = u32::MAX;
+
 /// A first-fit range of `count` in `free` (released ranges), else at `next` below `cap`.
 fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) -> Option<u32> {
     if let Some(i) = free.iter().position(|&(_, n)| n >= count) {
@@ -97,14 +108,14 @@ fn take_range(free: &mut Vec<(u32, u32)>, next: &mut u32, cap: u32, count: u32) 
     Some(*next - count)
 }
 
-/// `count` descriptors of the shared shader-visible heap (made on first use): the index of
-/// the first. None: no shared heap, or no room left in it.
-pub unsafe fn reserve_global(dev: &ID3D12Device, count: u32) -> Option<u32> {
+/// The shared shader-visible heap, made on first use. False: there is none (it could not be
+/// made) – view heaps then keep their own.
+pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let mut g = GLOBAL.lock().unwrap();
     if g.is_none() {
         if GLOBAL_FAILED.load(Relaxed) {
-            return None;
+            return false;
         }
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
         let max = if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &mut o as *mut _ as *mut std::ffi::c_void, std::mem::size_of_val(&o) as u32).is_ok() && o.MaxViewDescriptorHeapSize > 0 {
@@ -119,7 +130,7 @@ pub unsafe fn reserve_global(dev: &ID3D12Device, count: u32) -> Option<u32> {
             Err(e) => {
                 GLOBAL_FAILED.store(true, Relaxed);
                 crate::xlog_warn!("console descriptor heaps: no shared shader-visible heap of {cap} ({e}) – each keeps its own");
-                return None;
+                return false;
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
@@ -134,17 +145,37 @@ pub unsafe fn reserve_global(dev: &ID3D12Device, count: u32) -> Option<u32> {
             free: Vec::new(),
         });
     }
+    true
+}
+
+/// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
+/// no room left in it.
+fn reserve_global(count: u32) -> Option<u32> {
+    let mut g = GLOBAL.lock().unwrap();
     let s = g.as_mut()?;
     let (cap, mut next) = (s.cap, s.next);
     let r = take_range(&mut s.free, &mut next, cap, count);
     s.next = next;
     if r.is_none() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, Relaxed) == 0 {
-            crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) has no room for {count} more – that heap keeps its own");
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            crate::xlog_warn!("console descriptor heaps: the shared heap ({cap}) is full – shaders do not see the views of slots past it");
         }
     }
     r
+}
+
+/// The place in the shared heap of the page slot `k` of `h` is in – (index of the page's
+/// first SRV there, the page's first slot) – given now if the page has none yet. None: the
+/// heap is not in the shared heap, or that is full.
+fn page_of(h: &mut Heap, k: u32) -> Option<(u32, u32)> {
+    let p = (k / PAGE_SLOTS) as usize;
+    let mut first = *h.pages.get(p)?;
+    if first == UNMAPPED {
+        first = reserve_global(2 * PAGE_SLOTS)?;
+        h.pages[p] = first;
+    }
+    Some((first, p as u32 * PAGE_SLOTS))
 }
 
 /// The shared range starting at `first` (`count` descriptors) is free again.
@@ -161,14 +192,14 @@ pub fn global_heap() -> Option<ID3D12DescriptorHeap> {
 
 /// Whether `obj` (a title's view heap) has its descriptors in the shared heap.
 pub fn in_global(obj: usize) -> bool {
-    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && h.first.is_some())
+    HEAPS.lock().unwrap().iter().any(|h| h.obj == obj && !h.pages.is_empty())
 }
 
 /// `obj` is a PC heap from `pc_cpu` / `pc_gpu` (increment `inc`; `pc_gpu` 0 when not shader
 /// visible) with 2·`n` view descriptors or `n` samplers: give it `n` console slots in
-/// unified memory. `first`: its range in the shared heap (`reserve_global`); `visible`: what
-/// the title asked for.
-pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler: bool, first: Option<u32>, visible: bool) -> bool {
+/// unified memory. `shared`: its views go to the shared heap (`shared_heap`), a page at a
+/// time as slots are used; `visible`: what the title asked for.
+pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler: bool, shared: bool, visible: bool) -> bool {
     let Some(u) = crate::gpu::uma::get() else { return false };
     let bytes = n.max(1) * if sampler { SAMPLER_SLOT } else { SLOT };
     // Descriptor tables are 32-bit console addresses (high dword 0): must live in window 0.
@@ -196,11 +227,8 @@ pub fn register(obj: usize, n: u32, pc_cpu: u64, pc_gpu: u64, inc: u32, sampler:
             );
         }
     }
-    let first = first.and_then(|f| {
-        let g = GLOBAL.lock().unwrap();
-        g.as_ref().map(|s| (f, s.cpu + f as u64 * s.inc as u64, s.gpu + f as u64 * s.inc as u64))
-    });
-    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, first, visible, sparse });
+    let pages = if shared && !sampler && GLOBAL.lock().unwrap().is_some() { vec![UNMAPPED; n.div_ceil(PAGE_SLOTS).max(1) as usize] } else { Vec::new() };
+    HEAPS.lock().unwrap().push(Heap { obj, shadow: p as usize, n, pc_cpu, pc_gpu, inc, sampler, pages, visible, sparse });
     true
 }
 
@@ -211,8 +239,8 @@ pub fn unregister(obj: usize) {
         heaps.iter().position(|h| h.obj == obj).map(|i| heaps.swap_remove(i))
     };
     if let Some(h) = gone {
-        if let Some((f, _, _)) = h.first {
-            release_global(f, 2 * h.n);
+        for &f in h.pages.iter().filter(|&&f| f != UNMAPPED) {
+            release_global(f, 2 * PAGE_SLOTS);
         }
         if h.sparse {
             unsafe { super::sparse::free(h.shadow) };
@@ -241,22 +269,28 @@ pub struct Slot {
     pub sampler: bool,
     /// CPU handle of the SRV in the shared heap (0: the heap is not in it)
     pub shared_srv: u64,
+    /// the slot's number in its heap
+    pub k: u32,
 }
 
-/// The slot behind a console CPU handle (None: not one of XCL's console heaps).
+/// The slot behind a console CPU handle (None: not one of XCL's console heaps). A view slot
+/// of a heap in the shared heap gets its page's place there now if the page has none yet.
 pub fn slot(cpu: u64) -> Option<Slot> {
-    let heaps = HEAPS.lock().unwrap();
-    let h = heaps.iter().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
+    let mut heaps = HEAPS.lock().unwrap();
+    let h = heaps.iter_mut().find(|h| cpu >= h.shadow as u64 && cpu < (h.shadow + (h.n * h.slot_bytes()) as usize) as u64)?;
     let k = ((cpu - h.shadow as u64) / h.slot_bytes() as u64) as u32;
     if h.sampler {
-        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index: k, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv: 0 });
+        return Some(Slot { at: h.shadow + (k * SAMPLER_SLOT) as usize, index: k, pc_srv: h.pc_cpu + (k * h.inc) as u64, pc_uav: 0, pc_gpu_uav: 0, sampler: true, shared_srv: 0, k });
     }
     let uav = ((2 * k + 1) * h.inc) as u64;
-    let (index, pc_gpu_uav, shared_srv) = match h.first {
-        Some((f, cpu, gpu)) => (f + 2 * k, gpu + uav, cpu + (2 * k * h.inc) as u64),
-        None => (2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0),
-    };
-    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv })
+    let shared = page_of(h, k).and_then(|(first, k0)| {
+        let g = GLOBAL.lock().unwrap();
+        let g = g.as_ref()?;
+        let i = first + 2 * (k - k0);
+        Some((i, g.gpu + (i as u64 + 1) * g.inc as u64, g.cpu + i as u64 * g.inc as u64))
+    });
+    let (index, pc_gpu_uav, shared_srv) = shared.unwrap_or((2 * k, if h.pc_gpu == 0 { 0 } else { h.pc_gpu + uav }, 0));
+    Some(Slot { at: h.shadow + (k * SLOT) as usize, index, pc_srv: h.pc_cpu + (2 * k * h.inc) as u64, pc_uav: h.pc_cpu + uav, pc_gpu_uav, sampler: false, shared_srv, k })
 }
 
 /// The view just made in slot `s` (its SRV, or with `uav` its UAV) goes to the shared heap.
@@ -270,13 +304,20 @@ pub unsafe fn publish(s: &Slot, uav: bool) {
     }
 }
 
-/// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap.
+/// `n` view slots from `first` were copied (in the title's heap): they go to the shared heap,
+/// a run per page (a heap's pages lie apart there).
 pub unsafe fn publish_range(first: &Slot, n: u32) {
-    if first.shared_srv == 0 || n == 0 {
-        return;
-    }
-    if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
-        g.dev.CopyDescriptorsSimple(2 * n, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: first.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: first.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    let mut done = 0;
+    while done < n {
+        let s = if done == 0 { Some(*first) } else { slot((first.at + (done * SLOT) as usize) as u64) };
+        let Some(s) = s else { return };
+        let run = (PAGE_SLOTS - s.k % PAGE_SLOTS).min(n - done);
+        if s.shared_srv != 0 {
+            if let Some(g) = GLOBAL.lock().unwrap().as_ref() {
+                g.dev.CopyDescriptorsSimple(2 * run, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.shared_srv as usize }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: s.pc_srv as usize }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+        }
+        done += run;
     }
 }
 
@@ -357,13 +398,16 @@ pub fn census() {
     for h in heaps.iter().filter(|h| !h.sampler) {
         let (mut empty, mut own, mut other, mut buffers) = (0u32, 0u32, 0u32, 0u32);
         let mut examples: Vec<(u32, u32)> = Vec::new();
-        let base = h.first.map_or(0, |f| f.0);
+        let own_index = |k: u32| match h.pages.get((k / PAGE_SLOTS) as usize) {
+            Some(&f) if f != UNMAPPED => f + 2 * (k % PAGE_SLOTS),
+            _ => 2 * k,
+        };
         for k in 0..h.n {
             let w = unsafe { std::slice::from_raw_parts((h.shadow + (k * SLOT) as usize) as *const u32, 8) };
             if w.iter().all(|&x| x == 0) {
                 empty += 1;
             } else if w[3] >> 28 >= 8 {
-                if w[0] == base + 2 * k {
+                if w[0] == own_index(k) {
                     own += 1;
                 } else {
                     other += 1;
@@ -419,8 +463,8 @@ mod tests {
         let Some(u) = crate::gpu::uma::get() else { return };
         let rel = |p: u64| (p as usize - u.base()) as u32;
         // views: 4 slots over a PC heap at 0x1000 (increment 32, GPU 0x5000); samplers: 2 at 0x9000
-        assert!(register(0xA1, 4, 0x1000, 0x5000, 32, false, None, true));
-        assert!(register(0xA2, 2, 0x9000, 0, 16, true, None, true));
+        assert!(register(0xA1, 4, 0x1000, 0x5000, 32, false, false, true));
+        assert!(register(0xA2, 2, 0x9000, 0, 16, true, false, true));
         let (v, sm) = (start(0xA1).unwrap(), start(0xA2).unwrap());
         assert_eq!(u.window_of(v as usize), Some(0), "view heap must live in window 0 (32-bit table addressing)");
         assert_eq!(u.window_of(sm as usize), Some(0), "sampler heap must live in window 0");
@@ -451,5 +495,52 @@ mod tests {
         unregister(0xA1);
         unregister(0xA2);
         assert!(start(0xA1).is_none() && slot(v).is_none() && slot(sm).is_none());
+    }
+
+    /// Minecraft's view heaps: eight of 73 727 slots, 147 454 PC descriptors each – more in all
+    /// than an NVIDIA shared heap holds (1 000 000). Each gets a place there for the pages it
+    /// uses; before, the seventh and eighth got none and their views were lost (flicker).
+    #[test]
+    fn large_heaps_get_shared_pages_as_used() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        if crate::gpu::uma::get().is_none() {
+            return;
+        }
+        let dev = unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            dev.expect("D3D12 device")
+        };
+        assert!(unsafe { shared_heap(&dev) });
+        const N: u32 = 73_727;
+        let objs: Vec<usize> = (0..8).map(|i| 0xB000 + i).collect();
+        for &o in &objs {
+            assert!(register(o, N, 0x10_0000, 0, 32, false, true, true));
+            assert!(in_global(o));
+        }
+        let mut seen = Vec::new();
+        for &o in &objs {
+            let v = start(o).unwrap();
+            // slot 0, the last of page 0, the first of page 1 and the heap's last slot
+            let s: Vec<Slot> = [0, PAGE_SLOTS - 1, PAGE_SLOTS, N - 1].iter().map(|&k| slot(v + (k * SLOT) as u64).unwrap()).collect();
+            assert!(s.iter().all(|x| x.shared_srv != 0), "heap {o:#x}: a slot without a place in the shared heap");
+            assert_eq!(s[1].index, s[0].index + 2 * (PAGE_SLOTS - 1), "a page is contiguous");
+            assert_eq!(s[0].pc_srv, 0x10_0000, "views are still made in the title's heap");
+            assert_eq!(s[3].pc_srv, 0x10_0000 + (2 * (N - 1) * 32) as u64);
+            for x in &s {
+                assert!(!seen.contains(&x.index), "two slots share the PC index {}", x.index);
+                seen.push(x.index);
+            }
+            // the same slot again: the same place
+            assert_eq!(slot(v).unwrap().index, s[0].index);
+        }
+        for &o in &objs {
+            unregister(o);
+        }
     }
 }

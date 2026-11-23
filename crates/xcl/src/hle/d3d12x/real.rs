@@ -841,11 +841,11 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     // title's own a CPU-only mirror – `console_heap`); samplers: one per slot
     let pc_n = if sampler { d[1] } else { d[1].saturating_mul(2) };
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
-    let first = match ID3D12Device::from_raw_borrowed(&this) {
-        Some(dev) if !sampler && !desc.is_null() => super::console_heap::reserve_global(dev, pc_n),
-        _ => None,
+    let shared = match ID3D12Device::from_raw_borrowed(&this) {
+        Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
+        _ => false,
     };
-    let flags = if first.is_some() { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
+    let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
     let pc = [d[0], pc_n, flags, d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
     if hr >= 0 {
@@ -875,14 +875,9 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
                 dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
             }
         }
-        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, first, visible) {
+        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
-            if let Some(f) = first {
-                super::console_heap::release_global(f, pc_n);
-            }
         }
-    } else if let Some(f) = first {
-        super::console_heap::release_global(f, pc_n);
     }
     hr
 }
