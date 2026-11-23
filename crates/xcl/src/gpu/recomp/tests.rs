@@ -505,16 +505,94 @@ fn cvt_norm_f16_instructions() {
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}", t.unsupported);
     // single f16 source (low half) → unsigned / signed normalized short, 16-bit result
-    assert!(t.hlsl.contains("round(saturate(f16tof32(((v9) & 0xFFFFu))) * 65535.0f)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("cvt_norm_u16_f16(((v9) & 0xFFFFu))"), "{}", t.hlsl);
     // op_sel[0] reads the source's high half, op_sel[3] writes the destination's high
-    // half preserving the low one; abs/neg apply on the f16 value
-    assert!(t.hlsl.contains("round(clamp(f16tof32(((v9) >> 16)), -1.0f, 1.0f) * 32767.0f)"), "{}", t.hlsl);
+    // half preserving the low one; abs/neg apply directly on the binary16 sign bit
+    assert!(t.hlsl.contains("cvt_norm_i16_f16(((v9) >> 16))"), "{}", t.hlsl);
     assert!(t.hlsl.contains("(v2 & 0xFFFFu) | (t") && t.hlsl.contains("<< 16), v2)"), "{}", t.hlsl);
     // packed: two whole dwords written; each source half picked by op_sel
-    assert!(t.hlsl.contains("round(saturate(f16tof32(v9 & 0xFFFFu)) * 65535.0f) | ((uint)round(saturate(f16tof32(v10 & 0xFFFFu)) * 65535.0f) << 16"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("round(clamp(f16tof32(v9 >> 16), -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) | (((uint)(int)round(clamp(f16tof32(v10 >> 16), -1.0f, 1.0f) * 32767.0f) & 0xFFFFu) << 16"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(cvt_norm_u16_f16((v9 & 0xFFFFu)) | (cvt_norm_u16_f16((v10 & 0xFFFFu)) << 16))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(cvt_norm_i16_f16((v9 >> 16)) | (cvt_norm_i16_f16((v10 >> 16)) << 16))"), "{}", t.hlsl);
     // inline float constants decode as f16 bit patterns (1.0 = 0x3C00, −1.0 = 0xBC00)
-    assert!(t.hlsl.contains("f16tof32(0x00003C00u & 0xFFFFu)") && t.hlsl.contains("f16tof32(0x0000BC00u & 0xFFFFu)"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("cvt_norm_u16_f16((0x00003C00u & 0xFFFFu))") && t.hlsl.contains("cvt_norm_u16_f16((0x0000BC00u & 0xFFFFu))"), "{}", t.hlsl);
+}
+
+/// GPU verification of exact RNE rounding and edge cases for `V_CVT_NORM_*_F16` and
+/// `V_CVT_PKNORM_*_F16`: catches binary32 double-rounding (`0x3801`/`0xB801`), DXIL
+/// `clamp(NaN, -1, 1)` returning ±32767 instead of 0, ±Inf, ±0, subnormals, and VOP3 abs/neg.
+#[test]
+fn gpu_cvt_norm_f16_exact_rounding_and_edge_cases() {
+    if !gpu_ready() {
+        return;
+    }
+    // 16 test vectors (packed into lane % 16): (f16_bits, expected_unorm16, expected_snorm16)
+    const CASES: &[(u16, u16, u16)] = &[
+        (0x3801, 32799, 16399),         // 1025/2048: fp32 double-rounds to 32800 / 16400
+        (0xB801, 0, (-16399i16) as u16), // -1025/2048: fp32 double-rounds to -16400
+        (0x3800, 32768, 16384),         // +0.5: exact half tie-to-even
+        (0xB800, 0, (-16384i16) as u16), // -0.5: exact half tie-to-even
+        (0x7E00, 0, 0),                 // +qNaN -> 0 (not ±32767)
+        (0xFC01, 0, 0),                 // -sNaN -> 0
+        (0x7C00, 65535, 32767),         // +Inf
+        (0xFC00, 0, (-32767i16) as u16), // -Inf
+        (0x0000, 0, 0),                 // +0.0
+        (0x8000, 0, 0),                 // -0.0
+        (0x0080, 0, 0),                 // subnormal 128 * 2^-24: *65535 = 0.499992 -> 0
+        (0x0081, 1, 0),                 // subnormal 129 * 2^-24: *65535 = 0.503899 -> 1
+        (0x0101, 1, 1),                 // subnormal 257 * 2^-24: *32767 = 0.501938 -> 1
+        (0x3BFF, 65503, 32751),         // max f16 < 1.0 (2047/2048)
+        (0x3C00, 65535, 32767),         // +1.0
+        (0xBC00, 0, (-32767i16) as u16), // -1.0
+    ];
+    let code = prog(&[
+        // v1 = V_CVT_NORM_U16_F16(v0.lo), v2 = V_CVT_NORM_I16_F16(v0.lo)
+        ("V_CVT_NORM_U16_F16", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_CVT_NORM_I16_F16", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        // Packed: v3 = pknorm_u16(v0.lo, v0.hi), v4 = pknorm_i16(v0.lo, v0.hi)
+        ("V_CVT_PKNORM_U16_F16", "ENC_VOP3", &[("VDST", 3), ("SRC0", V), ("SRC1", V), ("OP_SEL", 0b0010)], None),
+        ("V_CVT_PKNORM_I16_F16", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V), ("OP_SEL", 0b0010)], None),
+        // VOP3 modifiers:
+        // - abs(-1025/2048) -> +1025/2048 -> u16 32799 / i16 16399
+        // - neg(+1025/2048) -> -1025/2048 -> i16 -16399 (0xBFF1)
+        // - neg(abs(-1025/2048)) -> -1025/2048 -> i16 -16399 (verifies abs before neg)
+        // - neg(qNaN) -> 0
+        ("V_CVT_NORM_U16_F16", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 5), ("ABS", 1)], None),
+        ("V_CVT_NORM_I16_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 5), ("ABS", 1)], None),
+        ("V_CVT_NORM_I16_F16", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 6), ("NEG", 1)], None),
+        ("V_CVT_NORM_I16_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 12), ("NEG", 1)], None),
+        ("V_CVT_NORM_I16_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 5), ("ABS", 1), ("NEG", 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let lo = CASES[l % CASES.len()].0 as u32;
+        let hi = CASES[(l + 1) % CASES.len()].0 as u32;
+        r[0] = lo | (hi << 16);
+        r[5] = 0xB801;  // -1025/2048
+        r[6] = 0x7E00;  // +qNaN
+        r[12] = 0x3801; // +1025/2048
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let (h_lo, exp_u_lo, exp_i_lo) = CASES[l % CASES.len()];
+        let (h_hi, exp_u_hi, exp_i_hi) = CASES[(l + 1) % CASES.len()];
+        assert_eq!(r.vgpr[l][1] & 0xFFFF, exp_u_lo as u32, "lane {l} u16(0x{h_lo:04X})");
+        assert_eq!(r.vgpr[l][2] & 0xFFFF, exp_i_lo as u32, "lane {l} i16(0x{h_lo:04X})");
+        assert_eq!(
+            r.vgpr[l][3],
+            (exp_u_lo as u32) | ((exp_u_hi as u32) << 16),
+            "lane {l} pknorm_u16(0x{h_lo:04X}, 0x{h_hi:04X})"
+        );
+        assert_eq!(
+            r.vgpr[l][4],
+            (exp_i_lo as u32) | ((exp_i_hi as u32) << 16),
+            "lane {l} pknorm_i16(0x{h_lo:04X}, 0x{h_hi:04X})"
+        );
+        assert_eq!(r.vgpr[l][7] & 0xFFFF, 32799, "lane {l} abs(0xB801) u16");
+        assert_eq!(r.vgpr[l][8] & 0xFFFF, 16399, "lane {l} abs(0xB801) i16");
+        assert_eq!(r.vgpr[l][9] & 0xFFFF, 0, "lane {l} neg(qNaN) i16");
+        assert_eq!(r.vgpr[l][10] & 0xFFFF, (-16399i16) as u16 as u32, "lane {l} neg(0x3801) i16");
+        assert_eq!(r.vgpr[l][11] & 0xFFFF, (-16399i16) as u16 as u32, "lane {l} -abs(0xB801) i16");
+    }
 }
 
 /// The f64 frexp pair: v_frexp_mant_f64 (m in [0.5,1) keeping the sign, input back for
