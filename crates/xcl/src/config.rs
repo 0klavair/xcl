@@ -76,6 +76,8 @@ impl Config {
     pub fn resolve(&mut self, manifest: Option<&crate::manifest::Manifest>) -> Vec<String> {
         let mut from = Vec::new();
         let series_s = self.is_series_s();
+        // "Auto" / "Advanced" in xcl.toml: read in any case, as device_type and the manifest (#106)
+        self.title_memory = self.title_memory.trim().to_ascii_lowercase();
         if self.title_memory == "auto" {
             let m = manifest.and_then(|m| if series_s { m.lockhart_memory.clone() } else { m.anaconda_memory.clone() });
             if let Some(m) = &m {
@@ -336,6 +338,16 @@ mod tests {
         let mut c = Config::default();
         c.resolve(Some(&manifest));
         assert_eq!((c.title_memory.as_str(), c.title_memory_mb), ("standard", 13_824));
+    }
+
+    #[test]
+    fn title_memory_is_read_in_any_case() {
+        let manifest = crate::manifest::Manifest { anaconda_memory: Some("Advanced".into()), ..Default::default() };
+        for (setting, m) in [("Auto", Some(&manifest)), ("ADVANCED", None)] {
+            let mut c = Config { title_memory: setting.into(), ..Config::default() };
+            c.resolve(m);
+            assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
+        }
     }
 
     #[test]
