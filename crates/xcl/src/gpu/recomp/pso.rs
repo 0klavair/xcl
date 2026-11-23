@@ -217,7 +217,16 @@ pub fn wave32_only(wave_min: u32, wave_max: u32) -> bool {
     !(wave_min <= 64 && wave_max >= 64)
 }
 
+/// `XCL_SPLIT_WAVE64=1`: the split wave64 form also where the GPU has 64-lane waves – to check
+/// the path of GPUs with 32-lane waves only (NVIDIA) on an RDNA GPU, which runs both sizes.
+pub fn split_wave64_forced() -> bool {
+    std::env::var("XCL_SPLIT_WAVE64").is_ok_and(|v| v == "1")
+}
+
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
+    if split_wave64_forced() {
+        return true;
+    }
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
     if unsafe {
         device.CheckFeatureSupport(

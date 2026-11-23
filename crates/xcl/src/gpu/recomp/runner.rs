@@ -356,7 +356,7 @@ pub fn wave64_supported() -> Result<bool, String> {
 /// Whether wave64 programs need the split form here (`Options::split_wave64`): the
 /// adapter runs only 32-lane waves. False without a usable GPU.
 pub fn split_wave64() -> bool {
-    wave64_supported() == Ok(false)
+    wave64_supported() == Ok(false) || (super::pso::split_wave64_forced() && wave64_programs_supported() == Ok(true))
 }
 
 /// Whether wave64 programs run on this adapter at all: natively (64-lane waves) or split (32).
