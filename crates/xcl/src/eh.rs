@@ -300,7 +300,8 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             ];
             *regs[r as usize & 15] = cpu;
         }
-        // the low quadword changes; the high one is undefined on the console and kept here
+        // the low quadword changes; the high one, undefined in AMD's manual, is zeroed – what a
+        // Zen 5 does in all of 32 779 cases compared (Kalmarv on #209)
         ConsoleOnly::Extrq { dst, src, len, idx } => {
             let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
             let (len, idx) = match src {
@@ -312,6 +313,7 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             };
             let d = &mut x[dst as usize & 15];
             d.Low = crate::insn::extrq(d.Low, len, idx);
+            d.High = 0;
         }
         ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
             let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
@@ -319,6 +321,7 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
             let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
             let d = &mut x[dst as usize & 15];
             d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
+            d.High = 0;
         }
     }
     ctx.Rip += len as u64;
