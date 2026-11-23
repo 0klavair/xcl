@@ -1202,13 +1202,16 @@ pub fn geometry_wave32_hazards(code: &[u8]) -> BTreeSet<&'static str> {
 }
 
 /// Translate a complete ES+GS program; `split_wave64`: for a GPU with 32-lane waves only.
-pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: bool) -> Result<Translation, String> {
-    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, ..Default::default() })
+/// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS.
+pub fn translate_geometry(code: &[u8], interface: GsInterface, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Geometry(interface), wave64: true, split_wave64, mem_windows, ..Default::default() })
 }
 
-/// Translate an NGG mesh program; `split_wave64`: for a GPU with 32-lane waves only.
-pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool) -> Result<Translation, String> {
-    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, ..Default::default() })
+/// Translate an NGG mesh program; `split_wave64`: for a GPU with 32-lane waves only;
+/// `mem_windows`: the title's memory windows (`pso::mem_windows`), as for VS / PS / CS – with
+/// one, a program reading title memory above the first window read the wrong memory.
+pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
