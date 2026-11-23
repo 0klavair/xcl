@@ -36,7 +36,7 @@ whole-wave:
 
 | operation | exchange |
 |---|---|
-| `ballot()` (every mask: `v_cmp*`, `v_cmpx*`, carries, EXEC at entry) | one word: each half gives its 32-bit ballot, both get the 64-bit mask |
+| `ballot()` (every mask: `v_cmp*`, `v_cmpx*`, carries, EXEC at entry) | one word: each half gives its 32-bit ballot, both get the 64-bit mask – unless the mask is only read lane by lane (below) |
 | `v_readlane`, `v_readfirstlane` (lane index uniform) | one word: each half gives the value of lane `l & 31`, the half that owns `l` wins |
 | `ds_bpermute` (any lane) | 32 words: each half gives its lanes |
 | DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16` | none: the ISA keeps them inside a 32-lane half (`WaveReadLaneAt(v, l & 31)`) |
@@ -99,11 +99,46 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
 4. **`WaveReadLaneAt` with a per-lane index** – used inside a half as before.
 5. **Forward progress** – only the multi-wave variant spins; see above.
 
+### Masks read lane by lane
+
+A mask whose only readers take the reading lane's own bit – `v_cndmask_b32`'s selector, the
+carry-in of `v_add_co_ci` / `v_sub(rev)_co_ci` – needs just that lane's half, so it is not
+exchanged: `xcl_x_ballot_local` gives the half's own word and 0 for the other half
+(`x64_masks.rs`). Which masks those are is a backward liveness analysis over the SGPRs: a
+register is *whole-live* after an instruction when some path may read its whole value (any
+SALU / SMEM operand, a VALU scalar operand, `s_cbranch_vcc*`, `src_vccz`, …) before it is
+written again; a mask written to registers that are not whole-live stays in its half.
+
+The halves then hold different values in those registers, so the rules follow what the
+emitter does, not only the ISA's operand tables:
+- a write is an overwrite only when the emitter replaces the whole register whatever it held:
+  not `s_cmov*` / `s_cmovk` (conditional), `s_addk` / `s_mulk` / `s_bitset*` (they read the
+  old value), `s_movreld` / `s_movrelsd_2` (they write `s[dst + m0]`), nor an SDWA compare
+  with SD = 1 (it writes its SDST, VCC keeps its value);
+- `s_movrels*` read `s[src + m0]`: every register from `src` up to s123, VCC included;
+- SDWA scalar sources (the S0 / S1 bits), SMEM register offsets, `src_vccz` / `src_execz` and
+  M0 are reads;
+- EXEC is always whole-live; an indirect jump (`s_setpc` / `s_swappc` other than a far jump,
+  which is a branch) makes every SGPR whole-live, and so does the end of a kernel-mode program
+  (the runner reads the SGPRs back – the halves still end with the same SGPRs);
+- every emitted loop can be left where its iteration budget (`LOOP_GUARD`) is checked – at
+  its top, and in the `pc` dispatcher form before each of its blocks, to the code after it or
+  (dispatcher) the end of the program: what is live there is live before each instruction of
+  the loop.
+
+A mask with no destination (VOP3 compare into NULL) or one that is 0 in every lane (the
+`false` mask of `v_div_scale`) is not exchanged either. Both halves make the same static
+choice, so their exchange counts stay in step. Geometry mode (ES → GS through `s_setpc`)
+has no liveness pass: its masks are exchanged as before, except those two kinds (no
+destination, 0 in every lane), which are the same in both halves either way.
+`XCL_X64_ALL_MASKS=1` exchanges every mask (for comparison).
+
 ## Cost
 
-A wave64 program pays one exchange per mask write (`v_cmp*`, carries) and per readlane /
-readfirstlane / ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP
-instruction. Wave32 programs, VS / PS and everything on GPUs with 64-lane waves are
+A wave64 program pays one exchange per mask write that is read whole (`v_cmp*` feeding
+`s_and_saveexec`, `s_cbranch_vccz`, `s_bcnt1`, …) and per readlane / readfirstlane /
+ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
+masks read lane by lane (selects, 64-bit carry chains). Wave32 programs, VS / PS and everything on GPUs with 64-lane waves are
 unchanged (the HLSL of every native translation the test suite makes is byte-identical).
 
 Measured on an RTX 5070 Ti (`bench_split_wave64`, an ignored test): a loop of 8
@@ -120,6 +155,29 @@ counter-paired variant is the expensive one: a waiting wave keeps issuing (no wa
 it in HLSL), taking issue slots from the waves it waits for. The next step would be to skip
 the exchange for masks only used lane by lane (`v_cmp` + `v_cndmask` selects; each half's
 own word is enough there), which needs a liveness pass over the mask registers.
+
+That pass is now in (see "Masks read lane by lane"). The benchmark now counts the
+exchanges a loop iteration makes and times each dispatch with GPU timestamps (median of 9
+dispatches in one command list; `runner::dispatch_timed`). Before, it took the wall time of
+a whole `runner::dispatch` – pipeline creation, buffers, uploads, submission and the CPU's
+wait included – which shrank every ratio towards 1 (the 5070 Ti figures above were taken
+that way). On an RTX 3090, three runs with all masks exchanged (`XCL_X64_ALL_MASKS=1`) and
+five with the default:
+
+| | mask only | mask + `v_readfirstlane` |
+|---|---|---|
+| exchanges per iteration (all masks / default) | 1 / 0 | 2 / 1 |
+| one console wave per group (barrier) | 1.64–1.68× → 1.04–1.11× | 1.99–2.02× → 1.74–1.81× |
+| four console waves per group (counters) | 3.90–4.14× → 1.07–1.16× | 6.45–6.64× → 4.09–4.34× |
+
+(wave32 baseline 11.4–14.1 ms.) The 4–16 % left with no exchange at all is the rest of
+the split form (64-bit masks, the threads' start), not measured further. The benchmark's
+loop mask is exactly the kind the pass keeps local – it shows the exchange gone and what
+one costs, not how often real shaders gain.
+
+What is left is readlane / readfirstlane, `ds_bpermute`, coherent scalar loads and masks
+read whole. Not measured on real compute shaders (none on that machine); Minecraft's 273
+wave64 programs, translated as compute, have 38 mask writes, all only read lane by lane.
 
 ## Relation to earlier work
 

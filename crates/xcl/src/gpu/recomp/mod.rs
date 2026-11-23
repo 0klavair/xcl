@@ -55,6 +55,7 @@ pub mod dxc;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
+pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
@@ -578,6 +579,40 @@ type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+
+/// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
+/// partly overlapping ones merged until they nest, sorted. `x64_masks` uses them for the
+/// exits through `LOOP_GUARD`.
+pub(super) fn loop_ranges(insts: &[Decoded]) -> Vec<(u64, u64)> {
+    let mut loops: Vec<(u64, u64)> = Vec::new();
+    for d in insts {
+        if let Some(t) = rdna2::branch_target(d) {
+            if t <= d.pc {
+                loops.push((t, d.pc + d.len as u64));
+            }
+        }
+    }
+    loop {
+        let mut merged = false;
+        'scan: for i in 0..loops.len() {
+            for j in 0..loops.len() {
+                let (a, b) = (loops[i], loops[j]);
+                if i != j && a.0 < b.0 && b.0 < a.1 && a.1 < b.1 {
+                    loops[i] = (a.0, b.1);
+                    loops.remove(j);
+                    merged = true;
+                    break 'scan;
+                }
+            }
+        }
+        if !merged {
+            break;
+        }
+    }
+    loops.sort();
+    loops.dedup();
+    loops
+}
 
 /// Target of an s_endpgm before the end of the program: "skip to the end".
 const END: u64 = u64::MAX;
@@ -1299,6 +1334,11 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     let mut em = emit::Em::new(opt.clone());
     em.configure_round_modes(&insts, branches == 0);
     em.static_ss = constant_samplers(&insts, &leaders);
+    // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
+    // continues from the ES into the GS through s_setpc: left as it is)
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    }
     em.max_vgpr = insts
         .iter()
         .flat_map(|d| {
@@ -1330,33 +1370,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
-        let mut loops: Vec<(u64, u64)> = Vec::new();
-        for d in &insts {
-            if let Some(t) = rdna2::branch_target(d) {
-                if t <= d.pc {
-                    loops.push((t, d.pc + d.len as u64));
-                }
-            }
-        }
-        loop {
-            let mut merged = false;
-            'scan: for i in 0..loops.len() {
-                for j in 0..loops.len() {
-                    let (a, b) = (loops[i], loops[j]);
-                    if i != j && a.0 < b.0 && b.0 < a.1 && a.1 < b.1 {
-                        loops[i] = (a.0, b.1);
-                        loops.remove(j);
-                        merged = true;
-                        break 'scan;
-                    }
-                }
-            }
-            if !merged {
-                break;
-            }
-        }
-        loops.sort();
-        loops.dedup();
+        let loops = loop_ranges(&insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
