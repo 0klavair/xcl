@@ -51,7 +51,7 @@ fn mesh_ready() -> bool {
 /// The wave sizes a per-lane test runs in, as the `wave64` option: true where the GPU has
 /// wave64, and false on every GPU, so the test also runs on NVIDIA. Empty without a GPU or DXC.
 fn gpu_waves() -> Vec<bool> {
-    if !gpu_ready_wave32() {
+    if !gpu_ready() {
         return Vec::new();
     }
     if runner::wave64_supported() == Ok(true) { vec![true, false] } else { vec![false] }
