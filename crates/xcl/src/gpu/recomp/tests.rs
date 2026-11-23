@@ -1672,7 +1672,10 @@ fn rect_list_ps_reads_flat() {
 /// via #189) reports from a retail title: positions (−1,1) (−1,−1) (1,−1), texture coordinates
 /// (0,0) (0,1) (1,1), the shared corner v1 and the implied one (1,1) with (1,0). Plain HLSL
 /// VS/PS around the GS. Every pixel must be drawn with its texture coordinate, for w 1 and 2;
-/// without the GS about half are.
+/// without the GS about half are. The other half of that rect as a triangle (v0, v2 and the
+/// implied corner – what a draw expanded to two triangles a rect on the CPU sends next) is three
+/// corners of the same rect, so the GS completes it to the whole rect as well: such a draw must
+/// not also get this GS, or each rect is drawn twice.
 #[test]
 fn gpu_rect_list_fullscreen_order() {
     if !gpu_ready() {
@@ -1691,8 +1694,9 @@ fn gpu_rect_list_fullscreen_order() {
         runner::VertexElement { semantic: "TEXCOORD", index: 0, format: DXGI_FORMAT_R32G32B32A32_FLOAT, offset: 16 },
     ];
     let (n, clear) = (16usize, [0.0f32, 0.0, 1.0, 0.5]);
-    let corners = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([-1.0, -1.0], [0.0, 1.0]), ([1.0, -1.0], [1.0, 1.0])];
-    for w in [1.0f32, 2.0] {
+    let first = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([-1.0, -1.0], [0.0, 1.0]), ([1.0, -1.0], [1.0, 1.0])];
+    let second = [([-1.0f32, 1.0], [0.0f32, 0.0]), ([1.0, -1.0], [1.0, 1.0]), ([1.0, 1.0], [1.0, 0.0])];
+    for (name, corners, w) in [("v0 v1 v2", first, 1.0f32), ("v0 v1 v2", first, 2.0), ("v0 v2 v3", second, 1.0)] {
         let v: Vec<f32> = corners.iter().flat_map(|&([x, y], [s, t])| [x * w, y * w, 0.0, w, s, t, 0.0, 1.0]).collect();
         let run = |with_gs: bool| runner::draw_gs(&vs, with_gs.then_some(gs.as_slice()), &ps, &layout, &v, 32, &[], &[], n as u32, clear).unwrap();
         let px = run(true);
@@ -1700,12 +1704,12 @@ fn gpu_rect_list_fullscreen_order() {
             for x in 0..n {
                 let want = [(x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32, 0.0, 1.0];
                 let got = px[y * n + x];
-                assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "w {w}: pixel ({x},{y}) = {got:?}, expected {want:?}");
+                assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{name}, w {w}: pixel ({x},{y}) = {got:?}, expected {want:?}");
             }
         }
-        // the negative control: the three vertices alone draw the lower-left half
+        // the negative control: the three vertices alone draw half the rect
         let drawn = run(false).iter().filter(|p| **p != clear).count();
-        assert!(drawn > n * n / 3 && drawn < n * n * 2 / 3, "w {w}: without the GS {drawn} of {} pixels drawn", n * n);
+        assert!(drawn > n * n / 3 && drawn < n * n * 2 / 3, "{name}, w {w}: without the GS {drawn} of {} pixels drawn", n * n);
     }
 }
 
