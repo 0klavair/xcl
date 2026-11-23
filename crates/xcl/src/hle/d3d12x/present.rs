@@ -27,9 +27,10 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::gpu::fence::{self, FenceError};
 use crate::stubs::StubInfo;
 
 static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
@@ -442,6 +443,7 @@ fn ensure_window() -> Option<HWND> {
 
 struct Presenter {
     queue: usize,
+    dev: ID3D12Device,
     sc: Option<IDXGISwapChain3>,
     w: u32,
     h: u32,
@@ -450,9 +452,19 @@ struct Presenter {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     copy_source: Option<ID3D12Resource>,
+    dumps: Vec<FrameDump>,
+    disabled: bool,
     value: u64,
     event: HANDLE,
     last: Instant,
+}
+
+struct FrameDump {
+    _source: ID3D12Resource,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    format: DXGI_FORMAT,
+    tag: String,
 }
 
 unsafe impl Send for Presenter {}
@@ -482,7 +494,11 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     list.Close().ok()?;
     let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
     let event = CreateEventW(None, false, false, None).ok()?;
-    Some(Presenter { queue, sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence, copy_source: None, value: 0, event, last: Instant::now() - Duration::from_secs(1) })
+    Some(Presenter {
+        queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
+        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        last: Instant::now() - Duration::from_secs(1),
+    })
 }
 
 unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: DXGI_FORMAT) -> bool {
@@ -561,7 +577,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         *guard = new_presenter(queue);
     }
     let Some(p) = guard.as_mut() else { return };
-    if p.last.elapsed() < min_interval {
+    if p.disabled || p.last.elapsed() < min_interval {
         return;
     }
     let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
@@ -571,14 +587,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         return; // swap chain is bound to the first queue we presented from
     }
     // wait for the previous copy so the allocator can be reused
-    if p.fence.GetCompletedValue() < p.value {
-        let _ = p.fence.SetEventOnCompletion(p.value, p.event);
-        WaitForSingleObject(p.event, 100);
-        if p.fence.GetCompletedValue() < p.value {
-            return;
+    if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
+        p.disabled = matches!(&e, FenceError::Removed(_));
+        if !matches!(&e, FenceError::Timeout(_)) {
+            crate::xlog_error!("present: previous copy: {e}");
         }
+        return;
     }
     p.copy_source = None;
+    p.dumps.clear();
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
     }
@@ -591,23 +608,35 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     p.list.ResourceBarrier(&b1);
     p.list.CopyResource(&bb, &src);
     let due = frame_dump_due();
-    let dump = due.then(|| readback_copy(&p.list, &src, &desc)).flatten();
+    let mut dumps = Vec::new();
+    if due {
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+        }
+    }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
-    let rt_dump: Vec<_> = if due && trace_frame() {
-        busiest_rt()
+    if due && trace_frame() {
+        let busiest = busiest_rt();
+        let followed = FOLLOWED.lock().unwrap();
+        let targets = busiest
             .into_iter()
-            .chain(FOLLOWED.lock().unwrap().iter().copied())
+            .chain(followed.iter().copied())
             .filter_map(|r| {
                 let rr = r as *mut c_void;
                 let res = ID3D12Resource::from_raw_borrowed(&rr)?.clone();
                 let d = res.GetDesc();
-                (d.SampleDesc.Count <= 1).then(|| readback_copy(&p.list, &res, &d).map(|x| (x, d.Format))).flatten()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+                if d.SampleDesc.Count > 1 {
+                    return None;
+                }
+                let (buffer, footprint) = readback_copy(&p.list, &res, &d)?;
+                Some((res, buffer, footprint, d.Format))
+            });
+        for (k, (res, buffer, footprint, format)) in targets.enumerate() {
+            let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
+            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
+        }
+    }
     let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
     p.list.ResourceBarrier(&b2);
     if p.list.Close().is_err() {
@@ -618,19 +647,37 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
+    p.dumps = dumps;
     p.value += 1;
-    let _ = q.Signal(&p.fence, p.value);
-    let _ = sc.Present(0, DXGI_PRESENT(0));
-    p.last = Instant::now();
-    if let Some((rb, fp)) = dump {
-        if p.fence.GetCompletedValue() < p.value {
-            let _ = p.fence.SetEventOnCompletion(p.value, p.event);
-            WaitForSingleObject(p.event, 2000);
-        }
-        write_frame(&rb, &fp, desc.Format, "frame");
+    if let Err(e) = q.Signal(&p.fence, p.value) {
+        // The copy is already submitted. Without its signal, keep its resources and allocator.
+        p.disabled = true;
+        let e = fence::api_error(&p.dev, "Signal", e);
+        crate::xlog_error!("present: submit copy: {e}");
+        return;
     }
-    for (k, ((rb, fp), f)) in rt_dump.into_iter().enumerate() {
-        write_frame(&rb, &fp, f, &if k == 0 { "rt".to_string() } else { format!("rt{k}") });
+    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+        let e = fence::api_error(&p.dev, "Present", e);
+        p.disabled = matches!(&e, FenceError::Removed(_));
+        crate::xlog_error!("present: {e}");
+        return;
+    }
+    p.last = Instant::now();
+    if !p.dumps.is_empty() {
+        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+            Ok(()) => {
+                for dump in p.dumps.drain(..) {
+                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
+                }
+            }
+            Err(e) => {
+                p.disabled = matches!(&e, FenceError::Removed(_));
+                crate::xlog_error!("present: frame dump copy: {e}");
+                if p.disabled {
+                    return;
+                }
+            }
+        }
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if n == 0 {

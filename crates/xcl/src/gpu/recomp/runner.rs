@@ -9,13 +9,13 @@ use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::Mutex;
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
 use super::{KERNEL_LANES, KERNEL_RES_DWORDS, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+use crate::gpu::fence;
 
 /// Initial state of a kernel run.
 #[derive(Clone)]
@@ -74,6 +74,13 @@ static GPU: Mutex<Option<Result<Gpu, String>>> = Mutex::new(None);
 
 fn e(x: windows::core::Error) -> String {
     format!("{x}")
+}
+
+unsafe fn wait_for_submission(
+    dev: &ID3D12Device, queue: &ID3D12CommandQueue, fence: &ID3D12Fence, value: u64, stage: &str,
+) -> Result<(), String> {
+    queue.Signal(fence, value).map_err(|e| format!("{stage}: {}", fence::api_error(dev, "Signal", e)))?;
+    fence::wait(fence, value, dev, None, 10_000).map_err(|e| format!("{stage}: {e}"))
 }
 
 fn init() -> Result<Gpu, String> {
@@ -509,14 +516,7 @@ pub fn run_with_statics(
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
-        gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU did not finish within 10 s (device removed: {:?})", dev.GetDeviceRemovedReason()));
-        }
+        wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "kernel dispatch")?;
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
         let raw = std::slice::from_raw_parts(p as *const u32, KERNEL_RES_DWORDS).to_vec();
@@ -862,14 +862,7 @@ pub fn draw_on_multi(
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
-        queue.Signal(&fence, 1).map_err(e)?;
-        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        fence.SetEventOnCompletion(1, ev).map_err(e)?;
-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if fence.GetCompletedValue() < 1 {
-            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
-        }
+        wait_for_submission(dev, &queue, &fence, 1, "draw")?;
         let mut p = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut p)).map_err(e)?;
         let pitch = layout_fp.Footprint.RowPitch as usize;
@@ -1073,14 +1066,7 @@ pub fn mesh_draw_split(
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
-        gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
-        }
+        wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "mesh draw")?;
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let pitch = fp.Footprint.RowPitch as usize;
@@ -1194,14 +1180,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
-        gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
-        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if gpu.fence.GetCompletedValue() < gpu.value {
-            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
-        }
+        wait_for_submission(dev, &gpu.queue, &gpu.fence, gpu.value, "arena dispatch")?;
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let raw = std::slice::from_raw_parts(q as *const u32, KERNEL_RES_DWORDS).to_vec();
@@ -1344,14 +1323,7 @@ fn dispatch_with(
         list.Close().map_err(e)?;
         queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         *value += 1;
-        queue.Signal(fence, *value).map_err(e)?;
-        let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        fence.SetEventOnCompletion(*value, ev).map_err(e)?;
-        windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
-        let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if fence.GetCompletedValue() < *value {
-            return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
-        }
+        wait_for_submission(dev, queue, fence, *value, "compute dispatch")?;
         let mut q = std::ptr::null_mut();
         readback.Map(0, None, Some(&mut q)).map_err(e)?;
         let out = std::slice::from_raw_parts(q as *const u32, mem_len).to_vec();
