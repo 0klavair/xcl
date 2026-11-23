@@ -14,22 +14,46 @@ pub struct Manifest {
     pub lockhart_memory: Option<String>,
     /// `<TitleId>` (hex)
     pub title_id: Option<String>,
+    /// `<Resources><Resource Language="..."/>`: declared package locales in manifest order
+    pub languages: Vec<String>,
 }
 
 fn element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    let open = format!("<{name}>");
-    let at = xml.find(&open)? + open.len();
-    let end = xml[at..].find(&format!("</{name}>"))?;
-    Some(xml[at..at + end].trim())
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open).map(|i| from + i) {
+        let after = i + open.len();
+        let Some(next) = xml[after..].chars().next() else { break };
+        if next == '>' || next.is_whitespace() {
+            let gt = xml[after..].find('>')?;
+            if !xml[after..after + gt].trim_end().ends_with('/') {
+                let body = after + gt + 1;
+                let end = xml[body..].find(&format!("</{name}>"))?;
+                return Some(xml[body..body + end].trim());
+            }
+        }
+        from = after;
+    }
+    None
 }
 
 pub fn parse(xml: &str) -> Manifest {
     let pls = element(xml, "PersistentLocalStorage").and_then(|section| element(section, "SizeMB"));
+    let languages = element(xml, "Resources")
+        .map(|section| {
+            crate::launcher::xml_attrs(section, "Resource", "Language")
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     Manifest {
         pls_mb: pls.and_then(|v| v.parse().ok()),
         anaconda_memory: element(xml, "XboxAnacondaTitleMemory").map(str::to_string),
         lockhart_memory: element(xml, "XboxLockhartTitleMemory").map(str::to_string),
         title_id: element(xml, "TitleId").map(str::to_string),
+        languages,
     }
 }
 
@@ -94,5 +118,35 @@ mod tests {
   <Other><SizeMB>512</SizeMB></Other>
 </Game>"#;
         assert_eq!(parse(xml).pls_mb, None);
+    }
+
+    #[test]
+    fn parses_declared_resources_languages_with_comments_and_utf16() {
+        let xml = r#"<Game configVersion="1">
+  <Other><Resource Language="xx-XX"/></Other>
+  <Resources>
+    <!-- <Resource Language="de-DE"/> -->
+    <Resource Language="en-US"/>
+    <Resource Scale="100"/>
+    <Resource Language="fr-FR" />
+    <Resource Language="   "/>
+    <Resource Language="ja-JP"></Resource>
+  </Resources>
+</Game>"#;
+        assert_eq!(parse(xml).languages, vec!["de-DE", "en-US", "fr-FR", "ja-JP"]);
+
+        let dir = std::env::temp_dir().join(format!("xcl_manifest_langs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MicrosoftGame.Config"), xml).unwrap();
+        assert_eq!(load(&dir).unwrap().languages, vec!["en-US", "fr-FR", "ja-JP"]);
+
+        // UTF-16 LE with BOM
+        let mut raw = vec![0xFF, 0xFE];
+        raw.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(dir.join("MicrosoftGame.Config"), raw).unwrap();
+        assert_eq!(load(&dir).unwrap().languages, vec!["en-US", "fr-FR", "ja-JP"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

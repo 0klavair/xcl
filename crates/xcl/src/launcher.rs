@@ -16,7 +16,7 @@ pub fn data_root() -> PathBuf {
 }
 
 /// Values of `attr` on every `<tag …>` element (so "<Executable" != "<ExecutableList").
-fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
+pub(crate) fn xml_attrs(xml: &str, tag: &str, attr: &str) -> Vec<String> {
     let open = format!("<{tag}");
     let key = format!("{attr}=\"");
     let mut out = Vec::new();

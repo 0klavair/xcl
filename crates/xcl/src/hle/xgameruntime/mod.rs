@@ -93,6 +93,7 @@ pub fn exports() -> Vec<(&'static str, usize)> {
         // package
         XPackageIsPackagedProcess,
         XPackageGetCurrentProcessPackageIdentifier,
+        XPackageGetIdentifier,
         XPackageMount,
         XPackageGetMountPathSize,
         XPackageGetMountPath,
@@ -301,6 +302,12 @@ pub unsafe extern "system" fn XPackageIsPackagedProcess() -> bool {
 }
 
 pub unsafe extern "system" fn XPackageGetCurrentProcessPackageIdentifier(size: usize, buf: *mut u8) -> HRESULT {
+    write_cstr_out(&package_identifier(), buf, size, std::ptr::null_mut())
+}
+
+/// `XPackageGetIdentifier(pathOrName, bufferSize, buffer)` — slot 27 on `XPackage` takes
+/// three arguments after `this` (unlike 2-arg `XPackageGetCurrentProcessPackageIdentifier`).
+pub unsafe extern "system" fn XPackageGetIdentifier(_path_or_name: *const u8, size: usize, buf: *mut u8) -> HRESULT {
     write_cstr_out(&package_identifier(), buf, size, std::ptr::null_mut())
 }
 
@@ -933,7 +940,7 @@ pub unsafe extern "system" fn XUserFindControllerForUserWithUiAsync(user: *mut c
     if !valid_user(user) {
         return E_INVALIDARG;
     }
-    begin_with(b, &FIND_CONTROLLER_ID as *const u8 as usize, || Ok(vec![0u8; 32]))
+    begin_with(b, &FIND_CONTROLLER_ID as *const u8 as usize, || Ok(crate::hle::gameinput::gamepad_device_id().to_vec()))
 }
 
 pub unsafe extern "system" fn XUserFindControllerForUserWithUiResult(b: *mut XAsyncBlock, device_id: *mut [u8; 32]) -> HRESULT {
