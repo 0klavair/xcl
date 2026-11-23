@@ -3647,6 +3647,10 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 /// console methods from CopyTextureRegionX on two slots later)
 pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 
+/// the title's runtime has the older queue layout: it signalled / waited on a fence at #14 / #15
+/// (on the newer layout those slots are other methods)
+static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
+
 /// command list slots of the newer layout → the older layout's slot of the same method
 const NEWER_LIST_SLOTS: [(usize, usize); 8] = [(85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
 
@@ -3670,6 +3674,9 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
     let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
+        QUEUE_OLDER.store(true, Ordering::Release);
+    }
     // the method in the older layout's numbering
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
     let pc = |s: usize| orig_fn(this, s);
@@ -3686,6 +3693,20 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
         17 => {
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_CLOCK_CALIBRATION));
             f(this, a1, a2) as u32 as usize
+        }
+        // #18 before either layout is known: the older layout's GetDesc (a 16-byte structure) or
+        // the newer one's GetTimestampFrequency (a UINT64). Only the first 8 bytes of the
+        // description are written (type and priority), so an 8-byte out-param is not overrun.
+        18 if !shifted && !QUEUE_OLDER.load(Ordering::Acquire) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue #18 before the title's first Signal / Wait: the queue layout is not known yet, GetDesc writes only its first 8 bytes"));
+            let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
+            let mut desc = [0u8; 16];
+            f(this, desc.as_mut_ptr() as usize);
+            if a1 != 0 {
+                std::ptr::copy_nonoverlapping(desc.as_ptr(), a1 as *mut u8, 8);
+            }
+            a1
         }
         // GetDesc returns its structure through the hidden pointer, and that pointer
         18 => {
@@ -4107,5 +4128,50 @@ mod readback_routing_tests {
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
+    unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
+        let d = [1u32, 2, 3, 4];
+        std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, out as *mut u8, 16);
+        out
+    }
+    unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
+        0
+    }
+
+    /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
+    /// layout) it is GetDesc with all 16.
+    #[test]
+    fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        let mut pc = [0usize; 32];
+        pc[14] = signal as usize;
+        pc[18] = get_desc as usize;
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        let mut obj = [vtbl];
+        let this = obj.as_mut_ptr() as *mut c_void;
+        let fence = 0x5EED_0000usize;
+        QUEUE_SHIFTED.store(false, Ordering::Release);
+        QUEUE_OLDER.store(false, Ordering::Release);
+        unsafe {
+            let mut out = [0xAAAA_AAAAu32; 4];
+            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            assert_eq!(r, out.as_ptr() as usize);
+            assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
+            FENCES.write().unwrap().push(fence);
+            queue_dispatch(14, this, fence, 1, 0, 0);
+            FENCES.write().unwrap().retain(|&f| f != fence);
+            assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
+            let mut out = [0xAAAA_AAAAu32; 4];
+            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
+        }
+        QUEUE_OLDER.store(false, Ordering::Release);
     }
 }
