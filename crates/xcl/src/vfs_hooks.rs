@@ -436,17 +436,43 @@ fn source_of(v: &vfs::Vfs, path: &str) -> Result<(String, Option<String>), u32> 
     }
 }
 
-fn dest_of(v: &vfs::Vfs, path: &str) -> Result<String, u32> {
+/// Destination for a copy/move: (real path to write, game rel if it lives in the game folder).
+/// For game paths, whiteouts are NOT cleared here — call `v.commit_write(&rel)` only after
+/// the underlying copy/move succeeds so a failed operation cannot resurrect a deleted file.
+fn dest_of(v: &vfs::Vfs, path: &str) -> Result<(String, Option<String>), u32> {
     match v.classify(path) {
-        Target::Pass => Ok(path.to_string()),
+        Target::Pass => Ok((path.to_string(), None)),
         Target::Translated(p) => {
             if let Some(parent) = std::path::Path::new(&p).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            Ok(p)
+            Ok((p, None))
         }
-        Target::Game { rel } => v.prepare_write(&rel, false),
+        Target::Game { rel } => Ok((v.stage_write(&rel)?, Some(rel))),
     }
+}
+
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+const MOVEFILE_COPY_ALLOWED: u32 = 0x2;
+const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x1;
+
+fn io_err_code(e: &std::io::Error, fallback: u32) -> u32 {
+    e.raw_os_error().map(|c| c as u32).unwrap_or(fallback)
+}
+
+fn vfs_path_exists(v: &vfs::Vfs, path: &str) -> Result<bool, u32> {
+    match source_of(v, path) {
+        Ok((real, _)) => Ok(std::path::Path::new(&real).exists()),
+        Err(vfs::ERROR_FILE_NOT_FOUND) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn validate_replace_targets(v: &vfs::Vfs, target: &str, source: &str) -> Result<(), u32> {
+    if !vfs_path_exists(v, target)? || !vfs_path_exists(v, source)? {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
+    Ok(())
 }
 
 unsafe extern "system" fn hk_move_file_ex_w(src: *const u16, dst: *const u16, flags: u32) -> i32 {
@@ -472,7 +498,7 @@ unsafe fn move_file_a(src: *const u8, dst: *const u8, prog: *const c_void, data:
 
 unsafe extern "system" fn hk_move_file_a(src: *const u8, dst: *const u8) -> i32 {
     let orig = orig!(O_MOVE_FILE_A as unsafe extern "system" fn(*const u8, *const u8) -> i32);
-    move_file_a(src, dst, std::ptr::null(), std::ptr::null(), 0x2 /* COPY_ALLOWED, as MoveFileW */, || orig(src, dst))
+    move_file_a(src, dst, std::ptr::null(), std::ptr::null(), MOVEFILE_COPY_ALLOWED /* as MoveFileW */, || orig(src, dst))
 }
 
 unsafe extern "system" fn hk_move_file_ex_a(src: *const u8, dst: *const u8, flags: u32) -> i32 {
@@ -485,39 +511,101 @@ unsafe extern "system" fn hk_move_file_with_progress_a(src: *const u8, dst: *con
     move_file_a(src, dst, prog, data, flags, || orig(src, dst, prog, data, flags))
 }
 
-unsafe fn move_file(src: *const u16, dst: *const u16, flags: u32, orig: impl Fn(*const u16, *const u16, u32) -> i32) -> i32 {
-    let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, flags) };
-    let (Some(s), d) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, flags) };
-    let Some(d) = d else { return orig(src, dst, flags) }; // delete-on-reboot form
-    let s_game = matches!(v.classify(&s), Target::Game { .. });
-    let d_game = matches!(v.classify(&d), Target::Game { .. });
+unsafe fn move_file_vfs(v: &vfs::Vfs, s: &str, d: &str, flags: u32, orig: impl Fn(*const u16, *const u16, u32) -> i32) -> i32 {
+    let s_target = v.classify(s);
+    let d_target = v.classify(d);
+    let s_game = matches!(s_target, Target::Game { .. });
+    let d_game = matches!(d_target, Target::Game { .. });
     if !s_game && !d_game {
-        let (rs, _) = match source_of(v, &s) {
+        let (rs, _) = match source_of(v, s) {
             Ok(x) => x,
             Err(e) => return bool_result(Err(e)),
         };
-        let rd = match dest_of(v, &d) {
+        let (rd, _) = match dest_of(v, d) {
             Ok(x) => x,
             Err(e) => return bool_result(Err(e)),
         };
         return orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags);
     }
+    let replace_existing = flags & MOVEFILE_REPLACE_EXISTING != 0;
+    let drel_opt = match d_target {
+        Target::Game { rel } => Some(rel),
+        _ => None,
+    };
     let r = (|| -> Result<(), u32> {
-        let (rs, srel) = source_of(v, &s)?;
-        let rd = dest_of(v, &d)?;
+        let (rs, srel) = source_of(v, s)?;
         match &srel {
             // source in the game folder: copy, then hide the source
-            Some(rel) => {
-                if std::path::Path::new(&rs).is_dir() {
+            Some(sr) => {
+                let src_meta = std::fs::metadata(&rs).map_err(|e| io_err_code(&e, vfs::ERROR_FILE_NOT_FOUND))?;
+                if src_meta.is_dir() {
                     return Err(vfs::ERROR_ACCESS_DENIED); // moving whole game dirs is not supported
                 }
-                std::fs::copy(&rs, &rd).map_err(|_| vfs::ERROR_ACCESS_DENIED)?;
-                v.delete_file(rel).or_else(|e| if e == vfs::ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(e) })?;
+                // Case-only or exact self-rename inside the game folder: never delete/whiteout!
+                if let Some(dr) = &drel_opt {
+                    if sr.to_lowercase() == dr.to_lowercase() {
+                        if sr == dr {
+                            return Ok(());
+                        }
+                        if v.visible_in_overlay(sr) {
+                            let rd = v.overlay_path(dr);
+                            if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags) == 0 {
+                                // SAFETY: GetLastError reads thread-local Win32 error state.
+                                return Err(windows_sys::Win32::Foundation::GetLastError());
+                            }
+                            v.commit_write(dr);
+                            return Ok(());
+                        }
+                        let rd = v.stage_write(dr)?;
+                        std::fs::copy(&rs, &rd).map_err(|e| io_err_code(&e, vfs::ERROR_ACCESS_DENIED))?;
+                        v.commit_write(dr);
+                        return Ok(());
+                    }
+                }
+                if let Some(dr) = &drel_opt {
+                    if v.is_dir(dr) {
+                        return Err(vfs::ERROR_ACCESS_DENIED);
+                    }
+                    if !replace_existing && v.exists(dr) {
+                        return Err(vfs::ERROR_ALREADY_EXISTS);
+                    }
+                }
+                let (rd, drel) = dest_of(v, d)?;
+                if drel.is_none() {
+                    if let Ok(m) = std::fs::metadata(&rd) {
+                        if m.is_dir() {
+                            return Err(vfs::ERROR_ACCESS_DENIED);
+                        }
+                        if !replace_existing {
+                            return Err(vfs::ERROR_ALREADY_EXISTS);
+                        }
+                    }
+                }
+                std::fs::copy(&rs, &rd).map_err(|e| io_err_code(&e, vfs::ERROR_ACCESS_DENIED))?;
+                if let Some(dr) = &drel {
+                    v.commit_write(dr);
+                }
+                v.delete_file(sr).or_else(|e| if e == vfs::ERROR_FILE_NOT_FOUND { Ok(()) } else { Err(e) })?;
                 Ok(())
             }
             None => {
-                if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags | 0x2 /* COPY_ALLOWED */) == 0 {
+                if let Some(dr) = &drel_opt {
+                    if std::path::Path::new(&rs).exists() {
+                        if v.is_dir(dr) {
+                            return Err(vfs::ERROR_ACCESS_DENIED);
+                        }
+                        if !replace_existing && v.exists(dr) {
+                            return Err(vfs::ERROR_ALREADY_EXISTS);
+                        }
+                    }
+                }
+                let (rd, drel) = dest_of(v, d)?;
+                if orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), flags | MOVEFILE_COPY_ALLOWED) == 0 {
+                    // SAFETY: GetLastError reads thread-local Win32 error state.
                     return Err(windows_sys::Win32::Foundation::GetLastError());
+                }
+                if let Some(dr) = &drel {
+                    v.commit_write(dr);
                 }
                 Ok(())
             }
@@ -526,19 +614,80 @@ unsafe fn move_file(src: *const u16, dst: *const u16, flags: u32, orig: impl Fn(
     bool_result(r)
 }
 
+unsafe fn move_file(src: *const u16, dst: *const u16, flags: u32, orig: impl Fn(*const u16, *const u16, u32) -> i32) -> i32 {
+    let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, flags) };
+    let (Some(s), d) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, flags) };
+    let Some(d) = d else { return orig(src, dst, flags) }; // delete-on-reboot form
+    move_file_vfs(v, &s, &d, flags, orig)
+}
+
+fn prepare_copy(v: &vfs::Vfs, s: &str, d: &str, fail_if_exists: bool) -> Result<(String, String, Option<String>), u32> {
+    let (rs, srel) = source_of(v, s)?;
+    if srel.is_some() && !std::path::Path::new(&rs).exists() {
+        return Err(vfs::ERROR_FILE_NOT_FOUND);
+    }
+    if let Target::Game { rel: drel } = v.classify(d) {
+        if std::path::Path::new(&rs).exists() {
+            if v.is_dir(&drel) {
+                return Err(vfs::ERROR_ACCESS_DENIED);
+            }
+            if fail_if_exists && v.exists(&drel) {
+                return Err(vfs::ERROR_FILE_EXISTS);
+            }
+        }
+    }
+    let (rd, drel) = dest_of(v, d)?;
+    Ok((rs, rd, drel))
+}
+
+unsafe fn copy_file_ex_w_vfs(
+    v: &vfs::Vfs,
+    s: &str,
+    d: &str,
+    prog: *const c_void,
+    data: *const c_void,
+    cancel: *mut i32,
+    flags: u32,
+    orig: impl Fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32,
+) -> i32 {
+    let (rs, rd, drel) = match prepare_copy(v, s, d, flags & COPY_FILE_FAIL_IF_EXISTS != 0) {
+        Ok(x) => x,
+        Err(e) => return bool_result(Err(e)),
+    };
+    let ok = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), prog, data, cancel, flags);
+    if ok != 0 {
+        if let Some(dr) = drel {
+            v.commit_write(&dr);
+        }
+    }
+    ok
+}
+
 unsafe extern "system" fn hk_copy_file_ex_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, cancel: *mut i32, flags: u32) -> i32 {
     let orig = orig!(O_COPY_FILE_EX_W as FnCopyFileExW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, prog, data, cancel, flags) };
     let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, prog, data, cancel, flags) };
-    let rs = match source_of(v, &s) {
-        Ok((p, _)) => p,
+    copy_file_ex_w_vfs(v, &s, &d, prog, data, cancel, flags, |s, d, p, dt, c, f| orig(s, d, p, dt, c, f))
+}
+
+unsafe fn copy_file_w_vfs(
+    v: &vfs::Vfs,
+    s: &str,
+    d: &str,
+    fail_if_exists: i32,
+    orig: impl Fn(*const u16, *const u16, i32) -> i32,
+) -> i32 {
+    let (rs, rd, drel) = match prepare_copy(v, s, d, fail_if_exists != 0) {
+        Ok(x) => x,
         Err(e) => return bool_result(Err(e)),
     };
-    let rd = match dest_of(v, &d) {
-        Ok(p) => p,
-        Err(e) => return bool_result(Err(e)),
-    };
-    orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), prog, data, cancel, flags)
+    let ok = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), fail_if_exists);
+    if ok != 0 {
+        if let Some(dr) = drel {
+            v.commit_write(&dr);
+        }
+    }
+    ok
 }
 
 /// CopyFileW (and CopyFileA, which calls it) need not go through CopyFileExW. When it does,
@@ -547,30 +696,50 @@ unsafe extern "system" fn hk_copy_file_w(src: *const u16, dst: *const u16, fail_
     let orig = orig!(O_COPY_FILE_W as FnCopyFileW);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, fail_if_exists) };
     let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, fail_if_exists) };
-    let rs = match source_of(v, &s) {
-        Ok((p, _)) => p,
-        Err(e) => return bool_result(Err(e)),
+    copy_file_w_vfs(v, &s, &d, fail_if_exists, |s, d, f| orig(s, d, f))
+}
+
+unsafe fn copy_file_2_fail_if_exists(params: *const c_void) -> bool {
+    if params.is_null() {
+        return false;
+    }
+    // COPYFILE2_EXTENDED_PARAMETERS { dwSize: u32, dwCopyFlags: u32, ... }.
+    // SAFETY: Caller passed a non-null COPYFILE2_EXTENDED_PARAMETERS pointer; check dwSize
+    // covers dwCopyFlags before reading offset 4.
+    let size = *(params as *const u32);
+    if (size as usize) < 8 {
+        return false;
+    }
+    let flags = *((params as *const u32).add(1));
+    flags & COPY_FILE_FAIL_IF_EXISTS != 0
+}
+
+unsafe fn copy_file_2_vfs(
+    v: &vfs::Vfs,
+    s: &str,
+    d: &str,
+    params: *const c_void,
+    orig: impl Fn(*const u16, *const u16, *const c_void) -> i32,
+) -> i32 {
+    let fail_if_exists = copy_file_2_fail_if_exists(params);
+    let (rs, rd, drel) = match prepare_copy(v, s, d, fail_if_exists) {
+        Ok(x) => x,
+        Err(e) => return crate::util::hresult_from_win32(e),
     };
-    let rd = match dest_of(v, &d) {
-        Ok(p) => p,
-        Err(e) => return bool_result(Err(e)),
-    };
-    orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), fail_if_exists)
+    let hr = orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), params);
+    if hr >= 0 {
+        if let Some(dr) = drel {
+            v.commit_write(&dr);
+        }
+    }
+    hr
 }
 
 unsafe extern "system" fn hk_copy_file_2(src: *const u16, dst: *const u16, params: *const c_void) -> i32 {
     let orig = orig!(O_COPY_FILE_2 as FnCopyFile2);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, params) };
     let (Some(s), Some(d)) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, params) };
-    let rs = match source_of(v, &s) {
-        Ok((p, _)) => p,
-        Err(e) => return crate::util::hresult_from_win32(e),
-    };
-    let rd = match dest_of(v, &d) {
-        Ok(p) => p,
-        Err(e) => return crate::util::hresult_from_win32(e),
-    };
-    orig(wide(&rs).as_ptr(), wide(&rd).as_ptr(), params)
+    copy_file_2_vfs(v, &s, &d, params, |s, d, p| orig(s, d, p))
 }
 
 /// ReplaceFileW – the usual "write a temporary file, then replace" save. Console paths outside
@@ -585,8 +754,11 @@ unsafe extern "system" fn hk_replace_file_w(replaced: *const u16, replacement: *
     let backup_path = from_wide_ptr(backup);
     let is_game = |p: &str| matches!(v.classify(p), Target::Game { .. });
     if is_game(&target) || is_game(&source) || backup_path.as_deref().is_some_and(is_game) {
+        if let Err(e) = validate_replace_targets(v, &target, &source) {
+            return bool_result(Err(e));
+        }
         drop(g); // the calls below go through their own hooks
-        use windows_sys::Win32::Storage::FileSystem::{CopyFileW, MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING};
+        use windows_sys::Win32::Storage::FileSystem::{CopyFileW, MoveFileExW};
         if let Some(b) = &backup_path {
             if CopyFileW(replaced, wide(b).as_ptr(), 0) == 0 {
                 return 0;
@@ -597,7 +769,7 @@ unsafe extern "system" fn hk_replace_file_w(replaced: *const u16, replacement: *
     let r = (|| -> Result<(String, String, Option<String>), u32> {
         let (rt, _) = source_of(v, &target)?;
         let (rs, _) = source_of(v, &source)?;
-        let rb = backup_path.as_deref().map(|b| dest_of(v, b)).transpose()?;
+        let rb = backup_path.as_deref().map(|b| dest_of(v, b).map(|(p, _)| p)).transpose()?;
         Ok((rt, rs, rb))
     })();
     match r {
@@ -890,5 +1062,283 @@ pub fn install() -> Result<(), String> {
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::{CopyFile2, CopyFileExW, CopyFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS};
+
+    struct HookFixture {
+        dir: PathBuf,
+        vfs: vfs::Vfs,
+    }
+
+    impl HookFixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("xcl_vfs_hooks_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let game = dir.join("game");
+            let data = dir.join("xcldata");
+            let temp = data.join("temp");
+            std::fs::create_dir_all(game.join("data")).unwrap();
+            std::fs::create_dir_all(&temp).unwrap();
+            std::fs::write(game.join("data").join("hello.txt"), b"original").unwrap();
+            std::fs::write(game.join("data").join("gone.txt"), b"bye").unwrap();
+            let mounts = vec![
+                ("G:".to_string(), game.to_string_lossy().to_string()),
+                ("T:".to_string(), temp.to_string_lossy().to_string()),
+            ];
+            let vfs = vfs::Vfs::new(&game, &data, mounts);
+            Self { dir, vfs }
+        }
+
+        fn game(&self) -> PathBuf {
+            self.dir.join("game")
+        }
+
+        fn temp(&self) -> PathBuf {
+            self.dir.join("xcldata").join("temp")
+        }
+
+        fn read_vfs(&self, path: &str) -> Option<Vec<u8>> {
+            let real = self.vfs.real_path_for_read(path)?;
+            std::fs::read(real).ok()
+        }
+    }
+
+    impl Drop for HookFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn real_move(s: *const u16, d: *const u16, f: u32) -> i32 {
+        // SAFETY: callers pass valid NUL-terminated UTF-16 paths to Win32 MoveFileExW.
+        unsafe { MoveFileExW(s, d, f) }
+    }
+
+    fn real_copy(s: *const u16, d: *const u16, fail: i32) -> i32 {
+        // SAFETY: callers pass valid NUL-terminated UTF-16 paths to Win32 CopyFileW.
+        unsafe { CopyFileW(s, d, fail) }
+    }
+
+    fn real_copy_ex(s: *const u16, d: *const u16, p: *const c_void, dt: *const c_void, c: *mut i32, f: u32) -> i32 {
+        // SAFETY: callers pass valid NUL-terminated UTF-16 paths and null callbacks to Win32 CopyFileExW.
+        unsafe { CopyFileExW(s, d, std::mem::transmute(p), dt, c, f) }
+    }
+
+    fn real_copy_2(s: *const u16, d: *const u16, params: *const c_void) -> i32 {
+        // SAFETY: callers pass valid NUL-terminated UTF-16 paths and optional COPYFILE2_EXTENDED_PARAMETERS.
+        unsafe { CopyFile2(s, d, params as *const COPYFILE2_EXTENDED_PARAMETERS) }
+    }
+
+    #[test]
+    fn move_case_only_and_self_rename_preserve_file() {
+        let f = HookFixture::new("case_move");
+        let v = &f.vfs;
+
+        // Case-only rename on an un-overlaid game file must NOT delete or whiteout it.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\hello.txt", "G:\\data\\HELLO.TXT", 0, real_move) };
+        assert_eq!(ok, 1);
+        assert!(!v.is_whiteout("data\\hello.txt"));
+        assert!(!v.is_whiteout("data\\HELLO.TXT"));
+        assert_eq!(f.read_vfs("G:\\data\\HELLO.TXT"), Some(b"original".to_vec()));
+        assert_eq!(f.read_vfs("G:\\data\\hello.txt"), Some(b"original".to_vec()));
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+
+        // Case-only rename on an already-overlaid file preserves modified overlay content.
+        let ov = v.overlay_path("data\\HELLO.TXT");
+        std::fs::write(&ov, b"modified").unwrap();
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\HELLO.TXT", "G:\\data\\Hello.txt", 0, real_move) };
+        assert_eq!(ok, 1);
+        assert!(!v.is_whiteout("data\\Hello.txt"));
+        assert_eq!(f.read_vfs("G:\\data\\Hello.txt"), Some(b"modified".to_vec()));
+        let ov_names: Vec<String> = std::fs::read_dir(v.overlay_path("data"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+
+        // Exact self-rename is a safe no-op.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\gone.txt", "G:\\data\\gone.txt", 0, real_move) };
+        assert_eq!(ok, 1);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"bye".to_vec()));
+
+        // Case-only rename of a nonexistent file fails with ERROR_FILE_NOT_FOUND.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\missing.txt", "G:\\data\\MISSING.TXT", 0, real_move) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+    }
+
+    #[test]
+    fn move_enforces_replace_existing_and_overwrites_cleanly() {
+        let f = HookFixture::new("move_replace");
+        let v = &f.vfs;
+        std::fs::write(f.temp().join("ext.txt"), b"from-ext").unwrap();
+
+        // Moving onto an existing un-overlaid game file without MOVEFILE_REPLACE_EXISTING fails.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\hello.txt", "G:\\data\\gone.txt", 0, real_move) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ALREADY_EXISTS);
+        assert_eq!(f.read_vfs("G:\\data\\hello.txt"), Some(b"original".to_vec()));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"bye".to_vec()));
+
+        // Moving external file onto un-overlaid game file without MOVEFILE_REPLACE_EXISTING fails.
+        let ok = unsafe { move_file_vfs(v, "T:\\ext.txt", "G:\\data\\hello.txt", 0, real_move) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ALREADY_EXISTS);
+        assert_eq!(std::fs::read(f.temp().join("ext.txt")).unwrap(), b"from-ext");
+        assert_eq!(f.read_vfs("G:\\data\\hello.txt"), Some(b"original".to_vec()));
+
+        // Moving game file onto existing external file without MOVEFILE_REPLACE_EXISTING fails.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\hello.txt", "T:\\ext.txt", 0, real_move) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ALREADY_EXISTS);
+        assert_eq!(std::fs::read(f.temp().join("ext.txt")).unwrap(), b"from-ext");
+
+        // With MOVEFILE_REPLACE_EXISTING, game->game overwrite succeeds and preserves source content.
+        let ok = unsafe { move_file_vfs(v, "G:\\data\\hello.txt", "G:\\data\\gone.txt", MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_eq!(ok, 1);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"original".to_vec()));
+        assert_eq!(f.read_vfs("G:\\data\\hello.txt"), None);
+        assert_eq!(std::fs::read(f.game().join("data").join("gone.txt")).unwrap(), b"bye");
+
+        // With MOVEFILE_REPLACE_EXISTING, external->game overwrite succeeds and reads back intact.
+        let ok = unsafe { move_file_vfs(v, "T:\\ext.txt", "G:\\data\\gone.txt", MOVEFILE_REPLACE_EXISTING, real_move) };
+        assert_eq!(ok, 1);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"from-ext".to_vec()));
+        assert!(!f.temp().join("ext.txt").exists());
+    }
+
+    #[test]
+    fn copy_enforces_fail_if_exists_and_overwrites_cleanly() {
+        let f = HookFixture::new("copy_flags");
+        let v = &f.vfs;
+
+        // CopyFileW with bFailIfExists=TRUE onto un-overlaid original fails with ERROR_FILE_EXISTS.
+        let ok = unsafe { copy_file_w_vfs(v, "G:\\data\\hello.txt", "G:\\data\\gone.txt", 1, real_copy) };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_EXISTS);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"bye".to_vec()));
+
+        // CopyFileExW with COPY_FILE_FAIL_IF_EXISTS onto un-overlaid original fails with ERROR_FILE_EXISTS.
+        let ok = unsafe {
+            copy_file_ex_w_vfs(
+                v,
+                "G:\\data\\hello.txt",
+                "G:\\data\\gone.txt",
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                COPY_FILE_FAIL_IF_EXISTS,
+                real_copy_ex,
+            )
+        };
+        assert_eq!(ok, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_EXISTS);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"bye".to_vec()));
+
+        // CopyFile2 with COPY_FILE_FAIL_IF_EXISTS onto un-overlaid original returns HRESULT(ERROR_FILE_EXISTS).
+        let params = COPYFILE2_EXTENDED_PARAMETERS {
+            dwSize: std::mem::size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
+            dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
+            pfCancel: std::ptr::null_mut(),
+            pProgressRoutine: None,
+            pvCallbackContext: std::ptr::null_mut(),
+        };
+        let hr = unsafe {
+            copy_file_2_vfs(
+                v,
+                "G:\\data\\hello.txt",
+                "G:\\data\\gone.txt",
+                &params as *const _ as *const c_void,
+                real_copy_2,
+            )
+        };
+        assert_eq!(hr, crate::util::hresult_from_win32(vfs::ERROR_FILE_EXISTS));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"bye".to_vec()));
+
+        // CopyFileW with bFailIfExists=FALSE overwrites cleanly and reads back intact.
+        let ok = unsafe { copy_file_w_vfs(v, "G:\\data\\hello.txt", "G:\\data\\gone.txt", 0, real_copy) };
+        assert_eq!(ok, 1);
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"original".to_vec()));
+        assert_eq!(std::fs::read(f.game().join("data").join("gone.txt")).unwrap(), b"bye");
+
+        // Deleting gone.txt makes bFailIfExists=TRUE succeed and clear the whiteout.
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\gone.txt"));
+        let ok = unsafe { copy_file_w_vfs(v, "G:\\data\\hello.txt", "G:\\data\\gone.txt", 1, real_copy) };
+        assert_eq!(ok, 1);
+        assert!(!v.is_whiteout("data\\gone.txt"));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn failed_copy_and_move_do_not_resurrect_whiteouts() {
+        let f = HookFixture::new("no_resurrect");
+        let v = &f.vfs;
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert!(v.is_whiteout("data\\gone.txt"));
+
+        // Failed CopyFileW (game missing src and external missing src) must keep whiteout.
+        assert_eq!(unsafe { copy_file_w_vfs(v, "G:\\data\\missing.txt", "G:\\data\\gone.txt", 0, real_copy) }, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), None);
+
+        assert_eq!(unsafe { copy_file_w_vfs(v, "T:\\missing.txt", "G:\\data\\gone.txt", 0, real_copy) }, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), None);
+
+        // Failed CopyFileExW and CopyFile2 must keep whiteout.
+        assert_eq!(
+            unsafe {
+                copy_file_ex_w_vfs(
+                    v,
+                    "T:\\missing.txt",
+                    "G:\\data\\gone.txt",
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                    real_copy_ex,
+                )
+            },
+            0
+        );
+        assert!(v.is_whiteout("data\\gone.txt"));
+
+        let hr = unsafe { copy_file_2_vfs(v, "T:\\missing.txt", "G:\\data\\gone.txt", std::ptr::null(), real_copy_2) };
+        assert!(hr < 0);
+        assert!(v.is_whiteout("data\\gone.txt"));
+
+        // Failed MoveFileExW (both external and game missing src) must keep whiteout.
+        assert_eq!(unsafe { move_file_vfs(v, "T:\\missing.txt", "G:\\data\\gone.txt", MOVEFILE_REPLACE_EXISTING, real_move) }, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        assert!(v.is_whiteout("data\\gone.txt"));
+
+        assert_eq!(unsafe { move_file_vfs(v, "G:\\data\\missing.txt", "G:\\data\\gone.txt", MOVEFILE_REPLACE_EXISTING, real_move) }, 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_FILE_NOT_FOUND);
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert_eq!(f.read_vfs("G:\\data\\gone.txt"), None);
+    }
+
+    #[test]
+    fn replace_file_rejects_missing_or_whited_out_targets() {
+        let f = HookFixture::new("replace_check");
+        let v = &f.vfs;
+        std::fs::write(f.temp().join("ext.txt"), b"replacement").unwrap();
+
+        assert_eq!(validate_replace_targets(v, "G:\\data\\missing.txt", "G:\\data\\hello.txt"), Err(vfs::ERROR_FILE_NOT_FOUND));
+        assert_eq!(validate_replace_targets(v, "G:\\data\\hello.txt", "G:\\data\\missing.txt"), Err(vfs::ERROR_FILE_NOT_FOUND));
+
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        assert_eq!(validate_replace_targets(v, "G:\\data\\gone.txt", "T:\\ext.txt"), Err(vfs::ERROR_FILE_NOT_FOUND));
+        assert_eq!(validate_replace_targets(v, "G:\\data\\hello.txt", "T:\\ext.txt"), Ok(()));
     }
 }

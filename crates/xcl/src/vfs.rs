@@ -388,6 +388,17 @@ impl Vfs {
         !self.is_whiteout(rel) && Path::new(&self.original_path(rel)).exists()
     }
 
+    pub fn exists(&self, rel: &str) -> bool {
+        self.visible_in_overlay(rel) || self.visible_in_original(rel)
+    }
+
+    pub fn is_dir(&self, rel: &str) -> bool {
+        if let Ok(m) = std::fs::metadata(self.overlay_path(rel)) {
+            return m.is_dir();
+        }
+        self.visible_in_original(rel) && Path::new(&self.original_path(rel)).is_dir()
+    }
+
     /// Real path to read `path` from. None = hidden by a whiteout.
     pub fn real_path_for_read(&self, path: &str) -> Option<String> {
         match self.classify(path) {
@@ -405,6 +416,29 @@ impl Vfs {
             return None;
         }
         Some(self.original_path(rel))
+    }
+
+    /// Stage the overlay path for a new/overwritten file (e.g. copy/move destination)
+    /// without removing whiteouts or recording the write yet. Call `commit_write(rel)`
+    /// only after the underlying file operation succeeds so a failed operation cannot
+    /// resurrect a whited-out original.
+    pub fn stage_write(&self, rel: &str) -> Result<String, u32> {
+        if let Some((parent_rel, _)) = rel.rsplit_once('\\') {
+            if !self.is_dir(parent_rel) {
+                return Err(ERROR_PATH_NOT_FOUND);
+            }
+        }
+        let ov = self.overlay_path(rel);
+        if let Some(parent) = Path::new(&ov).parent() {
+            std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
+        }
+        Ok(ov)
+    }
+
+    /// Finalise a staged write once the underlying file operation succeeded.
+    pub fn commit_write(&self, rel: &str) {
+        self.remove_whiteout(rel);
+        self.record_write(rel);
     }
 
     /// Ensure `rel` exists in the overlay (copying the original when `keep_content`)
