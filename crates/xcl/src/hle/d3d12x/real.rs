@@ -115,6 +115,9 @@ pub struct D3d12Stats {
     pub uma_gpu_va: String,
     #[serde(default)]
     pub uma_error: String,
+    /// whether the GPU sees CPU writes to the coherent windows (`check_uma_import`)
+    #[serde(default)]
+    pub uma_import_check: String,
     /// graphics pipelines built from recompiled console shaders (XCL shader ABI root signature)
     #[serde(default)]
     pub translated_pipelines: u64,
@@ -213,6 +216,80 @@ pub fn uma_va_of(p: usize) -> Option<u64> {
     Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
 }
 
+/// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
+/// run, "ok …", "off (XCL_UMA_CHECK=0)", or why the GPU does not see the CPU's writes.
+static UMA_IMPORT_CHECK: Mutex<String> = Mutex::new(String::new());
+
+/// A word the CPU writes into each coherent window, read back by a GPU copy. The windows are
+/// imported as heaps (`OpenExistingHeapFromAddress`), and a runtime that cannot import them may
+/// still succeed with memory of its own: vkd3d-proton under a Wine without `userfaultfd` write
+/// watches (#175). The GPU then reads zeros where the title wrote, and nothing else says so.
+/// Off with `XCL_UMA_CHECK=0`.
+unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs: &[(usize, u64)]) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let wins: Vec<usize> = (0..bufs.len()).filter(|&k| u.is_committed_window(k) && bufs[k].0 != 0).collect();
+    if wins.is_empty() {
+        return Ok("no coherent window".into());
+    }
+    let queue: ID3D12CommandQueue =
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(|e| format!("check not run: queue: {e}"))?;
+    let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| format!("check not run: allocator: {e}"))?;
+    let list: ID3D12GraphicsCommandList =
+        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(|e| format!("check not run: list: {e}"))?;
+    let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("check not run: fence: {e}"))?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut readback: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+        .map_err(|e| format!("check not run: readback buffer: {e}"))?;
+    let readback = readback.ok_or("check not run: readback buffer")?;
+    // a block of the window's own (title data is not touched), one word per window
+    let mut probes = Vec::new();
+    for (i, &k) in wins.iter().take(64).enumerate() {
+        let Some(p) = u.alloc_in(k, 4, 0) else { continue };
+        let canary = 0x5843_4C00 | k as u32; // "XCL" + the window
+        std::ptr::write_volatile(p as *mut u32, canary);
+        if let Some(src) = ID3D12Resource::from_raw_borrowed(&(bufs[k].0 as *mut c_void)) {
+            list.CopyBufferRegion(&readback, 4 * i as u64, src, (p as usize - u.window(k).0) as u64, 4);
+        }
+        probes.push((k, i, p as usize, canary));
+    }
+    let run = || -> Result<Vec<u32>, String> {
+        list.Close().map_err(|e| format!("check not run: Close: {e}"))?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
+        queue.Signal(&fence, 1).map_err(|e| format!("check not run: Signal: {e}"))?;
+        crate::gpu::fence::wait(&fence, 1, device, None, 2000).map_err(|e| format!("check not run: {e}"))?;
+        let mut m = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut m)).map_err(|e| format!("check not run: Map: {e}"))?;
+        let got = std::slice::from_raw_parts(m as *const u32, 64).to_vec();
+        readback.Unmap(0, None);
+        Ok(got)
+    };
+    let got = run();
+    for &(_, _, p, _) in &probes {
+        u.free(p);
+    }
+    let got = got?;
+    let wrong: Vec<String> =
+        probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "the GPU does not see what the CPU writes to unified memory ({}): the host-memory import fell back to memory of its own (Wine without userfaultfd write watches?); shaders will read zeros or stale data where the title wrote",
+            wrong.join("; ")
+        ));
+    }
+    Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
+}
+
 unsafe fn open_uma(device: &ID3D12Device) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
@@ -258,6 +335,16 @@ unsafe fn open_uma(device: &ID3D12Device) {
             }
         }
     }
+    let check = if std::env::var("XCL_UMA_CHECK").is_ok_and(|v| v == "0") {
+        Ok("off (XCL_UMA_CHECK=0)".into())
+    } else {
+        check_uma_import(device, u, &bufs)
+    };
+    match &check {
+        Ok(s) => crate::xlog_info!("D3D12.X: UMA import check: {s}"),
+        Err(e) => crate::xlog_error!("D3D12.X: UMA import check: {e}"),
+    }
+    *UMA_IMPORT_CHECK.lock().unwrap() = check.unwrap_or_else(|e| e);
     let sparse = super::sparse::init(device);
     for (k, buf_raw, va) in &sparse {
         if let Some(slot) = bufs.get_mut(*k) {
@@ -303,6 +390,7 @@ pub fn stats() -> D3d12Stats {
             v => format!("{v:#x}"),
         },
         uma_error: UMA_ERROR.lock().map(|e| e.clone()).unwrap_or_default(),
+        uma_import_check: UMA_IMPORT_CHECK.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),

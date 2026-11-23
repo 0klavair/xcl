@@ -2900,6 +2900,19 @@ fn gpu_memory_windows_above_4_gib() {
     assert_eq!(*word(w0 + 0x6000), 0, "nothing in window 0 at the same low address");
 }
 
+/// The start-up check of the coherent UMA windows (`real::check_uma_import`): the GPU sees what
+/// the CPU writes there. Fails, as it should, where the import fell back to memory of its own
+/// (vkd3d-proton under a Wine without `userfaultfd` write watches, #175).
+#[test]
+fn gpu_uma_import_check_at_init() {
+    if !gpu_ready() {
+        return;
+    }
+    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    let s = crate::hle::d3d12x::real::stats().uma_import_check;
+    assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
+}
+
 /// End-to-end GPU test of the sparse-window VRAM runtime layout:
 /// - Window 0..2 = sparse VRAM (tiled reserved buffers on DEFAULT heaps)
 /// - Window 3 = committed coherent RAM (`OpenExistingHeapFromAddress`)
