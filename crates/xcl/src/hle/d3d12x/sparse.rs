@@ -26,7 +26,10 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE};
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_DECOMMIT, PAGE_GUARD,
+    PAGE_NOACCESS, PAGE_READWRITE,
+};
 
 const TILE: usize = 0x1_0000;
 /// tiles of a video-memory pool heap (64 MiB)
@@ -87,9 +90,101 @@ struct TileEntry {
 }
 
 impl TileEntry {
-    fn new(pool: (u32, u32)) -> Self {
-        Self { pool, holes: 0, sent: std::array::from_fn(|_| None) }
+    fn with_holes(pool: (u32, u32), holes: u16) -> Self {
+        Self { pool, holes, sent: std::array::from_fn(|_| None) }
     }
+}
+
+/// Query actual OS page commitment across the 64 KiB tile at `tile`.
+/// Bit `i` in the returned mask is set whenever 4 KiB page `tile + i * PAGE` is not committed
+/// and accessible (`MEM_RESERVE`, `MEM_FREE`, `PAGE_NOACCESS`, `PAGE_GUARD`, etc.).
+unsafe fn query_tile_holes(tile: usize) -> u16 {
+    let mut holes = 0xFFFFu16;
+    let end = tile.saturating_add(TILE);
+    let mut cur = tile;
+    while cur < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        // SAFETY: `VirtualQuery` inspects process virtual memory metadata without dereferencing `cur`.
+        let n = VirtualQuery(cur as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
+        if n == 0 || mbi.RegionSize == 0 {
+            break;
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize).min(end);
+        let accessible = mbi.State == MEM_COMMIT && mbi.Protect != 0 && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        if accessible {
+            let mut pg = cur;
+            while pg < region_end {
+                holes &= !(1u16 << ((pg - tile) / PAGE));
+                pg += PAGE;
+            }
+        }
+        if region_end <= cur {
+            break;
+        }
+        cur = region_end;
+    }
+    holes
+}
+
+/// Update `mapped`, `free`, and `to_zero` for a decommit of `[a, a + n)`.
+/// Returns the base addresses of tiles that became completely uncommitted (`holes == 0xFFFF`)
+/// and were removed from `mapped` (ready to be unmapped from their sparse window buffers).
+fn decommit_tiles(
+    mapped: &mut FxHashMap<usize, TileEntry>,
+    pinned: &FxHashMap<(u32, u32), u32>,
+    free: &mut Vec<(u32, u32)>,
+    to_zero: &mut Vec<(usize, usize)>,
+    a: usize,
+    n: usize,
+) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut unmapped: Vec<usize> = Vec::new();
+    let mut pg = a & !(PAGE - 1);
+    let end = a.saturating_add(n);
+    while pg < end {
+        let t = pg & !(TILE - 1);
+        let tile_end = t.saturating_add(TILE).min(end);
+        if let Some(entry) = mapped.get_mut(&t) {
+            let mut newly_holed = 0u16;
+            let mut p = pg;
+            while p < tile_end {
+                let idx = (p - t) / PAGE;
+                entry.sent[idx] = None;
+                let bit = 1u16 << idx;
+                if entry.holes & bit == 0 {
+                    entry.holes |= bit;
+                    newly_holed |= bit;
+                }
+                p += PAGE;
+            }
+            if entry.holes == 0xFFFF {
+                unmapped.push(t);
+            } else if newly_holed != 0 {
+                for idx in 0..PAGES_PER_TILE {
+                    if newly_holed & (1u16 << idx) != 0 {
+                        to_zero.push((t + idx * PAGE, PAGE));
+                    }
+                }
+            }
+        }
+        if tile_end <= pg {
+            break;
+        }
+        pg = tile_end;
+    }
+    for &t in &unmapped {
+        if let Some(entry) = mapped.remove(&t) {
+            if !pinned.contains_key(&entry.pool) {
+                free.push(entry.pool);
+            }
+        }
+    }
+    if !unmapped.is_empty() {
+        to_zero.retain(|&(za, _)| mapped.contains_key(&(za & !(TILE - 1))));
+    }
+    unmapped
 }
 
 struct UploadSlot {
@@ -513,22 +608,30 @@ impl State {
         );
     }
 
-    /// tiles of `[a, a + n)` get video memory (mapped in their window)
-    unsafe fn ensure_mapped(&mut self, a: usize, n: usize) {
+    /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
+    /// the initial 16-bit hole mask for each newly mapped 64 KiB tile.
+    unsafe fn ensure_mapped(&mut self, a: usize, n: usize, mut initial_holes: impl FnMut(usize) -> u16) {
+        if n == 0 {
+            return;
+        }
         let first = a & !(TILE - 1);
+        let end = a.saturating_add(n);
         let mut new: Vec<(usize, (u32, u32))> = Vec::new();
         let mut t = first;
-        while t < a + n {
+        while t < end {
             if !self.mapped.contains_key(&t) && self.window_index(t).is_some() {
                 let Some((tile, reused)) = self.take_tile() else { break };
-                self.mapped.insert(t, TileEntry::new(tile));
+                self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                 self.runs = None;
                 if reused {
                     self.to_zero.push((t, TILE));
                 }
                 new.push((t, tile));
             }
-            t += TILE;
+            match t.checked_add(TILE) {
+                Some(next) => t = next,
+                None => break,
+            }
         }
         if new.is_empty() {
             return;
@@ -1036,30 +1139,20 @@ pub unsafe fn readback_now(va: usize, len: usize) {
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
         EARLY.lock().unwrap().push((a, n));
         return;
     };
-    let tiles: Vec<usize> = (a & !(TILE - 1)..a + n).step_by(TILE).filter(|t| !s.mapped.contains_key(t)).collect();
-    s.ensure_mapped(a, n);
-    for t in tiles {
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut mask = 0u16;
-            for i in 0..PAGES_PER_TILE {
-                let pg = t + i * PAGE;
-                if pg + PAGE <= a || pg >= a + n {
-                    mask |= 1u16 << i;
-                }
-            }
-            entry.holes |= mask;
-        }
-    }
+    s.ensure_mapped(a, n, |_| 0xFFFF);
     let mut pg = a & !(PAGE - 1);
-    let end = a + n;
+    let end = a.saturating_add(n);
     while pg < end {
         let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
+        let tile_end = t.saturating_add(TILE).min(end);
         if let Some(entry) = s.mapped.get_mut(&t) {
             let mut p = pg;
             while p < tile_end {
@@ -1067,20 +1160,30 @@ pub unsafe fn committed(a: usize, n: usize) {
                 p += PAGE;
             }
         }
+        if tile_end <= pg {
+            break;
+        }
         pg = tile_end;
     }
 }
 
-/// The title decommitted `[a, a + n)`: its whole tiles give their video memory back (unless a
-/// placed buffer still uses it).
+/// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
+/// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
+/// (unless a placed buffer still pins the pool tile).
 pub unsafe fn decommitted(a: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
         EARLY.lock().unwrap().retain(|&(x, m)| x + m <= a || x >= a + n);
         return;
     };
-    let first = (a + TILE - 1) & !(TILE - 1);
-    let tiles: Vec<usize> = (first..(a + n) & !(TILE - 1)).step_by(TILE).filter(|t| s.mapped.contains_key(t)).collect();
+    let tiles = decommit_tiles(&mut s.mapped, &s.pinned, &mut s.free, &mut s.to_zero, a, n);
+    if tiles.is_empty() {
+        return;
+    }
+    s.runs = None;
     let mut by_window: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for &t in &tiles {
         if let Some(wi) = s.window_index(t) {
@@ -1091,43 +1194,8 @@ pub unsafe fn decommitted(a: usize, n: usize) {
         let (b, r) = (s.windows[wi].0, s.windows[wi].1.clone());
         s.unmap_tiles(&r, b, &ts);
     }
-    let unmapped_any = !tiles.is_empty();
-    for t in tiles {
-        if let Some(entry) = s.mapped.remove(&t) {
-            s.runs = None;
-            if !s.pinned.contains_key(&entry.pool) {
-                s.free.push(entry.pool);
-            }
-        }
-    }
-    if unmapped_any {
-        MAPPED_GEN.fetch_add(1, Ordering::Release);
-    }
-    // pages of tiles that stay mapped: holes, their video memory cleared (sent: None = zero;
-    // the title finds zeros there when it commits them again)
-    let mut pg = a & !(PAGE - 1);
-    let end = a + n;
-    while pg < end {
-        let t = pg & !(TILE - 1);
-        let tile_end = (t + TILE).min(end);
-        if let Some(entry) = s.mapped.get_mut(&t) {
-            let mut p = pg;
-            while p < tile_end {
-                let idx = (p - t) / PAGE;
-                entry.sent[idx] = None;
-                let bit = 1u16 << idx;
-                if entry.holes & bit == 0 {
-                    entry.holes |= bit;
-                    s.to_zero.push((p, PAGE));
-                }
-                p += PAGE;
-            }
-        }
-        pg = tile_end;
-    }
-    if unmapped_any {
-        s.signal();
-    }
+    MAPPED_GEN.fetch_add(1, Ordering::Release);
+    s.signal();
 }
 
 impl State {
@@ -1263,8 +1331,11 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     let start = va & !(TILE - 1);
     let delta = va - start;
     let bytes = desc.Width as usize;
+    if bytes == 0 {
+        return None;
+    }
     s.window_index(start)?;
-    s.window_index(va + bytes - 1)?;
+    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
     let mut d = *desc;
     d.Width = (delta + bytes) as u64;
     d.Alignment = 0;
@@ -1278,8 +1349,9 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         return None;
     }
-    // its tiles: the window's video memory at the same addresses
-    s.ensure_mapped(start, delta + bytes);
+    // its tiles: the window's video memory at the same addresses; probe actual OS commitment
+    // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
+    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
     let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
     let raw = *ppv;
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
@@ -1378,5 +1450,203 @@ mod tests {
         let (a, n) = plan_ring_chunk(tiny, 4096, cap);
         assert_eq!((a, n), (cap as u64, 4096));
         assert_eq!(a as usize % cap, 0);
+    }
+
+    /// `query_tile_holes` marks reserved, free, and `PAGE_NOACCESS` pages as holes while clearing
+    /// bits only for committed, accessible 4 KiB pages.
+    #[test]
+    fn query_tile_holes_detects_reserved_noaccess_and_committed_pages() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            // SAFETY: Reserving 2 tiles (128 KiB) with VirtualAlloc returns a 64 KiB-aligned VA.
+            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+
+            // Initially every page in both reserved tiles is a hole.
+            assert_eq!(query_tile_holes(base), 0xFFFF);
+            assert_eq!(query_tile_holes(base + TILE), 0xFFFF);
+
+            // Commit pages 4..8 as PAGE_READWRITE and page 9 as PAGE_NOACCESS.
+            let p4 = VirtualAlloc((base + 4 * PAGE) as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p4.is_null());
+            let p9 = VirtualAlloc((base + 9 * PAGE) as *const c_void, PAGE, MEM_COMMIT, PAGE_NOACCESS);
+            assert!(!p9.is_null());
+
+            // Only bits 4..8 are cleared; reserved [0..4), PAGE_NOACCESS [9], and reserved [10..16) remain holes.
+            assert_eq!(query_tile_holes(base), 0xFFFF & !(0b1111u16 << 4));
+            assert_eq!(query_tile_holes(base + TILE), 0xFFFF);
+
+            // Commit pages 0..4 and confirm bits 0..4 clear too.
+            let p0 = VirtualAlloc(base as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!p0.is_null());
+            assert_eq!(query_tile_holes(base), 0xFF00);
+
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+            // Released (MEM_FREE) memory reports all holes.
+            assert_eq!(query_tile_holes(base), 0xFFFF);
+        }
+    }
+
+    /// Mapping tiles for a placed buffer over partially-committed/reserved memory must preserve
+    /// uncommitted hole bits so `readback_ranges` / `sync_sent_range` do not access-violate,
+    /// and later commits clear those hole bits so subsequent writes scan cleanly.
+    #[test]
+    fn ensure_mapped_with_query_holes_skips_uncommitted_pages_on_readback() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE};
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+
+            // Reserve 2 tiles; commit only [base + 0x4000, base + 0x8000) to simulate a
+            // non-64KiB-aligned placed buffer with uncommitted prefix [base, base + 0x4000) and
+            // uncommitted second tile [base + TILE, base + 2*TILE).
+            let base = VirtualAlloc(std::ptr::null(), 2 * TILE, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert!(base != 0 && base % TILE == 0);
+            assert!(!VirtualAlloc((base + 4 * PAGE) as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+
+            let mut reserved: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&buffer_desc((2 * TILE) as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved)
+                .expect("CreateReservedResource");
+            let reserved = reserved.expect("reserved buffer");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let rb_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("rb_fence");
+            let event = windows::Win32::System::Threading::CreateEventW(None, false, false, None).expect("event");
+            let rb_alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("rb_alloc");
+            let rb_list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).expect("rb_list");
+            rb_list.Close().expect("rb_list close");
+
+            let mut s = State {
+                dev,
+                queue,
+                fence,
+                value: 0,
+                event,
+                rb_fence,
+                rb_value: 0,
+                windows: vec![(base, reserved)],
+                pools: Vec::new(),
+                free: Vec::new(),
+                mapped: FxHashMap::default(),
+                pinned: FxHashMap::default(),
+                buffers: FxHashMap::default(),
+                to_zero: Vec::new(),
+                staging: None,
+                ring_write: 0,
+                ring_submitted: 0,
+                ring_free: 0,
+                inflight: VecDeque::new(),
+                zero_buf: None,
+                slots: Vec::new(),
+                next_slot: 0,
+                readback: None,
+                rb_alloc,
+                rb_list,
+                rb_last_fence: 0,
+                waited: FxHashMap::default(),
+                runs: None,
+                scratch_runs: Vec::new(),
+            };
+
+            // Mirrors `place_buffer`: map both tiles probing real OS page commitment.
+            s.ensure_mapped(base, 2 * TILE, |t| query_tile_holes(t));
+            assert_eq!(s.mapped[&base].holes, 0xFF0F, "uncommitted prefix and suffix pages must stay holes");
+            assert_eq!(s.mapped[&(base + TILE)].holes, 0xFFFF, "fully reserved tile must have all 16 holes set");
+
+            // Reading back the full 2-tile span must not fault on uncommitted pages.
+            s.readback_ranges(&[(base, 2 * TILE)]);
+
+            // Now incrementally commit [base, base + 4*PAGE) and clear its hole bits (as `committed` does).
+            assert!(!VirtualAlloc(base as *const c_void, 4 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let entry = s.mapped.get_mut(&base).unwrap();
+            for i in 0..4 {
+                entry.holes &= !(1u16 << i);
+            }
+            assert_eq!(entry.holes, 0xFF00);
+
+            // Writing to the newly committed page is detected by `scan_page`.
+            *(base as *mut u8) = 0x5A;
+            let mut dirty = Vec::new();
+            let page0 = std::slice::from_raw_parts(base as *const u8, PAGE);
+            scan_page(page0, base, &mut entry.sent[0], &mut dirty);
+            assert_eq!(dirty, vec![(base, CHUNK)]);
+
+            s.wait_for(s.value);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Sub-tile decommits (two 32 KiB halves, sixteen 4 KiB pages, or decommitting the last
+    /// remaining committed page) must unmap the tile and return unpinned pool tiles to `free`
+    /// once `holes` reaches `0xFFFF`, pruning stale `to_zero` entries for unmapped tiles.
+    #[test]
+    fn decommit_sub_tile_reclaims_pool_tile_when_all_pages_become_holes() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let mut pinned: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        let mut free: Vec<(u32, u32)> = Vec::new();
+        let mut to_zero: Vec<(usize, usize)> = Vec::new();
+
+        // 1. Two 32 KiB decommits across a full 64 KiB tile.
+        let t0 = 0x10_0000usize;
+        mapped.insert(t0, TileEntry::with_holes((0, 10), 0));
+        assert!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t0, TILE / 2).is_empty());
+        assert_eq!(mapped[&t0].holes, 0x00FF);
+        assert_eq!(to_zero.len(), 8);
+        assert!(free.is_empty());
+
+        let unmapped = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t0 + TILE / 2, TILE / 2);
+        assert_eq!(unmapped, vec![t0]);
+        assert!(!mapped.contains_key(&t0));
+        assert_eq!(free, vec![(0, 10)]);
+        assert!(to_zero.is_empty(), "stale to_zero entries for the unmapped tile must be pruned");
+
+        // 2. Sixteen individual 4 KiB decommits in reverse order.
+        let t1 = 0x20_0000usize;
+        free.clear();
+        mapped.insert(t1, TileEntry::with_holes((0, 11), 0));
+        for i in (1..PAGES_PER_TILE).rev() {
+            let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t1 + i * PAGE, PAGE);
+            assert!(u.is_empty(), "tile still has committed pages after step {i}");
+        }
+        assert!(free.is_empty());
+        let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t1, PAGE);
+        assert_eq!(u, vec![t1]);
+        assert!(!mapped.contains_key(&t1));
+        assert_eq!(free, vec![(0, 11)]);
+        assert!(to_zero.is_empty());
+
+        // 3. Pinned tile decommitted in two halves: unmapped from `mapped`, NOT returned to `free`.
+        let t2 = 0x30_0000usize;
+        free.clear();
+        mapped.insert(t2, TileEntry::with_holes((0, 12), 0));
+        pinned.insert((0, 12), 1);
+        assert!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t2, TILE / 2).is_empty());
+        let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t2 + TILE / 2, TILE / 2);
+        assert_eq!(u, vec![t2]);
+        assert!(!mapped.contains_key(&t2));
+        assert!(free.is_empty(), "pinned pool tile must not return to free list");
+        assert!(to_zero.is_empty());
+
+        // 4. Single-committed-page tile decommit reclaims tile without dropping another tile's to_zero.
+        let t3 = 0x40_0000usize;
+        let t4 = 0x50_0000usize;
+        mapped.insert(t3, TileEntry::with_holes((0, 13), 0xFFFF & !(1u16 << 2)));
+        mapped.insert(t4, TileEntry::with_holes((0, 14), 0));
+        assert!(decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t4, PAGE).is_empty());
+        assert_eq!(to_zero, vec![(t4, PAGE)]);
+        let u = decommit_tiles(&mut mapped, &pinned, &mut free, &mut to_zero, t3 + 2 * PAGE, PAGE);
+        assert_eq!(u, vec![t3]);
+        assert_eq!(free, vec![(0, 13)]);
+        assert_eq!(to_zero, vec![(t4, PAGE)], "unrelated mapped tile's to_zero must remain");
     }
 }

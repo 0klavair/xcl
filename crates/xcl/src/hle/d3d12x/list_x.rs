@@ -654,6 +654,11 @@ pub(super) fn on_release(list: usize) {
     }
 }
 
+#[cfg(test)]
+pub(super) fn has_list_state(list: usize) -> bool {
+    LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
+}
+
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
 pub(super) fn on_allocator_release(alloc: usize) {
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
@@ -2023,10 +2028,12 @@ pub(super) unsafe extern "system" fn end_query_x(this: *mut c_void, heap: usize,
 
 /// command list #30 ResolveQueryData(heap, type, first, count, destination, offset) (PC #54):
 /// outer occlusion queries ended early are written over the resolved data (after it, in COPY_DEST as
-/// ResolveQueryData wants the destination)
+/// ResolveQueryData wants the destination). Buffers placed below their console address add
+/// `buffer_delta(dest)` to the destination offset.
 pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, heap: usize, ty: D3D12_QUERY_TYPE, first: u32, count: u32, dest: usize, offset: u64) {
+    let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, offset);
+    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
     if !is_occlusion(ty) {
         return;
     }
@@ -2036,7 +2043,7 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     };
     let dest = dest as *mut c_void;
     let Some(res) = ID3D12Resource::from_raw_borrowed(&dest).filter(|_| !visible.is_empty()) else { return };
-    let at = res.GetGPUVirtualAddress() + offset;
+    let at = res.GetGPUVirtualAddress().saturating_add(pc_offset);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = visible
         .iter()
         .flat_map(|&(i, v)| {
@@ -2460,5 +2467,108 @@ mod tests {
         device_x::forget_base(pso_dyn_zero);
         device_x::forget_base(pso_dyn_static);
         device_x::forget_base(pso_static_only);
+    }
+
+    #[test]
+    fn resolve_query_data_applies_buffer_delta_to_pc_resolve_and_occlusion_writeback() {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static RESOLVED: RefCell<Vec<(usize, u32, u32, usize, u64)>> = const { RefCell::new(Vec::new()) };
+            static WRITES: RefCell<Vec<(u64, u32)>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "system" fn fake_resolve(
+            _this: *mut c_void,
+            heap: usize,
+            _ty: D3D12_QUERY_TYPE,
+            first: u32,
+            count: u32,
+            dest: usize,
+            offset: u64,
+        ) {
+            RESOLVED.with(|r| r.borrow_mut().push((heap, first, count, dest, offset)));
+        }
+
+        unsafe extern "system" fn fake_write_immediate(
+            _this: *mut c_void,
+            count: u32,
+            params: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+            _modes: *const D3D12_WRITEBUFFERIMMEDIATE_MODE,
+        ) {
+            let slice = std::slice::from_raw_parts(params, count as usize);
+            WRITES.with(|w| {
+                let mut w = w.borrow_mut();
+                for p in slice {
+                    w.push((p.Dest, p.Value));
+                }
+            });
+        }
+
+        const BASE_GPU_VA: u64 = 0x1_0000_0000;
+        unsafe extern "system" fn fake_gpu_va(_this: *mut c_void) -> u64 {
+            BASE_GPU_VA
+        }
+
+        #[repr(C)]
+        struct FakeCom {
+            vt: *const usize,
+        }
+
+        let mut orig_list_vt = [0usize; 70];
+        orig_list_vt[PC_RESOLVE_QUERY_DATA] = fake_resolve as usize;
+        orig_list_vt[PC_WRITE_BUFFER_IMMEDIATE] = fake_write_immediate as usize;
+        // Adopted objects store `orig` at `ext[-1]`.
+        let ext_list_vt = [orig_list_vt.as_ptr() as usize, 0usize];
+        let mut fake_list = FakeCom {
+            // SAFETY: `ext_list_vt` has 2 elements; `.add(1)` points at `ext[0]` with `ext[-1] = orig`.
+            vt: unsafe { ext_list_vt.as_ptr().add(1) },
+        };
+
+        let mut res_vt = [0usize; 16];
+        res_vt[11] = fake_gpu_va as usize;
+        let mut fake_res = FakeCom { vt: res_vt.as_ptr() };
+
+        let heap = 0x5555_0001usize;
+        let dest = &mut fake_res as *mut FakeCom as usize;
+        let delta = 0x3400u64;
+        let title_offset = 0x100u64;
+
+        real::set_test_buffer_delta(dest, Some(delta));
+        VISIBLE.lock().unwrap().get_or_insert_with(HashMap::new).insert((heap, 2), VISIBLE_SAMPLES);
+        RESOLVED.with(|r| r.borrow_mut().clear());
+        WRITES.with(|w| w.borrow_mut().clear());
+
+        unsafe {
+            resolve_query_data_x(
+                &mut fake_list as *mut FakeCom as *mut c_void,
+                heap,
+                D3D12_QUERY_TYPE_OCCLUSION,
+                1,
+                3,
+                dest,
+                title_offset,
+            );
+        }
+
+        real::set_test_buffer_delta(dest, None);
+        if let Some(m) = VISIBLE.lock().unwrap().as_mut() {
+            m.remove(&(heap, 2));
+        }
+
+        let expected_off = title_offset + delta;
+        RESOLVED.with(|r| {
+            assert_eq!(*r.borrow(), vec![(heap, 1, 3, dest, expected_off)]);
+        });
+        WRITES.with(|w| {
+            let expected_va = BASE_GPU_VA + expected_off + 8; // query index 2 = slot (2 - 1) = +8 bytes
+            assert_eq!(
+                *w.borrow(),
+                vec![
+                    (expected_va, VISIBLE_SAMPLES as u32),
+                    (expected_va + 4, (VISIBLE_SAMPLES >> 32) as u32),
+                ]
+            );
+        });
     }
 }
