@@ -1131,16 +1131,41 @@ pub unsafe extern "system" fn GetProcAddress(h: usize, name: *const u8) -> usize
 }
 
 fn module_handle_impl(name: &str) -> usize {
+    module_handle_in(crate::hle::registry(), name)
+}
+
+fn module_handle_in(reg: &crate::hle::Registry, name: &str) -> usize {
     let key = dll_key(name);
-    let reg = crate::hle::registry();
-    if let Some(m) = reg.hle_for(&key) {
-        if !(m.aliases_are_system() && key != m.name) {
+    match reg.route(&key) {
+        Some(crate::hle::Route::Hle(i)) => {
+            let m = &reg.modules[*i];
+            if m.aliases_are_system() && key != m.name {
+                // Real Windows DLLs (kernel32 / kernelbase / advapi32 / Windows API sets) keep
+                // their genuine HMODULE; console-only aliases (advapi32legacy, kernel32legacy,
+                // minappmodelx) fall back to the HLE pseudo handle, matching LoadLibrary.
+                // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
+                let real = unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize };
+                if real != 0 {
+                    return real;
+                }
+            }
             return modules::hle_handle(m.name);
         }
+        Some(crate::hle::Route::Stub) => {
+            // Return the pseudo handle only if the @stub DLL has already been loaded or imported,
+            // preserving GetModuleHandle's non-loading probe semantics for optional DLLs.
+            return modules::find_hle_handle(&key).unwrap_or(0);
+        }
+        Some(crate::hle::Route::System) => {
+            // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
+            return unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize };
+        }
+        None => {}
     }
     if let Some(m) = modules::find_mapped_by_name(&key) {
         return m.base;
     }
+    // SAFETY: `wide(name)` produces a valid NUL-terminated UTF-16 string.
     unsafe { ll::GetModuleHandleW(crate::util::wide(name).as_ptr()) as usize }
 }
 
@@ -1564,5 +1589,46 @@ mod tests {
                 assert_eq!(VirtualFreeEx(cur, sp, 0, mem::MEM_RELEASE), 1);
             }
         }
+    }
+
+    #[test]
+    fn get_module_handle_matches_load_library_for_console_aliases_and_stubs() {
+        unsafe {
+            // Real Windows system DLL keeps its genuine Windows HMODULE.
+            let real_k32 = ll::GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()) as usize;
+            assert_ne!(real_k32, 0);
+            assert_eq!(GetModuleHandleW(crate::util::wide("kernel32.dll").as_ptr()), real_k32);
+            assert_eq!(GetModuleHandleA(c"kernel32.dll".as_ptr() as *const u8), real_k32);
+
+            // Console-only kernelx aliases return the kernelx HLE pseudo handle (matching LoadLibrary).
+            let kx = modules::hle_handle(crate::hle::KERNELX);
+            for dll in ["advapi32legacy.dll", "kernel32legacy.dll", "minappmodelx.dll"] {
+                let w = crate::util::wide(dll);
+                let h_load = LoadLibraryW(w.as_ptr());
+                assert_eq!(h_load, kx, "LoadLibraryW({dll})");
+                assert_eq!(GetModuleHandleW(w.as_ptr()), kx, "GetModuleHandleW({dll})");
+
+                let c = std::ffi::CString::new(dll).unwrap();
+                assert_eq!(GetModuleHandleA(c.as_ptr() as *const u8), kx, "GetModuleHandleA({dll})");
+
+                let mut out = 0usize;
+                assert_eq!(GetModuleHandleExW(0, w.as_ptr(), &mut out), 1, "GetModuleHandleExW({dll})");
+                assert_eq!(out, kx);
+            }
+
+            // Unknown DLL still returns NULL + ERROR_MOD_NOT_FOUND.
+            fnd::SetLastError(0);
+            assert_eq!(GetModuleHandleW(crate::util::wide("no_such_optional_dll_xyz.dll").as_ptr()), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_MOD_NOT_FOUND);
+        }
+
+        // @stub DLLs: unloaded probe returns 0; once loaded (hle_handle created), returns that handle.
+        let mut cfg = crate::config::Config::default();
+        cfg.aliases.insert("unit_stub_probe.dll".into(), "@stub".into());
+        let reg = crate::hle::build(&cfg);
+        assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), 0);
+        let stub_h = modules::hle_handle("unit_stub_probe.dll");
+        assert_ne!(stub_h, 0);
+        assert_eq!(module_handle_in(&reg, "unit_stub_probe.dll"), stub_h);
     }
 }
