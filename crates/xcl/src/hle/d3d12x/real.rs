@@ -1838,6 +1838,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
+    // translated shaders declare every cube T# as a TextureCubeArray: a title's TEXTURECUBE
+    // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
+    let cube = desc.as_ref().and_then(cube_as_cube_array);
+    let desc = cube.as_ref().map_or(desc, |v| v as *const _);
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
@@ -1888,6 +1892,28 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
+}
+
+/// A TEXTURECUBE view as the TEXTURECUBEARRAY of its one cube (None: any other view).
+fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE {
+        return None;
+    }
+    // SAFETY: the union member the view dimension names
+    let c = unsafe { v.Anonymous.TextureCube };
+    Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                MostDetailedMip: c.MostDetailedMip,
+                MipLevels: c.MipLevels,
+                First2DArrayFace: 0,
+                NumCubes: 1,
+                ResourceMinLODClamp: c.ResourceMinLODClamp,
+            },
+        },
+        ..*v
+    })
 }
 
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
@@ -4883,5 +4909,38 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
         QUEUE_OLDER.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod srv_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM_SRGB;
+
+    #[test]
+    fn a_cube_view_becomes_the_cube_array_of_one_cube() {
+        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC1_UNORM_SRGB,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: 0x1688,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV { MostDetailedMip: 2, MipLevels: 3, ResourceMinLODClamp: 1.5 },
+            },
+        };
+        let v = cube_as_cube_array(&cube).expect("a cube view is rewritten");
+        assert_eq!(v.ViewDimension, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY);
+        assert_eq!((v.Format, v.Shader4ComponentMapping), (DXGI_FORMAT_BC1_UNORM_SRGB, 0x1688), "format and mapping kept");
+        let a = unsafe { v.Anonymous.TextureCubeArray };
+        assert_eq!((a.MostDetailedMip, a.MipLevels, a.First2DArrayFace, a.NumCubes), (2, 3, 0, 1));
+        assert_eq!(a.ResourceMinLODClamp, 1.5);
+
+        // a cube array and every other view are forwarded as the title made them
+        let mut array = cube;
+        array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        array.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { NumCubes: 2, ..Default::default() };
+        assert!(cube_as_cube_array(&array).is_none());
+        let mut d2 = cube;
+        d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        assert!(cube_as_cube_array(&d2).is_none());
     }
 }
