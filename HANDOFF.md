@@ -1588,6 +1588,12 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   pipeline creation and copies). RTX 3090, `XCL_X64_ALL_MASKS=1` vs default: mask-only loop 1.64–1.68× → 1.04–1.11×
   (one console wave per group), 3.90–4.14× → 1.07–1.16× (four); with a readfirstlane too 1.99–2.02× → 1.74–1.81×,
   6.45–6.64× → 4.09–4.34×. Test `gpu_split_wave64_lane_local_masks` (fails if the local word lands in the wrong half).
+  Merged 2026-11-23 (#94) after: workspace tests on the RX 9070 natively and with `XCL_SPLIT_WAVE64=1`, and
+  XDefiant run in the split form on AMD (`XCL_SPLIT_WAVE64=1`, every wave64 compute / mesh program split): its
+  title screen right with a warm cache. With a cold cache (the split programs compiling) it showed only the logo
+  and the A / Y glyphs even after the compiles ended, until restarted – the known cold-cache issue (pipelines
+  recorded while a stand-in was bound), not the split form. Also merged: #92 (the VFS hook guard keeps
+  GetLastError – GNU builds' TLS access reset it), #93 (under Wine PEB.ImageBaseAddress stays the real image).
 - Still open on NVIDIA: wave64 VS / PS with readlane of lanes 32..63 (`wave_hazards`; the driver picks 32-lane
   waves, lanes ≥ 32 do not exist – `WaveReadLaneAt` wraps to lane & 31 there).
 
