@@ -400,16 +400,40 @@ pub fn clamp_regions(b: &mut XAudio2Buffer, total_frames: u32) {
     if b.play_begin >= total_frames {
         b.play_begin = 0;
         b.play_length = 0;
-    } else if b.play_length > 0 && b.play_begin.saturating_add(b.play_length) > total_frames {
+    } else if b.play_length == 0 {
+        if b.play_begin > 0 {
+            b.play_length = total_frames - b.play_begin;
+        }
+    } else if b.play_length > total_frames - b.play_begin {
         b.play_length = total_frames - b.play_begin;
     }
-    if b.loop_count > 0 {
-        if b.loop_begin >= total_frames {
+    if b.loop_count == 0 {
+        b.loop_begin = 0;
+        b.loop_length = 0;
+        return;
+    }
+    let play_end = if b.play_length > 0 {
+        b.play_begin + b.play_length
+    } else {
+        total_frames
+    };
+    if b.loop_begin >= play_end {
+        b.loop_begin = 0;
+        b.loop_length = 0;
+        b.loop_count = 0;
+    } else if b.loop_length == 0 {
+        if b.loop_begin > 0 || play_end < total_frames {
+            b.loop_length = play_end - b.loop_begin;
+        }
+    } else {
+        let max_loop = play_end - b.loop_begin;
+        if b.loop_length > max_loop {
+            b.loop_length = max_loop;
+        }
+        if b.loop_begin.saturating_add(b.loop_length) <= b.play_begin {
             b.loop_begin = 0;
             b.loop_length = 0;
             b.loop_count = 0;
-        } else if b.loop_length > 0 && b.loop_begin.saturating_add(b.loop_length) > total_frames {
-            b.loop_length = total_frames - b.loop_begin;
         }
     }
 }
@@ -429,6 +453,8 @@ pub fn estimate_frames(i: &XmaInfo, audio_bytes: u32) -> u64 {
     f.max(128)
 }
 
+const XAUDIO2_MAX_BUFFER_BYTES: u64 = 0x8000_0000;
+
 /// The PCM16 silence buffer that stands in for an XMA (or fallback) buffer: same play/loop
 /// region and flags/context; length from PlayBegin+PlayLength (or RFC 6716 Opus packet
 /// durations / XMA2 estimate), clamped to `max_bytes`.
@@ -447,10 +473,10 @@ pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_byt
         opus_est.unwrap_or_else(|| estimate_frames(i, b.audio_bytes)).max(pb + 1)
     };
     if b.loop_count > 0 {
-        frames = frames.max(lb + ll);
+        frames = frames.max(lb + if ll == 0 && lb > 0 { 1 } else { ll });
     }
     let frame_bytes = i.channels.max(1) as u64 * 2;
-    let max_frames = max_bytes as u64 / frame_bytes;
+    let max_frames = (max_bytes as u64).min(XAUDIO2_MAX_BUFFER_BYTES) / frame_bytes;
     if frames > max_frames {
         frames = max_frames;
         nb.play_begin = 0;
@@ -458,6 +484,7 @@ pub fn silent_buffer(i: &XmaInfo, b: &XAudio2Buffer, silence: *const u8, max_byt
         nb.loop_begin = 0;
         nb.loop_length = 0;
     }
+    clamp_regions(&mut nb, frames as u32);
     nb.audio_bytes = (frames * frame_bytes) as u32;
     nb.audio_data = silence;
     nb
@@ -1572,6 +1599,162 @@ mod tests {
             destroy(master);
             let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vt_eng.add(2).read());
             release(eng);
+        }
+    }
+
+    #[test]
+    fn clamp_regions_enforces_play_end_and_loop_invariants() {
+        // Loop extending past PlayBegin + PlayLength is clamped to play_end (300).
+        let mut b = buffer(100, 100, 200, 50, 400, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (100, 200, 50, 250, 1));
+
+        // Loop starting at or past play_end is disabled.
+        let mut b = buffer(100, 100, 200, 350, 50, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 0, 0));
+
+        // Loop ending at or before PlayBegin (including exact loop_end == play_begin) is disabled.
+        let mut b = buffer(100, 200, 400, 50, 100, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 0, 0));
+        let mut b = buffer(100, 200, 400, 50, 150, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 0, 0));
+
+        // PlayBegin > 0 with PlayLength == 0 gets explicit PlayLength = total_frames - PlayBegin.
+        let mut b = buffer(100, 100, 0, 0, 0, 0);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.play_begin }, { b.play_length }), (100, 860));
+
+        // Non-zero LoopBegin with LoopLength == 0 gets explicit LoopLength = play_end - loop_begin.
+        let mut b = buffer(100, 0, 0, 100, 0, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (100, 860, 1));
+
+        // LoopBegin == 0, LoopLength == 0 with restricted PlayLength gets explicit LoopLength = play_end.
+        let mut b = buffer(100, 100, 200, 0, 0, 1);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 300, 1));
+
+        // LoopCount == 0 clears stale LoopBegin/LoopLength.
+        let mut b = buffer(100, 0, 0, 100, 200, 0);
+        clamp_regions(&mut b, 960);
+        assert_eq!(({ b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 0, 0));
+
+        // total_frames == u32::MAX with play_begin + play_length overflowing u32 does not panic or wrap.
+        let mut b = buffer(100, 1, u32::MAX, 0, u32::MAX, 1);
+        clamp_regions(&mut b, u32::MAX);
+        assert_eq!(({ b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (1, u32::MAX - 1, 0, u32::MAX, 1));
+    }
+
+    #[test]
+    fn silent_buffer_clamps_regions_and_zero_max_bytes() {
+        let i = XmaInfo { channels: 2, rate: 48_000, ..Default::default() };
+        let z = 0x5000 as *const u8;
+
+        // Loop longer than play_length keeps the buffer big enough, while clamping loop_length to play_end.
+        let b = silent_buffer(&i, &buffer(0x1000, 0, 100, 0, 9000, 255), z, 1 << 20);
+        assert_eq!({ b.audio_bytes } / 4, 9000);
+        assert_eq!(({ b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 100, 0, 100, 255));
+
+        // Non-zero LoopBegin with LoopLength == 0 allocates at least LoopBegin + 1 frames and sets explicit LoopLength.
+        let b = silent_buffer(&i, &buffer(0x100, 0, 0, 5000, 0, 1), z, 1 << 20);
+        assert!({ b.audio_bytes } / 4 >= 5001);
+        assert_eq!({ b.loop_begin }, 5000);
+        assert!({ b.loop_length } >= 1);
+        assert_eq!({ b.loop_count }, 1);
+
+        // Zero max_bytes clears loop_count as well as all regions.
+        let b = silent_buffer(&i, &buffer(0x1000, 0, 100, 0, 100, 255), z, 0);
+        assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (0, 0, 0, 0, 0, 0));
+
+        // Truncated looping buffer with non-zero max_bytes loops the full silence buffer cleanly.
+        let b = silent_buffer(&i, &buffer(0x1000, 1000, 1_000_000, 1000, 500_000, 255), z, 4000);
+        assert_eq!(({ b.audio_bytes }, { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count }), (4000, 0, 0, 0, 0, 255));
+    }
+
+    #[test]
+    fn clamped_and_silenced_buffers_accepted_by_windows_xaudio2() {
+        struct AudioGuard {
+            eng: *mut c_void,
+            master: *mut c_void,
+            voice: *mut c_void,
+        }
+        impl Drop for AudioGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.voice.is_null() {
+                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.voice).add(VOICE_DESTROY).read());
+                        destroy(self.voice);
+                    }
+                    if !self.master.is_null() {
+                        let destroy: DestroyVoiceFn = std::mem::transmute(vtable(self.master).add(VOICE_DESTROY).read());
+                        destroy(self.master);
+                    }
+                    if !self.eng.is_null() {
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(vtable(self.eng).add(2).read());
+                        release(self.eng);
+                    }
+                }
+            }
+        }
+
+        // Buffers declared before the guard so the guard drops first (destroying voices before backing memory frees).
+        let pcm = vec![0u8; 960 * 4];
+        let sil = vec![0u8; 64 * 1024];
+
+        unsafe {
+            let mut guard = AudioGuard { eng: std::ptr::null_mut(), master: std::ptr::null_mut(), voice: std::ptr::null_mut() };
+            assert_eq!(XAudio2Create(&mut guard.eng, 0, 1), S_OK);
+            let vt_eng = vtable(guard.eng);
+            let create_master: CreateMasteringVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_MASTERING_VOICE).read());
+            if create_master(guard.eng, &mut guard.master, 0, 0, 0, std::ptr::null(), std::ptr::null(), AUDIO_CATEGORY_GAME_EFFECTS) < 0 {
+                eprintln!("skipping: no audio device");
+                return;
+            }
+            let create_src: CreateSourceVoiceFn = std::mem::transmute(vt_eng.add(ENGINE_CREATE_SOURCE_VOICE).read());
+            let wfx = pcm16_for_rate(2, 48_000);
+            assert_eq!(create_src(guard.eng, &mut guard.voice, &wfx, 0, 2.0, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()), S_OK);
+            let vt_v = vtable(guard.voice);
+            let submit: SubmitSourceBufferFn = std::mem::transmute(vt_v.add(VOICE_SUBMIT_SOURCE_BUFFER).read());
+            let flush: FlushSourceBuffersFn = std::mem::transmute(vt_v.add(VOICE_FLUSH_SOURCE_BUFFERS).read());
+
+            let cases = [
+                (100, 200, 50, 400, 1),  // loop_end > play_end
+                (100, 200, 350, 50, 1),  // loop_begin >= play_end
+                (200, 400, 50, 100, 1),  // loop_end <= play_begin
+                (200, 400, 50, 150, 1),  // loop_end == play_begin
+                (0, 0, 100, 0, 1),       // loop_begin > 0 with loop_length == 0
+                (100, 200, 0, 0, 1),     // loop_length == 0 with restricted play_length
+                (100, 0, 0, 0, 1),       // play_begin > 0, play_length == 0, whole-buffer loop
+                (0, 0, 100, 200, 0),     // loop_count == 0 with stale loop fields
+            ];
+            for (pb, pl, lb, ll, lc) in cases {
+                let mut b = XAudio2Buffer {
+                    flags: 0,
+                    audio_bytes: pcm.len() as u32,
+                    audio_data: pcm.as_ptr(),
+                    play_begin: pb,
+                    play_length: pl,
+                    loop_begin: lb,
+                    loop_length: ll,
+                    loop_count: lc,
+                    context: std::ptr::null_mut(),
+                };
+                clamp_regions(&mut b, 960);
+                let hr = submit(guard.voice, &b, std::ptr::null());
+                assert_eq!(hr, S_OK, "SubmitSourceBuffer failed ({hr:#x}) for case ({pb},{pl},{lb},{ll},{lc}) -> ({},{},{},{},{})", { b.play_begin }, { b.play_length }, { b.loop_begin }, { b.loop_length }, { b.loop_count });
+                assert_eq!(flush(guard.voice), S_OK);
+            }
+
+            let info = XmaInfo { channels: 2, rate: 48_000, ..Default::default() };
+            let sb1 = silent_buffer(&info, &buffer(0x1000, 0, 100, 0, 9000, 255), sil.as_ptr(), sil.len());
+            assert_eq!(submit(guard.voice, &sb1, std::ptr::null()), S_OK);
+            assert_eq!(flush(guard.voice), S_OK);
+            let sb2 = silent_buffer(&info, &buffer(0x100, 0, 0, 5000, 0, 1), sil.as_ptr(), sil.len());
+            assert_eq!(submit(guard.voice, &sb2, std::ptr::null()), S_OK);
+            assert_eq!(flush(guard.voice), S_OK);
         }
     }
 }
