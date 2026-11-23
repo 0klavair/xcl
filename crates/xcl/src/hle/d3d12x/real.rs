@@ -688,6 +688,16 @@ fn console_remap(kind: Kind) -> Vec<(usize, usize)> {
 /// console D3D12_DESCRIPTOR_HEAP_TYPE also used for CBV / SRV / UAV heaps
 const XBOX_EXTRA_CBV_SRV_UAV: u32 = 4;
 
+/// Map a console `D3D12_DESCRIPTOR_HEAP_TYPE` to its PC equivalent.
+#[inline]
+fn pc_heap_type(ty: u32) -> u32 {
+    if ty == XBOX_EXTRA_CBV_SRV_UAV {
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32
+    } else {
+        ty
+    }
+}
+
 /// Where a class's console extensions start: the device's from #44 (`device_x`), the command
 /// list's from #60 (`list_x`).
 fn console_extensions(kind: Kind) -> Option<usize> {
@@ -873,9 +883,7 @@ unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
 
 unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: *const [u32; 4], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let mut d = if desc.is_null() { [u32::MAX; 4] } else { *desc };
-    if d[0] == XBOX_EXTRA_CBV_SRV_UAV {
-        d[0] = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32;
-    }
+    d[0] = pc_heap_type(d[0]);
     let desc = if desc.is_null() { desc } else { &d as *const [u32; 4] };
     let sampler = d[0] == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32;
     if d[0] != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 && !sampler {
@@ -927,7 +935,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
 }
 
 unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u32 {
-    let ty = if ty == XBOX_EXTRA_CBV_SRV_UAV { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 } else { ty };
+    let ty = pc_heap_type(ty);
     if ty == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32 {
         return super::console_heap::SLOT;
     }
@@ -1129,12 +1137,22 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     None
 }
 
+/// Sanitize a console buffer description and initial state for placement in a coherent
+/// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
+fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
+    let mut d = *desc;
+    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    d.Alignment = 0;
+    (d, state as u32 & PC_RESOURCE_STATES)
+}
+
 unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
     let u = crate::gpu::uma::get()?;
     if UMA_BUFFER.lock().unwrap().is_empty() || ppv.is_null() {
         return None;
     }
-    let mut d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
+    let d: D3D12_RESOURCE_DESC = std::ptr::read(desc as *const D3D12_RESOURCE_DESC);
     if d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || d.Width == 0 {
         return None;
     }
@@ -1159,13 +1177,11 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         }
         return None;
     };
-    // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + this flag
-    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-    d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    d.Alignment = 0;
+    // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
+    let (d, st) = sanitize_coherent_buffer(&d, state);
     let k = u.window_of(p)?;
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, state, clear, riid, ppv);
+    let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
         static ONCE: AtomicU64 = AtomicU64::new(0);
@@ -1241,6 +1257,21 @@ static BUFFER_DELTA: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 /// Where offset 0 of a console buffer is in its PC resource (0 for most).
 pub fn buffer_delta(res: usize) -> u64 {
     BUFFER_DELTA.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
+    let mut g = BUFFER_DELTA.lock().unwrap();
+    match delta {
+        Some(d) => {
+            g.get_or_insert_with(HashMap::new).insert(res, d);
+        }
+        None => {
+            if let Some(m) = g.as_mut() {
+                m.remove(&res);
+            }
+        }
+    }
 }
 
 /// resource Release (every caller): a console buffer's unified memory goes with it
@@ -1478,6 +1509,7 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     if d0.sampler != s0.sampler {
         return false;
     }
+    let ty = pc_heap_type(ty);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
     if !d0.sampler {
@@ -1511,6 +1543,7 @@ fn note_mixed_copy() {
 
 /// #24 CopyDescriptorsSimple(n, dst, src, type)
 unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
+    let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptorsSimple", n, dst, src);
     if copy_console_slots(this, n, dst, src, ty) {
         return;
@@ -1526,6 +1559,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dsts: *const u64, dsizes: *const u32, ns: u32, srcs: *const u64, ssizes: *const u32, ty: u32) {
+    let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptors", nd, if dsts.is_null() { 0 } else { *dsts }, if srcs.is_null() { 0 } else { *srcs });
     use super::console_heap::{slot, SAMPLER_SLOT, SLOT};
     let console = !dsts.is_null() && !srcs.is_null() && nd > 0 && slot(*dsts).is_some();
@@ -1814,6 +1848,11 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
+        ]),
+        Kind::DmaList => v.extend_from_slice(&[
+            ("Release", cl_release as usize),
+            ("Close", cl_close as usize),
+            ("Reset", cl_reset as usize),
         ]),
         Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
@@ -3830,5 +3869,183 @@ mod readback_routing_tests {
         assert!(is_coherent_readback_buffer(&custom_wb, copy_dest, none, 4 << 20));
         assert!(!is_coherent_readback_buffer(&custom_wb, copy_dest, none, COHERENT_CUSTOM_WB_MAX + 0x1_0000));
         assert!(is_cpu_readback_buffer(&custom_wb, copy_dest, none));
+    }
+
+    /// Bug #4: `place_console_buffer` coherent fallback must strip console-only resource flags
+    /// and state bits before creating the cross-adapter placed resource.
+    #[test]
+    fn coherent_buffer_sanitizes_console_flags_and_state() {
+        let raw_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Alignment: 0x10_0000,
+            Width: 0x1_0000,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT(0x101), // console layout
+            Flags: D3D12_RESOURCE_FLAGS(0x0130_0000 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0),
+            ..Default::default()
+        };
+        let console_state = 0x0010_0000usize | (D3D12_RESOURCE_STATE_COPY_DEST.0 as usize);
+
+        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state);
+        assert_eq!(clean.Alignment, 0);
+        assert_eq!(clean.Layout, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
+        assert_eq!(
+            clean.Flags,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER
+        );
+        assert_eq!(st, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+
+        // Verify against a real D3D12 device: raw console flags/state are rejected, sanitized succeeds.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            if let Ok(dev3) = dev.cast::<ID3D12Device3>() {
+                use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+                let mem = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                assert!(!mem.is_null());
+                if let Ok(heap) = dev3.OpenExistingHeapFromAddress::<ID3D12Heap>(mem) {
+                    let mut unsanitized = raw_desc;
+                    unsanitized.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+                    unsanitized.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    unsanitized.Alignment = 0;
+                    let mut r_bad: Option<ID3D12Resource> = None;
+                    assert!(
+                        dev.CreatePlacedResource(&heap, 0, &unsanitized, D3D12_RESOURCE_STATES(console_state as i32), None, &mut r_bad).is_err(),
+                        "PC D3D12 must reject unsanitized console flags/state"
+                    );
+                    let mut r_ok: Option<ID3D12Resource> = None;
+                    dev.CreatePlacedResource(&heap, 0, &clean, D3D12_RESOURCE_STATES(st as i32), None, &mut r_ok)
+                        .expect("sanitized coherent buffer must succeed on PC D3D12");
+                    assert!(r_ok.is_some());
+                    drop(r_ok);
+                    drop(heap);
+                }
+                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
+    /// Bug #5: `CopyDescriptors` and `CopyDescriptorsSimple` must remap `XBOX_EXTRA_CBV_SRV_UAV`
+    /// (`4`) to `D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV` (`0`) on both console and PC paths.
+    #[test]
+    fn copy_descriptors_remaps_xbox_extra_cbv_srv_uav_to_pc_enum() {
+        use std::cell::RefCell;
+
+        assert_eq!(pc_heap_type(XBOX_EXTRA_CBV_SRV_UAV), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV.0 as u32);
+        assert_eq!(pc_heap_type(0), 0);
+        assert_eq!(pc_heap_type(1), 1);
+        assert_eq!(pc_heap_type(2), 2);
+        assert_eq!(pc_heap_type(3), 3);
+
+        thread_local! {
+            static SIMPLE_TYPES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+            static RANGE_TYPES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe extern "system" fn fake_copy_simple(_this: *mut c_void, _n: u32, _dst: u64, _src: u64, ty: u32) {
+            SIMPLE_TYPES.with(|v| v.borrow_mut().push(ty));
+        }
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "system" fn fake_copy_ranges(
+            _this: *mut c_void,
+            _nd: u32,
+            _dsts: *const u64,
+            _dsizes: *const u32,
+            _ns: u32,
+            _srcs: *const u64,
+            _ssizes: *const u32,
+            ty: u32,
+        ) {
+            RANGE_TYPES.with(|v| v.borrow_mut().push(ty));
+        }
+
+        #[repr(C)]
+        struct FakeDev {
+            vt: *const usize,
+        }
+
+        let mut orig_vt = [0usize; 32];
+        orig_vt[23] = fake_copy_ranges as usize;
+        orig_vt[24] = fake_copy_simple as usize;
+        let ext_vt = [orig_vt.as_ptr() as usize, 0usize];
+        let mut dev = FakeDev {
+            // SAFETY: `ext_vt` has 2 entries; `.add(1)` puts `orig_vt` at `ext[-1]`.
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+        };
+        let dev_ptr = &mut dev as *mut FakeDev as *mut c_void;
+
+        SIMPLE_TYPES.with(|v| v.borrow_mut().clear());
+        RANGE_TYPES.with(|v| v.borrow_mut().clear());
+
+        unsafe {
+            // Non-console PC fallback paths
+            dev_copy_descriptors_simple_x(dev_ptr, 1, 0x1000, 0x2000, XBOX_EXTRA_CBV_SRV_UAV);
+            dev_copy_descriptors_simple_x(dev_ptr, 1, 0x1000, 0x2000, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32);
+            let (d, s, sz) = ([0x1000u64], [0x2000u64], [1u32]);
+            dev_copy_descriptors_x(dev_ptr, 1, d.as_ptr(), sz.as_ptr(), 1, s.as_ptr(), sz.as_ptr(), XBOX_EXTRA_CBV_SRV_UAV);
+            dev_copy_descriptors_x(dev_ptr, 1, d.as_ptr(), sz.as_ptr(), 1, s.as_ptr(), sz.as_ptr(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV.0 as u32);
+
+            // Console-slot paths (`copy_console_slots` invoked from both Simple and Ranges)
+            let heap_obj = 0x5555_DEADusize;
+            if crate::gpu::uma::get().is_some()
+                && super::super::console_heap::register(heap_obj, 4, 0x10_0000, 0, 32, false, false, false)
+            {
+                let start = super::super::console_heap::start(heap_obj).unwrap();
+                let dst_h = start + super::super::console_heap::SLOT as u64;
+                dev_copy_descriptors_simple_x(dev_ptr, 1, dst_h, start, XBOX_EXTRA_CBV_SRV_UAV);
+                let (cd, cs, csz) = ([dst_h], [start], [1u32]);
+                dev_copy_descriptors_x(dev_ptr, 1, cd.as_ptr(), csz.as_ptr(), 1, cs.as_ptr(), csz.as_ptr(), XBOX_EXTRA_CBV_SRV_UAV);
+                super::super::console_heap::unregister(heap_obj);
+
+                SIMPLE_TYPES.with(|v| assert_eq!(*v.borrow(), vec![0, 1, 0, 0]));
+            } else {
+                SIMPLE_TYPES.with(|v| assert_eq!(*v.borrow(), vec![0, 1]));
+            }
+            RANGE_TYPES.with(|v| assert_eq!(*v.borrow(), vec![0, 2]));
+        }
+    }
+
+    /// Bug #6: `Kind::DmaList` must install `cl_release` so releasing a DMA command list removes
+    /// its entry from `list_x::LISTS`.
+    #[test]
+    fn dma_list_release_cleans_up_list_state() {
+        assert!(
+            overrides(Kind::DmaList).iter().any(|&(name, f)| name == "Release" && f == cl_release as usize),
+            "Kind::DmaList must override Release with cl_release"
+        );
+
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp: IDXGIAdapter = factory.EnumWarpAdapter().expect("WARP");
+                D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).expect("WARP D3D12 device");
+            }
+            let dev = dev.expect("D3D12 device");
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).expect("copy alloc");
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &alloc, None).expect("copy list");
+            let raw = list.into_raw();
+            let key = raw as usize;
+
+            // Mirror `device_x::create_list`: adopt as CommandList, track via `list_x::on_create`,
+            // then re-adopt as `Kind::DmaList`.
+            adopt(raw, Kind::CommandList);
+            super::super::list_x::on_create(raw, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_COPY);
+            readopt(raw, Kind::DmaList);
+            assert!(super::super::list_x::has_list_state(key), "DMA list must be tracked in list_x::LISTS");
+
+            // Invoke Release through the adopted vtable slot 2.
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt(raw).add(2));
+            assert_eq!(release(raw), 0);
+            assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
+        }
     }
 }
