@@ -3699,6 +3699,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
 /// used (before the process ends on purpose).
 pub fn drain_gpu() {
+    use crate::gpu::fence::{self, FenceError};
+
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     unsafe {
@@ -3706,13 +3708,42 @@ pub fn drain_gpu() {
         let mut fences = Vec::new();
         for q in super::present::known_queues() {
             let qr = q as *mut c_void;
-            let (Some(q), Ok(f)) = (ID3D12CommandQueue::from_raw_borrowed(&qr), dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)) else { continue };
-            if q.Signal(&f, 1).is_ok() {
-                fences.push(f);
+            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
+            let submit = || {
+                let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
+                    .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
+                q.Signal(&f, 1).map_err(|e| fence::api_error(dev, "Signal", e))?;
+                Ok(f)
+            };
+            match submit() {
+                Ok(f) => fences.push(f),
+                Err(e) => {
+                    crate::xlog_error!("D3D12 queue drain: {e}");
+                    if matches!(e, FenceError::Removed(_)) {
+                        return;
+                    }
+                }
             }
         }
         let start = std::time::Instant::now();
-        while fences.iter().any(|f| f.GetCompletedValue() < 1) && start.elapsed().as_secs() < 10 {
+        loop {
+            let mut pending = false;
+            for f in &fences {
+                match fence::completed_value(f, dev) {
+                    Ok(value) => pending |= value < 1,
+                    Err(e) => {
+                        crate::xlog_error!("D3D12 queue drain: {e}");
+                        return;
+                    }
+                }
+            }
+            if !pending {
+                return;
+            }
+            if start.elapsed().as_secs() >= 10 {
+                crate::xlog_warn!("D3D12 queue drain: GPU fences still pending after 10 s");
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }

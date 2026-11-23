@@ -6,6 +6,7 @@ pub mod agility;
 pub mod bvh;
 pub mod desc;
 pub mod dxbc;
+pub(crate) mod fence;
 pub mod pack;
 pub mod rdna2;
 pub mod recomp;
