@@ -1528,6 +1528,13 @@ pub(super) fn register_translated_compute_for_test(pso: usize) {
 }
 
 #[cfg(test)]
+pub(super) fn register_rect_list_gs_for_test(pso: usize) {
+    if pso != 0 {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+#[cfg(test)]
 pub(super) fn register_translated_graphics_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
