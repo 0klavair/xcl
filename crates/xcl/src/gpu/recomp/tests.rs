@@ -2755,6 +2755,86 @@ fn gpu_ds_read_destination_overlaps_address() {
     }
 }
 
+/// `DS_WRITE_ADDTID_B32` / `DS_READ_ADDTID_B32` compute `M0[15:0] + offset16 + 4 * lane_id`
+/// without touching unused `ADDR`/`DATA1` VGPR fields, and reject `GDS=1`.
+#[test]
+fn ds_addtid_translates_with_m0_offset_and_lane_id() {
+    let mut code = Vec::new();
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0xDEAD_0100)).unwrap());
+    // Populate unused ADDR/DATA1 (and DATA0 on read) with nonzero indices to verify they are ignored.
+    code.extend(encode("DS_WRITE_ADDTID_B32", "ENC_DS", &[("ADDR", 9), ("DATA0", 2), ("DATA1", 11), ("OFFSET0", 0x40), ("OFFSET1", 0x01)], None).unwrap());
+    code.extend(encode("DS_READ_ADDTID_B32", "ENC_DS", &[("ADDR", 10), ("DATA0", 12), ("DATA1", 13), ("VDST", 3), ("OFFSET0", 0x40), ("OFFSET1", 0x01)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.unsupported.is_empty(), "{:?}\n{}", t.unsupported, t.hlsl);
+    assert!(t.hlsl.contains("groupshared uint xcl_lds"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("((m0 & 0xFFFFu) + 320u + 4u * lane_id)"), "{}", t.hlsl);
+    for unused in ["uint v9 =", "uint v10 =", "uint v11 =", "uint v12 =", "uint v13 ="] {
+        assert!(!t.hlsl.contains(unused), "unexpected {unused} in:\n{}", t.hlsl);
+    }
+
+    // GDS=1 must be reported as unsupported and not allocate LDS.
+    let mut gds_code = Vec::new();
+    gds_code.extend(encode("DS_READ_ADDTID_B32", "ENC_DS", &[("VDST", 3), ("GDS", 1)], None).unwrap());
+    gds_code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let tg = translate(&gds_code, &Options::default()).unwrap();
+    assert_eq!(tg.unsupported.get("ds_read_addtid_b32"), Some(&1), "{:?}", tg.unsupported);
+    assert!(tg.hlsl.contains("GDS"), "{}", tg.hlsl);
+    assert!(!tg.hlsl.contains("groupshared uint xcl_lds"), "{}", tg.hlsl);
+}
+
+/// GPU verification for `DS_WRITE_ADDTID_B32` / `DS_READ_ADDTID_B32`: verifies exact LDS byte
+/// address (`M0[15:0] + ((OFFSET1 << 8) | OFFSET0) + 4 * lane_id`, ignoring `M0[31:16]`) in both
+/// directions against explicit `DS_READ_B32` / `DS_WRITE_B32`, plus EXEC masking on writes & reads.
+#[test]
+fn gpu_ds_addtid_roundtrip_and_exec_masking() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut code = Vec::new();
+    // m0 = 0xDEAD_0100 -> M0[15:0] = 256, offset = 0x4040 = 16448 -> base byte offset = 16704 + 4 * lane
+    code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0xDEAD_0100)).unwrap());
+    // Direction 1: seed LDS via explicit DS_WRITE_B32 at v1 (= 16704 + 4 * lane) and read via DS_READ_ADDTID_B32 -> v7
+    code.extend(encode("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 8)], None).unwrap());
+    code.extend(encode("DS_READ_ADDTID_B32", "ENC_DS", &[("VDST", 7), ("OFFSET0", 0x40), ("OFFSET1", 0x40)], None).unwrap());
+    // Direction 2: all lanes write v2 via DS_WRITE_ADDTID_B32 and verify via explicit DS_READ_B32 -> v4
+    code.extend(encode("DS_WRITE_ADDTID_B32", "ENC_DS", &[("DATA0", 2), ("OFFSET0", 0x40), ("OFFSET1", 0x40)], None).unwrap());
+    code.extend(encode("DS_READ_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 1)], None).unwrap());
+    // Mask EXEC to even lanes (s[0:1] = 0x5555_5555_5555_5555): overwrite LDS with v6 and read into v3
+    code.extend(encode("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)], None).unwrap());
+    code.extend(encode("DS_WRITE_ADDTID_B32", "ENC_DS", &[("DATA0", 6), ("OFFSET0", 0x40), ("OFFSET1", 0x40)], None).unwrap());
+    code.extend(encode("DS_READ_ADDTID_B32", "ENC_DS", &[("VDST", 3), ("OFFSET0", 0x40), ("OFFSET1", 0x40)], None).unwrap());
+    // Restore all 64 lanes (EXEC = -1) and read final LDS contents into v5
+    code.extend(encode("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None).unwrap());
+    code.extend(encode("DS_READ_ADDTID_B32", "ENC_DS", &[("VDST", 5), ("OFFSET0", 0x40), ("OFFSET1", 0x40)], None).unwrap());
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 0x5555_5555;
+    st.sgpr[1] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[1] = 16704 + 4 * l; // explicit byte address (256 + 0x4040 + 4 * lane)
+        r[2] = 0x1000 + l;    // ADDTID write value
+        r[3] = 0xCAFE_0000 + l; // sentinel preserved on inactive (odd) lanes
+        r[6] = 0x2000 + l;    // masked overwrite value (even lanes only)
+        r[8] = 0xBEEF_0000 + l; // seeded via DS_WRITE_B32 for ADDTID read check
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let lu = l as u32;
+        assert_eq!(r.vgpr[l][7], 0xBEEF_0000 + lu, "lane {l} DS_WRITE_B32 -> DS_READ_ADDTID_B32");
+        assert_eq!(r.vgpr[l][4], 0x1000 + lu, "lane {l} DS_WRITE_ADDTID_B32 -> DS_READ_B32");
+        if l % 2 == 0 {
+            assert_eq!(r.vgpr[l][3], 0x2000 + lu, "even lane {l} masked DS_READ_ADDTID_B32");
+            assert_eq!(r.vgpr[l][5], 0x2000 + lu, "even lane {l} final DS_READ_ADDTID_B32");
+        } else {
+            assert_eq!(r.vgpr[l][3], 0xCAFE_0000 + lu, "odd lane {l} sentinel must be preserved");
+            assert_eq!(r.vgpr[l][5], 0x1000 + lu, "odd lane {l} LDS slot must be untouched");
+        }
+    }
+}
+
 /// Ray tracing: image_bvh(64)_intersect_ray on a hand-built BVH (box32 root with 4 children,
 /// a box16 node, triangles), several rays; sorted and unsorted box results, triangle hit as
 /// (t, denominator, i, j) numerators, misses, and the 64-bit node pointer form.
