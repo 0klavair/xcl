@@ -631,7 +631,7 @@ pub fn draw(
     size: u32,
     clear: [f32; 4],
 ) -> Result<Vec<[f32; 4]>, String> {
-    draw_views(vs, None, ps, layout, vertices, stride, sgprs, mem, &[], &[], size, clear)
+    draw_gs(vs, None, ps, layout, vertices, stride, sgprs, mem, size, clear)
 }
 
 /// `draw` with a geometry shader (DXIL) between the VS and the PS.
