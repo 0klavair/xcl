@@ -1218,7 +1218,13 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        if crate::util::under_wine() {
+            // Wine's MoveFileExW succeeds on a case-only rename but keeps the old name
+            assert_eq!(ov_names.len(), 1);
+            assert!(ov_names[0].eq_ignore_ascii_case("Hello.txt"), "{ov_names:?}");
+        } else {
+            assert_eq!(ov_names, vec!["Hello.txt".to_string()]);
+        }
 
         // Exact self-rename is a safe no-op.
         let ok = unsafe { move_file_vfs(v, "G:\\data\\gone.txt", "G:\\data\\gone.txt", 0, real_move) };

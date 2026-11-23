@@ -104,6 +104,16 @@ pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     Some(String::from_utf16_lossy(&buf))
 }
 
+/// The process runs under Wine (its ntdll exports `wine_get_version`).
+pub fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
+    *WINE.get_or_init(|| unsafe {
+        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
+    })
+}
+
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.
 pub fn dll_key(name: &str) -> String {
     let base = name.rsplit(['\\', '/']).next().unwrap_or(name);

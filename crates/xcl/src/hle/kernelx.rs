@@ -1765,7 +1765,11 @@ mod tests {
 
             fnd::SetLastError(0);
             assert_eq!(GetProcAddress(k32, std::ptr::null()), 0);
-            assert_eq!(fnd::GetLastError(), win32_err);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            // Windows' own answer; Wine's GetProcAddress says ERROR_PROC_NOT_FOUND instead
+            if !crate::util::under_wine() {
+                assert_eq!(win32_err, fnd::ERROR_INVALID_PARAMETER);
+            }
 
             // Non-zero ordinal lookup still resolves when valid (ordinal #1 on kernel32).
             assert_ne!(GetProcAddress(k32, 1usize as *const u8), 0);

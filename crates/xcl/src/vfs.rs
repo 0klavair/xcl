@@ -897,7 +897,11 @@ mod tests {
                 )
             };
             assert_eq!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
-            assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            // Windows' own codes are the reference; Wine answers a directory opened with
+            // FILE_FLAG_BACKUP_SEMANTICS and TRUNCATE_EXISTING with ERROR_FILE_EXISTS
+            if !crate::util::under_wine() {
+                assert_eq!(unsafe { windows_sys::Win32::Foundation::GetLastError() }, expected);
+            }
             assert_eq!(v.open_decision("G:\\data", GENERIC_WRITE, TRUNCATE_EXISTING, flags), Decision::Fail(expected));
         }
         assert!(!v.visible_in_overlay("data"));
