@@ -111,6 +111,40 @@ struct Mods {
     opsel: u64,
 }
 
+/// A float VOPC compare of `a` and `b`, f32 or f64, with NaN tested explicitly. `isnan` names
+/// the NaN test for the type. The ordered compares lt, eq, le, gt, ge, lg and o are false and
+/// the unordered ones, n… and u, are true when either operand is NaN.
+/// The plain HLSL compare is not enough. After `!(a >= b)` in a shader, the AMD driver gave a
+/// later `a < b` of the same operands that unordered result, which is true for a NaN. The
+/// DXIL holds a correct `fcmp olt`, with or without -Gis. Seen with driver 32.0.32029.2010 on
+/// an RX 7900 XTX and on an RDNA2 iGPU.
+/// `and` and `or` replace `&&` and `||`, so the compare has no branches and DXC computes the
+/// NaN tests of operands that several compares share only once.
+fn float_compare(op: &str, a: &str, b: &str, isnan: &str) -> Option<String> {
+    let rel = |r: &str| {
+        Some(match r {
+            "lt" => format!("{a} < {b}"),
+            "eq" => format!("{a} == {b}"),
+            "le" => format!("{a} <= {b}"),
+            "gt" => format!("{a} > {b}"),
+            "ge" => format!("{a} >= {b}"),
+            "lg" => format!("or({a} < {b}, {a} > {b})"),
+            _ => return None,
+        })
+    };
+    let nan = format!("or({isnan}({a}), {isnan}({b}))");
+    Some(match op {
+        "f" => "false".to_string(),
+        "t" | "tru" => "true".to_string(),
+        "o" => format!("!{nan}"),
+        "u" => nan,
+        _ => match op.strip_prefix('n').and_then(rel) {
+            Some(r) => format!("or({nan}, !({r}))"),
+            None => format!("and(!{nan}, {})", rel(op)?),
+        },
+    })
+}
+
 /// Layout of the SDWA / DPP extension dword for this instruction's base encoding.
 fn ext_encoding(d: &Decoded) -> Option<&'static Encoding> {
     let base = match d.enc.name {
@@ -2526,26 +2560,20 @@ impl Em {
                 "f64" => (f64v(0), f64v(1)),
                 _ => return Err("VOPC 64"),
             };
-            let cond = match op {
-                "f" => "false".to_string(),
-                "lt" => format!("{a} < {b}"),
-                "eq" => format!("{a} == {b}"),
-                "le" => format!("{a} <= {b}"),
-                "gt" => format!("{a} > {b}"),
-                "ne" => format!("{a} != {b}"),
-                "lg" if ty == "f64" => format!("({a} < {b} || {a} > {b})"),
-                "nlg" => format!("!({a} < {b} || {a} > {b})"),
-                "lg" => format!("{a} != {b}"),
-                "ge" => format!("{a} >= {b}"),
-                "neq" => format!("!({a} == {b})"),
-                "nlt" => format!("!({a} < {b})"),
-                "nge" => format!("!({a} >= {b})"),
-                "ngt" => format!("!({a} > {b})"),
-                "nle" => format!("!({a} <= {b})"),
-                "o" => format!("({a} == {a} && {b} == {b})"),
-                "u" => format!("({a} != {a} || {b} != {b})"),
-                "t" | "tru" => "true".to_string(),
-                _ => return Err("VOPC 64"),
+            let cond = if ty == "f64" {
+                float_compare(op, &a, &b, "isnan_d").ok_or("VOPC 64")?
+            } else {
+                match op {
+                    "f" => "false".to_string(),
+                    "lt" => format!("{a} < {b}"),
+                    "eq" => format!("{a} == {b}"),
+                    "le" => format!("{a} <= {b}"),
+                    "gt" => format!("{a} > {b}"),
+                    "ne" | "lg" => format!("{a} != {b}"),
+                    "ge" => format!("{a} >= {b}"),
+                    "t" | "tru" => "true".to_string(),
+                    _ => return Err("VOPC 64"),
+                }
             };
             let dst = if name.starts_with("v_cmpx_") { Dst::S(126) } else { dst };
             self.write_mask(&dst, &cond);
@@ -2587,20 +2615,23 @@ impl Em {
                     "v_frexp_mant_f64" => format!("frexp_mant_d({})", f64v(0)),
                     "v_sqrt_f64" => format!("sqrt_d({})", f64v(0)),
                     "v_rsq_f64" => format!("((double)1 / sqrt_d({}))", f64v(0)),
-                    "v_trunc_f64" => format!("(double)(int64_t){}", f64v(0)),
-                    "v_ldexp_f64" => format!("({} * (double)exp2((float)(int){}))", f64v(0), lo_hi[1].0),
+                    "v_trunc_f64" => format!("trunc_d({})", f64v(0)),
+                    "v_ldexp_f64" => format!("ldexp_d({}, (int){})", f64v(0), lo_hi[1].0),
                     "v_cvt_f32_f64" => {
                         self.line(&format!("uint {t} = asuint((float){});", f64v(0)));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
                     "v_cvt_i32_f64" => {
-                        self.line(&format!("uint {t} = (uint)(int)clamp({}, -2147483648.0, 2147483647.0);", f64v(0)));
+                        // saturating, and NaN gives 0 where clamp would give −2^31
+                        self.line(&format!("double {t}_x = {};", f64v(0)));
+                        self.line(&format!("uint {t} = isnan_d({t}_x) ? 0u : (uint)(int)clamp({t}_x, -2147483648.0, 2147483647.0);"));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
                     "v_cvt_u32_f64" => {
-                        self.line(&format!("uint {t} = (uint)clamp({}, 0.0, 4294967295.0);", f64v(0)));
+                        self.line(&format!("double {t}_x = {};", f64v(0)));
+                        self.line(&format!("uint {t} = isnan_d({t}_x) ? 0u : (uint)clamp({t}_x, 0.0, 4294967295.0);"));
                         self.write32(&dst, &t);
                         return Ok(());
                     }
@@ -3040,23 +3071,7 @@ impl Em {
                 let (a, b) = (Self::fsrc(m, 0, &ua), Self::fsrc(m, 1, &ub));
                 match op {
                     "class" => format!("((({ub}) >> fclass({a})) & 1u) != 0u"),
-                    "f" => "false".to_string(),
-                    "lt" => format!("{a} < {b}"),
-                    "eq" => format!("{a} == {b}"),
-                    "le" => format!("{a} <= {b}"),
-                    "gt" => format!("{a} > {b}"),
-                    "lg" => format!("({a} < {b} || {a} > {b})"),
-                    "ge" => format!("{a} >= {b}"),
-                    "o" => format!("(!isnan({a}) && !isnan({b}))"),
-                    "u" => format!("(isnan({a}) || isnan({b}))"),
-                    "nge" => format!("!({a} >= {b})"),
-                    "nlg" => format!("!({a} < {b} || {a} > {b})"),
-                    "ngt" => format!("!({a} > {b})"),
-                    "nle" => format!("!({a} <= {b})"),
-                    "neq" => format!("!({a} == {b})"),
-                    "nlt" => format!("!({a} < {b})"),
-                    "tru" => "true".to_string(),
-                    _ => return Err("VOPC f32"),
+                    _ => float_compare(op, &a, &b, "isnan").ok_or("VOPC f32")?,
                 }
             }
             "i32" | "u32" => {
@@ -4843,18 +4858,65 @@ int frexp_exp_d(double x) {
     uint top = m != 0u ? 32u + firstbithigh(m) : firstbithigh(l);
     return (int)top - 1073;
 }
-double floor_d(double x) { double t = (double)(int64_t)x; return t > x ? t - 1.0 : t; }
-// no f64 negation here: -floor_d(-x) gave -0.0 for 1.5625 on an AMD driver
-// HLSL has no f64 sqrt (it computes in f32): the f32 root refined by two Newton steps in f64;
-// zero, negative, inf, NaN and values outside the f32 range keep the f32 result
-double sqrt_d(double x) {
-    double y = (double)sqrt((float)x);
-    if (!(y > 0.0) || isinf(y)) return y;
-    y = y + (x - y * y) / (y + y);
-    return y + (x - y * y) / (y + y);
+// f64 classes from the bits. DXC narrows isinf and isnan of a double to f32, so 1e300 tested as inf.
+bool isnan_d(double x) { uint l, h; asuint(x, l, h); h &= 0x7FFFFFFFu; return h > 0x7FF00000u || (h == 0x7FF00000u && l != 0u); }
+bool isinf_d(double x) { uint l, h; asuint(x, l, h); return (h & 0x7FFFFFFFu) == 0x7FF00000u && l == 0u; }
+// f64 rounding on the bits. An int64_t cast breaks at |x| >= 2^63, on inf and NaN, and on the
+// sign of zero. |x| >= 2^52, inf and NaN are already integral, and |x| < 1 gives a zero of x's sign.
+double trunc_d(double x) {
+    uint l, h; asuint(x, l, h);
+    uint e = (h >> 20) & 0x7FFu;
+    if (e >= 1075u) return x;
+    if (e < 1023u) return asdouble(0u, h & 0x80000000u);
+    uint64_t bits = (((uint64_t)h << 32) | (uint64_t)l) & ~((1ull << (1075u - e)) - 1ull);
+    return asdouble((uint)bits, (uint)(bits >> 32));
 }
-double ceil_d(double x) { if (isinf(x) || isnan(x) || abs(x) >= 4503599627370496.0) return x; double t = (double)(int64_t)x; return t < x ? t + 1.0 : t; }
-double fract_d(double x) { return (isinf(x) || isnan(x)) ? x - x : min(x - floor_d(x), asdouble(0xFFFFFFFFu, 0x3FEFFFFFu)); }
+// t ± 1 only happens where |x| < 2^52, so it is exact. floor(−0) = −0 and ceil(−0.5) = −0.
+double floor_d(double x) { double t = trunc_d(x); return t > x ? t - 1.0 : t; }
+// no f64 negation here: -floor_d(-x) gave -0.0 for 1.5625 on an AMD driver
+double ceil_d(double x) { double t = trunc_d(x); return t < x ? t + 1.0 : t; }
+// x · 2^n for any n, rounded once. 2^n is built from bits in at most three steps whose
+// intermediate results stay normal, as in musl's scalbn. exp2() works in f32 and ends at 2^±127.
+// The steps are `precise` because DXC otherwise folds them into one product that over- or underflows.
+double ldexp_d(double x, int n) {
+    if (isnan_d(x) || isinf_d(x) || x == 0.0) return x;
+    precise double r = x;
+    n = clamp(n, -2200, 2200);
+    if (n > 1023) {
+        r *= asdouble(0u, 0x7FE00000u); n -= 1023;
+        if (n > 1023) { r *= asdouble(0u, 0x7FE00000u); n = min(n - 1023, 1023); }
+    } else if (n < -1022) {
+        // 2^-1022 · 2^53, so only the last step can round into a denormal
+        r *= asdouble(0u, 0x03600000u); n += 969;
+        if (n < -1022) { r *= asdouble(0u, 0x03600000u); n = max(n + 969, -1022); }
+    }
+    r *= asdouble(0u, (uint)(n + 1023) << 20);
+    return r;
+}
+// HLSL has no f64 sqrt, its sqrt works in f32. x is scaled by 2^-2k into [0.5, 2), its f32 root
+// is refined by two Newton steps in f64, the second with an exact fma residual, and the result
+// is scaled back by 2^k. Denormals and values outside the f32 range work too. The result is
+// within 1 ulp of the correctly rounded root, and exact on 98.6 % of 64 000 random inputs.
+// ±0, +inf and NaN return x, and x < 0 gives NaN.
+double sqrt_d(double x) {
+    if (isnan_d(x) || x == 0.0 || (isinf_d(x) && x > 0.0)) return x;
+    if (x < 0.0) return asdouble(0u, 0x7FF80000u);
+    int k = frexp_exp_d(x) >> 1;
+    precise double s = ldexp_d(x, -2 * k);
+    precise double y = (double)sqrt((float)s);
+    y = y + (s - y * y) / (y + y);
+    y = y + fma(-y, y, s) / (y + y);
+    return ldexp_d(y, k);
+}
+// ±inf gives NaN, and NaN gives x
+double fract_d(double x) {
+    if (isnan_d(x)) return x;
+    if (isinf_d(x)) return asdouble(0u, 0x7FF80000u);
+    // a zero result is +0, as x - floor(x) gives in IEEE. With the inline constant 0, an AMD
+    // driver ran 0.0 - floor_d(0.0) as a negation and gave -0.
+    double f = x - floor_d(x);
+    return f == 0.0 ? asdouble(0u, 0u) : min(f, asdouble(0xFFFFFFFFu, 0x3FEFFFFFu));
+}
 double round_ne_d(double x) {
     uint l, h; asuint(x, l, h);
     uint sign = h & 0x80000000u;
