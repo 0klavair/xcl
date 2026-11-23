@@ -5048,3 +5048,316 @@ fn float_compares_random(wave64: bool) {
     }
     assert_eq!(total_bad, 0);
 }
+
+fn hwreg_imm(id: u64, offset: u64, width: u64) -> u64 {
+    id | (offset << 6) | ((width - 1) << 11)
+}
+
+#[test]
+fn round_mode_classification_and_lowering() {
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+
+    // Default RNE (0x0): exact NOOP even when f16/f64 ops are present.
+    let def = prog(&[
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x0)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 4), ("SRC1", V + 6)], None),
+    ]);
+    let t = translate(&def, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(!t.hlsl.contains("xcl_fp16_rm"));
+    assert_eq!(t.ignored.get("s_round_mode"), Some(&1));
+
+    // Retail graphics pattern (`s_round_mode 0xC`: f32=RNE, f16/f64=RTZ) with no f16/f64 ops:
+    // exact NOOP, zero HLSL overhead.
+    let f32_only = prog(&[
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V), ("VSRC1", 2)], None),
+    ]);
+    let t = translate(&f32_only, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(!t.hlsl.contains("xcl_fp16_rm"));
+    assert_eq!(t.ignored.get("s_round_mode"), Some(&1));
+
+    // `s_round_mode 0xC` with f16 ops: emits `xcl_fp16_rm` and routes f16 rounding through `f32_to_f16_rm`.
+    let f16_rtz = prog(&[
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+    ]);
+    let t = translate(&f16_rtz, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("static uint xcl_fp16_rm = 0u;"));
+    assert!(t.hlsl.contains("xcl_fp16_rm = 3u;"));
+    assert!(t.hlsl.contains("f32_to_f16_rm("));
+
+    // Non-default f64 round mode: rejected instead of silently running RNE.
+    let f64_rtz = prog(&[
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 4), ("SRC1", V + 6)], None),
+    ]);
+    let t = translate(&f64_rtz, &opt).unwrap();
+    assert!(!t.complete());
+    assert!(t.unsupported_why.contains_key("s_round_mode: non-default f64 round mode"), "{:?}", t.unsupported_why);
+
+    // Non-default f32 round mode: rejected.
+    for sp in [1u64, 2, 3] {
+        let f32_rm = prog(&[
+            ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", sp)], None),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V), ("VSRC1", 2)], None),
+        ]);
+        let t = translate(&f32_rm, &opt).unwrap();
+        assert!(!t.complete(), "sp={sp}");
+        assert!(t.unsupported_why.contains_key("s_round_mode: non-default f32 round mode"), "{:?}", t.unsupported_why);
+    }
+
+    // `s_setreg_imm32_b32`: full MODE[3:0] write, partial bit writes, non-MODE & denorm-bit NOOPs, rejections.
+    let setreg_partial = prog(&[
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 1))], Some(1)),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 3, 1))], Some(1)),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+    ]);
+    let t = translate(&setreg_partial, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("xcl_fp16_rm = (xcl_fp16_rm & 2u) | 1u;"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("xcl_fp16_rm = (xcl_fp16_rm & 1u) | 2u;"), "{}", t.hlsl);
+
+    let setreg_f32_bad = prog(&[
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 0, 4))], Some(0x1)),
+    ]);
+    let t = translate(&setreg_f32_bad, &opt).unwrap();
+    assert!(!t.complete());
+    assert!(t.unsupported_why.contains_key("s_setreg_imm32_b32: non-default f32 round mode"), "{:?}", t.unsupported_why);
+
+    let setreg_f64_bad = prog(&[
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2))], Some(0x3)),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 4), ("SRC1", V + 6)], None),
+    ]);
+    let t = translate(&setreg_f64_bad, &opt).unwrap();
+    assert!(!t.complete());
+    assert!(t.unsupported_why.contains_key("s_setreg_imm32_b32: non-default f64 round mode"), "{:?}", t.unsupported_why);
+
+    let setreg_noop = prog(&[
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(20, 0, 32))], Some(0x1234_5678)), // flat scratch
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 4, 4))], Some(0xF)),           // MODE denorm bits
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+    ]);
+    let t = translate(&setreg_noop, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(!t.hlsl.contains("xcl_fp16_rm"));
+    assert_eq!(t.ignored.get("s_setreg_imm32_b32"), Some(&2));
+
+    // `s_setreg_b32`: dynamic SGPR write to MODE[3:2] with f16 ops succeeds; f32/f64 rejected.
+    let setreg_dyn = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2)), ("SDST", 0)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+    ]);
+    let t = translate(&setreg_dyn, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("xcl_fp16_rm = (s0 & 3u);"), "{}", t.hlsl);
+
+    let setreg_dyn_f32 = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 0, 2)), ("SDST", 0)], None),
+    ]);
+    let t = translate(&setreg_dyn_f32, &opt).unwrap();
+    assert!(!t.complete());
+    assert!(t.unsupported_why.contains_key("s_setreg_b32: dynamic f32 round mode"), "{:?}", t.unsupported_why);
+
+    let setreg_dyn_f64 = prog(&[
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2)), ("SDST", 0)], None),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 4), ("SRC1", V + 6)], None),
+    ]);
+    let t = translate(&setreg_dyn_f64, &opt).unwrap();
+    assert!(!t.complete());
+    assert!(t.unsupported_why.contains_key("s_setreg_b32: dynamic f64 round mode"), "{:?}", t.unsupported_why);
+
+    // Straight-line pre-scan stops at `s_endpgm`: unreachable trailing f64 op does not break `s_round_mode 0xC`.
+    let mut trailing = prog(&[("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None)]);
+    trailing.extend(encode("V_ADD_F64", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 4), ("SRC1", V + 6)], None).unwrap());
+    let t = translate(&trailing, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+}
+
+#[test]
+fn gpu_nonfused_mad_and_mac_prevent_fma_contraction() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    // Two golden vectors where fused FMA and non-fused multiply-then-add disagree:
+    //   lane 0 (overflow):     a = f32::MAX, b = 1 + 2^-23, c = -f32::MAX
+    //     non-fused -> +inf (0x7F800000), fused -> 0x73FFFFFF
+    //   lane 1 (cancellation): a = 1 + 2^-23, b = 1 + 2^-23, c = -(1 + 2^-22)
+    //     non-fused -> +0.0 (0x00000000), fused -> 2^-46 (0x28800000)
+    let code = prog(&[
+        ("V_MAC_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 0), ("VSRC1", 1)], None),
+        ("V_MAC_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 0), ("SRC1", V + 1)], None),
+        ("V_MAD_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_MADMK_F32", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 0), ("VSRC1", 2)], Some(0x3F80_0001)),
+        ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 0), ("VSRC1", 1)], Some(0xFF7F_FFFF)),
+        ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 0), ("VSRC1", 1)], Some(0xBF80_0002)),
+        // Fused control on the exact same inputs proves the backend has hardware FMA and `precise` mattered.
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 0), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    let vectors = [
+        (0x7F7F_FFFFu32, 0x3F80_0001u32, 0xFF7F_FFFFu32), // overflow
+        (0x3F80_0001u32, 0x3F80_0001u32, 0xBF80_0002u32), // cancellation
+    ];
+    for (l, &(a, b, c)) in vectors.iter().enumerate() {
+        st.vgpr[l][0] = a;
+        st.vgpr[l][1] = b;
+        st.vgpr[l][2] = c;
+        st.vgpr[l][10] = c;
+        st.vgpr[l][11] = c;
+    }
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+
+    let v0 = &r.vgpr[0];
+    assert_eq!(v0[10], 0x7F80_0000, "v_mac_f32 (VOP2) overflow must not fuse");
+    assert_eq!(v0[11], 0x7F80_0000, "v_mac_f32 (VOP3) overflow must not fuse");
+    assert_eq!(v0[12], 0x7F80_0000, "v_mad_f32 overflow must not fuse");
+    assert_eq!(v0[13], 0x7F80_0000, "v_madmk_f32 overflow must not fuse");
+    assert_eq!(v0[14], 0x7F80_0000, "v_madak_f32 overflow must not fuse");
+    assert_eq!(v0[16], 0x73FF_FFFF, "v_fma_f32 overflow control should stay fused");
+
+    let v1 = &r.vgpr[1];
+    assert_eq!(v1[10], 0x0000_0000, "v_mac_f32 (VOP2) cancellation must not fuse");
+    assert_eq!(v1[11], 0x0000_0000, "v_mac_f32 (VOP3) cancellation must not fuse");
+    assert_eq!(v1[12], 0x0000_0000, "v_mad_f32 cancellation must not fuse");
+    assert_eq!(v1[13], 0x0000_0000, "v_madmk_f32 cancellation must not fuse");
+    assert_eq!(v1[15], 0x0000_0000, "v_madak_f32 cancellation must not fuse");
+    assert_eq!(v1[16], 0x2880_0000, "v_fma_f32 cancellation control should stay fused");
+}
+
+#[test]
+fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    let code = prog(&[
+        // Default RNE (0) -> v10 (v_cvt_f16_f32), v20 (v_mul_f16), v21 (v_pk_mul_f16), v22 (v_fma_mixlo_f16)
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 21), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+        ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 22), ("SRC0", V + 0), ("SRC1", 242), ("SRC2", 128)], None),
+        // Switch to RTZ (3) via S_ROUND_MODE 0xC -> v11, v23, v24, v25
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 0)], None),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 23), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 24), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)], None),
+        ("V_FMA_MIXLO_F16", "ENC_VOP3P", &[("VDST", 25), ("SRC0", V + 0), ("SRC1", 242), ("SRC2", 128)], None),
+        // Switch to +inf (1) via S_ROUND_MODE 0x4 -> v12
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x4)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 0)], None),
+        // Switch to -inf (2) via S_ROUND_MODE 0x8 -> v13
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x8)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 0)], None),
+        // Switch back to RNE (0) via S_ROUND_MODE 0x0 -> v14
+        ("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0x0)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 14), ("SRC0", V + 0)], None),
+        // Switch to RTZ (3) via S_SETREG_IMM32_B32, then clear bit 0 -> -inf (2) -> v15
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2))], Some(3)),
+        ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 1))], Some(0)),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 0)], None),
+        // Switch dynamically via S_SETREG_B32 from s0 (= 1 -> +inf) -> v16
+        ("S_SETREG_B32", "ENC_SOPK", &[("SIMM16", hwreg_imm(1, 2, 2)), ("SDST", 0)], None),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 0)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    // (f32 bits, RNE, RTZ, +inf, -inf)
+    let cases: &[(u32, u16, u16, u16, u16)] = &[
+        (0x3F80_0800, 0x3C00, 0x3C00, 0x3C01, 0x3C00), // +(1 + 2^-12)
+        (0xBF80_0800, 0xBC00, 0xBC00, 0xBC00, 0xBC01), // -(1 + 2^-12)
+        (0x3F80_1000, 0x3C00, 0x3C00, 0x3C01, 0x3C00), // +(1 + 2^-11): tie to even (0x3C00)
+        (0x3F80_3000, 0x3C02, 0x3C01, 0x3C02, 0x3C01), // +(1 + 3*2^-11): tie to odd -> rounds up to 0x3C02
+        (0xBF80_3000, 0xBC02, 0xBC01, 0xBC01, 0xBC02), // -(1 + 3*2^-11)
+        (0x477F_E040, 0x7BFF, 0x7BFF, 0x7C00, 0x7BFF), // +65504.5
+        (0xC77F_E040, 0xFBFF, 0xFBFF, 0xFBFF, 0xFC00), // -65504.5
+        (0x477F_F000, 0x7C00, 0x7BFF, 0x7C00, 0x7BFF), // +65520.0 (tie to +inf)
+        (0xC77F_F000, 0xFC00, 0xFBFF, 0xFBFF, 0xFC00), // -65520.0 (tie to -inf)
+        (0x4788_B800, 0x7C00, 0x7BFF, 0x7C00, 0x7BFF), // +70000.0 (> 65536 overflow)
+        (0xC788_B800, 0xFC00, 0xFBFF, 0xFBFF, 0xFC00), // -70000.0
+        (0x33C0_0000, 0x0002, 0x0001, 0x0002, 0x0001), // +1.5 * 2^-24 (subnormal tie to even)
+        (0x387F_FFFF, 0x0400, 0x03FF, 0x0400, 0x03FF), // subnormal-to-normal carry
+        (0x3300_0000, 0x0000, 0x0000, 0x0001, 0x0000), // +2^-25 (exact tie to 0)
+        (0x3300_0001, 0x0001, 0x0000, 0x0001, 0x0000), // +(2^-25 + eps)
+        (0x8D80_0000, 0x8000, 0x8000, 0x8000, 0x8001), // tiny negative underflow
+        (0x0000_0000, 0x0000, 0x0000, 0x0000, 0x0000), // +0.0
+        (0x8000_0000, 0x8000, 0x8000, 0x8000, 0x8000), // -0.0
+        (0x7F80_0000, 0x7C00, 0x7C00, 0x7C00, 0x7C00), // +inf
+        (0xFF80_0000, 0xFC00, 0xFC00, 0xFC00, 0xFC00), // -inf
+    ];
+
+    let mut st = KernelState::default();
+    st.sgpr[0] = 1; // +inf for S_SETREG_B32
+    st.sgpr[127] = 0;
+    for (l, &(bits, ..)) in cases.iter().enumerate() {
+        st.vgpr[l][0] = bits;
+        // Pack two f16 overflow pairs: 65504 * (1 + 2^-10) = 65567.96875 -> +inf (RNE) vs 65504 (RTZ)
+        // High half: -65504 * (1 + 2^-10) -> -inf (RNE) vs -65504 (RTZ)
+        st.vgpr[l][1] = 0xFBFF_7BFF;
+        st.vgpr[l][2] = 0x3C01_3C01;
+    }
+    // Lane 20: quiet NaN preservation check
+    st.vgpr[20][0] = 0x7FC0_2000;
+
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    for (l, &(bits, rne, rtz, rtp, rtn)) in cases.iter().enumerate() {
+        let v = &r.vgpr[l];
+        assert_eq!(v[10] as u16, rne, "lane {l} ({bits:#010x}) RNE");
+        assert_eq!(v[11] as u16, rtz, "lane {l} ({bits:#010x}) RTZ");
+        assert_eq!(v[12] as u16, rtp, "lane {l} ({bits:#010x}) +inf");
+        assert_eq!(v[13] as u16, rtn, "lane {l} ({bits:#010x}) -inf");
+        assert_eq!(v[14] as u16, rne, "lane {l} ({bits:#010x}) reset to RNE");
+        assert_eq!(v[15] as u16, rtn, "lane {l} ({bits:#010x}) setreg_imm32 partial -> -inf");
+        assert_eq!(v[16] as u16, rtp, "lane {l} ({bits:#010x}) setreg_b32 dynamic -> +inf");
+        assert_eq!(v[22] as u16, rne, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RNE");
+        assert_eq!(v[25] as u16, rtz, "lane {l} ({bits:#010x}) v_fma_mixlo_f16 RTZ");
+    }
+    // Verify V_MUL_F16 & V_PK_MUL_F16 honor RNE vs RTZ
+    assert_eq!(r.vgpr[0][20] as u16, 0x7C00, "v_mul_f16 overflow RNE");
+    assert_eq!(r.vgpr[0][23] as u16, 0x7BFF, "v_mul_f16 overflow RTZ");
+    assert_eq!(r.vgpr[0][21], 0xFC00_7C00, "v_pk_mul_f16 overflow RNE");
+    assert_eq!(r.vgpr[0][24], 0xFBFF_7BFF, "v_pk_mul_f16 overflow RTZ");
+    // Verify NaN stays NaN across all 4 rounding modes
+    for reg in [10, 11, 12, 13] {
+        let h = r.vgpr[20][reg] as u16;
+        assert!((h & 0x7C00) == 0x7C00 && (h & 0x03FF) != 0, "reg v{reg} NaN corrupted: {h:#06x}");
+    }
+}
+
+#[test]
+fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    // Compile a wave32 kernel containing the recompiler PRELUDE and exercise `mad_nf_f16` directly.
+    let base = prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 0)], None)]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let mut hlsl = translate(&base, &opt).unwrap().hlsl;
+    let probe = "\
+    if (lane_id == 0u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 0u), 0u);\n\
+    if (lane_id == 1u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x7BFFu), f16tof32(0x3C01u), f16tof32(0xFBFFu), 3u), 3u);\n\
+    if (lane_id == 2u) v0 = f32_to_f16_rm(mad_nf_f16(f16tof32(0x3C01u), f16tof32(0x3C01u), f16tof32(0xBC02u), 0u), 0u);\n";
+    let marker = "    v0 = select((((exec_lo >> lane_id) & 1u) != 0u), (v0), v0);\n";
+    assert!(hlsl.contains(marker), "unexpected kernel body:\n{hlsl}");
+    hlsl = hlsl.replace(marker, probe);
+
+    let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
+    let mut st = KernelState::default();
+    st.sgpr[127] = 0;
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+
+    assert_eq!(r.vgpr[0][0], 0x7C00, "mad_nf_f16 RNE overflow: 65504*(1+2^-10)-65504 -> +inf");
+    assert_eq!(r.vgpr[1][0], 0x0000, "mad_nf_f16 RTZ clamp: 65504*(1+2^-10)->65504, -65504 -> 0");
+    assert_eq!(r.vgpr[2][0], 0x0000, "mad_nf_f16 cancellation: (1+2^-10)^2-(1+2^-9) -> 0 (not 2^-20)");
+}
