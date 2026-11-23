@@ -120,8 +120,12 @@ fn test_title_runs_and_game_folder_is_untouched() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
 
+    // Only the launcher's own verdict on the file counts here: preflight warnings about the host
+    // (no Gaming Services / xgameruntime.dll, no mesh shaders, WARP) say nothing about the title.
     assert!(
-        stdout.contains("console: imports kernelx.dll") && !stdout.contains("WARNING"),
+        stdout.contains("console: imports kernelx.dll")
+            && !stdout.contains("imports no console library")
+            && !stdout.contains("not a valid x64 PE file"),
         "the launcher should recognize a console title"
     );
     let fails: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[FAIL]")).collect();
