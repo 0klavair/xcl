@@ -1459,8 +1459,12 @@ unsafe fn set_index_buffer(list: *mut c_void, view: Option<&D3D12_INDEX_BUFFER_V
     f(list, view.map_or(std::ptr::null(), |v| v as *const _));
 }
 
-/// Bind the shared heap for shared view indices and the selected private heap for local
-/// view indices. Sampler heaps are passed through.
+/// The heaps a list binds for console code: a view heap in the shared shader-visible heap
+/// is that one (`console_heap`), which is bound whatever the title names (a console
+/// descriptor table may be in any heap); a view heap that kept its own shader-visible PC heap
+/// (no shared heap) is bound itself, for its local indices; sampler heaps as they are. A view
+/// heap whose views were meant for the shared heap but found no room there is CPU-only
+/// (`dev_create_descriptor_heap_x` dropped the flag) and cannot be bound.
 pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12DescriptorHeap>> {
     let mut view_heap = super::console_heap::global_heap();
     let mut out = Vec::new();
@@ -1470,8 +1474,11 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
             continue;
         }
         let Some(h) = ID3D12DescriptorHeap::from_raw_borrowed(&p) else { continue };
-        if h.GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
-            view_heap = Some(h.clone());
+        let desc = h.GetDesc();
+        if desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV {
+            if desc.Flags.contains(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+                view_heap = Some(h.clone());
+            }
         } else {
             out.push(Some(h.clone()));
         }
