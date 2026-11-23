@@ -3138,8 +3138,16 @@ mod tests {
         });
         let list_ptr = &*fake as *const FakeDrawList as *mut c_void;
 
+        // The index buffers' addresses: reserved, never committed, so not readable and never
+        // mirrored into unified memory. A fixed address (0x1_0000_1000) was committed memory once
+        // earlier tests had allocated there, and the draw then bound its mirror.
+        let reserved = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(std::ptr::null(), 0x1_0000, windows_sys::Win32::System::Memory::MEM_RESERVE, windows_sys::Win32::System::Memory::PAGE_NOACCESS)
+        } as u64;
+        assert_ne!(reserved, 0, "reserve the index buffers' addresses");
+        let ib = |k: u64| reserved + k * 0x1000;
         let orig_ib = D3D12_INDEX_BUFFER_VIEW {
-            BufferLocation: 0x0000_0001_0000_1000,
+            BufferLocation: ib(1),
             SizeInBytes: 64,
             Format: DXGI_FORMAT_R16_UINT,
         };
@@ -3152,14 +3160,14 @@ mod tests {
             // records DRAW_ARGS, binds temp IB, then restores orig_ib.
             super::super::bind::reset(list_ptr, 0x7400_0100, 0);
             let before = super::super::bind::counts_snapshot();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_2000, DXGI_FORMAT_R16_UINT, 6, 0);
+            draw_indexed_x(list_ptr, ib(2), DXGI_FORMAT_R16_UINT, 6, 0);
             let after = super::super::bind::counts_snapshot();
             assert_eq!(super::super::bind::last_draw_args(), (true, 6, 1, 0, 0));
             assert!(after[2] > before[2], "DRAWS_PC must increment via bind::draw_indexed_instanced");
             assert_eq!(*fake.draws.lock().unwrap(), vec![(6, 1, 0, 0, 0)]);
             let ibs = std::mem::take(&mut *fake.index_buffers.lock().unwrap());
             assert_eq!(ibs.len(), 2);
-            assert_eq!(ibs[0].unwrap().BufferLocation, 0x0000_0001_0000_2000);
+            assert_eq!(ibs[0].unwrap().BufferLocation, ib(2));
             assert_eq!(ibs[0].unwrap().SizeInBytes, 12);
             assert_eq!(ibs[0].unwrap().Format, DXGI_FORMAT_R16_UINT);
             assert_eq!(ibs[1].unwrap().BufferLocation, orig_ib.BufferLocation);
@@ -3171,7 +3179,7 @@ mod tests {
             real::register_translated_graphics_for_test(translated_pso);
             super::super::bind::reset(list_ptr, 0x7400_0100, translated_pso);
             let before = super::super::bind::counts_snapshot();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_3000, DXGI_FORMAT_R32_UINT, 12, 0);
+            draw_indexed_x(list_ptr, ib(3), DXGI_FORMAT_R32_UINT, 12, 0);
             let after = super::super::bind::counts_snapshot();
             assert_eq!(super::super::bind::last_draw_args(), (true, 12, 1, 0, 0));
             assert_eq!(
@@ -3192,8 +3200,8 @@ mod tests {
 
             // 3. Zero count or invalid format returns early without touching IB or draws.
             let draws_before = fake.draws.lock().unwrap().len();
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R16_UINT, 0, 0);
-            draw_indexed_x(list_ptr, 0x0000_0001_0000_4000, DXGI_FORMAT_R8_UINT, 3, 0);
+            draw_indexed_x(list_ptr, ib(4), DXGI_FORMAT_R16_UINT, 0, 0);
+            draw_indexed_x(list_ptr, ib(4), DXGI_FORMAT_R8_UINT, 3, 0);
             assert_eq!(fake.draws.lock().unwrap().len(), draws_before);
             assert!(fake.index_buffers.lock().unwrap().is_empty());
 
@@ -3202,6 +3210,7 @@ mod tests {
 
         super::super::bind::forget(list_ptr);
         on_release(list_ptr as usize);
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(reserved as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
     }
 
     #[test]
