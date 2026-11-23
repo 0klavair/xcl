@@ -829,6 +829,20 @@ and with `XCL_SPLIT_WAVE64=1` (NEW: the 32-lane GPUs' split form on RDNA, which 
 - **#79** `ds_write_addtid_b32` / `ds_read_addtid_b32` (M0[15:0] + offset + 4 · lane); on merge also kept below
   the split wave64 exchange (`XCL_X_LDS_TOP`).
 
+## PRs #80–#82, #85, #86 (merged), 2026-11-23
+- **#86** (Foniass) a texture placed in a title heap whose PC size is larger than its XG size gets a committed
+  resource of the heap's kind (the console's aliasing of that placement is lost): Minecraft's logo (0x29F000 on the
+  console, 0x2E0000 on the PC) covered the 16x16 textures packed after it – the magenta / black squares on its
+  loading screen (the open item above). On merge: COMMON retried when the PC refuses the state. Minecraft logs ~10
+  such placements at start.
+- **#80** exact round-to-nearest-even and NaN → 0 for `v_cvt_(pk)norm_{u16,i16}_f16` (integer math on the f16 bits).
+- **#81** DirectStorage queues: RetrieveErrorRecord clears the error and resets the event, GetErrorEvent duplicates
+  the handle, Release / Close / Enqueue races, status / fence pointers validated. Fortnite (all its IO through it)
+  still loads to its splash screen.
+- **#82** `XCL_ADAPTER=5070` / `7900`: a number past the adapter count matches a model number in the name.
+- **#85** XAccessibility (closed captions, high contrast) as an XCL fallback object and by-name exports when the
+  system xgameruntime.dll is missing.
+
 ## Opus decoding (session 5, 2026-11-21, PR #3)
 - `hle/opus.rs`: Windows' own decoder, the "Microsoft Opus Audio Decoder MFT" (`MSOpusDecoder.dll`, Media Foundation),
   loaded with `mfplat.dll` at run time through `DllGetClassObject` (no COM registration, no libopus). RFC 6716 packet
