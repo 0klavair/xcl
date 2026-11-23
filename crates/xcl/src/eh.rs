@@ -263,10 +263,10 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
         return 0;
     };
-    static SEEN: std::sync::Mutex<Vec<ConsoleOnly>> = std::sync::Mutex::new(Vec::new());
+    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock() {
-        if !seen.contains(&what) {
-            seen.push(what);
+        if !seen.contains(&std::mem::discriminant(&what)) {
+            seen.push(std::mem::discriminant(&what));
             if what == ConsoleOnly::Ud2 {
                 crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
             } else {
@@ -299,6 +299,29 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
                 &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
             ];
             *regs[r as usize & 15] = cpu;
+        }
+        // the low quadword changes; the high one, undefined in AMD's manual, is zeroed – what a
+        // Zen 5 does in all of 32 779 cases compared (Kalmarv on #209)
+        ConsoleOnly::Extrq { dst, src, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let (len, idx) = match src {
+                Some(s) => {
+                    let c = x[s as usize & 15].Low;
+                    (c as u8, (c >> 8) as u8)
+                }
+                None => (len, idx),
+            };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::extrq(d.Low, len, idx);
+            d.High = 0;
+        }
+        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let s = x[src as usize & 15];
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
+            d.High = 0;
         }
     }
     ctx.Rip += len as u64;
