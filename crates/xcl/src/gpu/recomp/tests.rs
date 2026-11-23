@@ -6835,6 +6835,29 @@ fn gpu_sdwa_f16_inline_constants() {
     }
 }
 
+#[test]
+fn fspx_compute_user_sgprs_from_rsrc2() {
+    use crate::gpu::xbox::tests::container;
+
+    let counts = [4u32, 8].map(|count| {
+        // Two directory entries: type 0 holds the compute registers, type 6 holds the code.
+        let mut part = Vec::from(*b"FSPX");
+        for word in [1u32, 2, 0x74, 0, 0x30, 0x1c, 0, 6, 0x4c, 0x28, 0] {
+            part.extend_from_slice(&word.to_le_bytes());
+        }
+        part.resize(0x74, 0);
+        let header = &mut part[0x30..0x4c];
+        header[0x0c..0x12].copy_from_slice(&[1, 0, 1, 0, 1, 0]); // numthreads(1, 1, 1)
+        let rsrc2 = (count << 1) | 0x81; // set unrelated bits on both sides of USER_SGPR
+        header[0x18..0x1c].copy_from_slice(&rsrc2.to_le_bytes());
+        part[0x70..].copy_from_slice(&0xbf81_0000u32.to_le_bytes()); // s_endpgm
+        let blob = container(&[(b"ACCC", &part)]);
+        assert_eq!(super::pso::fspx(&blob).unwrap().rsrc2, rsrc2);
+        super::pso::compute_user_sgprs(&blob)
+    });
+    assert_eq!(counts, [Some(4), Some(8)]);
+}
+
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –
 /// e.g. the FSR4 pipelines XCL dumps to `<data>\shaders` – translates and compiles.
 #[test]
