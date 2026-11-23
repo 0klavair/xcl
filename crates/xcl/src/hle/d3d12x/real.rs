@@ -2105,7 +2105,12 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     }
     let h = pc_heap_desc(heap)?;
     let st = state as u32 & PC_RESOURCE_STATES;
-    let hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    if hr < 0 && st != 0 {
+        // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
+        // without the UAV flag) – COMMON rather than falling back to the overlapping placement
+        hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, 0, clear, riid, ppv);
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
         let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
